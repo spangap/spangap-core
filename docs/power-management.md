@@ -22,7 +22,7 @@ Two locks manage power states:
 | `streaming` | `CPU_FREQ_MAX` | Held during active audio/camera/RTSP/web streaming. Keeps CPU at 240 MHz, prevents DFS and light sleep. |
 | `usb` | `NO_LIGHT_SLEEP` | Held while USB Serial JTAG host is connected. Allows DFS (240→80 MHz) but prevents light sleep so console output works. |
 
-The `streaming` lock is managed by `lightSleepInhibit(true/false)`, called by audio, camera, RTSP, and web tasks when they start/stop streaming.
+The `streaming` lock is managed by `allowLightSleep(bool)`, called by audio, camera, RTSP, and web tasks when they start/stop streaming.
 
 The `usb` lock is polled from the log task using `usb_serial_jtag_is_connected()`, which detects USB host presence via SOF packets. Power banks (no SOF) are correctly identified as "not connected".
 
@@ -30,13 +30,13 @@ The `usb` lock is polled from the log task using `usb_serial_jtag_is_connected()
 
 | State | CPU | Light Sleep | Current | Condition |
 |-------|-----|-------------|---------|-----------|
-| Streaming | 240 MHz fixed | No | ~120 mA | `lightInhibitCount > 0` |
+| Streaming | 240 MHz fixed | No | ~120 mA | `allowLightSleep(false)` held |
 | Idle + USB | 240/80 MHz DFS | No | ~25 mA | USB host connected |
 | Idle + no USB | 240/80 MHz DFS | Yes | 7–10 mA | USB disconnected or `sleep` CLI command |
 
 ## Idle Poll Interval
 
-When idle (`lightInhibitCount == 0`), `ipcReceive()` extends task timeouts to a 200ms grid (`IDLE_POLL_MS`). This gives PM longer idle windows to enter light sleep or hold the CPU at minimum frequency.
+When idle (no locks held), `ipcReceive()` extends task timeouts to a 200ms grid (`IDLE_POLL_MS`). This gives PM longer idle windows to enter light sleep or hold the CPU at minimum frequency.
 
 ## CLI Commands
 
@@ -55,6 +55,6 @@ When deployed without USB (or on a power bank), light sleep engages automaticall
 
 ## Key Files
 
-- `main/ipc.cpp` — `pmInit()`, `lightSleepInhibit()`, `pmPollUsb()`, `pmAllowSleep()`, PM lock management
-- `main/ipc.h` — `pmInit()`, `pmAllowSleep()`, `lightSleepInhibit()` API
+- `main/ipc.cpp` — `pmInit()`, `allowLightSleep()`, `allowSlow()`, `allowDeepSleep()`, `pmPollUsb()`, PM lock management
+- `main/ipc.h` — `pmInit()`, `allowLightSleep()`, `allowSlow()`, `allowDeepSleep()` API
 - `sdkconfig.defaults` — PM and tickless idle config
