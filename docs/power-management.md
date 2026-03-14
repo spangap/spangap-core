@@ -45,7 +45,9 @@ USB SOF packets arrive every 1ms from the host, waking the CPU from light sleep 
 
 `esp_sleep_enable_wifi_wakeup()` is called at WiFi init and on wifi up. This registers WiFi as a light sleep wakeup source — CPU wakes for incoming packets between DTIM beacon intervals.
 
-On `wifi down`: `ntpStop()` + `mdns_free()` before `esp_wifi_stop()` (so mDNS goodbye multicast can be sent while RF is up), then `esp_wifi_deinit()` to fully tear down WiFi driver tasks (saves ~5mA vs `esp_wifi_stop()` alone). On `wifi up`: `esp_wifi_init()` + `esp_wifi_start()` to reinitialize.
+**Graceful shutdown** (`wifi down`): sets `wantDown` flag and waits for 30s of idle (no `wifiActivity()` calls from rtsp, web, log, or CLI network clients). Consumer tasks call `wifiActivity()` in their active loops. `wifi up` cancels a pending shutdown. `wifi down!` forces immediate teardown.
+
+On actual shutdown: broadcasts `MSG_WIFI_DOWN` to all tasks, then `ntpStop()` + `mdns_free()` before `esp_wifi_stop()` (so mDNS goodbye multicast can be sent while RF is up), then `esp_wifi_deinit()` to fully tear down WiFi driver tasks (saves ~5mA vs `esp_wifi_stop()` alone). On `wifi up`: `esp_wifi_init()` + `esp_wifi_start()` to reinitialize. WiFi state (`wifiWasUp`) survives deep sleep via `RTC_DATA_ATTR`.
 
 `WIFI_PS_MAX_MODEM` is set after network up for aggressive modem sleep.
 
@@ -55,6 +57,9 @@ On `wifi down`: `ntpStop()` + `mdns_free()` before `esp_wifi_stop()` (so mDNS go
 - `usb down` — Disable D+ pullup, release USB PM lock, allow light sleep
 - `usb up` — Reset USB Serial JTAG peripheral, re-enable PHY/pads, acquire PM lock
 - `usb down; sleep 30; usb up` — Semicolons split commands upfront so all execute even after USB disconnects
+- `wifi down` — Graceful shutdown (waits for 30s idle)
+- `wifi down!` — Immediate WiFi teardown
+- `wifi up` — Bring WiFi up (cancels pending graceful shutdown)
 
 ## Task Watchdog
 
