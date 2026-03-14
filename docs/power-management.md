@@ -25,11 +25,13 @@ Three locks manage power states:
 
 The `no_sleep` lock is managed by `allowLightSleep(bool)`, called by audio, camera, RTSP, and web tasks when they start/stop streaming.
 
-The `usb` lock is polled every 200ms from the log task using `usb_serial_jtag_is_connected()`, which detects USB host presence via SOF packets. Power banks (no SOF) are correctly identified as "not connected" — lock releases automatically.
+The `usb` lock is polled every 200ms from the log task using `usb_serial_jtag_is_connected()`, which detects USB host presence via SOF packets. Power banks (no SOF) are correctly identified as "not connected" — lock releases automatically. A 5-second grace period after boot keeps the lock held regardless of SOF detection, giving the host time to enumerate before light sleep gates the USB clock.
 
 ## USB D+ Pullup
 
-USB SOF packets arrive every 1ms from the host, waking the CPU from light sleep even after the USB PM lock is released. The `usb down` CLI command disables the D+ pullup via `usb_serial_jtag_ll_phy_enable_pull_override()`, signaling device disconnect to the host and stopping SOF packets. `usb up` restores hardware pull control.
+USB SOF packets arrive every 1ms from the host, waking the CPU from light sleep even after the USB PM lock is released. The `usb down` CLI command disables the D+ pullup via `usb_serial_jtag_ll_phy_enable_pull_override()`, signaling device disconnect to the host and stopping SOF packets.
+
+`usb up` does a full USB Serial JTAG peripheral reset (`usb_serial_jtag_ll_reset_register()`), re-enables the internal PHY and pads, and restores hardware pull control. The peripheral reset is necessary because light sleep gates the USB clock, leaving the internal state machine in a confused state that won't respond to host enumeration with just a pullup restore.
 
 ## Power States
 
@@ -50,8 +52,9 @@ On `wifi down`: `ntpStop()` + `mdns_free()` before `esp_wifi_stop()` (so mDNS go
 ## CLI Commands
 
 - `pm` — Show current CPU frequency, USB connection state, and all PM lock status
-- `usb down` — Disable D+ pullup, release USB PM lock, allow light sleep (reboot or `usb up` to restore)
-- `usb up` — Re-enable D+ pullup, restore normal USB PM behavior
+- `usb down` — Disable D+ pullup, release USB PM lock, allow light sleep
+- `usb up` — Reset USB Serial JTAG peripheral, re-enable PHY/pads, acquire PM lock
+- `usb down; sleep 30; usb up` — Semicolons split commands upfront so all execute even after USB disconnects
 
 ## Task Watchdog
 
