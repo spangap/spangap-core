@@ -21,10 +21,7 @@
 
 /* ---- RTC state (survives deep sleep) ---- */
 
-#define CRON_MAGIC 0xCE0A0000
-
 RTC_DATA_ATTR static uint32_t cronLastMinute = 0;
-RTC_DATA_ATTR static uint32_t cronMagic = 0;
 
 /* ---- Command stream → CLI task ---- */
 
@@ -182,7 +179,7 @@ bool cronPoll(bool execute) {
 static void cronDeepSleep() {
     time_t now = time(nullptr);
     int sleepSec = 61 - (int)(now % 60);  /* +1s so we land inside the new minute */
-    cronMagic = CRON_MAGIC;
+    rtcSetValid();
     printf("cron: deep sleep %ds\n", sleepSec);
     fflush(stdout);
     vTaskDelay(pdMS_TO_TICKS(50));
@@ -193,7 +190,7 @@ static void cronDeepSleep() {
 bool cronWakeupHandler() {
     if (esp_sleep_get_wakeup_cause() != ESP_SLEEP_WAKEUP_TIMER)
         return false;
-    if (cronMagic != CRON_MAGIC)
+    if (!rtcValid())
         return false;
 
     printf("cron: deep sleep wakeup\n");
@@ -205,7 +202,6 @@ bool cronWakeupHandler() {
     }
 
     /* Work to do — stay awake, cron task will handle it */
-    cronMagic = 0;
     return true;
 }
 

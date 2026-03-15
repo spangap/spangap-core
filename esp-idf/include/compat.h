@@ -1,7 +1,13 @@
 #pragma once
 #include "esp_timer.h"
+#include "esp_sleep.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+
+/** Central RTC RAM validity — one magic word for all application RTC state.
+ *  Set before deep sleep, checked on wakeup. If invalid, all RTC vars are stale. */
+bool rtcValid();
+void rtcSetValid();
 
 static inline uint32_t millis() {
     return static_cast<uint32_t>(esp_timer_get_time() / 1000);
