@@ -27,9 +27,23 @@ RTC_DATA_ATTR static uint32_t cronLastMinute = 0;
 
 #define CRON_STREAM_SIZE 256
 static StreamBufferHandle_t cronStream = nullptr;
+static pm_lock_handle_t cronDeepLock = nullptr;
 
 static bool cronEnabled() {
     return nvsGetInt("cron_enable") != 0;
+}
+
+/** Update deep sleep lock: held unless cron is enabled with entries. */
+static void cronUpdateLock() {
+    bool allow = cronEnabled() && nvsExists("cron_0");
+    static bool released = false;
+    if (allow && !released) {
+        pmLockRelease(cronDeepLock);
+        released = true;
+    } else if (!allow && released) {
+        pmLockAcquire(cronDeepLock);
+        released = false;
+    }
 }
 
 /* ---- Cron field matching ---- */
@@ -180,10 +194,12 @@ static void cronDeepSleep() {
     time_t now = time(nullptr);
     int sleepSec = 61 - (int)(now % 60);  /* +1s so we land inside the new minute */
     rtcSetValid();
+    int64_t sleepUs = (int64_t)sleepSec * 1000000;
+    pmRecordDeepSleep(sleepUs);
     printf("cron: deep sleep %ds\n", sleepSec);
     fflush(stdout);
     vTaskDelay(pdMS_TO_TICKS(50));
-    esp_sleep_enable_timer_wakeup((uint64_t)sleepSec * 1000000);
+    esp_sleep_enable_timer_wakeup((uint64_t)sleepUs);
     esp_deep_sleep_start();
 }
 
@@ -209,20 +225,26 @@ bool cronWakeupHandler() {
 
 static void cronTaskFn(void*) {
     ipcEnsureRegistered("cron");
+    cronUpdateLock();
 
     for (;;) {
         ipc_msg_t msg;
-        ipcReceive(&msg, 30000);  /* 30s or MSG_NVS_CHANGED wakes us */
+        bool got = ipcReceive(&msg, 30000);  /* 30s or MSG_NVS_CHANGED wakes us */
+
+        if (got && msg.type == MSG_NVS_CHANGED)
+            cronUpdateLock();
 
         cronPoll(true);
-        if (deepSleepAllowed() && cronEnabled() && nvsExists("cron_0")) {
+
+        if (got && msg.type == MSG_SYS_SLEEP)
             cronDeepSleep();  /* never returns */
-        }
     }
 }
 
 void cronInit() {
     cronStream = xStreamBufferCreate(CRON_STREAM_SIZE, 1);
+    pmLockCreate(PM_NO_DEEP_SLEEP, "cron", &cronDeepLock);
+    pmLockAcquire(cronDeepLock);
     xTaskCreatePinnedToCore(cronTaskFn, "cron", 4096, nullptr, 1, nullptr, 0);
 }
 
