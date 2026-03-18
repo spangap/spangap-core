@@ -3,9 +3,10 @@
  *
  * Entries in NVS: cron_0, cron_1, ... (standard unix cron, no user field).
  * Commands sent to CLI via stream buffer for proper serialization.
- * Enabled/disabled via NVS cron_enable (default 0). Listens for MSG_NVS_CHANGED.
+ * Enabled/disabled via NVS cron_enable (default 0). Listens for MSG_CFG_CHANGED.
  */
 #include "cron.h"
+#include "cfg.h"
 #include "ipc.h"
 #include "nvs_config.h"
 #include "compat.h"
@@ -30,12 +31,12 @@ static StreamBufferHandle_t cronStream = nullptr;
 static pm_lock_handle_t cronDeepLock = nullptr;
 
 static bool cronEnabled() {
-    return nvsGetInt("cron_enable") != 0;
+    return cfgGetInt("cron_enable") != 0;
 }
 
 /** Update deep sleep lock: held unless cron is enabled with entries. */
 static void cronUpdateLock() {
-    bool allow = cronEnabled() && nvsExists("cron_0");
+    bool allow = cronEnabled() && cfgExists("cron_0");
     static bool released = false;
     if (allow && !released) {
         pmLockRelease(cronDeepLock);
@@ -169,7 +170,7 @@ bool cronPoll(bool execute) {
 
     for (int i = 0; ; i++) {
         snprintf(key, sizeof(key), "cron_%d", i);
-        nvsGetStr(key, val, sizeof(val));
+        cfgGetStr(key, val, sizeof(val));
         if (val[0] == '\0') break;
 
         const char* cmd = cronMatch(val, &tm);
@@ -229,9 +230,9 @@ static void cronTaskFn(void*) {
 
     for (;;) {
         ipc_msg_t msg;
-        bool got = ipcReceive(&msg, 30000);  /* 30s or MSG_NVS_CHANGED wakes us */
+        bool got = ipcReceive(&msg, 30000);  /* 30s or MSG_CFG_CHANGED wakes us */
 
-        if (got && msg.type == MSG_NVS_CHANGED)
+        if (got && msg.type == MSG_CFG_CHANGED)
             cronUpdateLock();
 
         cronPoll(true);
