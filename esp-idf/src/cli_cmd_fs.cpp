@@ -11,7 +11,7 @@
 #include "ff.h"  /* FATFS */
 
 static void cmdLs(const char* a) {
-    if (strcmp(a, "help") == 0) { cliPrintf("  %-*s [-la] [/path]       list files\n", CLI_HELP_COL, "ls"); return; }
+    if (strcmp(a, "help") == 0) { cliPrintf("  %-*s list files\n", CLI_HELP_COL, "ls [-la] [/path]"); return; }
     const char* arg = a;
     bool showAll = false, longFmt = false;
     while (*arg == '-') {
@@ -67,7 +67,7 @@ static void cmdLs(const char* a) {
 }
 
 static void cmdRm(const char* a) {
-    if (strcmp(a, "help") == 0) { cliPrintf("  %-*s <file|dir>          delete file or directory\n", CLI_HELP_COL, "rm"); return; }
+    if (strcmp(a, "help") == 0) { cliPrintf("  %-*s delete file or directory\n", CLI_HELP_COL, "rm <file|dir>"); return; }
     if (!*a) { cliPrintf("usage: rm <file>\n"); return; }
     char filepath[192];
     if (a[0] == '/') snprintf(filepath, sizeof(filepath), "%s", a);
@@ -104,7 +104,7 @@ static void cmdRm(const char* a) {
 }
 
 static void cmdDf(const char* a) {
-    if (strcmp(a, "help") == 0) { cliPrintf("  %-*s [/path]             show disk usage\n", CLI_HELP_COL, "df"); return; }
+    if (strcmp(a, "help") == 0) { cliPrintf("  %-*s show disk usage\n", CLI_HELP_COL, "df [/path]"); return; }
     const char* path = *a ? a : "/sdcard";
     uint64_t total = 0, used = 0;
     bool ok = false;

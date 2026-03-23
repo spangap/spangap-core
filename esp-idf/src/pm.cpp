@@ -247,13 +247,13 @@ void pmRecordDeepSleep(int64_t durationUs) {
 /* ---- CLI commands: pm, top, usb ---- */
 
 static void cmdUsb(const char* a) {
-    if (strcmp(a, "help") == 0) { cliPrintf("  %-*s up|down            reconnect or disconnect USB\n", CLI_HELP_COL, "usb"); return; }
+    if (strcmp(a, "help") == 0) { cliPrintf("  %-*s reconnect or disconnect USB\n", CLI_HELP_COL, "usb up|down"); return; }
     if (strcmp(a, "down") == 0) cliUsbDown();
     else if (strcmp(a, "up") == 0) cliUsbUp();
 }
 
 static void cmdPm(const char* args) {
-    if (strcmp(args, "help") == 0) { cliPrintf("  %-*s [wifi ...]          power management\n", CLI_HELP_COL, "pm"); return; }
+    if (strcmp(args, "help") == 0) { cliPrintf("  %-*s power management\n", CLI_HELP_COL, "pm [wifi ...]"); return; }
     if (strstr(args, "allow") || strstr(args, "inhibit")) {
         static pm_lock_handle_t cliDeep = nullptr, cliLight = nullptr, cliSlow = nullptr;
         static bool deepHeld = false, lightHeld = false, slowHeld = false;

@@ -117,11 +117,16 @@ static struct {
 static int cliActiveHandle = -1;
 
 static void itsCliWrite(const char* data, size_t len) {
-    if (cliActiveHandle >= 0) {
-        if (cliClients[cliActiveHandle].ws)
-            wsSendText(cliActiveHandle, data, len);
-        else
-            itsSend(cliActiveHandle, data, len, 0);
+    if (cliActiveHandle < 0) return;
+    if (cliClients[cliActiveHandle].ws) {
+        wsSendText(cliActiveHandle, data, len);
+    } else {
+        while (len > 0) {
+            size_t sent = itsSend(cliActiveHandle, data, len, pdMS_TO_TICKS(100));
+            if (sent == 0) break;
+            data += sent;
+            len -= sent;
+        }
     }
 }
 
@@ -403,7 +408,7 @@ static void cliBuiltinInit() {
     pmRegisterCmds();
     logRegisterCmds();
     cliRegisterCmd("help", [](const char* a) {
-        if (strcmp(a, "help") == 0) { cliPrintf("  %-*s [<cmd>]           show commands\n", CLI_HELP_COL, "help"); return; }
+        if (strcmp(a, "help") == 0) { cliPrintf("  %-*s show commands\n", CLI_HELP_COL, "help [<cmd>]"); return; }
         if (*a) {
             for (int i = 0; i < cliCmdCount; i++)
                 if (strcmp(cliCmds[i].cmd, a) == 0) { cliCmds[i].cb("help"); return; }

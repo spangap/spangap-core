@@ -19,7 +19,7 @@ static void cmdReboot(const char* a) {
 }
 
 static void cmdResetFactory(const char* a) {
-    if (strcmp(a, "help") == 0) { cliPrintf("  %-*s factory          erase NVS and reboot\n", CLI_HELP_COL, "reset"); return; }
+    if (strcmp(a, "help") == 0) { cliPrintf("  %-*s erase NVS and reboot\n", CLI_HELP_COL, "reset factory"); return; }
     cliPrintf("erasing NVS + state and rebooting...\n");
     fflush(stdout);
     nvsErase();
@@ -29,7 +29,7 @@ static void cmdResetFactory(const char* a) {
 }
 
 static void cmdDate(const char* a) {
-    if (strcmp(a, "help") == 0) { cliPrintf("  %-*s [yyyymmddhhmmss]  show or set date/time\n", CLI_HELP_COL, "date"); return; }
+    if (strcmp(a, "help") == 0) { cliPrintf("  %-*s show or set date/time\n", CLI_HELP_COL, "date [yyyymmddhhmmss]"); return; }
     if (!*a) {
         struct timeval tv;
         gettimeofday(&tv, NULL);
@@ -55,13 +55,13 @@ static void cmdDate(const char* a) {
 }
 
 static void cmdSleep(const char* a) {
-    if (strcmp(a, "help") == 0) { cliPrintf("  %-*s <seconds>        delay execution\n", CLI_HELP_COL, "sleep"); return; }
+    if (strcmp(a, "help") == 0) { cliPrintf("  %-*s delay execution\n", CLI_HELP_COL, "sleep <seconds>"); return; }
     int secs = atoi(a);
     if (secs > 0) vTaskDelay(pdMS_TO_TICKS(secs * 1000));
 }
 
 static void cmdRun(const char* a) {
-    if (strcmp(a, "help") == 0) { cliPrintf("  %-*s <file>             run CLI script file\n", CLI_HELP_COL, "run"); return; }
+    if (strcmp(a, "help") == 0) { cliPrintf("  %-*s run CLI script file\n", CLI_HELP_COL, "run <file>"); return; }
     if (!*a) { cliPrintf("usage: run <file>\n"); return; }
     cliRunFile(a);
 }

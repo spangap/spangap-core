@@ -355,7 +355,7 @@ const char* cfd(int fd) {
 
 void logRegisterCmds() {
     cliRegisterCmd("log", [](const char* a) {
-        if (strcmp(a, "help") == 0) { cliPrintf("  %-*s [tag] [level]      show/set log level\n", CLI_HELP_COL, "log"); return; }
+        if (strcmp(a, "help") == 0) { cliPrintf("  %-*s show/set log level\n", CLI_HELP_COL, "log [tag] [level]"); return; }
         if (!*a) {
             char val[16]; cfgGetStr("log", val, sizeof(val), "info");
             cliPrintf("  %s\n", val);

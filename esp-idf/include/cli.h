@@ -27,7 +27,7 @@ typedef void (*cli_cmd_cb_t)(const char* args);
 void cliRegisterCmd(const char* cmd, cli_cmd_cb_t cb);
 
 /** Column width for help alignment. Usage: cliPrintf("  %-*s description\n", CLI_HELP_COL, "cmd [args]"); */
-#define CLI_HELP_COL 22
+#define CLI_HELP_COL 23
 
 /** printf to the active CLI client (ITS handle or serial). */
 void cliPrintf(const char* fmt, ...) __attribute__((format(printf, 1, 2)));
