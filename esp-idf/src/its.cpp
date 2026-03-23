@@ -5,6 +5,64 @@
 #include "esp_heap_caps.h"
 #include <string.h>
 
+/* ---- Stream buffer pool ---- */
+
+#define ITS_MAX_POOL 32
+
+struct its_pool_entry_t {
+    StreamBufferHandle_t handle;
+    size_t               size;
+    volatile bool        inUse;
+};
+
+static its_pool_entry_t itsPool[ITS_MAX_POOL];
+static int              itsPoolCount = 0;
+static portMUX_TYPE     itsPoolMux = portMUX_INITIALIZER_UNLOCKED;
+
+void itsReserveStreams(int count, size_t size) {
+    for (int i = 0; i < count && itsPoolCount < ITS_MAX_POOL; i++) {
+        auto& e = itsPool[itsPoolCount++];
+        e.handle = xStreamBufferCreateWithCaps(size, 1, MALLOC_CAP_SPIRAM);
+        e.size = size;
+        e.inUse = false;
+    }
+}
+
+/* Best-fit: find free stream with least oversize >= minSize */
+static StreamBufferHandle_t itsGetStream(size_t minSize) {
+    if (minSize == 0) return nullptr;
+    portENTER_CRITICAL(&itsPoolMux);
+    int best = -1;
+    size_t bestSize = SIZE_MAX;
+    for (int i = 0; i < itsPoolCount; i++) {
+        if (!itsPool[i].inUse && itsPool[i].size >= minSize && itsPool[i].size < bestSize) {
+            best = i;
+            bestSize = itsPool[i].size;
+        }
+    }
+    StreamBufferHandle_t h = nullptr;
+    if (best >= 0) {
+        itsPool[best].inUse = true;
+        h = itsPool[best].handle;
+    }
+    portEXIT_CRITICAL(&itsPoolMux);
+    if (h) xStreamBufferReset(h);
+    return h;
+}
+
+static void itsFreeStream(StreamBufferHandle_t h) {
+    if (!h) return;
+    xStreamBufferReset(h);
+    portENTER_CRITICAL(&itsPoolMux);
+    for (int i = 0; i < itsPoolCount; i++) {
+        if (itsPool[i].handle == h) {
+            itsPool[i].inUse = false;
+            break;
+        }
+    }
+    portEXIT_CRITICAL(&itsPoolMux);
+}
+
 /* ---- Signaling protocol (over per-task message buffer inbox) ---- */
 
 enum {
@@ -222,11 +280,16 @@ bool itsPoll(void) {
 
         if (accepted) {
             its_slot_t* s = &srv->slots[slot];
+            /* Get streams from pool (or reuse if slot already has them) */
+            if (!s->toServer && srv->toSize > 0)
+                s->toServer = itsGetStream(srv->toSize);
+            else if (s->toServer) xStreamBufferReset(s->toServer);
+            if (!s->fromServer && srv->fromSize > 0)
+                s->fromServer = itsGetStream(srv->fromSize);
+            else if (s->fromServer) xStreamBufferReset(s->fromServer);
             s->active = true;
             s->client = hdr->sender;
             s->itsPort = hdr->itsPort;
-            if (s->toServer) xStreamBufferReset(s->toServer);
-            if (s->fromServer) xStreamBufferReset(s->fromServer);
             cli->ackSlot = s;
         } else if (cli) {
             cli->ackSlot = nullptr;
@@ -239,8 +302,8 @@ bool itsPoll(void) {
             if (srv->slots[i].active && srv->slots[i].client == hdr->sender) {
                 srv->slots[i].active = false;
                 srv->slots[i].client = nullptr;
-                if (srv->slots[i].toServer) xStreamBufferReset(srv->slots[i].toServer);
-                if (srv->slots[i].fromServer) xStreamBufferReset(srv->slots[i].fromServer);
+                itsFreeStream(srv->slots[i].toServer);   srv->slots[i].toServer = nullptr;
+                itsFreeStream(srv->slots[i].fromServer); srv->slots[i].fromServer = nullptr;
                 if (srv->onDisconnect) srv->onDisconnect(i);
                 break;
             }
@@ -293,13 +356,10 @@ bool itsServerInit(int maxHandles, size_t toSize, size_t fromSize,
     srv->onDisconnect = onDisconnect;
 
     for (int i = 0; i < maxHandles; i++) {
-        its_slot_t* slot = &srv->slots[i];
-        slot->active = false;
-        slot->client = nullptr;
-        if (toSize > 0)
-            slot->toServer = xStreamBufferCreateWithCaps(toSize, 1, MALLOC_CAP_SPIRAM);
-        if (fromSize > 0)
-            slot->fromServer = xStreamBufferCreateWithCaps(fromSize, 1, MALLOC_CAP_SPIRAM);
+        srv->slots[i].active = false;
+        srv->slots[i].client = nullptr;
+        srv->slots[i].toServer = nullptr;
+        srv->slots[i].fromServer = nullptr;
     }
 
     entry->server = srv;
@@ -317,8 +377,8 @@ void itsServerKick(int handle) {
     TaskHandle_t client = slot->client;
     slot->active = false;
     slot->client = nullptr;
-    if (slot->toServer) xStreamBufferReset(slot->toServer);
-    if (slot->fromServer) xStreamBufferReset(slot->fromServer);
+    itsFreeStream(slot->toServer);   slot->toServer = nullptr;
+    itsFreeStream(slot->fromServer); slot->fromServer = nullptr;
 
     if (client) xTaskNotifyGive(client);
 }
@@ -368,13 +428,13 @@ int itsServerForwardByHandle(int handle, TaskHandle_t targetTask, int itsPort,
     its_slot_t* dstSlot = &dst->slots[dstIdx];
     TaskHandle_t client = src->client;
 
-    /* Swap stream buffers — data in flight travels with the buffers */
-    StreamBufferHandle_t tmpTo = dstSlot->toServer;
-    StreamBufferHandle_t tmpFrom = dstSlot->fromServer;
+    /* Move stream buffers — no swap needed (target slot has none) */
+    itsFreeStream(dstSlot->toServer);    /* free any leftover */
+    itsFreeStream(dstSlot->fromServer);
     dstSlot->toServer = src->toServer;
     dstSlot->fromServer = src->fromServer;
-    src->toServer = tmpTo;
-    src->fromServer = tmpFrom;
+    src->toServer = nullptr;
+    src->fromServer = nullptr;
 
     /* Activate target slot */
     dstSlot->active = true;

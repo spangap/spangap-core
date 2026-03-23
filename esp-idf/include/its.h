@@ -33,6 +33,12 @@
 #define ITS_MAX_MSG_DATA      64
 #define ITS_CLIENT_BASE       128
 
+/* ---- Stream buffer pool ---- */
+
+/** Pre-allocate stream buffers into a systemwide pool.
+ *  Call multiple times for different sizes. Called from main at boot. */
+void          itsReserveStreams(int count, size_t size);
+
 /* ---- Callbacks ---- */
 
 /** Server: called on incoming connection. itsPort identifies which endpoint.
