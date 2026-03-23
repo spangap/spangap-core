@@ -11,14 +11,17 @@ enum {
     ITS_MSG_CONNECT,
     ITS_MSG_DISCONNECT,
     ITS_MSG_AUX,
+    ITS_MSG_FORWARD,    /* slot already set up, just call onConnect */
 };
 
 typedef struct {
     TaskHandle_t sender;
     uint8_t      msg;
     uint8_t      _pad;
+    uint16_t     itsPort;   /* endpoint identifier */
     uint16_t     len;       /* payload bytes after header */
-} its_header_t;             /* 8 bytes, naturally aligned */
+    uint16_t     _pad2;
+} its_header_t;             /* 12 bytes, naturally aligned */
 
 #define ITS_INBOX_SIZE  (sizeof(its_header_t) + ITS_MAX_MSG_DATA + 4)
 
@@ -27,6 +30,7 @@ typedef struct {
 typedef struct {
     volatile bool        active;
     TaskHandle_t         client;
+    int                  itsPort;
     StreamBufferHandle_t toServer;
     StreamBufferHandle_t fromServer;
 } its_slot_t;
@@ -198,7 +202,7 @@ bool itsPoll(void) {
 
         /* All slots busy — ask server if it wants to evict */
         if (slot < 0 && srv->onBusy) {
-            if (!srv->onBusy(payload, hdr->len)) {
+            if (!srv->onBusy(hdr->itsPort, payload, hdr->len)) {
                 /* Server freed a slot — retry */
                 for (int i = 0; i < srv->maxHandles; i++) {
                     if (!srv->slots[i].active) { slot = i; break; }
@@ -213,13 +217,14 @@ bool itsPoll(void) {
         bool accepted = false;
         if (slot >= 0 && cli) {
             accepted = !srv->onConnect ||
-                       srv->onConnect(slot, payload, hdr->len);
+                       srv->onConnect(slot, hdr->itsPort, payload, hdr->len);
         }
 
         if (accepted) {
             its_slot_t* s = &srv->slots[slot];
             s->active = true;
             s->client = hdr->sender;
+            s->itsPort = hdr->itsPort;
             if (s->toServer) xStreamBufferReset(s->toServer);
             if (s->fromServer) xStreamBufferReset(s->fromServer);
             cli->ackSlot = s;
@@ -238,6 +243,17 @@ bool itsPoll(void) {
                 if (srv->slots[i].fromServer) xStreamBufferReset(srv->slots[i].fromServer);
                 if (srv->onDisconnect) srv->onDisconnect(i);
                 break;
+            }
+        }
+
+    } else if (hdr->msg == ITS_MSG_FORWARD && entry->server) {
+        /* Slot already active (set up by itsServerForward). Just call onConnect. */
+        ItsServer* srv = entry->server;
+        int slot = hdr->_pad;  /* slot index passed in _pad field */
+        if (slot >= 0 && slot < srv->maxHandles && srv->slots[slot].active) {
+            if (srv->onConnect && !srv->onConnect(slot, hdr->itsPort, payload, hdr->len)) {
+                /* Rejected — tear down */
+                itsServerKick(slot);
             }
         }
 
@@ -316,6 +332,98 @@ int itsServerActive(void) {
     return count;
 }
 
+size_t itsServerInject(int handle, const void* data, size_t len) {
+    ItsServer* srv = myServer();
+    if (!srv || handle < 0 || handle >= srv->maxHandles) return 0;
+    its_slot_t* slot = &srv->slots[handle];
+    if (!slot->active || !slot->toServer) return 0;
+    return xStreamBufferSend(slot->toServer, data, len, 0);
+}
+
+int itsServerForwardByHandle(int handle, TaskHandle_t targetTask, int itsPort,
+                             const void* data, size_t dataLen) {
+    ItsServer* my = myServer();
+    if (!my || handle < 0 || handle >= my->maxHandles) return -1;
+    its_slot_t* src = &my->slots[handle];
+    if (!src->active) return -1;
+
+    its_task_entry_t* te = taskFind(targetTask);
+    if (!te || !te->server) return -1;
+    ItsServer* dst = te->server;
+
+    /* Find free slot on target */
+    int dstIdx = -1;
+    for (int i = 0; i < dst->maxHandles; i++) {
+        if (!dst->slots[i].active) { dstIdx = i; break; }
+    }
+    if (dstIdx < 0 && dst->onBusy) {
+        if (!dst->onBusy(itsPort, data, dataLen)) {
+            for (int i = 0; i < dst->maxHandles; i++) {
+                if (!dst->slots[i].active) { dstIdx = i; break; }
+            }
+        }
+    }
+    if (dstIdx < 0) return -1;
+
+    its_slot_t* dstSlot = &dst->slots[dstIdx];
+    TaskHandle_t client = src->client;
+
+    /* Swap stream buffers — data in flight travels with the buffers */
+    StreamBufferHandle_t tmpTo = dstSlot->toServer;
+    StreamBufferHandle_t tmpFrom = dstSlot->fromServer;
+    dstSlot->toServer = src->toServer;
+    dstSlot->fromServer = src->fromServer;
+    src->toServer = tmpTo;
+    src->fromServer = tmpFrom;
+
+    /* Activate target slot */
+    dstSlot->active = true;
+    dstSlot->client = client;
+    dstSlot->itsPort = itsPort;
+
+    /* Deactivate source slot */
+    src->active = false;
+    src->client = nullptr;
+
+    /* Update client's connection to point to new server slot */
+    its_task_entry_t* ce = taskFind(client);
+    if (ce && ce->client) {
+        for (int i = 0; i < ce->client->maxConns; i++) {
+            if (ce->client->conns[i].active && ce->client->conns[i].slot == src) {
+                ce->client->conns[i].slot = dstSlot;
+                ce->client->conns[i].server = targetTask;
+                break;
+            }
+        }
+    }
+
+    /* Notify target via inbox — onConnect runs on target's task */
+    its_task_entry_t* dstEntry = taskFind(targetTask);
+    if (dstEntry) {
+        if (dataLen > ITS_MAX_MSG_DATA) dataLen = ITS_MAX_MSG_DATA;
+        uint8_t buf[sizeof(its_header_t) + ITS_MAX_MSG_DATA];
+        auto* fhdr = (its_header_t*)buf;
+        fhdr->sender = xTaskGetCurrentTaskHandle();
+        fhdr->msg = ITS_MSG_FORWARD;
+        fhdr->_pad = (uint8_t)dstIdx;  /* slot index */
+        fhdr->itsPort = (uint16_t)itsPort;
+        fhdr->len = dataLen;
+        fhdr->_pad2 = 0;
+        if (data && dataLen > 0)
+            memcpy(buf + sizeof(its_header_t), data, dataLen);
+        inboxSend(dstEntry, buf, sizeof(its_header_t) + dataLen, pdMS_TO_TICKS(100));
+    }
+
+    return dstIdx;
+}
+
+int itsServerForward(int handle, const char* targetServer, int itsPort,
+                     const void* data, size_t dataLen) {
+    TaskHandle_t task = xTaskGetHandle(targetServer);
+    if (!task) return -1;
+    return itsServerForwardByHandle(handle, task, itsPort, data, dataLen);
+}
+
 /* ---- Client API ---- */
 
 void itsClientInit(int maxConns,
@@ -341,7 +449,7 @@ void itsClientInit(int maxConns,
     entry->onAux = onAux;
 }
 
-int itsConnectByHandle(TaskHandle_t serverTask,
+int itsConnectByHandle(TaskHandle_t serverTask, int itsPort,
                        const void* data, size_t dataLen, TickType_t timeout) {
     ItsClient* cli = myClient();
     if (!cli) return -1;
@@ -364,7 +472,9 @@ int itsConnectByHandle(TaskHandle_t serverTask,
     hdr->sender = cli->task;
     hdr->msg = ITS_MSG_CONNECT;
     hdr->_pad = 0;
+    hdr->itsPort = (uint16_t)itsPort;
     hdr->len = dataLen;
+    hdr->_pad2 = 0;
     if (data && dataLen > 0)
         memcpy(buf + sizeof(its_header_t), data, dataLen);
 
@@ -382,11 +492,17 @@ int itsConnectByHandle(TaskHandle_t serverTask,
     return ITS_CLIENT_BASE + idx;
 }
 
-int itsConnect(const char* serverName,
+int itsConnect(const char* serverName, int itsPort,
                const void* data, size_t dataLen, TickType_t timeout) {
     TaskHandle_t task = xTaskGetHandle(serverName);
     if (!task) return -1;
-    return itsConnectByHandle(task, data, dataLen, timeout);
+    return itsConnectByHandle(task, itsPort, data, dataLen, timeout);
+}
+
+int itsServerPort(int handle) {
+    ItsServer* s = myServer();
+    if (!s || handle < 0 || handle >= s->maxHandles) return -1;
+    return s->slots[handle].active ? s->slots[handle].itsPort : -1;
 }
 
 void itsDisconnect(int handle) {
@@ -488,6 +604,10 @@ bool itsIsEmpty(int handle) {
 bool itsIsFull(int handle) {
     StreamBufferHandle_t buf = sendBuf(handle);
     return buf ? xStreamBufferIsFull(buf) : true;
+}
+
+TaskHandle_t itsRemoteTask(int handle) {
+    return remoteTask(handle);
 }
 
 bool itsReset(int handle) {
