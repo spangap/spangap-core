@@ -8,6 +8,8 @@
 #include "cron.h"
 #include "cfg.h"
 #include "ipc.h"
+#include "pm.h"
+#include "cli.h"
 #include "nvs_config.h"
 #include "compat.h"
 
