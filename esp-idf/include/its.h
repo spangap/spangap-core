@@ -2,24 +2,20 @@
  * ITS — Inter-Task Streaming
  *
  * Point-to-point connections between FreeRTOS tasks.
- * Server pre-allocates handles with stream buffers at init.
- * Client connects by task name or handle, gets a handle back.
+ * Global connection table — handles are indices, same number on both sides.
+ * Stream buffers from a pre-allocated PSRAM pool.
  *
- * All API uses int handles:
- *   Server handles: 0 .. maxHandles-1
- *   Client handles: ITS_CLIENT_BASE .. ITS_CLIENT_BASE+maxConns-1
+ * itsPort: 16-bit endpoint identifier passed from connect through to onConnect.
+ * A server could use different itsPort values to distinguish multiple endpoints
+ * (e.g. TCP ports, URL paths). When proxying incoming TCP connections to a task,
+ * one could use the TCP port number (80, 443, 554) as the itsPort. Or just 0.
+ * Aux messages also carry a port, dispatched to the matching registered callback.
  *
- * A task can be both server and client — handle ranges don't overlap.
+ * Signaling goes through per-task inbox (message buffer, configurable size).
+ * itsPoll() reads one inbox message, dispatches to callback, and gives the
+ * pickup semaphore if the sender requested PICKUP acknowledgment.
  *
- * itsPort: 16-bit endpoint identifier. Servers register multiple endpoints
- * (TCP ports, URL paths) with different itsPort values. The itsPort flows
- * from connect through to onConnect so the server knows which endpoint
- * the connection is for. Convention: use the TCP port number (80, 443, 554)
- * or 0 if not meaningful.
- *
- * Signaling (connect/disconnect/aux) goes through per-task message buffers.
- * Data flows through per-handle stream buffers (SPSC, partial send/recv).
- * itsPoll() reads one inbox message and dispatches to callbacks.
+ * Data flows through per-connection stream buffers (SPSC, partial send/recv).
  */
 
 #ifndef SECCAM_ITS_H
@@ -31,7 +27,12 @@
 #include "freertos/task.h"
 
 #define ITS_MAX_MSG_DATA      64
-#define ITS_CLIENT_BASE       128
+
+/** Timeout waits for delivery into inbox (default) or pickup by receiver's itsPoll. */
+enum its_wait_t {
+  ITS_WAIT_DELIVERY = 0,   /* return when message is in the inbox */
+  ITS_WAIT_PICKUP,         /* return when receiver has processed the message */
+};
 
 /* ---- Stream buffer pool ---- */
 
@@ -41,57 +42,65 @@ void          itsReserveStreams(int count, size_t size);
 
 /* ---- Callbacks ---- */
 
-/** Server: called on incoming connection. itsPort identifies which endpoint.
- *  Return true to accept. */
+/** Server: called on incoming connection. Return true to accept. */
 typedef bool (*its_connect_cb_t)(int handle, int itsPort, const void* data, size_t len);
 
-/** Server: called when all handles are busy and a new client wants in.
- *  Return true to reject. Free a handle (itsServerKick) and return false
- *  to let ITS retry — the freed slot will be used for the new client. */
+/** Server: called when active connections == maxHandles and a new client wants in.
+ *  Return true to reject. Kick a handle (itsServerKick) and return false
+ *  to let ITS retry. */
 typedef bool (*its_busy_cb_t)(int itsPort, const void* data, size_t len);
 
 /** Either side: called when connection is closed by remote. */
 typedef void (*its_disconnect_cb_t)(int handle);
 
-/** Called when an aux message arrives. */
-typedef void (*its_aux_cb_t)(TaskHandle_t sender, const void* data, size_t len);
+/** Called when an aux message arrives on the registered port. */
+typedef void (*its_aux_cb_t)(TaskHandle_t sender, uint16_t port, const void* data, size_t len);
 
 /* ---- Server API ---- */
 
 /** Init this task as a server. One server per task.
- *  toSize:   client→server stream buffer per handle (0 = send-only server)
- *  fromSize: server→client stream buffer per handle (0 = recv-only server) */
+ *  maxHandles:     max concurrent connections this server accepts.
+ *  toSize:         client→server stream buffer per connection (0 = send-only server)
+ *  fromSize:       server→client stream buffer per connection (0 = recv-only server)
+ *  inboxMaxMsgLen: max message size for this task's inbox (0 = default)
+ *  inboxDepth:     inbox buffer size in bytes (0 = default, single message) */
 bool          itsServerInit(int maxHandles, size_t toSize, size_t fromSize,
-                            its_connect_cb_t onConnect,
-                            its_busy_cb_t onBusy,
-                            its_disconnect_cb_t onDisconnect,
-                            its_aux_cb_t onAux);
+                            size_t inboxMaxMsgLen = 0, size_t inboxDepth = 0);
+
+/** Register callbacks individually. Can be called before or after init. */
+void          itsServerOnConnect(its_connect_cb_t cb);
+void          itsServerOnBusy(its_busy_cb_t cb);
+void          itsServerOnDisconnect(its_disconnect_cb_t cb);
+
+/** Register an aux callback for a specific port. Up to ITS_MAX_AUX_CALLBACKS per task.
+ *  Port 0 is the default catch-all (matches aux messages with no specific port). */
+void          itsOnAux(its_aux_cb_t cb, uint16_t port = 0);
 
 void          itsServerKick(int handle);
 int           itsServerActive(void);
 
-/** Write data into a server handle's receive buffer (the buffer the server
- *  reads from). Use before itsServerForward to inject the consumed HTTP
- *  request so the target task can read it. Safe when no concurrent client
- *  writes (true for HTTP: browser awaits response before sending more). */
+/** Write data into a connection's client→server buffer.
+ *  Use before itsServerForward to inject consumed HTTP headers. */
 size_t        itsServerInject(int handle, const void* data, size_t len);
 
-/** Forward a server handle to another server task.
- *  Stream buffers swap from this server's slot to the target's slot.
- *  Target's onConnect fires with itsPort + data. Returns target handle, or -1. */
+/** Forward a connection to another server task.
+ *  Buffers stay, serverTask changes. Target's onConnect fires.
+ *  Handle number stays the same. Returns handle on success, -1 on failure. */
 int           itsServerForward(int handle, const char* targetServer, int itsPort,
                                const void* data, size_t dataLen);
 int           itsServerForwardByHandle(int handle, TaskHandle_t targetTask, int itsPort,
                                        const void* data, size_t dataLen);
 
-/** Get the itsPort of an active server handle (set on connect/forward). */
+/** Get the itsPort of an active connection. */
 int           itsServerPort(int handle);
 
 /* ---- Client API ---- */
 
+/** Init this task as a client.
+ *  inboxMaxMsgLen/inboxDepth: same as server (0 = default). Ignored if already set. */
 void          itsClientInit(int maxConns,
-                            its_disconnect_cb_t onDisconnect,
-                            its_aux_cb_t onAux);
+                            its_disconnect_cb_t onDisconnect = nullptr,
+                            size_t inboxMaxMsgLen = 0, size_t inboxDepth = 0);
 
 int           itsConnect(const char* serverName, int itsPort,
                          const void* data, size_t dataLen, TickType_t timeout);
@@ -102,15 +111,19 @@ void          itsDisconnect(int handle);
 
 /* ---- Aux messages ---- */
 
+/** Send an aux message. Port dispatches to the matching itsOnAux callback on the receiver. */
 bool          itsSendAux(const char* taskName,
-                         const void* data, size_t dataLen, TickType_t timeout);
+                         const void* data, size_t dataLen,
+                         TickType_t timeout, uint16_t port = 0,
+                         its_wait_t wait = ITS_WAIT_DELIVERY);
 bool          itsSendAuxByHandle(TaskHandle_t task,
                                  const void* data, size_t dataLen,
-                                 TickType_t timeout);
+                                 TickType_t timeout, uint16_t port = 0,
+                                 its_wait_t wait = ITS_WAIT_DELIVERY);
 
 /* ---- Poll (call on task notification or periodically) ---- */
 
-/** Read one inbox message and dispatch to the appropriate callback.
+/** Read one inbox message, dispatch to callback, ACK pickup if requested.
  *  Returns true if a message was processed. */
 bool          itsPoll(void);
 
@@ -128,7 +141,7 @@ bool          itsIsEmpty(int handle);
 bool          itsIsFull(int handle);
 bool          itsReset(int handle);
 
-/** Get the remote task for a handle (server handle → client task, or vice versa). */
+/** Get the remote task for a handle. */
 TaskHandle_t  itsRemoteTask(int handle);
 
 #endif /* SECCAM_ITS_H */

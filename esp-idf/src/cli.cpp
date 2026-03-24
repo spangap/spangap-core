@@ -7,7 +7,7 @@
 #include "its.h"
 #include "web.h"
 #include "net.h"
-#include "cfg.h"
+#include "storage.h"
 #include "cron.h"
 #include "compat.h"
 #include <driver/usb_serial_jtag.h>
@@ -402,7 +402,7 @@ extern void pmRegisterCmds();
 extern void logRegisterCmds();
 
 static void cliBuiltinInit() {
-    cfgRegisterCmds();
+    storageRegisterCmds();
     cliCmdFsInit();
     cliCmdSysInit();
     pmRegisterCmds();
@@ -451,8 +451,9 @@ static void cliOnDisconnect(int handle) {
 static TaskHandle_t cliTaskHandle = NULL;
 
 static void cliTaskFn(void* arg) {
-  itsServerInit(CLI_MAX_CLIENTS, 512, 2048,
-                cliOnConnect, nullptr, cliOnDisconnect, nullptr);
+  itsServerInit(CLI_MAX_CLIENTS, 512, 2048);
+  itsServerOnConnect(cliOnConnect);
+  itsServerOnDisconnect(cliOnDisconnect);
 
   /* Register TCP port with network */
   { net_port_msg_t reg = {};
@@ -526,7 +527,7 @@ static void serialTaskFn(void* arg) {
   int flags = fcntl(STDIN_FILENO, F_GETFL, 0);
   fcntl(STDIN_FILENO, F_SETFL, flags | O_NONBLOCK);
 
-  itsClientInit(2, nullptr, nullptr);
+  itsClientInit(2);
 
   int logHandle = -1;
   int cliHandle = -1;

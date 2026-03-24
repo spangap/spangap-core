@@ -8,7 +8,7 @@
 #include "its.h"
 #include "web.h"
 #include "net.h"
-#include "cfg.h"
+#include "storage.h"
 #include "compat.h"
 #include "freertos/stream_buffer.h"
 #include <esp_log.h>
@@ -94,7 +94,7 @@ static int logReformat(const char* src, char* dst, size_t dstSize, bool ansi) {
 
     lastLevel = level;
 
-    /* Timestamp: keep or skip "(12345) " based on NVS log_timestamp */
+    /* Timestamp: keep or skip "(12345) " based on s.log.timestamp */
     const char* afterLevel = p + 1;
     while (*afterLevel == ' ') afterLevel++;
     const char* tsStart = nullptr;
@@ -110,7 +110,7 @@ static int logReformat(const char* src, char* dst, size_t dstSize, bool ansi) {
         }
         while (*afterLevel == ' ') afterLevel++;
     }
-    bool showTimestamp = cfgGetInt("log_timestamp", 0) != 0;
+    bool showTimestamp = storageGetInt("s.log.timestamp", 0) != 0;
 
     /* Extract TAG (everything up to ": " or ":\033" or ":\n") */
     const char* tagStart = afterLevel;
@@ -219,8 +219,9 @@ static void logOnDisconnect(int handle) {
 /* ---- Log task: drains input stream → fan out to ITS consumers ---- */
 
 static void logTaskFn(void* arg) {
-  itsServerInit(LOG_MAX_CONSUMERS, 0, 2048,
-                logOnConnect, nullptr, logOnDisconnect, nullptr);
+  itsServerInit(LOG_MAX_CONSUMERS, 0, 2048);
+  itsServerOnConnect(logOnConnect);
+  itsServerOnDisconnect(logOnDisconnect);
 
   /* Register TCP port with network */
   { net_port_msg_t reg = {};
@@ -305,9 +306,9 @@ static esp_log_level_t parseEspLevel(const char* val) {
 }
 
 void logApplyLevels() {
-  /* Global level from "log" key */
+  /* Global level from "s.log.level" key */
   char val[16];
-  cfgGetStr("log", val, sizeof(val), "info");
+  storageGetStr("s.log.level", val, sizeof(val), "info");
   esp_log_level_t global = parseEspLevel(val);
   esp_log_level_set("*", global);
 
@@ -316,13 +317,13 @@ void logApplyLevels() {
   else if (global >= ESP_LOG_INFO) currentLogLevel = LOG_INFO;
   else currentLogLevel = LOG_ERROR;
 
-  /* Per-tag overrides from "log_*" keys */
-  cfgForEach("log_", [](const char* key, const char* val) {
-    const char* tag = key + 4;  /* skip "log_" */
+  /* Per-tag overrides from "s.log.tag.*" keys */
+  storageForEach("s.log.tag.", [](const char* key, const char* val) {
+    const char* tag = key + 10;  /* skip "s.log.tag." */
     if (val[0] == '-') {
       /* Inherit: re-apply global */
       char gval[16];
-      cfgGetStr("log", gval, sizeof(gval), "info");
+      storageGetStr("s.log.level", gval, sizeof(gval), "info");
       esp_log_level_set(tag, parseEspLevel(gval));
     } else {
       esp_log_level_set(tag, parseEspLevel(val));
@@ -331,14 +332,14 @@ void logApplyLevels() {
 }
 
 void logSetGlobal(const char* level) {
-  cfgSet("log", level);
+  storageSet("s.log.level", level);
   logApplyLevels();
 }
 
 void logSetTag(const char* tag, const char* level) {
-  char key[24];
-  snprintf(key, sizeof(key), "log_%.19s", tag);
-  cfgSet(key, level);
+  char key[32];
+  snprintf(key, sizeof(key), "s.log.tag.%.19s", tag);
+  storageSet(key, level);
   logApplyLevels();
 }
 
@@ -357,7 +358,7 @@ void logRegisterCmds() {
     cliRegisterCmd("log", [](const char* a) {
         if (strcmp(a, "help") == 0) { cliPrintf("  %-*s show/set log level\n", CLI_HELP_COL, "log [tag] [level]"); return; }
         if (!*a) {
-            char val[16]; cfgGetStr("log", val, sizeof(val), "info");
+            char val[16]; storageGetStr("s.log.level", val, sizeof(val), "info");
             cliPrintf("  %s\n", val);
             return;
         }
@@ -373,8 +374,8 @@ void logRegisterCmds() {
                        strcasecmp(first, "debug") == 0;
         if (isLevel && !*rest) logSetGlobal(first);
         else if (!*rest) {
-            char key[24]; snprintf(key, sizeof(key), "log_%.19s", first);
-            char val[16]; cfgGetStr(key, val, sizeof(val), "-");
+            char key[32]; snprintf(key, sizeof(key), "s.log.tag.%.19s", first);
+            char val[16]; storageGetStr(key, val, sizeof(val), "-");
             cliPrintf("  %s: %s\n", first, val[0] == '-' ? "(default)" : val);
         } else logSetTag(first, rest);
     });

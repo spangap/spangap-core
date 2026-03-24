@@ -1,5 +1,6 @@
 /** CLI commands: reboot, reset, date, sleep, run, help. */
 #include "cli.h"
+#include "storage.h"
 #include "nvs_config.h"
 #include "esp_littlefs.h"
 #include "compat.h"
@@ -12,6 +13,7 @@
 
 static void cmdReboot(const char* a) {
     if (strcmp(a, "help") == 0) { cliPrintf("  %-*s restart device\n", CLI_HELP_COL, "reboot"); return; }
+    storageSave();  /* flush pending settings before reboot */
     cliPrintf("rebooting...\n");
     fflush(stdout);
     delay(100);
@@ -19,11 +21,11 @@ static void cmdReboot(const char* a) {
 }
 
 static void cmdResetFactory(const char* a) {
-    if (strcmp(a, "help") == 0) { cliPrintf("  %-*s erase NVS and reboot\n", CLI_HELP_COL, "reset factory"); return; }
-    cliPrintf("erasing NVS + state and rebooting...\n");
+    if (strcmp(a, "help") == 0) { cliPrintf("  %-*s factory reset and reboot\n", CLI_HELP_COL, "reset factory"); return; }
+    cliPrintf("factory reset: formatting /state and rebooting...\n");
     fflush(stdout);
-    nvsErase();
     esp_littlefs_format("state");
+    nvsFactoryReset();
     delay(100);
     esp_restart();
 }

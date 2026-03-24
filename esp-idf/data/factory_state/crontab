@@ -1,0 +1,3 @@
+# seccam crontab — minute-resolution scheduler
+# Format: min hour dom month dow command
+# Example: */10 * * * * net up

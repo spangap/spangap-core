@@ -1,11 +1,11 @@
 /**
  * cron — minute-resolution task scheduler.
  *
- * Entries stored in NVS as cron_0, cron_1, ... (sequential, stops at first
- * missing key).  Format: standard unix cron (5 time fields + command), no
- * user field.  Commands execute via CLI stream.
+ * Entries stored in /state/crontab file (one per line, standard unix cron
+ * format: 5 time fields + command, no user field).
+ * Commands execute via CLI stream.
  *
- * Deep sleep: when allowed and cron_0 exists, the cron task enters deep sleep
+ * Deep sleep: when allowed and crontab has entries, the cron task enters deep sleep
  * until the next minute boundary (+1s).  cronWakeupHandler() checks on boot
  * whether there's cron work — stays awake if so, otherwise goes back to sleep.
  */

@@ -1,12 +1,13 @@
 /**
  * cron — minute-resolution task scheduler with deep sleep support.
  *
- * Entries in NVS: cron_0, cron_1, ... (standard unix cron, no user field).
+ * Entries in /state/crontab file (standard unix cron, no user field).
  * Commands sent to CLI via stream buffer for proper serialization.
- * Enabled/disabled via NVS cron_enable (default 0). Listens for MSG_CFG_CHANGED.
+ * Enabled/disabled via s.cron.enable config. Subscribes via storageSubscribeChanges.
  */
 #include "cron.h"
-#include "cfg.h"
+#include "storage.h"
+#include "its.h"
 #include "ipc.h"
 #include "pm.h"
 #include "cli.h"
@@ -34,12 +35,27 @@ static StreamBufferHandle_t cronStream = nullptr;
 static pm_lock_handle_t cronDeepLock = nullptr;
 
 static bool cronEnabled() {
-    return cfgGetInt("cron_enable") != 0;
+    return storageGetInt("s.cron.enable") != 0;
+}
+
+/** Check if /state/crontab has any non-comment entries. */
+static bool crontabHasEntries() {
+    FILE* f = fopen("/state/crontab", "r");
+    if (!f) return false;
+    char line[192];
+    bool found = false;
+    while (fgets(line, sizeof(line), f)) {
+        const char* p = line;
+        while (*p == ' ' || *p == '\t') p++;
+        if (*p && *p != '#' && *p != '\n') { found = true; break; }
+    }
+    fclose(f);
+    return found;
 }
 
 /** Update deep sleep lock: held unless cron is enabled with entries. */
 static void cronUpdateLock() {
-    bool allow = cronEnabled() && cfgExists("cron_0");
+    bool allow = cronEnabled() && crontabHasEntries();
     static bool released = false;
     if (allow && !released) {
         pmLockRelease(cronDeepLock);
@@ -168,26 +184,34 @@ bool cronPoll(bool execute) {
     localtime_r(&now, &tm);
 
     bool hasWork = false;
-    char key[16];
-    char val[128];
 
-    for (int i = 0; ; i++) {
-        snprintf(key, sizeof(key), "cron_%d", i);
-        cfgGetStr(key, val, sizeof(val));
-        if (val[0] == '\0') break;
+    FILE* f = fopen("/state/crontab", "r");
+    if (!f) return false;
 
-        const char* cmd = cronMatch(val, &tm);
+    char line[192];
+    while (fgets(line, sizeof(line), f)) {
+        /* Strip trailing newline */
+        size_t len = strlen(line);
+        while (len > 0 && (line[len - 1] == '\n' || line[len - 1] == '\r'))
+            line[--len] = '\0';
+
+        /* Skip empty lines and comments */
+        const char* p = line;
+        while (*p == ' ' || *p == '\t') p++;
+        if (!*p || *p == '#') continue;
+
+        const char* cmd = cronMatch(p, &tm);
         if (cmd) {
             hasWork = true;
             if (execute && cronStream) {
                 size_t cmdLen = strlen(cmd);
-                /* Write command + newline to stream for CLI to drain */
                 xStreamBufferSend(cronStream, cmd, cmdLen, pdMS_TO_TICKS(100));
                 xStreamBufferSend(cronStream, "\n", 1, pdMS_TO_TICKS(100));
                 printf("[cron] %02d:%02d %s\n", tm.tm_hour, tm.tm_min, cmd);
             }
         }
     }
+    fclose(f);
 
     return hasWork;
 }
@@ -231,12 +255,13 @@ static void cronTaskFn(void*) {
     ipcEnsureRegistered("cron");
     cronUpdateLock();
 
+    storageSubscribeChanges("s.cron", ON_CHANGE { cronUpdateLock(); });
+
     for (;;) {
         ipc_msg_t msg;
-        bool got = ipcReceive(&msg, 30000);  /* 30s or MSG_CFG_CHANGED wakes us */
+        bool got = ipcReceive(&msg, 30000);  /* 30s timeout for periodic poll */
 
-        if (got && msg.type == MSG_CFG_CHANGED)
-            cronUpdateLock();
+        while (itsPoll()) {}
 
         cronPoll(true);
 

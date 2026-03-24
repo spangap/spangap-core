@@ -6,7 +6,7 @@
 #include "pm.h"
 #include "log.h"
 #include "cli.h"
-#include "cfg.h"
+#include "storage.h"
 #include "compat.h"
 #include <esp_system.h>
 #include <esp_heap_caps.h>
