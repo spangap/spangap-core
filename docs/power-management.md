@@ -48,9 +48,9 @@ ESP types delegate to `esp_pm_lock_*()`. `PM_NO_DEEP_SLEEP` is tracked in our ow
 
 ## Deep Sleep Triggering
 
-Deep sleep is not initiated directly by any module during normal operation. Instead, `pmLockRelease()` broadcasts `MSG_SYS_SLEEP` whenever `deepSleepAllowed()` becomes true (all locks released). The cron task listens for this message and enters deep sleep until the next minute boundary (+1s).
+Deep sleep is not initiated directly by any module during normal operation. Instead, `pmLockRelease()` sets the `sys.going_down` ephemeral config var whenever `deepSleepAllowed()` becomes true (all locks released). The cron task subscribes to this var and enters deep sleep until the next minute boundary (+1s).
 
-The cron lock prevents accidental deep sleep: without `s.cron.enable=1` and at least one cron entry, the lock stays held and `MSG_SYS_SLEEP` is never broadcast. This means `usb down` alone only achieves light sleep — deep sleep requires an explicit cron configuration that can wake the device.
+The cron lock prevents accidental deep sleep: without `s.cron.enable=1` and at least one cron entry, the lock stays held and `sys.going_down` is never set. This means `usb down` alone only achieves light sleep — deep sleep requires an explicit cron configuration that can wake the device.
 
 **Wakeup handler** (separate fast path): `cronWakeupHandler()` runs early in `app_main()` before full boot. If timer wakeup with no cron work this minute, goes right back to sleep without initializing any tasks. If work to do, returns true and full boot proceeds.
 
@@ -88,7 +88,7 @@ USB SOF packets arrive every 1ms from the host, waking the CPU from light sleep 
 
 **Graceful shutdown** (`net down`): sets `wantDown` flag and waits for 30s of idle (no `netActivity()` calls from rtsp, web, log, or CLI network clients). Consumer tasks call `netActivity()` in their active loops. `net up` cancels a pending shutdown. `net down!` forces immediate teardown.
 
-On actual shutdown: broadcasts `MSG_NETWORK_DOWN` to all tasks, then `ntpStop()` + `mdns_free()` before `esp_wifi_stop()` (so mDNS goodbye multicast can be sent while RF is up), then `esp_wifi_deinit()` to fully tear down WiFi driver tasks (saves ~5mA vs `esp_wifi_stop()` alone). On `net up`: `esp_wifi_init()` + `esp_wifi_start()` to reinitialize. WiFi state survives deep sleep via `RTC_DATA_ATTR`.
+On actual shutdown: sets `net.up` ephemeral var to 0 (subscribers react accordingly), then `ntpStop()` + `mdns_free()` before `esp_wifi_stop()` (so mDNS goodbye multicast can be sent while RF is up), then `esp_wifi_deinit()` to fully tear down WiFi driver tasks (saves ~5mA vs `esp_wifi_stop()` alone). On `net up`: `esp_wifi_init()` + `esp_wifi_start()` to reinitialize. WiFi state survives deep sleep via `RTC_DATA_ATTR`.
 
 `WIFI_PS_MAX_MODEM` is set after network up for aggressive modem sleep.
 

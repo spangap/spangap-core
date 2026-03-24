@@ -38,8 +38,6 @@ int    storageGetInt(const char* key, int def = 0);
 void   storageGetStr(const char* key, char* out, size_t outLen, const char* def = "");
 void   storageSet(const char* key, int val);
 void   storageSet(const char* key, const char* val);
-void   storageSetQuiet(const char* key, int val);
-void   storageSetQuiet(const char* key, const char* val);
 void   storageUnset(const char* key);
 void   storageSave();                   /** Force immediate JSON write. */
 cfg_type_t storageGetType(const char* key);

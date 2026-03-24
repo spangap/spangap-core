@@ -84,7 +84,7 @@ void pmLockRelease(pm_lock_handle_t h) {
   if (h->esp_handle)
     esp_pm_lock_release(h->esp_handle);
   if (deepSleepAllowed())
-    ipcBroadcast(MSG_SYS_SLEEP);
+    storageSet("sys.going_down", 1);
 }
 
 static pm_lock_handle_t usbLock = nullptr;

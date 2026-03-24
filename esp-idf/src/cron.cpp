@@ -8,7 +8,6 @@
 #include "cron.h"
 #include "storage.h"
 #include "its.h"
-#include "ipc.h"
 #include "pm.h"
 #include "cli.h"
 #include "nvs_config.h"
@@ -252,21 +251,17 @@ bool cronWakeupHandler() {
 /* ---- Cron task ---- */
 
 static void cronTaskFn(void*) {
-    ipcEnsureRegistered("cron");
     cronUpdateLock();
 
     storageSubscribeChanges("s.cron", ON_CHANGE { cronUpdateLock(); });
+    storageSubscribeChanges("sys.going_down", ON_CHANGE {
+        if (atoi(val)) cronDeepSleep();  /* never returns */
+    });
 
     for (;;) {
-        ipc_msg_t msg;
-        bool got = ipcReceive(&msg, 30000);  /* 30s timeout for periodic poll */
-
         while (itsPoll()) {}
-
         cronPoll(true);
-
-        if (got && msg.type == MSG_SYS_SLEEP)
-            cronDeepSleep();  /* never returns */
+        ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(30000));
     }
 }
 

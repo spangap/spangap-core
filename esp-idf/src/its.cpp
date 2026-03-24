@@ -257,6 +257,7 @@ static its_task_t* myTask() {
 
 static bool inboxSend(its_task_t* target, const void* data, size_t len,
                       TickType_t timeout) {
+    if (!target->inboxReady || !target->inbox) return false;
     if (xSemaphoreTake(target->inboxReady, timeout) != pdTRUE) return false;
     size_t sent = xMessageBufferSend(target->inbox, data, len, timeout);
     if (sent == 0) {

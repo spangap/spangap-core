@@ -9,7 +9,6 @@
  * ITS server: handle 0 = browser config WS (root path "/").
  */
 #include "storage.h"
-#include "ipc.h"
 #include "log.h"
 #include "cli.h"
 #include "its.h"
@@ -265,11 +264,11 @@ static void writeSettingsFile() {
   savePending = false;
 }
 
+#define STORAGE_SAVE_PORT 43
+
 static void saveTimerCb(void* arg) {
   if (!storageHandle) return;
-  ipc_msg_t msg = {};
-  msg.type = MSG_STORAGE_SAVE;
-  ipcSendMsg(storageHandle, msg);
+  itsSendAuxByHandle(storageHandle, nullptr, 0, 0, STORAGE_SAVE_PORT);
 }
 
 static void startSaveTimer() {
@@ -396,18 +395,6 @@ void storageSet(const char* key, const char* val) {
   store[key] = { inferType(val), std::string(val) };
   fireSubscriptions(key, val);
   if (isSaved(key)) startSaveTimer();
-}
-
-void storageSetQuiet(const char* key, int val) {
-  char buf[16];
-  snprintf(buf, sizeof(buf), "%d", val);
-  store[key] = { CFG_INT, std::string(buf) };
-  fireSubscriptions(key, buf);
-}
-
-void storageSetQuiet(const char* key, const char* val) {
-  store[key] = { inferType(val), std::string(val) };
-  fireSubscriptions(key, val);
 }
 
 void storageUnset(const char* key) {
@@ -666,14 +653,25 @@ static void storageItsDisconnect(int handle) {
 
 /* ---- Task function ---- */
 
+static void storageSaveAux(TaskHandle_t, uint16_t, const void*, size_t) {
+    writeSettingsFile();
+}
+
 static void storageTaskFn(void* arg) {
     itsServerInit(1, 2048, 4096);
     itsServerOnConnect(storageItsConnect);
     itsServerOnDisconnect(storageItsDisconnect);
+    itsOnAux(storageSaveAux, STORAGE_SAVE_PORT);
 
     /* Subscribe to all config changes for browser WS sync */
     storageSubscribeChanges("", ON_CHANGE {
         wsSendKeyChange(key);
+    });
+    storageSubscribeChanges("net.up", ON_CHANGE {
+        if (atoi(val) == 0 && wsHandle >= 0) {
+            itsServerKick(wsHandle);
+            wsHandle = -1;
+        }
     });
 
     web_path_msg_t reg = {};
@@ -687,18 +685,6 @@ static void storageTaskFn(void* arg) {
     for (;;) {
         while (itsPoll()) {}
 
-        ipc_msg_t msg;
-        while (ipcReceive(&msg, 0)) {
-            if (msg.type == MSG_NETWORK_DOWN) {
-                if (wsHandle >= 0) {
-                    itsServerKick(wsHandle);
-                    wsHandle = -1;
-                }
-            }
-            if (msg.type == MSG_STORAGE_SAVE)
-                writeSettingsFile();
-        }
-
         wsPollConfig();
         ulTaskNotifyTake(pdTRUE, wsHandle >= 0 ? pdMS_TO_TICKS(10) : pdMS_TO_TICKS(200));
     }
@@ -709,8 +695,6 @@ void storageInit() {
     fsQueue = xQueueCreate(4, sizeof(storage_file_op_t*));
     xTaskCreatePinnedToCore(fsWorkerFn, "fs", 3072, nullptr, 1, nullptr, 1);
 
-    /* storage task: PSRAM stack (config WS + IPC, no direct file I/O) */
+    /* storage task: PSRAM stack (config WS + ITS, no direct file I/O) */
     xTaskCreatePinnedToCoreWithCaps(storageTaskFn, "storage", 4096, NULL, 1, &storageHandle, 1, MALLOC_CAP_SPIRAM);
-    QueueHandle_t q = xQueueCreate(16, sizeof(ipc_msg_t));
-    ipcRegister(storageHandle, q, "storage");
 }
