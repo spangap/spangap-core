@@ -606,5 +606,5 @@ void cliInit() {
 
   xTaskCreatePinnedToCore(cliTaskFn, "cli", 6144, NULL, 1, &cliTaskHandle, 1);
   static TaskHandle_t serialTaskHandle = NULL;
-  xTaskCreatePinnedToCore(serialTaskFn, "serial", 3072, NULL, 1, &serialTaskHandle, 1);
+  xTaskCreatePinnedToCoreWithCaps(serialTaskFn, "serial", 3072, NULL, 1, &serialTaskHandle, 1, MALLOC_CAP_SPIRAM);
 }

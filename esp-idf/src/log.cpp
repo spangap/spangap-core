@@ -283,7 +283,7 @@ void logInit() {
   /* Install ESP-IDF vprintf hook — all logging now flows through our callback */
   esp_log_set_vprintf(logVprintf);
 
-  xTaskCreatePinnedToCore(logTaskFn, "log", 4096, NULL, 1, &logTaskHandle, 1);
+  xTaskCreatePinnedToCoreWithCaps(logTaskFn, "log", 4096, NULL, 1, &logTaskHandle, 1, MALLOC_CAP_SPIRAM);
 }
 
 /* ---- Log levels ---- */

@@ -12,6 +12,7 @@
 #include "cli.h"
 #include "nvs_config.h"
 #include "compat.h"
+#include "esp_heap_caps.h"
 
 #include <cstdio>
 #include <cstdlib>
@@ -248,7 +249,7 @@ void cronInit() {
     cronStream = xStreamBufferCreate(CRON_STREAM_SIZE, 1);
     pmLockCreate(PM_NO_DEEP_SLEEP, "cron", &cronDeepLock);
     pmLockAcquire(cronDeepLock);
-    xTaskCreatePinnedToCore(cronTaskFn, "cron", 4096, nullptr, 1, nullptr, 0);
+    xTaskCreatePinnedToCoreWithCaps(cronTaskFn, "cron", 4096, nullptr, 1, nullptr, 0, MALLOC_CAP_SPIRAM);
 }
 
 /* ---- CLI drain ---- */
