@@ -572,25 +572,16 @@ int itsConnectByHandle(TaskHandle_t serverTask, int itsPort,
                        const void* data, size_t dataLen, TickType_t timeout,
                        int ref) {
     its_task_t* me = myTask();
-    if (!me || !me->isClient) {
-        dbg("its: connect fail: me=%p isClient=%d\n", me, me ? me->isClient : -1);
-        return -1;
-    }
+    if (!me || !me->isClient) return -1;
 
     int clientActive = 0;
     for (int i = 0; i < ITS_MAX_CONNS; i++)
         if (connTable[i].active && connTable[i].clientTask == me->task)
             clientActive++;
-    if (clientActive >= me->maxConns) {
-        dbg("its: connect fail: clientActive=%d >= maxConns=%d\n", clientActive, me->maxConns);
-        return -1;
-    }
+    if (clientActive >= me->maxConns) return -1;
 
     its_task_t* se = taskFind(serverTask);
-    if (!se || !se->isServer) {
-        dbg("its: connect fail: server '%s' not found/not server\n", pcTaskGetName(serverTask));
-        return -1;
-    }
+    if (!se || !se->isServer) return -1;
 
     xSemaphoreTake(me->ackSem, 0);
     me->ackHandle = -1;
@@ -607,15 +598,11 @@ int itsConnectByHandle(TaskHandle_t serverTask, int itsPort,
     if (data && dataLen > 0)
         memcpy(buf + sizeof(its_header_t), data, dataLen);
 
-    if (!inboxSend(se, buf, sizeof(its_header_t) + dataLen, timeout)) {
-        dbg("its: connect fail: inboxSend to '%s' failed\n", pcTaskGetName(serverTask));
+    if (!inboxSend(se, buf, sizeof(its_header_t) + dataLen, timeout))
         return -1;
-    }
 
-    if (xSemaphoreTake(me->ackSem, timeout) != pdTRUE) {
-        dbg("its: connect fail: ack timeout from '%s'\n", pcTaskGetName(serverTask));
+    if (xSemaphoreTake(me->ackSem, timeout) != pdTRUE)
         return -1;
-    }
     int handle = me->ackHandle;
     if (handle >= 0 && ref >= 0) connTable[handle].clientRef = (int8_t)ref;
     return handle;
@@ -623,12 +610,9 @@ int itsConnectByHandle(TaskHandle_t serverTask, int itsPort,
 
 int itsConnect(const char* serverName, int itsPort,
                const void* data, size_t dataLen, TickType_t timeout, int ref) {
-    dbg("its: connect('%s')\n", serverName);
     TaskHandle_t task = xTaskGetHandle(serverName);
-    if (!task) { dbg("its: task '%s' not found\n", serverName); return -1; }
-    int r = itsConnectByHandle(task, itsPort, data, dataLen, timeout, ref);
-    dbg("its: connect('%s') = %d\n", serverName, r);
-    return r;
+    if (!task) return -1;
+    return itsConnectByHandle(task, itsPort, data, dataLen, timeout, ref);
 }
 
 void itsDisconnect(int handle) {
