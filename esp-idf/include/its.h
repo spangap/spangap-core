@@ -80,6 +80,7 @@ void          itsOnAux(its_aux_cb_t cb, uint16_t port = 0);
 
 void          itsServerKick(int handle);
 int           itsServerActive(void);
+int           itsActiveTotal(void);
 
 /** Write data into a connection's client→server buffer.
  *  Use before itsServerForward to inject consumed HTTP headers. */

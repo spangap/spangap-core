@@ -259,10 +259,14 @@ static its_task_t* myTask() {
 static bool inboxSend(its_task_t* target, const void* data, size_t len,
                       TickType_t timeout) {
     if (!target->inbox || len > target->inboxItemSize) return false;
-    /* Pad to fixed item size — queue requires uniform items */
-    uint8_t* item = (uint8_t*)alloca(target->inboxItemSize);
-    memcpy(item, data, len);
-    if (len < target->inboxItemSize) memset(item + len, 0, target->inboxItemSize - len);
+    /* xQueueSend reads exactly inboxItemSize bytes. Pad if needed. */
+    const void* item = data;
+    uint8_t* padBuf = nullptr;
+    if (len < target->inboxItemSize) {
+        padBuf = (uint8_t*)alloca(target->inboxItemSize);
+        memcpy(padBuf, data, len);
+        item = padBuf;
+    }
     if (xQueueSend(target->inbox, item, timeout) != pdTRUE) return false;
     xTaskNotifyGive(target->task);
     return true;
@@ -488,6 +492,13 @@ int itsServerActive(void) {
     return me ? serverActiveCount(me) : 0;
 }
 
+int itsActiveTotal(void) {
+    int n = 0;
+    for (int i = 0; i < ITS_MAX_CONNS; i++)
+        if (connTable[i].active) n++;
+    return n;
+}
+
 int itsRef(int handle) {
     its_conn_t* c = conn(handle);
     if (!c) return -1;
@@ -646,13 +657,18 @@ static bool itsSendAuxInternal(TaskHandle_t task,
                                its_wait_t wait) {
     its_task_t* te = taskFind(task);
     if (!te) return false;
-    if (dataLen > ITS_MAX_MSG_DATA) dataLen = ITS_MAX_MSG_DATA;
+
+    /* Max payload = target's inbox item size minus header */
+    size_t maxPayload = te->inboxItemSize > sizeof(its_header_t)
+                      ? te->inboxItemSize - sizeof(its_header_t) : ITS_MAX_MSG_DATA;
+    if (dataLen > maxPayload) dataLen = maxPayload;
 
     int pickupIdx = -1;
     if (wait == ITS_WAIT_PICKUP)
         pickupIdx = pickupAcquire();
 
-    uint8_t buf[sizeof(its_header_t) + ITS_MAX_MSG_DATA];
+    size_t totalLen = sizeof(its_header_t) + dataLen;
+    uint8_t* buf = (uint8_t*)alloca(totalLen);
     auto* hdr = (its_header_t*)buf;
     hdr->sender = xTaskGetCurrentTaskHandle();
     hdr->msg = ITS_MSG_AUX;
@@ -663,7 +679,7 @@ static bool itsSendAuxInternal(TaskHandle_t task,
     if (data && dataLen > 0)
         memcpy(buf + sizeof(its_header_t), data, dataLen);
 
-    bool delivered = inboxSend(te, buf, sizeof(its_header_t) + dataLen, timeout);
+    bool delivered = inboxSend(te, buf, totalLen, timeout);
 
     if (!delivered) {
         /* Message never entered inbox — free pickup slot */
