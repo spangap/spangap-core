@@ -172,6 +172,7 @@ static int logReformat(const char* src, char* dst, size_t dstSize, bool ansi) {
 }
 
 static TaskHandle_t logTaskHandle = NULL;
+static SemaphoreHandle_t logMutex = NULL;
 
 /* vprintf callback — called by ESP-IDF log system from any task */
 static int logVprintf(const char* fmt, va_list args) {
@@ -186,8 +187,13 @@ static int logVprintf(const char* fmt, va_list args) {
     int fmtLen = logReformat(buf, formatted, sizeof(formatted), true);
     if (fmtLen <= 0) return rawLen;
 
-    /* Write to input stream (non-blocking — drop if full) */
-    xStreamBufferSend(logInputStream, formatted, fmtLen, 0);
+    /* Stream buffers are single-writer — serialize concurrent loggers.
+     * Must use mutex (not spinlock): xStreamBufferSend internally calls
+     * vTaskSuspendAll which is unsafe with interrupts disabled. */
+    if (xSemaphoreTake(logMutex, 0) == pdTRUE) {
+        xStreamBufferSend(logInputStream, formatted, fmtLen, 0);
+        xSemaphoreGive(logMutex);
+    }
 
     /* Wake log task */
     if (logTaskHandle) xTaskNotifyGive(logTaskHandle);
@@ -275,8 +281,9 @@ void logInit() {
   if (logInited) return;
   logInited = true;
 
-  /* Log input stream: vprintf callback writes here */
-  logInputStream = xStreamBufferCreateWithCaps(LOG_INPUT_SIZE, 1, MALLOC_CAP_SPIRAM);
+  /* Log input stream in DRAM — accessed during SPI flash ops when PSRAM cache is disabled */
+  logInputStream = xStreamBufferCreateWithCaps(LOG_INPUT_SIZE, 1, MALLOC_CAP_INTERNAL);
+  logMutex = xSemaphoreCreateMutex();
 
   /* Set INFO as default until nvsRunBoot sets the real level via logApplyLevels() */
   esp_log_level_set("*", ESP_LOG_INFO);
