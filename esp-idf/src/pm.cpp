@@ -1,8 +1,7 @@
 /**
  * PM — power management locks, USB management, RTC stats.
- * Split from ipc.cpp. CLI commands: pm, top, usb.
+ * CLI commands: pm, top, usb.
  */
-#include "ipc.h"
 #include "pm.h"
 #include "log.h"
 #include "cli.h"
@@ -23,6 +22,12 @@
 #include <cstdio>
 #include <cstring>
 #include <algorithm>
+
+/* ---- Central RTC RAM validity (was in ipc.cpp) ---- */
+#define RTC_APP_MAGIC 0x5ECC0001
+RTC_DATA_ATTR static uint32_t rtcAppMagic = 0;
+bool rtcValid()    { return rtcAppMagic == RTC_APP_MAGIC; }
+void rtcSetValid() { rtcAppMagic = RTC_APP_MAGIC; }
 
 /* ---- Deep sleep + PM mode stats (RTC RAM — survive deep sleep) ---- */
 RTC_DATA_ATTR static int32_t rtcDeepSleepCount = 0;

@@ -188,7 +188,7 @@ typedef struct {
 
 /* ---- Task registry ---- */
 
-#define ITS_MAX_TASKS          12
+#define ITS_MAX_TASKS          24
 #define ITS_MAX_AUX_CALLBACKS  8
 
 struct its_aux_entry_t {
