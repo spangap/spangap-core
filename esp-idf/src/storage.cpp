@@ -628,10 +628,10 @@ static void wsPollConfig() {
 
 /* ---- ITS server callbacks ---- */
 
-static bool storageItsConnect(int handle, int itsPort, const void* data, size_t len) {
-    if (len < sizeof(net_connect_t)) return false;
+static int storageItsConnect(int handle, int itsPort, const void* data, size_t len) {
+    if (len < sizeof(net_connect_t)) return -1;
     auto* cd = (const net_connect_t*)data;
-    if (!cd->ws) return false;
+    if (!cd->ws) return -1;
 
     if (wsHandle >= 0) {
         wsSendClose(wsHandle);
@@ -641,14 +641,15 @@ static bool storageItsConnect(int handle, int itsPort, const void* data, size_t 
 
     if (!wsUpgrade(handle)) {
         wsHandle = -1;
-        return false;
+        return -1;
     }
     wsSendFullDump();
-    return true;
+    return 0;
 }
 
-static void storageItsDisconnect(int handle) {
-    if (handle == wsHandle) wsHandle = -1;
+static void storageItsDisconnect(int ref) {
+    (void)ref;
+    wsHandle = -1;
 }
 
 /* ---- Task function ---- */
@@ -683,10 +684,9 @@ static void storageTaskFn(void* arg) {
     info("ready\n");
 
     for (;;) {
-        while (itsPoll()) {}
-
+        TickType_t timeout = wsHandle >= 0 ? pdMS_TO_TICKS(10) : portMAX_DELAY;
+        while (itsPoll(timeout)) { timeout = 0; }
         wsPollConfig();
-        ulTaskNotifyTake(pdTRUE, wsHandle >= 0 ? pdMS_TO_TICKS(10) : pdMS_TO_TICKS(200));
     }
 }
 

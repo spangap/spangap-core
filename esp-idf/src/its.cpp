@@ -1,6 +1,6 @@
 #include "its.h"
-#include "freertos/stream_buffer.h"
-#include "freertos/message_buffer.h"
+#include "log.h"
+#include "freertos/queue.h"
 #include "freertos/semphr.h"
 #include "esp_heap_caps.h"
 #include "esp_timer.h"
@@ -125,6 +125,8 @@ struct its_conn_t {
     int            toPoolIdx;
     int            fromPoolIdx;
     int            itsPort;
+    int8_t         clientRef;
+    int8_t         serverRef;
 };
 
 static its_conn_t    connTable[ITS_MAX_CONNS];
@@ -140,6 +142,8 @@ static int connAlloc() {
             connTable[idx].active = true;
             connTable[idx].toPoolIdx = -1;
             connTable[idx].fromPoolIdx = -1;
+            connTable[idx].clientRef = -1;
+            connTable[idx].serverRef = -1;
             connCounter = (idx + 1) % ITS_MAX_CONNS;
             portEXIT_CRITICAL(&connMux);
             return idx;
@@ -210,9 +214,8 @@ struct its_task_t {
     int                   ackHandle;
     its_aux_entry_t       auxCallbacks[ITS_MAX_AUX_CALLBACKS];
     int                   auxCount;
-    MessageBufferHandle_t inbox;
-    SemaphoreHandle_t     inboxReady;
-    size_t                inboxBufSize;
+    QueueHandle_t         inbox;
+    size_t                inboxItemSize; /* max message size (header + payload) */
     bool                  isServer;
     bool                  isClient;
 };
@@ -239,13 +242,11 @@ static its_task_t* taskFindOrCreate(TaskHandle_t task, size_t inboxMaxMsgLen, si
     e->task = task;
     e->ackHandle = -1;
 
-    size_t msgSize = inboxMaxMsgLen > 0 ? (sizeof(its_header_t) + inboxMaxMsgLen + 4)
-                                     : ITS_DEFAULT_INBOX_SIZE;
-    size_t bufSize = inboxDepth > 0 ? inboxDepth : msgSize;
-    e->inboxBufSize = msgSize;
-    e->inbox = xMessageBufferCreate(bufSize);
-    e->inboxReady = xSemaphoreCreateBinary();
-    xSemaphoreGive(e->inboxReady);
+    size_t itemSize = inboxMaxMsgLen > 0 ? (sizeof(its_header_t) + inboxMaxMsgLen)
+                                        : ITS_DEFAULT_INBOX_SIZE;
+    int depth = inboxDepth > 0 ? (int)inboxDepth : 8;
+    e->inboxItemSize = itemSize;
+    e->inbox = xQueueCreate(depth, itemSize);
     return e;
 }
 
@@ -257,13 +258,12 @@ static its_task_t* myTask() {
 
 static bool inboxSend(its_task_t* target, const void* data, size_t len,
                       TickType_t timeout) {
-    if (!target->inboxReady || !target->inbox) return false;
-    if (xSemaphoreTake(target->inboxReady, timeout) != pdTRUE) return false;
-    size_t sent = xMessageBufferSend(target->inbox, data, len, timeout);
-    if (sent == 0) {
-        xSemaphoreGive(target->inboxReady);
-        return false;
-    }
+    if (!target->inbox || len > target->inboxItemSize) return false;
+    /* Pad to fixed item size — queue requires uniform items */
+    uint8_t* item = (uint8_t*)alloca(target->inboxItemSize);
+    memcpy(item, data, len);
+    if (len < target->inboxItemSize) memset(item + len, 0, target->inboxItemSize - len);
+    if (xQueueSend(target->inbox, item, timeout) != pdTRUE) return false;
     xTaskNotifyGive(target->task);
     return true;
 }
@@ -307,16 +307,23 @@ static int serverActiveCount(its_task_t* t) {
 
 /* ---- itsPoll ---- */
 
-bool itsPoll(void) {
+bool itsPoll(TickType_t timeout) {
     its_task_t* me = myTask();
-    if (!me) return false;
-
-    uint8_t buf[sizeof(its_header_t) + ITS_MAX_MSG_DATA];
-    size_t n = xMessageBufferReceive(me->inbox, buf, sizeof(buf), 0);
-    if (n < sizeof(its_header_t)) {
-        if (n == 0) return false;
-        xSemaphoreGive(me->inboxReady);
+    if (!me) {
+        /* Not registered yet — just sleep if requested */
+        if (timeout > 0) ulTaskNotifyTake(pdTRUE, timeout);
         return false;
+    }
+
+    uint8_t* buf = (uint8_t*)alloca(me->inboxItemSize);
+
+    /* Try non-blocking read first */
+    if (xQueueReceive(me->inbox, buf, 0) != pdTRUE) {
+        if (timeout == 0) return false;
+        /* No message pending — block until notification, then retry */
+        ulTaskNotifyTake(pdTRUE, timeout);
+        if (xQueueReceive(me->inbox, buf, 0) != pdTRUE)
+            return false;
     }
 
     auto* hdr = (its_header_t*)buf;
@@ -346,8 +353,13 @@ bool itsPoll(void) {
             if (me->toSize > 0)   c->toPoolIdx = poolGet(me->toSize);
             if (me->fromSize > 0) c->fromPoolIdx = poolGet(me->fromSize);
 
-            accepted = !me->onConnect ||
-                       me->onConnect(handle, hdr->itsPort, payload, hdr->len);
+            if (!me->onConnect) {
+                accepted = true;
+            } else {
+                int sRef = me->onConnect(handle, hdr->itsPort, payload, hdr->len);
+                accepted = sRef >= 0;
+                if (accepted) c->serverRef = (int8_t)sRef;
+            }
             if (!accepted) connFree(handle);
         }
 
@@ -358,17 +370,34 @@ bool itsPoll(void) {
 
     } else if (hdr->msg == ITS_MSG_DISCONNECT && me->isServer) {
         int handle = hdr->handle;
+        int8_t ref = -1;
         its_conn_t* c = conn(handle);
         if (c && c->serverTask == me->task && c->clientTask == hdr->sender) {
+            ref = c->serverRef;
             connFree(handle);
-            if (me->srvDisconnect) me->srvDisconnect(handle);
+        } else if (hdr->len >= 1) {
+            ref = (int8_t)((uint8_t*)payload)[0];
         }
+        if (ref >= 0 && me->srvDisconnect) me->srvDisconnect(ref);
+
+    } else if (hdr->msg == ITS_MSG_DISCONNECT && me->isClient) {
+        int handle = hdr->handle;
+        int8_t ref = -1;
+        its_conn_t* c = conn(handle);
+        if (c && c->clientTask == me->task && c->serverTask == hdr->sender) {
+            ref = c->clientRef;
+            connFree(handle);
+        } else if (hdr->len >= 1) {
+            /* Conn already freed (server kicked) — ref embedded in payload */
+            ref = (int8_t)((uint8_t*)payload)[0];
+        }
+        if (ref >= 0 && me->cliDisconnect) me->cliDisconnect(ref);
 
     } else if (hdr->msg == ITS_MSG_FORWARD && me->isServer) {
         int handle = hdr->handle;
         its_conn_t* c = conn(handle);
         if (c && c->serverTask == me->task) {
-            if (me->onConnect && !me->onConnect(handle, hdr->itsPort, payload, hdr->len))
+            if (me->onConnect && me->onConnect(handle, hdr->itsPort, payload, hdr->len) < 0)
                 itsServerKick(handle);
         }
 
@@ -387,7 +416,6 @@ bool itsPoll(void) {
     /* ACK pickup AFTER callback has fully returned */
     if (pickupIdx >= 0) pickupRelease(pickupIdx);
 
-    xSemaphoreGive(me->inboxReady);
     return true;
 }
 
@@ -437,13 +465,36 @@ void itsServerKick(int handle) {
     if (!c) return;
     if (c->serverTask != xTaskGetCurrentTaskHandle()) return;
     TaskHandle_t client = c->clientTask;
+    int8_t clientRef = c->clientRef;
     connFree(handle);
-    if (client) xTaskNotifyGive(client);
+    /* Notify client with their ref embedded in the message */
+    its_task_t* ce = taskFind(client);
+    if (ce) {
+        uint8_t buf[sizeof(its_header_t) + 1];
+        auto* hdr = (its_header_t*)buf;
+        *hdr = {};
+        hdr->sender = xTaskGetCurrentTaskHandle();
+        hdr->msg = ITS_MSG_DISCONNECT;
+        hdr->handle = (int16_t)handle;
+        hdr->pickupIdx = -1;
+        hdr->len = 1;
+        buf[sizeof(its_header_t)] = (uint8_t)clientRef;
+        inboxSend(ce, buf, sizeof(buf), 0);
+    }
 }
 
 int itsServerActive(void) {
     its_task_t* me = myTask();
     return me ? serverActiveCount(me) : 0;
+}
+
+int itsRef(int handle) {
+    its_conn_t* c = conn(handle);
+    if (!c) return -1;
+    TaskHandle_t me = xTaskGetCurrentTaskHandle();
+    if (c->serverTask == me) return c->serverRef;
+    if (c->clientTask == me) return c->clientRef;
+    return -1;
 }
 
 size_t itsServerInject(int handle, const void* data, size_t len) {
@@ -518,18 +569,28 @@ void itsClientInit(int maxConns,
 }
 
 int itsConnectByHandle(TaskHandle_t serverTask, int itsPort,
-                       const void* data, size_t dataLen, TickType_t timeout) {
+                       const void* data, size_t dataLen, TickType_t timeout,
+                       int ref) {
     its_task_t* me = myTask();
-    if (!me || !me->isClient) return -1;
+    if (!me || !me->isClient) {
+        dbg("its: connect fail: me=%p isClient=%d\n", me, me ? me->isClient : -1);
+        return -1;
+    }
 
     int clientActive = 0;
     for (int i = 0; i < ITS_MAX_CONNS; i++)
         if (connTable[i].active && connTable[i].clientTask == me->task)
             clientActive++;
-    if (clientActive >= me->maxConns) return -1;
+    if (clientActive >= me->maxConns) {
+        dbg("its: connect fail: clientActive=%d >= maxConns=%d\n", clientActive, me->maxConns);
+        return -1;
+    }
 
     its_task_t* se = taskFind(serverTask);
-    if (!se || !se->isServer) return -1;
+    if (!se || !se->isServer) {
+        dbg("its: connect fail: server '%s' not found/not server\n", pcTaskGetName(serverTask));
+        return -1;
+    }
 
     xSemaphoreTake(me->ackSem, 0);
     me->ackHandle = -1;
@@ -546,18 +607,28 @@ int itsConnectByHandle(TaskHandle_t serverTask, int itsPort,
     if (data && dataLen > 0)
         memcpy(buf + sizeof(its_header_t), data, dataLen);
 
-    if (!inboxSend(se, buf, sizeof(its_header_t) + dataLen, timeout))
+    if (!inboxSend(se, buf, sizeof(its_header_t) + dataLen, timeout)) {
+        dbg("its: connect fail: inboxSend to '%s' failed\n", pcTaskGetName(serverTask));
         return -1;
+    }
 
-    if (xSemaphoreTake(me->ackSem, timeout) != pdTRUE) return -1;
-    return me->ackHandle;
+    if (xSemaphoreTake(me->ackSem, timeout) != pdTRUE) {
+        dbg("its: connect fail: ack timeout from '%s'\n", pcTaskGetName(serverTask));
+        return -1;
+    }
+    int handle = me->ackHandle;
+    if (handle >= 0 && ref >= 0) connTable[handle].clientRef = (int8_t)ref;
+    return handle;
 }
 
 int itsConnect(const char* serverName, int itsPort,
-               const void* data, size_t dataLen, TickType_t timeout) {
+               const void* data, size_t dataLen, TickType_t timeout, int ref) {
+    dbg("its: connect('%s')\n", serverName);
     TaskHandle_t task = xTaskGetHandle(serverName);
-    if (!task) return -1;
-    return itsConnectByHandle(task, itsPort, data, dataLen, timeout);
+    if (!task) { dbg("its: task '%s' not found\n", serverName); return -1; }
+    int r = itsConnectByHandle(task, itsPort, data, dataLen, timeout, ref);
+    dbg("its: connect('%s') = %d\n", serverName, r);
+    return r;
 }
 
 void itsDisconnect(int handle) {
@@ -565,17 +636,21 @@ void itsDisconnect(int handle) {
     if (!c || c->clientTask != xTaskGetCurrentTaskHandle()) return;
 
     TaskHandle_t serverTask = c->serverTask;
+    int8_t serverRef = c->serverRef;
     connFree(handle);
 
     its_task_t* se = taskFind(serverTask);
     if (se) {
-        its_header_t hdr = {};
-        hdr.sender = xTaskGetCurrentTaskHandle();
-        hdr.msg = ITS_MSG_DISCONNECT;
-        hdr.pickupIdx = -1;
-        hdr.handle = (int16_t)handle;
-        hdr.len = 0;
-        inboxSend(se, &hdr, sizeof(hdr), pdMS_TO_TICKS(100));
+        uint8_t buf[sizeof(its_header_t) + 1];
+        auto* hdr = (its_header_t*)buf;
+        *hdr = {};
+        hdr->sender = xTaskGetCurrentTaskHandle();
+        hdr->msg = ITS_MSG_DISCONNECT;
+        hdr->pickupIdx = -1;
+        hdr->handle = (int16_t)handle;
+        hdr->len = 1;
+        buf[sizeof(its_header_t)] = (uint8_t)serverRef;
+        inboxSend(se, buf, sizeof(buf), pdMS_TO_TICKS(100));
     }
 }
 

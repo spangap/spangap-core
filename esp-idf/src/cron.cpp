@@ -259,9 +259,8 @@ static void cronTaskFn(void*) {
     });
 
     for (;;) {
-        while (itsPoll()) {}
+        while (itsPoll(pdMS_TO_TICKS(30000))) {}
         cronPoll(true);
-        ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(30000));
     }
 }
 

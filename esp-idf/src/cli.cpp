@@ -105,24 +105,36 @@ struct cli_edit {
     bool savedValid = false;
 };
 
-/* CLI ITS server: per-handle state */
+/* CLI ITS server: per-slot state */
 #define CLI_MAX_CLIENTS 4
-static struct {
+static struct cli_slot_t {
+    int itsHandle;
     cli_edit edit;
     cli_mode_t mode;
     bool ws;
     char lineBuf[128];
     int lineLen;
-} cliClients[CLI_MAX_CLIENTS];
-static int cliActiveHandle = -1;
+} cliSlots[CLI_MAX_CLIENTS];
+static int cliActiveSlot = -1;
+
+static int cliAllocSlot(int itsHandle) {
+    for (int i = 0; i < CLI_MAX_CLIENTS; i++)
+        if (cliSlots[i].itsHandle < 0) {
+            cliSlots[i].itsHandle = itsHandle;
+            return i;
+        }
+    return -1;
+}
 
 static void itsCliWrite(const char* data, size_t len) {
-    if (cliActiveHandle < 0) return;
-    if (cliClients[cliActiveHandle].ws) {
-        wsSendText(cliActiveHandle, data, len);
+    if (cliActiveSlot < 0) return;
+    int h = cliSlots[cliActiveSlot].itsHandle;
+    if (h < 0) return;
+    if (cliSlots[cliActiveSlot].ws) {
+        wsSendText(h, data, len);
     } else {
         while (len > 0) {
-            size_t sent = itsSend(cliActiveHandle, data, len, pdMS_TO_TICKS(100));
+            size_t sent = itsSend(h, data, len, pdMS_TO_TICKS(100));
             if (sent == 0) break;
             data += sent;
             len -= sent;
@@ -131,8 +143,8 @@ static void itsCliWrite(const char* data, size_t len) {
 }
 
 static bool cliIsAnsi() {
-    return cliActiveHandle >= 0 && cliActiveHandle < CLI_MAX_CLIENTS &&
-           cliClients[cliActiveHandle].mode == CLI_ANSI;
+    return cliActiveSlot >= 0 &&
+           cliSlots[cliActiveSlot].mode == CLI_ANSI;
 }
 
 /* Redraw buffer from position 'from' to end, clear rest, restore cursor */
@@ -329,7 +341,8 @@ static void cliEditChar(cli_edit& e, char c, cli_write_fn write) {
       write("\033[0 q", 5);
     } else {
       /* Empty enter — kick client (session done) */
-      if (cliActiveHandle >= 0) itsServerKick(cliActiveHandle);
+      if (cliActiveSlot >= 0 && cliSlots[cliActiveSlot].itsHandle >= 0)
+          itsServerKick(cliSlots[cliActiveSlot].itsHandle);
     }
   } else if (c == 0x7F || c == 0x08) {
     if (e.cursor > 0) {
@@ -421,14 +434,15 @@ static void cliBuiltinInit() {
 
 /* ---- CLI ITS server callbacks ---- */
 
-static bool cliOnConnect(int handle, int itsPort, const void* data, size_t len) {
-  if (handle < 0 || handle >= CLI_MAX_CLIENTS) return false;
-  auto& cl = cliClients[handle];
+static int cliOnConnect(int handle, int itsPort, const void* data, size_t len) {
+  int slot = cliAllocSlot(handle);
+  if (slot < 0) return -1;
+  auto& cl = cliSlots[slot];
   cl.edit = {};
   cl.lineLen = 0;
   cl.ws = false;
   if (len >= sizeof(net_connect_t) && ((const net_connect_t*)data)->ws) {
-    if (!wsUpgrade(handle)) return false;
+    if (!wsUpgrade(handle)) return -1;
     cl.ws = true;
     cl.mode = CLI_LINE;  /* WS clients are line-mode */
   } else if (len >= sizeof(cli_connect_t)) {
@@ -436,13 +450,13 @@ static bool cliOnConnect(int handle, int itsPort, const void* data, size_t len) 
   } else {
     cl.mode = CLI_LINE;
   }
-  return true;
+  return slot;
 }
 
-static void cliOnDisconnect(int handle) {
-  if (handle >= 0 && handle < CLI_MAX_CLIENTS) {
-    cliClients[handle].edit = {};
-    cliClients[handle].lineLen = 0;
+static void cliOnDisconnect(int ref) {
+  if (ref >= 0 && ref < CLI_MAX_CLIENTS) {
+    cliSlots[ref] = {};
+    cliSlots[ref].itsHandle = -1;
   }
 }
 
@@ -451,6 +465,7 @@ static void cliOnDisconnect(int handle) {
 static TaskHandle_t cliTaskHandle = NULL;
 
 static void cliTaskFn(void* arg) {
+  for (int i = 0; i < CLI_MAX_CLIENTS; i++) cliSlots[i].itsHandle = -1;
   itsServerInit(CLI_MAX_CLIENTS, 512, 2048);
   itsServerOnConnect(cliOnConnect);
   itsServerOnDisconnect(cliOnDisconnect);
@@ -473,15 +488,15 @@ static void cliTaskFn(void* arg) {
   cliBuiltinInit();  /* register built-in CLI commands */
 
   for (;;) {
-    ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(50));
-    itsPoll();
+    while (itsPoll(pdMS_TO_TICKS(50))) {}
 
-    /* Process each active ITS handle */
+    /* Process each active slot */
     char buf[128];
-    for (int h = 0; h < CLI_MAX_CLIENTS; h++) {
-      if (!itsConnected(h)) continue;
+    for (int s = 0; s < CLI_MAX_CLIENTS; s++) {
+      int h = cliSlots[s].itsHandle;
+      if (h < 0 || !itsConnected(h)) continue;
       size_t n = 0;
-      if (cliClients[h].ws) {
+      if (cliSlots[s].ws) {
         size_t outLen = 0;
         int op = wsReadFrame(h, (uint8_t*)buf, sizeof(buf), &outLen);
         if (op > 0) n = outLen;
@@ -490,8 +505,8 @@ static void cliTaskFn(void* arg) {
         n = itsRecv(h, buf, sizeof(buf), 0);
       }
       if (n == 0) continue;
-      cliActiveHandle = h;
-      auto& cl = cliClients[h];
+      cliActiveSlot = s;
+      auto& cl = cliSlots[s];
       if (cl.mode == CLI_ANSI) {
         for (size_t i = 0; i < n; i++)
           cliEditChar(cl.edit, buf[i], itsCliWrite);
@@ -511,7 +526,7 @@ static void cliTaskFn(void* arg) {
           }
         }
       }
-      cliActiveHandle = -1;
+      cliActiveSlot = -1;
     }
 
     /* Cron commands */
@@ -540,7 +555,7 @@ static void serialTaskFn(void* arg) {
   connectLog();
 
   for (;;) {
-    ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(50));
+    while (itsPoll(pdMS_TO_TICKS(50))) {}
 
     /* Poll serial input */
     char c;

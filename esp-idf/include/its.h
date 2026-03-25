@@ -42,16 +42,18 @@ void          itsReserveStreams(int count, size_t size);
 
 /* ---- Callbacks ---- */
 
-/** Server: called on incoming connection. Return true to accept. */
-typedef bool (*its_connect_cb_t)(int handle, int itsPort, const void* data, size_t len);
+/** Server: called on incoming connection. Return >= 0 to accept (value = serverRef),
+ *  return < 0 to reject. */
+typedef int (*its_connect_cb_t)(int handle, int itsPort, const void* data, size_t len);
 
 /** Server: called when active connections == maxHandles and a new client wants in.
  *  Return true to reject. Kick a handle (itsServerKick) and return false
  *  to let ITS retry. */
 typedef bool (*its_busy_cb_t)(int itsPort, const void* data, size_t len);
 
-/** Either side: called when connection is closed by remote. */
-typedef void (*its_disconnect_cb_t)(int handle);
+/** Either side: called when connection is closed by remote.
+ *  ref is the serverRef (for servers) or clientRef (for clients). */
+typedef void (*its_disconnect_cb_t)(int ref);
 
 /** Called when an aux message arrives on the registered port. */
 typedef void (*its_aux_cb_t)(TaskHandle_t sender, uint16_t port, const void* data, size_t len);
@@ -103,11 +105,16 @@ void          itsClientInit(int maxConns,
                             size_t inboxMaxMsgLen = 0, size_t inboxDepth = 0);
 
 int           itsConnect(const char* serverName, int itsPort,
-                         const void* data, size_t dataLen, TickType_t timeout);
+                         const void* data, size_t dataLen, TickType_t timeout,
+                         int ref = -1);
 int           itsConnectByHandle(TaskHandle_t serverTask, int itsPort,
                                  const void* data, size_t dataLen,
-                                 TickType_t timeout);
+                                 TickType_t timeout, int ref = -1);
 void          itsDisconnect(int handle);
+
+/** Get this side's ref for a connection (serverRef or clientRef depending
+ *  on whether the caller is the server or client for this handle). */
+int           itsRef(int handle);
 
 /* ---- Aux messages ---- */
 
@@ -121,11 +128,14 @@ bool          itsSendAuxByHandle(TaskHandle_t task,
                                  TickType_t timeout, uint16_t port = 0,
                                  its_wait_t wait = ITS_WAIT_DELIVERY);
 
-/* ---- Poll (call on task notification or periodically) ---- */
+/* ---- Poll ---- */
 
 /** Read one inbox message, dispatch to callback, ACK pickup if requested.
- *  Returns true if a message was processed. */
-bool          itsPoll(void);
+ *  If no message is pending and timeout > 0, blocks (ulTaskNotifyTake)
+ *  until notified, then retries. Default portMAX_DELAY = sleep until work.
+ *  Returns true if a message was processed.
+ *  Typical loop: while (itsPoll()) {} — drains all, blocks on last call. */
+bool          itsPoll(TickType_t timeout = portMAX_DELAY);
 
 /* ---- Data (handle from either side) ---- */
 

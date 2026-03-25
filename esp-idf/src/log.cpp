@@ -10,24 +10,58 @@
 #include "net.h"
 #include "storage.h"
 #include "compat.h"
-#include "freertos/stream_buffer.h"
 #include <esp_log.h>
 #include <esp_heap_caps.h>
 #include <cstdio>
 #include <cstring>
 
-/* ---- Log input stream ---- */
+/* ---- Log input ring buffer ---- */
 
 static bool logInited = false;
 
-#define LOG_INPUT_SIZE 2048
-static StreamBufferHandle_t logInputStream = NULL;  /* vprintf callback writes here */
+#define LOG_RING_SIZE 2048
+static uint8_t  logRing[LOG_RING_SIZE];   /* static DRAM — no heap alloc to corrupt */
+static volatile uint32_t logRingHead = 0; /* write position (writers) */
+static volatile uint32_t logRingTail = 0; /* read position (log task only) */
+static portMUX_TYPE logSpinlock = portMUX_INITIALIZER_UNLOCKED;
+
+static size_t logRingWrite(const char* data, size_t len) {
+  taskENTER_CRITICAL(&logSpinlock);
+  uint32_t h = logRingHead, t = logRingTail;
+  uint32_t free = LOG_RING_SIZE - (h - t);
+  if (len > free) len = free;
+  for (size_t i = 0; i < len; i++)
+    logRing[(h + i) % LOG_RING_SIZE] = data[i];
+  logRingHead = h + len;
+  taskEXIT_CRITICAL(&logSpinlock);
+  return len;
+}
+
+static size_t logRingRead(char* buf, size_t maxLen) {
+  uint32_t h = logRingHead, t = logRingTail;
+  uint32_t avail = h - t;
+  if (avail == 0) return 0;
+  if (avail > maxLen) avail = maxLen;
+  for (size_t i = 0; i < avail; i++)
+    buf[i] = logRing[(t + i) % LOG_RING_SIZE];
+  logRingTail = t + avail;
+  return avail;
+}
 
 /* ---- Log ITS server — consumers connect as clients ---- */
 
 #define LOG_MAX_CONSUMERS 4
-static log_ansi_t logConsumerAnsi[LOG_MAX_CONSUMERS];  /* per-handle ansi pref */
-static bool logConsumerWs[LOG_MAX_CONSUMERS];           /* per-handle WS flag */
+static struct {
+  int itsHandle;
+  log_ansi_t ansi;
+  bool ws;
+} logSlots[LOG_MAX_CONSUMERS];
+
+static int logAllocSlot(int h) {
+  for (int i = 0; i < LOG_MAX_CONSUMERS; i++)
+    if (logSlots[i].itsHandle < 0) { logSlots[i].itsHandle = h; return i; }
+  return -1;
+}
 
 /* Strip ANSI escape codes from a buffer in-place, return new length */
 static size_t stripAnsi(char* buf, size_t len) {
@@ -172,11 +206,10 @@ static int logReformat(const char* src, char* dst, size_t dstSize, bool ansi) {
 }
 
 static TaskHandle_t logTaskHandle = NULL;
-static SemaphoreHandle_t logMutex = NULL;
 
 /* vprintf callback — called by ESP-IDF log system from any task */
 static int logVprintf(const char* fmt, va_list args) {
-    if (!logInputStream) return 0;
+    if (!logInited) return 0;
 
     char buf[256];
     int rawLen = vsnprintf(buf, sizeof(buf), fmt, args);
@@ -187,13 +220,9 @@ static int logVprintf(const char* fmt, va_list args) {
     int fmtLen = logReformat(buf, formatted, sizeof(formatted), true);
     if (fmtLen <= 0) return rawLen;
 
-    /* Stream buffers are single-writer — serialize concurrent loggers.
-     * Must use mutex (not spinlock): xStreamBufferSend internally calls
-     * vTaskSuspendAll which is unsafe with interrupts disabled. */
-    if (xSemaphoreTake(logMutex, 0) == pdTRUE) {
-        xStreamBufferSend(logInputStream, formatted, fmtLen, 0);
-        xSemaphoreGive(logMutex);
-    }
+    /* Write to ring buffer — spinlock serializes concurrent writers.
+     * Safe from any task context (spinlock disables interrupts briefly). */
+    logRingWrite(formatted, fmtLen);
 
     /* Wake log task */
     if (logTaskHandle) xTaskNotifyGive(logTaskHandle);
@@ -203,28 +232,30 @@ static int logVprintf(const char* fmt, va_list args) {
 
 /* ---- Log ITS server callbacks ---- */
 
-static bool logOnConnect(int handle, int itsPort, const void* data, size_t len) {
-  logConsumerWs[handle] = false;
+static int logOnConnect(int handle, int itsPort, const void* data, size_t len) {
+  int s = logAllocSlot(handle);
+  if (s < 0) return -1;
+  logSlots[s].ws = false;
   if (len >= sizeof(net_connect_t) && ((const net_connect_t*)data)->ws) {
-    if (!wsUpgrade(handle)) return false;
-    logConsumerWs[handle] = true;
-    logConsumerAnsi[handle] = LOG_NO_ANSI;
+    if (!wsUpgrade(handle)) { logSlots[s].itsHandle = -1; return -1; }
+    logSlots[s].ws = true;
+    logSlots[s].ansi = LOG_NO_ANSI;
   } else if (len >= sizeof(log_connect_t)) {
-    auto* req = (const log_connect_t*)data;
-    logConsumerAnsi[handle] = req->ansi;
+    logSlots[s].ansi = ((const log_connect_t*)data)->ansi;
   } else {
-    logConsumerAnsi[handle] = LOG_NO_ANSI;
+    logSlots[s].ansi = LOG_NO_ANSI;
   }
-  return true;
+  return s;
 }
 
-static void logOnDisconnect(int handle) {
-  (void)handle;
+static void logOnDisconnect(int ref) {
+  if (ref >= 0 && ref < LOG_MAX_CONSUMERS) logSlots[ref].itsHandle = -1;
 }
 
 /* ---- Log task: drains input stream → fan out to ITS consumers ---- */
 
 static void logTaskFn(void* arg) {
+  for (int i = 0; i < LOG_MAX_CONSUMERS; i++) logSlots[i].itsHandle = -1;
   itsServerInit(LOG_MAX_CONSUMERS, 0, 2048);
   itsServerOnConnect(logOnConnect);
   itsServerOnDisconnect(logOnDisconnect);
@@ -247,11 +278,10 @@ static void logTaskFn(void* arg) {
   char buf[512];
   for (;;) {
     pmPollUsb();
-    ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(200));
-    itsPoll();
+    while (itsPoll(pdMS_TO_TICKS(200))) {}
     /* Drain input stream → fan out to all ITS consumers */
     for (;;) {
-      size_t n = xStreamBufferReceive(logInputStream, buf, sizeof(buf) - 1, 0);
+      size_t n = logRingRead(buf, sizeof(buf) - 1);
       if (n == 0) break;
       buf[n] = '\0';
       if (itsServerActive() == 0) continue;
@@ -259,17 +289,26 @@ static void logTaskFn(void* arg) {
       size_t pn = 0;
       bool plainDone = false;
       for (int i = 0; i < LOG_MAX_CONSUMERS; i++) {
-        if (!itsConnected(i)) continue;
+        int h = logSlots[i].itsHandle;
+        if (h < 0 || !itsConnected(h)) continue;
         const char* out = buf;
         size_t outLen = n;
-        if (logConsumerAnsi[i] != LOG_ANSI) {
+        if (logSlots[i].ansi != LOG_ANSI) {
           if (!plainDone) { memcpy(plain, buf, n); pn = stripAnsi(plain, n); plainDone = true; }
           out = plain; outLen = pn;
         }
-        if (logConsumerWs[i])
-          wsSendText(i, out, outLen);
-        else
-          itsSend(i, out, outLen, 0);
+        if (logSlots[i].ws) {
+          /* WS frame header + payload, non-blocking — drop if buffer full */
+          uint8_t hdr[4];
+          int hdrLen;
+          hdr[0] = 0x81; /* FIN + text */
+          if (outLen < 126) { hdr[1] = outLen; hdrLen = 2; }
+          else { hdr[1] = 126; hdr[2] = outLen >> 8; hdr[3] = outLen & 0xff; hdrLen = 4; }
+          if (itsSend(h, hdr, hdrLen, 0) == (size_t)hdrLen)
+            itsSend(h, out, outLen, 0);
+        } else {
+          itsSend(h, out, outLen, 0);
+        }
       }
     }
   }
@@ -281,9 +320,7 @@ void logInit() {
   if (logInited) return;
   logInited = true;
 
-  /* Log input stream in DRAM — accessed during SPI flash ops when PSRAM cache is disabled */
-  logInputStream = xStreamBufferCreateWithCaps(LOG_INPUT_SIZE, 1, MALLOC_CAP_INTERNAL);
-  logMutex = xSemaphoreCreateMutex();
+  /* Ring buffer is static DRAM — no heap allocation needed */
 
   /* Set INFO as default until nvsRunBoot sets the real level via logApplyLevels() */
   esp_log_level_set("*", ESP_LOG_INFO);
@@ -291,7 +328,9 @@ void logInit() {
   /* Install ESP-IDF vprintf hook — all logging now flows through our callback */
   esp_log_set_vprintf(logVprintf);
 
-  xTaskCreatePinnedToCoreWithCaps(logTaskFn, "log", 4096, NULL, 1, &logTaskHandle, 1, MALLOC_CAP_SPIRAM);
+  /* DRAM stack — log task accesses DRAM stream buffer; PSRAM stack would
+   * crash if SPI flash ops disable the PSRAM cache mid-read. */
+  xTaskCreatePinnedToCoreWithCaps(logTaskFn, "log", 4096, NULL, 1, &logTaskHandle, 1, MALLOC_CAP_INTERNAL);
 }
 
 /* ---- Log levels ---- */
