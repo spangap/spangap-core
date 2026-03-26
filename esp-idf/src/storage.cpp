@@ -414,6 +414,23 @@ cfg_type_t storageGetType(const char* key) {
   return it->second.type;
 }
 
+void storageCopy(const char* srcPrefix, const char* dstPrefix, bool onlyIfTargetKeyExists) {
+  size_t srcLen = strlen(srcPrefix);
+  std::vector<std::pair<std::string, CfgEntry>> copies;
+  for (auto it = store.lower_bound(srcPrefix); it != store.end(); ++it) {
+    if (strncmp(it->first.c_str(), srcPrefix, srcLen) != 0) break;
+    std::string dstKey = std::string(dstPrefix) + it->first.substr(srcLen);
+    if (onlyIfTargetKeyExists && store.count(dstKey) == 0) continue;
+    copies.emplace_back(std::move(dstKey), it->second);
+  }
+  for (auto& [key, entry] : copies) {
+    if (entry.type == CFG_INT)
+      storageSet(key.c_str(), atoi(entry.value.c_str()));
+    else
+      storageSet(key.c_str(), entry.value.c_str());
+  }
+}
+
 void storageForEach(const char* prefix, void (*cb)(const char* key, const char* val)) {
   size_t plen = strlen(prefix);
   for (auto it = store.lower_bound(prefix); it != store.end(); ++it) {

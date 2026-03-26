@@ -40,6 +40,11 @@ void   storageSet(const char* key, int val);
 void   storageSet(const char* key, const char* val);
 void   storageUnset(const char* key);
 void   storageSave();                   /** Force immediate JSON write. */
+
+/** Copy all keys matching srcPrefix to dstPrefix.
+ *  e.g., storageCopy("s.camera.", "camera.") copies s.camera.img.quality → camera.img.quality.
+ *  If onlyIfTargetKeyExists, only overwrites keys that already exist at the destination. */
+void   storageCopy(const char* srcPrefix, const char* dstPrefix, bool onlyIfTargetKeyExists = false);
 cfg_type_t storageGetType(const char* key);
 void   storageForEach(const char* prefix, void (*cb)(const char* key, const char* val));
 
@@ -56,7 +61,7 @@ typedef void (*storage_change_cb_t)(const char* key, const char* val);
 
 /** Subscribe to config changes matching a scope prefix.
  *  Callback fires on the calling task's own stack (via itsPoll).
- *  Scope is prefix-matched: "s.cam.img" matches "s.cam.img.quality", "s.cam.img.brightness", etc.
+ *  Scope is prefix-matched: "s.camera.img" matches "s.camera.img.quality", "s.camera.img.brightness", etc.
  *  Empty scope "" matches all changes.
  *  Call from the task that should receive the callback (during init, before main loop). */
 void storageSubscribeChanges(const char* scope, storage_change_cb_t cb);
