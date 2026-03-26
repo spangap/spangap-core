@@ -1,6 +1,6 @@
 /**
  * Log — log task, ESP-IDF vprintf hook, log reformatting, log levels.
- * Split from ipc.cpp. CLI command: log.
+ * CLI command: log.
  */
 #include "log.h"
 #include "pm.h"

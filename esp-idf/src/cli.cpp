@@ -1,6 +1,5 @@
 /**
  * CLI — command registry, line editor, serial task, CLI task.
- * Split from ipc.cpp.
  */
 #include "cli.h"
 #include "log.h"

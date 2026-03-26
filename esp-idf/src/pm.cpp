@@ -23,7 +23,7 @@
 #include <cstring>
 #include <algorithm>
 
-/* ---- Central RTC RAM validity (was in ipc.cpp) ---- */
+/* ---- Central RTC RAM validity ---- */
 #define RTC_APP_MAGIC 0x5ECC0001
 RTC_DATA_ATTR static uint32_t rtcAppMagic = 0;
 bool rtcValid()    { return rtcAppMagic == RTC_APP_MAGIC; }

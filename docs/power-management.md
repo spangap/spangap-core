@@ -16,7 +16,7 @@ max_freq_mhz = 240, min_freq_mhz = 80, light_sleep_enable = true
 
 ## PM Lock API
 
-Per-caller locks via `pmLockCreate/pmLockAcquire/pmLockRelease` (ipc.h):
+Per-caller locks via `pmLockCreate/pmLockAcquire/pmLockRelease` (pm.h):
 
 ```cpp
 enum pm_lock_type_t {
@@ -113,6 +113,6 @@ The lwIP timer thread (~1.3mA), started by `esp_netif_init()`, cannot be stopped
 ## Key Files
 
 - `main/pm.cpp` — `pmInit()`, `pmLockCreate/Acquire/Release`, `pmPollUsb()`, `cliUsbDown()`/`cliUsbUp()`, `pm` command, deep sleep lock table
-- `main/ipc.h` — `pm_lock_type_t` enum, `pmLockCreate/Acquire/Release` API, `deepSleepAllowed()`
+- `main/pm.h` — `pm_lock_type_t` enum, `pmLockCreate/Acquire/Release` API, `deepSleepAllowed()`
 - `main/net.cpp` — `esp_wifi_deinit()`/`esp_wifi_init()`, `esp_sleep_enable_wifi_wakeup()`, `"net"` deep sleep lock
 - `sdkconfig.defaults` — PM, tickless idle, profiling config
