@@ -123,10 +123,14 @@ static int logReformat(const char* src, char* dst, size_t dstSize, bool ansi) {
             if (*color) reset = "\033[0m";
         }
         bool showTs = storageGetInt("s.log.timestamp", 0) != 0;
-        char ts[24] = "";
-        if (showTs) fmtWallClock(ts, sizeof(ts));
-        return snprintf(dst, dstSize, "%s%s%s%c [%s] %.*s%s\n",
-            ts, showTs ? " " : "", color, lastLevel, taskName, (int)msgLen, p, reset);
+        char tsBuf[36] = "";
+        if (showTs) {
+            char ts[24]; fmtWallClock(ts, sizeof(ts));
+            if (ansi) snprintf(tsBuf, sizeof(tsBuf), "\033[0;90m%s\033[0m ", ts);
+            else snprintf(tsBuf, sizeof(tsBuf), "%s ", ts);
+        }
+        return snprintf(dst, dstSize, "%s%s%c [%s] %.*s%s\n",
+            tsBuf, color, lastLevel, taskName, (int)msgLen, p, reset);
     }
 
     lastLevel = level;
@@ -134,13 +138,9 @@ static int logReformat(const char* src, char* dst, size_t dstSize, bool ansi) {
     /* Timestamp: keep or skip "(12345) " based on s.log.timestamp */
     const char* afterLevel = p + 1;
     while (*afterLevel == ' ') afterLevel++;
-    const char* tsStart = nullptr;
-    int tsLen = 0;
     if (*afterLevel == '(') {
-        tsStart = afterLevel;
         const char* tsEnd = strchr(afterLevel, ')');
         if (tsEnd) {
-            tsLen = (int)(tsEnd - tsStart + 1);
             afterLevel = tsEnd + 1;
         } else {
             afterLevel = p + 1;
@@ -191,21 +191,24 @@ static int logReformat(const char* src, char* dst, size_t dstSize, bool ansi) {
     }
 
     /* Format: "Mar 27 16:23:15.342 L [task] msg" or "L [task] msg" */
-    char tsBuf[24] = "";
-    if (showTimestamp)
-        fmtWallClock(tsBuf, sizeof(tsBuf));
-    const char* tsSpace = showTimestamp ? " " : "";
+    char tsBuf[36] = "";
+    if (showTimestamp) {
+        char ts[24];
+        fmtWallClock(ts, sizeof(ts));
+        if (ansi) snprintf(tsBuf, sizeof(tsBuf), "\033[0;90m%s\033[0m ", ts);
+        else snprintf(tsBuf, sizeof(tsBuf), "%s ", ts);
+    }
 
     /* Suppress TAG if it matches the task name */
     if (tag[0] && strcmp(tag, taskName) == 0) {
-        return snprintf(dst, dstSize, "%s%s%s%c [%s] %.*s%s\n",
-            tsBuf, tsSpace, color, level, taskName, (int)msgLen, msgStart, reset);
+        return snprintf(dst, dstSize, "%s%s%c [%s] %.*s%s\n",
+            tsBuf, color, level, taskName, (int)msgLen, msgStart, reset);
     } else if (tag[0]) {
-        return snprintf(dst, dstSize, "%s%s%s%c [%s] %s: %.*s%s\n",
-            tsBuf, tsSpace, color, level, taskName, tag, (int)msgLen, msgStart, reset);
+        return snprintf(dst, dstSize, "%s%s%c [%s] %s: %.*s%s\n",
+            tsBuf, color, level, taskName, tag, (int)msgLen, msgStart, reset);
     } else {
-        return snprintf(dst, dstSize, "%s%s%s%c [%s] %.*s%s\n",
-            tsBuf, tsSpace, color, level, taskName, (int)msgLen, msgStart, reset);
+        return snprintf(dst, dstSize, "%s%s%c [%s] %.*s%s\n",
+            tsBuf, color, level, taskName, (int)msgLen, msgStart, reset);
     }
 }
 
