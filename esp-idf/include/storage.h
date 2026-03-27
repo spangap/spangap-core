@@ -46,6 +46,11 @@ void   storageSave();                   /** Force immediate JSON write. */
  *  If onlyIfTargetKeyExists, only overwrites keys that already exist at the destination. */
 void   storageCopy(const char* srcPrefix, const char* dstPrefix, bool onlyIfTargetKeyExists = false);
 cfg_type_t storageGetType(const char* key);
+
+/** Count consecutive numbered entries (0, 1, 2, ...) with at least one subkey.
+ *  Prefix must end with dot, e.g., "s.web.map." → checks .0.*, .1.*, ... */
+int    storageArrayCount(const char* prefix);
+
 void   storageForEach(const char* prefix, void (*cb)(const char* key, const char* val));
 
 /** Output function type for CLI output routing. */

@@ -431,6 +431,19 @@ void storageCopy(const char* srcPrefix, const char* dstPrefix, bool onlyIfTarget
   }
 }
 
+int storageArrayCount(const char* prefix) {
+    int count = 0;
+    char key[64];
+    for (;;) {
+        snprintf(key, sizeof(key), "%s%d.", prefix, count);
+        size_t klen = strlen(key);
+        auto it = store.lower_bound(key);
+        if (it == store.end() || strncmp(it->first.c_str(), key, klen) != 0) break;
+        count++;
+    }
+    return count;
+}
+
 void storageForEach(const char* prefix, void (*cb)(const char* key, const char* val)) {
   size_t plen = strlen(prefix);
   for (auto it = store.lower_bound(prefix); it != store.end(); ++it) {
@@ -550,12 +563,12 @@ static void cmdUnset(const char* a) {
 static void cmdShow(const char* a) {
     if (strcmp(a, "help") == 0) { cliPrintf("  %-*s show config variables\n", CLI_HELP_COL, "show [<prefix>]"); return; }
     if (*a) {
+        size_t alen = strlen(a);
         bool found = false;
-        for (auto& [key, entry] : store) {
-            if (strncmp(key.c_str(), a, strlen(a)) == 0) {
-                cliPrintf("  %s = %s\n", key.c_str(), entry.value.c_str());
-                found = true;
-            }
+        for (auto it = store.lower_bound(a); it != store.end(); ++it) {
+            if (strncmp(it->first.c_str(), a, alen) != 0) break;
+            cliPrintf("  %s = %s\n", it->first.c_str(), it->second.value.c_str());
+            found = true;
         }
         if (!found) cliPrintf("  (no matches)\n");
     } else {
