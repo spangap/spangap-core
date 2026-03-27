@@ -122,8 +122,11 @@ static int logReformat(const char* src, char* dst, size_t dstSize, bool ansi) {
             }
             if (*color) reset = "\033[0m";
         }
-        return snprintf(dst, dstSize, "%s%c [%s] %.*s%s\n",
-            color, lastLevel, taskName, (int)msgLen, p, reset);
+        bool showTs = storageGetInt("s.log.timestamp", 0) != 0;
+        char ts[24] = "";
+        if (showTs) fmtWallClock(ts, sizeof(ts));
+        return snprintf(dst, dstSize, "%s%s%s%c [%s] %.*s%s\n",
+            ts, showTs ? " " : "", color, lastLevel, taskName, (int)msgLen, p, reset);
     }
 
     lastLevel = level;
@@ -187,21 +190,22 @@ static int logReformat(const char* src, char* dst, size_t dstSize, bool ansi) {
         if (*color) reset = "\033[0m";
     }
 
-    /* Format: "L (ts) [task] msg" or "L [task] msg" */
+    /* Format: "Mar 27 16:23:15.342 L [task] msg" or "L [task] msg" */
     char tsBuf[24] = "";
-    if (showTimestamp && tsStart && tsLen > 0)
-        snprintf(tsBuf, sizeof(tsBuf), " %.*s", tsLen, tsStart);
+    if (showTimestamp)
+        fmtWallClock(tsBuf, sizeof(tsBuf));
+    const char* tsSpace = showTimestamp ? " " : "";
 
     /* Suppress TAG if it matches the task name */
     if (tag[0] && strcmp(tag, taskName) == 0) {
-        return snprintf(dst, dstSize, "%s%c%s [%s] %.*s%s\n",
-            color, level, tsBuf, taskName, (int)msgLen, msgStart, reset);
+        return snprintf(dst, dstSize, "%s%s%s%c [%s] %.*s%s\n",
+            tsBuf, tsSpace, color, level, taskName, (int)msgLen, msgStart, reset);
     } else if (tag[0]) {
-        return snprintf(dst, dstSize, "%s%c%s [%s] %s: %.*s%s\n",
-            color, level, tsBuf, taskName, tag, (int)msgLen, msgStart, reset);
+        return snprintf(dst, dstSize, "%s%s%s%c [%s] %s: %.*s%s\n",
+            tsBuf, tsSpace, color, level, taskName, tag, (int)msgLen, msgStart, reset);
     } else {
-        return snprintf(dst, dstSize, "%s%c%s [%s] %.*s%s\n",
-            color, level, tsBuf, taskName, (int)msgLen, msgStart, reset);
+        return snprintf(dst, dstSize, "%s%s%s%c [%s] %.*s%s\n",
+            tsBuf, tsSpace, color, level, taskName, (int)msgLen, msgStart, reset);
     }
 }
 
@@ -347,6 +351,7 @@ static esp_log_level_t parseEspLevel(const char* val) {
     case 'w': return ESP_LOG_WARN;
     case 'i': return ESP_LOG_INFO;
     case 'd': return ESP_LOG_DEBUG;
+    case 'v': return ESP_LOG_VERBOSE;
     default:  return ESP_LOG_INFO;
   }
 }
@@ -402,7 +407,13 @@ const char* cfd(int fd) {
 
 void logRegisterCmds() {
     cliRegisterCmd("log", [](const char* a) {
-        if (strcmp(a, "help") == 0) { cliPrintf("  %-*s show/set log level\n", CLI_HELP_COL, "log [tag] [level]"); return; }
+        if (strcmp(a, "help") == 0) {
+            cliPrintf("  %-*s show/set log level\n", CLI_HELP_COL, "log [tag] [level]");
+            cliPrintf("  %-*s toggle timestamps\n", CLI_HELP_COL, "log [no]timestamp");
+            return;
+        }
+        if (strcmp(a, "timestamp") == 0) { storageSet("s.log.timestamp", 1); return; }
+        if (strcmp(a, "notimestamp") == 0) { storageSet("s.log.timestamp", 0); return; }
         if (!*a) {
             char val[16]; storageGetStr("s.log.level", val, sizeof(val), "info");
             cliPrintf("  %s\n", val);
@@ -414,10 +425,10 @@ void logRegisterCmds() {
         first[i] = '\0';
         const char* rest = a + i;
         while (*rest == ' ') rest++;
-        bool isLevel = (first[1] == '\0' && strchr("newidNEWID", first[0])) ||
+        bool isLevel = (first[1] == '\0' && strchr("newidvNEWIDV", first[0])) ||
                        strcasecmp(first, "none") == 0 || strcasecmp(first, "error") == 0 ||
                        strcasecmp(first, "warn") == 0 || strcasecmp(first, "info") == 0 ||
-                       strcasecmp(first, "debug") == 0;
+                       strcasecmp(first, "debug") == 0 || strcasecmp(first, "verbose") == 0;
         if (isLevel && !*rest) logSetGlobal(first);
         else if (!*rest) {
             char key[32]; snprintf(key, sizeof(key), "s.log.tag.%.19s", first);

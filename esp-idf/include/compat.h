@@ -3,6 +3,8 @@
 #include "esp_sleep.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include <sys/time.h>
+#include <time.h>
 
 /** Central RTC RAM validity — one magic word for all application RTC state.
  *  Set before deep sleep, checked on wakeup. If invalid, all RTC vars are stale. */
@@ -22,6 +24,17 @@ static inline void delay(uint32_t ms) {
 static inline uint32_t fpsToIntervalMs(int fps) {
     if (fps == 0) return 0;
     return fps > 0 ? (uint32_t)(1000 / fps) : (uint32_t)(-fps) * 1000;
+}
+
+/** Format wall clock: "Mar 27 16:23:15.342". Returns buf. */
+static inline const char* fmtWallClock(char* buf, size_t len) {
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    struct tm tm;
+    localtime_r(&tv.tv_sec, &tm);
+    int n = strftime(buf, len, "%b %d %H:%M:%S", &tm);
+    snprintf(buf + n, len - n, ".%03d", (int)(tv.tv_usec / 1000));
+    return buf;
 }
 
 /** Format elapsed seconds as "3s", "1m22s", "2h3m7s", "3d5h12m7s". */

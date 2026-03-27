@@ -52,7 +52,9 @@ const char* cfd(int fd);
 /* ---- Log macros — route through ESP-IDF logging with task name as TAG ---- */
 
 #define err(fmt, ...)  ESP_LOGE(pcTaskGetName(NULL), fmt, ##__VA_ARGS__)
+#define warn(fmt, ...) ESP_LOGW(pcTaskGetName(NULL), fmt, ##__VA_ARGS__)
 #define info(fmt, ...) ESP_LOGI(pcTaskGetName(NULL), fmt, ##__VA_ARGS__)
 #define dbg(fmt, ...)  ESP_LOGD(pcTaskGetName(NULL), fmt, ##__VA_ARGS__)
+#define verb(fmt, ...) ESP_LOGV(pcTaskGetName(NULL), fmt, ##__VA_ARGS__)
 
 #endif
