@@ -534,7 +534,10 @@ int itsServerForwardByHandle(int handle, TaskHandle_t targetTask, int itsPort,
     c->serverTask = targetTask;
     c->itsPort = itsPort;
 
-    if (dataLen > ITS_MAX_MSG_DATA) dataLen = ITS_MAX_MSG_DATA;
+    if (dataLen > ITS_MAX_MSG_DATA) {
+        err("forward data truncated: %u > %u", (unsigned)dataLen, ITS_MAX_MSG_DATA);
+        dataLen = ITS_MAX_MSG_DATA;
+    }
     uint8_t buf[sizeof(its_header_t) + ITS_MAX_MSG_DATA];
     auto* fhdr = (its_header_t*)buf;
     fhdr->sender = xTaskGetCurrentTaskHandle();
@@ -597,7 +600,10 @@ int itsConnectByHandle(TaskHandle_t serverTask, int itsPort,
     xSemaphoreTake(me->ackSem, 0);
     me->ackHandle = -1;
 
-    if (dataLen > ITS_MAX_MSG_DATA) dataLen = ITS_MAX_MSG_DATA;
+    if (dataLen > ITS_MAX_MSG_DATA) {
+        err("connect data truncated: %u > %u", (unsigned)dataLen, ITS_MAX_MSG_DATA);
+        dataLen = ITS_MAX_MSG_DATA;
+    }
     uint8_t buf[sizeof(its_header_t) + ITS_MAX_MSG_DATA];
     auto* hdr = (its_header_t*)buf;
     hdr->sender = me->task;
@@ -661,7 +667,10 @@ static bool itsSendAuxInternal(TaskHandle_t task,
     /* Max payload = target's inbox item size minus header */
     size_t maxPayload = te->inboxItemSize > sizeof(its_header_t)
                       ? te->inboxItemSize - sizeof(its_header_t) : ITS_MAX_MSG_DATA;
-    if (dataLen > maxPayload) dataLen = maxPayload;
+    if (dataLen > maxPayload) {
+        err("aux data truncated: %u > %u", (unsigned)dataLen, (unsigned)maxPayload);
+        dataLen = maxPayload;
+    }
 
     int pickupIdx = -1;
     if (wait == ITS_WAIT_PICKUP)

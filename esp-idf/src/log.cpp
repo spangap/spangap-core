@@ -12,8 +12,12 @@
 #include "compat.h"
 #include <esp_log.h>
 #include <esp_heap_caps.h>
+#include <esp_timer.h>
 #include <cstdio>
 #include <cstring>
+#include <sys/stat.h>
+#include <dirent.h>
+#include <unistd.h>
 
 /* ---- Log input ring buffer ---- */
 
@@ -46,6 +50,100 @@ static size_t logRingRead(char* buf, size_t maxLen) {
     buf[i] = logRing[(t + i) % LOG_RING_SIZE];
   logRingTail = t + avail;
   return avail;
+}
+
+/* ---- Log file output ---- */
+
+static FILE* logFile = nullptr;
+static char logFilePath[128] = {};
+static int64_t lastFlushUs = 0;
+static int logFileLevelMax = 4;  /* 0=E 1=W 2=I 3=D 4=V — default: pass all */
+
+static int levelCharToNum(char c) {
+    switch (c) {
+        case 'E': return 0; case 'W': return 1; case 'I': return 2;
+        case 'D': return 3; case 'V': return 4; default: return 2;
+    }
+}
+
+static int parseLevelNum(const char* s) {
+    char c = s[0];
+    if (c >= 'a' && c <= 'z') c -= 32;
+    switch (c) {
+        case 'E': case 'N': return 0;  /* error/none */
+        case 'W': return 1; case 'I': return 2;
+        case 'D': return 3; case 'V': return 4;
+        default: return 4;
+    }
+}
+
+static bool isLevelArg(const char* s) {
+    if (!*s) return false;
+    if (s[1] == '\0' && strchr("newidvNEWIDV", s[0])) return true;
+    return strcasecmp(s, "none") == 0 || strcasecmp(s, "error") == 0 ||
+           strcasecmp(s, "warn") == 0 || strcasecmp(s, "info") == 0 ||
+           strcasecmp(s, "debug") == 0 || strcasecmp(s, "verbose") == 0;
+}
+
+/* Find log level character in a plain-text line: the char before " [" */
+static char lineLevel(const char* line, size_t len) {
+    for (size_t i = 1; i + 1 < len && line[i] != '\n'; i++) {
+        if (line[i] == ' ' && line[i + 1] == '[') {
+            char c = line[i - 1];
+            if (c == 'E' || c == 'W' || c == 'I' || c == 'D' || c == 'V') return c;
+        }
+    }
+    return 'I';
+}
+
+static void logFileMsg(const char* msg) {
+    if (!logFile) return;
+    char ts[24]; fmtWallClock(ts, sizeof(ts));
+    fprintf(logFile, "%s I [log] %s\n", ts, msg);
+}
+
+static void logFileClose() {
+    if (!logFile) return;
+    logFileMsg("log file closed");
+    fflush(logFile); fsync(fileno(logFile));
+    fclose(logFile);
+    logFile = nullptr;
+    logFilePath[0] = '\0';
+}
+
+static void logFileOpen(const char* path) {
+    logFileClose();
+    if (!path || !*path) return;
+    FILE* f = fopen(path, "a");
+    if (!f) return;
+    logFile = f;
+    safeStrncpy(logFilePath, path, sizeof(logFilePath));
+    lastFlushUs = esp_timer_get_time();
+    logFileMsg("log file opened");
+}
+
+/* Write plain text to log file, filtering lines by level */
+static void logFileWrite(const char* data, size_t len) {
+    if (!logFile) return;
+    const char* p = data;
+    const char* end = data + len;
+    while (p < end) {
+        const char* nl = (const char*)memchr(p, '\n', end - p);
+        size_t lineLen = nl ? (size_t)(nl - p + 1) : (size_t)(end - p);
+        if (levelCharToNum(lineLevel(p, lineLen)) <= logFileLevelMax)
+            fwrite(p, 1, lineLen, logFile);
+        p += lineLen;
+    }
+}
+
+static void logFileFlush() {
+    if (!logFile) return;
+    int intervalS = storageGetInt("s.log.file.interval", 5);
+    int64_t now = esp_timer_get_time();
+    if (now - lastFlushUs >= (int64_t)intervalS * 1000000) {
+        fflush(logFile); fsync(fileno(logFile));
+        lastFlushUs = now;
+    }
 }
 
 /* ---- Log ITS server — consumers connect as clients ---- */
@@ -270,38 +368,65 @@ static void logTaskFn(void* arg) {
   /* Register TCP port with network */
   { net_port_msg_t reg = {};
     reg.itsPort = 8080;  /* convention for log */
-    strncpy(reg.nvsKey, "log_port", sizeof(reg.nvsKey));
+    safeStrncpy(reg.nvsKey, "log_port", sizeof(reg.nvsKey));
     while (!itsSendAux("net", &reg, sizeof(reg), pdMS_TO_TICKS(500)))
       vTaskDelay(pdMS_TO_TICKS(100));
   }
   /* Register WS path with web */
   { web_path_msg_t reg = {};
     reg.itsPort = 8080;
-    strncpy(reg.path, "log", sizeof(reg.path));
+    safeStrncpy(reg.path, "log", sizeof(reg.path));
     while (!itsSendAux("web", &reg, sizeof(reg), pdMS_TO_TICKS(500)))
       vTaskDelay(pdMS_TO_TICKS(100));
   }
+
+  /* Open log file if configured */
+  { char lvl[16];
+    storageGetStr("s.log.file.level", lvl, sizeof(lvl), "verbose");
+    logFileLevelMax = parseLevelNum(lvl);
+    char path[128];
+    storageGetStr("s.log.file.path", path, sizeof(path));
+    if (path[0]) logFileOpen(path);
+  }
+
+  storageSubscribeChanges("s.log.file.path", ON_CHANGE {
+    logFileClose();
+    if (val[0]) logFileOpen(val);
+  });
+  storageSubscribeChanges("s.log.file.level", ON_CHANGE {
+    logFileLevelMax = parseLevelNum(val);
+  });
 
   char buf[512];
   for (;;) {
     pmPollUsb();
     while (itsPoll(pdMS_TO_TICKS(200))) {}
-    /* Drain input stream → fan out to all ITS consumers */
+    /* Drain input stream → fan out to ITS consumers + log file */
     for (;;) {
       size_t n = logRingRead(buf, sizeof(buf) - 1);
       if (n == 0) break;
       buf[n] = '\0';
-      if (itsServerActive() == 0) continue;
       char plain[512];
       size_t pn = 0;
       bool plainDone = false;
+
+      /* Strip ANSI once if needed by file or any non-ANSI consumer */
+      auto ensurePlain = [&]() {
+        if (plainDone) return;
+        memcpy(plain, buf, n); pn = stripAnsi(plain, n); plainDone = true;
+      };
+
+      /* Write plain text to log file */
+      if (logFile) { ensurePlain(); logFileWrite(plain, pn); }
+
+      if (itsServerActive() == 0) continue;
       for (int i = 0; i < LOG_MAX_CONSUMERS; i++) {
         int h = logSlots[i].itsHandle;
         if (h < 0 || !itsConnected(h)) continue;
         const char* out = buf;
         size_t outLen = n;
         if (logSlots[i].ansi != LOG_ANSI) {
-          if (!plainDone) { memcpy(plain, buf, n); pn = stripAnsi(plain, n); plainDone = true; }
+          ensurePlain();
           out = plain; outLen = pn;
         }
         if (logSlots[i].ws) {
@@ -318,6 +443,7 @@ static void logTaskFn(void* arg) {
         }
       }
     }
+    logFileFlush();
   }
 }
 
@@ -337,7 +463,7 @@ void logInit() {
 
   /* DRAM stack — log task accesses DRAM stream buffer; PSRAM stack would
    * crash if SPI flash ops disable the PSRAM cache mid-read. */
-  xTaskCreatePinnedToCoreWithCaps(logTaskFn, "log", 4096, NULL, 1, &logTaskHandle, 1, MALLOC_CAP_INTERNAL);
+  xTaskCreatePinnedToCoreWithCaps(logTaskFn, "log", 4608, NULL, 1, &logTaskHandle, 1, MALLOC_CAP_INTERNAL);
 }
 
 /* ---- Log levels ---- */
@@ -406,9 +532,134 @@ const char* cfd(int fd) {
   return buf;
 }
 
-/* ---- CLI command: log ---- */
+/* ---- CLI commands: log, logfile, logrotate ---- */
+
+static void cmdLogfile(const char* a) {
+    if (strcmp(a, "help") == 0) {
+        cliPrintf("  %-*s start/stop logging to file\n", CLI_HELP_COL, "logfile [level] [path|off]");
+        return;
+    }
+
+    /* logfile off — stop logging */
+    if (strcmp(a, "off") == 0) { storageSet("s.log.file.path", ""); return; }
+
+    /* Parse optional level, then optional path */
+    char first[24] = {};
+    int i = 0;
+    while (a[i] && a[i] != ' ' && i < 23) { first[i] = a[i]; i++; }
+    first[i] = '\0';
+    const char* rest = a + i;
+    while (*rest == ' ') rest++;
+
+    const char* level = "verbose";
+    const char* pathArg = nullptr;
+
+    if (first[0] && isLevelArg(first)) {
+        level = first;
+        if (*rest) pathArg = rest;
+    } else if (first[0]) {
+        pathArg = a;  /* no level, entire arg is the path */
+    }
+
+    storageSet("s.log.file.level", level);
+
+    char path[128];
+    if (!pathArg) {
+        /* Default: /sdcard/log/YYYYMMDD.log */
+        char dir[64];
+        storageGetStr("s.log.dir", dir, sizeof(dir), "/sdcard/log");
+        mkdir(dir, 0755);  /* create if needed, ignore EEXIST */
+        time_t now = time(nullptr);
+        struct tm tm;
+        localtime_r(&now, &tm);
+        snprintf(path, sizeof(path), "%s/%04d%02d%02d.log", dir,
+            tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday);
+    } else if (pathArg[0] == '/') {
+        snprintf(path, sizeof(path), "%s", pathArg);
+    } else {
+        char dir[64];
+        storageGetStr("s.log.dir", dir, sizeof(dir), "/sdcard/log");
+        mkdir(dir, 0755);
+        snprintf(path, sizeof(path), "%s/%s", dir, pathArg);
+    }
+
+    storageSet("s.log.file.path", path);
+    cliPrintf("  %s (%s)\n", path, level);
+}
+
+/* ---- CLI command: logrotate ---- */
+
+static bool isLogDateFile(const char* name) {
+    /* Match YYYYMMDD.log — 8 digits + ".log" */
+    if (strlen(name) != 12) return false;
+    for (int i = 0; i < 8; i++)
+        if (name[i] < '0' || name[i] > '9') return false;
+    return strcmp(name + 8, ".log") == 0;
+}
+
+static time_t logDateToTime(const char* name) {
+    /* Parse YYYYMMDD from filename */
+    struct tm tm = {};
+    char buf[9];
+    memcpy(buf, name, 8); buf[8] = '\0';
+    if (sscanf(buf, "%4d%2d%2d", &tm.tm_year, &tm.tm_mon, &tm.tm_mday) != 3) return 0;
+    tm.tm_year -= 1900; tm.tm_mon -= 1;
+    return mktime(&tm);
+}
+
+static void cmdLogrotate(const char* a) {
+    if (strcmp(a, "help") == 0) {
+        cliPrintf("  %-*s rotate log, delete old files\n", CLI_HELP_COL, "logrotate [days]");
+        return;
+    }
+
+    /* Check current log file is in date format */
+    char dir[64];
+    storageGetStr("s.log.dir", dir, sizeof(dir), "/sdcard/log");
+    char curFile[128];
+    storageGetStr("s.log.file.path", curFile, sizeof(curFile));
+    /* Extract basename from current file */
+    const char* curBase = strrchr(curFile, '/');
+    curBase = curBase ? curBase + 1 : curFile;
+    if (curFile[0] && !isLogDateFile(curBase)) {
+        cliPrintf("logrotate: current log file is not a date-format log\n");
+        return;
+    }
+
+    /* Set log path to today's date */
+    time_t now = time(nullptr);
+    struct tm tm;
+    localtime_r(&now, &tm);
+    char path[128];
+    snprintf(path, sizeof(path), "%s/%04d%02d%02d.log", dir,
+        tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday);
+    storageSet("s.log.file.path", path);
+
+    /* Delete expired files if days specified */
+    int days = *a ? atoi(a) : 0;
+    if (days <= 0) return;
+
+    time_t cutoff = now - (time_t)days * 86400;
+    DIR* d = opendir(dir);
+    if (!d) return;
+    int deleted = 0;
+    struct dirent* ent;
+    while ((ent = readdir(d)) != nullptr) {
+        if (!isLogDateFile(ent->d_name)) continue;
+        time_t ft = logDateToTime(ent->d_name);
+        if (ft > 0 && ft < cutoff) {
+            char fp[80];  /* dir(64) + '/' + "YYYYMMDD.log"(12) + NUL */
+            snprintf(fp, sizeof(fp), "%.63s/%.12s", dir, ent->d_name);
+            if (remove(fp) == 0) deleted++;
+        }
+    }
+    closedir(d);
+    if (deleted) cliPrintf("  deleted %d old log file%s\n", deleted, deleted > 1 ? "s" : "");
+}
 
 void logRegisterCmds() {
+    cliRegisterCmd("logfile", cmdLogfile);
+    cliRegisterCmd("logrotate", cmdLogrotate);
     cliRegisterCmd("log", [](const char* a) {
         if (strcmp(a, "help") == 0) {
             cliPrintf("  %-*s show/set log level\n", CLI_HELP_COL, "log [tag] [level]");

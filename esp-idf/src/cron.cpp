@@ -100,8 +100,7 @@ static bool cronMatchField(const char* field, int value, int minVal, int maxVal)
         step = atoi(slash + 1);
         if (step <= 0) return false;
     } else {
-        strncpy(base, field, sizeof(base) - 1);
-        base[sizeof(base) - 1] = '\0';
+        safeStrncpy(base, field, sizeof(base));
     }
 
     /* Star: match any (with optional step) */

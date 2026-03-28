@@ -14,6 +14,7 @@
 #include "its.h"
 #include "web.h"
 #include "net.h"
+#include "compat.h"
 
 #include <map>
 #include <string>
@@ -300,8 +301,8 @@ static int           subCount = 0;
 /* Payload for aux message on STORAGE_CHANGE_PORT */
 struct storage_change_msg_t {
   storage_change_cb_t cb;
-  char                key[36];
-  char                val[24];
+  char                key[28];
+  char                val[32];
 };
 
 /* Aux handler installed on each subscribing task — unpacks and calls */
@@ -328,14 +329,13 @@ void storageSubscribeChanges(const char* scope, storage_change_cb_t cb) {
   auto& s = subs[subCount++];
   s.task = me;
   s.cb = cb;
-  strncpy(s.scope, scope, sizeof(s.scope) - 1);
-  s.scope[sizeof(s.scope) - 1] = '\0';
+  safeStrncpy(s.scope, scope, sizeof(s.scope));
 }
 
 static void fireSubscriptions(const char* key, const char* val) {
   storage_change_msg_t msg = {};
-  strncpy(msg.key, key, sizeof(msg.key) - 1);
-  strncpy(msg.val, val, sizeof(msg.val) - 1);
+  safeStrncpy(msg.key, key, sizeof(msg.key));
+  safeStrncpy(msg.val, val, sizeof(msg.val));
 
   for (int i = 0; i < subCount; i++) {
     size_t scopeLen = strlen(subs[i].scope);
@@ -379,8 +379,7 @@ void storageGetStr(const char* key, char* out, size_t outLen, const char* def) {
   if (outLen == 0) return;
   auto it = store.find(key);
   const char* src = (it != store.end()) ? it->second.value.c_str() : def;
-  strncpy(out, src, outLen - 1);
-  out[outLen - 1] = '\0';
+  safeStrncpy(out, src, outLen);
 }
 
 void storageSet(const char* key, int val) {

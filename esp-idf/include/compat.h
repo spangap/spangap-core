@@ -1,15 +1,26 @@
 #pragma once
 #include "esp_timer.h"
 #include "esp_sleep.h"
+#include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include <sys/time.h>
 #include <time.h>
+#include <cstring>
 
 /** Central RTC RAM validity — one magic word for all application RTC state.
  *  Set before deep sleep, checked on wakeup. If invalid, all RTC vars are stale. */
 bool rtcValid();
 void rtcSetValid();
+
+/** strncpy with truncation warning. Always NUL-terminates. */
+static inline char* safeStrncpy(char* dst, const char* src, size_t n) {
+    if (strlen(src) >= n)
+        ESP_LOGE("strncpy", "truncated: '%s' to %u chars", src, (unsigned)(n - 1));
+    strncpy(dst, src, n - 1);
+    dst[n - 1] = '\0';
+    return dst;
+}
 
 static inline uint32_t millis() {
     return static_cast<uint32_t>(esp_timer_get_time() / 1000);

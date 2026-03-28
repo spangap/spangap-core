@@ -336,8 +336,7 @@ static void cmdTop(const char* args) {
         n = uxTaskGetSystemState(raw, n, &total);
         int cnt = n < (UBaseType_t)max ? (int)n : max;
         for (int i = 0; i < cnt; i++) {
-            strncpy(out[i].name, raw[i].pcTaskName, configMAX_TASK_NAME_LEN - 1);
-            out[i].name[configMAX_TASK_NAME_LEN - 1] = '\0';
+            safeStrncpy(out[i].name, raw[i].pcTaskName, configMAX_TASK_NAME_LEN);
             out[i].run = raw[i].ulRunTimeCounter;
             out[i].pri = (int)raw[i].uxCurrentPriority;
             out[i].stack = raw[i].usStackHighWaterMark;

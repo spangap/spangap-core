@@ -37,8 +37,7 @@ static void cmdLs(const char* a) {
         snprintf(fullpath, sizeof(fullpath), "%.80s/%.80s", path, ent->d_name);
         struct stat st;
         if (stat(fullpath, &st) == 0) {
-            strncpy(entries[count].name, ent->d_name, sizeof(entries[0].name) - 1);
-            entries[count].name[sizeof(entries[0].name) - 1] = '\0';
+            safeStrncpy(entries[count].name, ent->d_name, sizeof(entries[0].name));
             entries[count].mtime = st.st_mtime;
             entries[count].size = (uint32_t)st.st_size;
             entries[count].isDir = S_ISDIR(st.st_mode);

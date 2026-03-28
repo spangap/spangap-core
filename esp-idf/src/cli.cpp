@@ -81,8 +81,7 @@ static void histAdd(const char* cmd) {
   /* skip if same as last entry */
   int last = (histHead + HIST_SIZE - 1) % HIST_SIZE;
   if (histCount > 0 && strcmp(histBuf[last], cmd) == 0) return;
-  strncpy(histBuf[histHead], cmd, sizeof(histBuf[0]) - 1);
-  histBuf[histHead][sizeof(histBuf[0]) - 1] = '\0';
+  safeStrncpy(histBuf[histHead], cmd, sizeof(histBuf[0]));
   histHead = (histHead + 1) % HIST_SIZE;
   if (histCount < HIST_SIZE) histCount++;
 }
@@ -227,10 +226,9 @@ static void cliTabComplete(cli_edit& e, cli_write_fn write) {
     int dlen = lastSlash - wordStart;
     if (dlen == 0) { strcpy(dirPath, "/"); }
     else { memcpy(dirPath, wordStart, dlen); dirPath[dlen] = '\0'; }
-    strncpy(prefix, lastSlash + 1, sizeof(prefix) - 1);
+    safeStrncpy(prefix, lastSlash + 1, sizeof(prefix));
   } else {
-    strncpy(prefix, wordStart, wordLen);
-    prefix[wordLen] = '\0';
+    safeStrncpy(prefix, wordStart, sizeof(prefix));
   }
 
   int prefixLen = strlen(prefix);
@@ -244,7 +242,7 @@ static void cliTabComplete(cli_edit& e, cli_write_fn write) {
     if (strncmp(ent->d_name, prefix, prefixLen) != 0) continue;
     matchCount++;
     if (matchCount == 1) {
-      strncpy(match, ent->d_name, sizeof(match) - 1);
+      safeStrncpy(match, ent->d_name, sizeof(match));
     } else {
       /* Shorten match to common prefix */
       int i = 0;
@@ -472,14 +470,14 @@ static void cliTaskFn(void* arg) {
   /* Register TCP port with network */
   { net_port_msg_t reg = {};
     reg.itsPort = 8081;  /* convention for cli */
-    strncpy(reg.nvsKey, "cli_port", sizeof(reg.nvsKey));
+    safeStrncpy(reg.nvsKey, "cli_port", sizeof(reg.nvsKey));
     while (!itsSendAux("net", &reg, sizeof(reg), pdMS_TO_TICKS(500)))
       vTaskDelay(pdMS_TO_TICKS(100));
   }
   /* Register WS path with web */
   { web_path_msg_t reg = {};
     reg.itsPort = 8081;
-    strncpy(reg.path, "cli", sizeof(reg.path));
+    safeStrncpy(reg.path, "cli", sizeof(reg.path));
     while (!itsSendAux("web", &reg, sizeof(reg), pdMS_TO_TICKS(500)))
       vTaskDelay(pdMS_TO_TICKS(100));
   }
