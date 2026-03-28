@@ -10,8 +10,8 @@
 
 /** Central RTC RAM validity — one magic word for all application RTC state.
  *  Set before deep sleep, checked on wakeup. If invalid, all RTC vars are stale. */
-bool rtcValid();
-void rtcSetValid();
+bool rtcRamValid();
+void rtcRamSetValid();
 
 /** strncpy with truncation warning. Always NUL-terminates. */
 static inline char* safeStrncpy(char* dst, const char* src, size_t n) {

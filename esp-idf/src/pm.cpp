@@ -26,8 +26,8 @@
 /* ---- Central RTC RAM validity ---- */
 #define RTC_APP_MAGIC 0x5ECC0001
 RTC_DATA_ATTR static uint32_t rtcAppMagic = 0;
-bool rtcValid()    { return rtcAppMagic == RTC_APP_MAGIC; }
-void rtcSetValid() { rtcAppMagic = RTC_APP_MAGIC; }
+bool rtcRamValid()    { return rtcAppMagic == RTC_APP_MAGIC; }
+void rtcRamSetValid() { rtcAppMagic = RTC_APP_MAGIC; }
 
 /* ---- Deep sleep + PM mode stats (RTC RAM — survive deep sleep) ---- */
 RTC_DATA_ATTR static int32_t rtcDeepSleepCount = 0;
@@ -136,7 +136,7 @@ void pmInit() {
   dbg("pm: configured 240/80 MHz + light sleep (%s)\n", esp_err_to_name(err));
 
   pmLockCreate(PM_NO_LIGHT_SLEEP, "usb", &usbLock);
-  if (rtcValid() && rtcUsbDisabled) {
+  if (rtcRamValid() && rtcUsbDisabled) {
     /* USB was disabled before deep sleep — keep it off */
     usb_serial_jtag_pull_override_vals_t vals = { .dp_pu = false, .dm_pu = false,
                                                    .dp_pd = false, .dm_pd = false };

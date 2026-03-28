@@ -13,7 +13,7 @@
 #define SECCAM_CRON_H
 
 /** Spawn cron task and create CLI command stream.
- *  Call from app_main() after nvsInit(). */
+ *  Call from app_main() after mountFilesystems(). */
 void cronInit();
 
 /** Check cron entries against current time.
@@ -22,7 +22,7 @@ void cronInit();
  *  Returns true if any entry matched. */
 bool cronPoll(bool execute);
 
-/** Deep sleep wakeup handler.  Call early in app_main() after nvsInit().
+/** Deep sleep wakeup handler.  Call early in app_main() after mountFilesystems().
  *  If not a cron deep sleep wakeup: returns false.
  *  If wakeup with work: clears magic, returns true (stay awake).
  *  If wakeup without work: enters deep sleep (never returns). */

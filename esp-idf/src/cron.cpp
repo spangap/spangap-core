@@ -10,7 +10,6 @@
 #include "its.h"
 #include "pm.h"
 #include "cli.h"
-#include "nvs_config.h"
 #include "compat.h"
 #include "esp_heap_caps.h"
 
@@ -219,7 +218,7 @@ bool cronPoll(bool execute) {
 static void cronDeepSleep() {
     time_t now = time(nullptr);
     int sleepSec = 61 - (int)(now % 60);  /* +1s so we land inside the new minute */
-    rtcSetValid();
+    rtcRamSetValid();
     int64_t sleepUs = (int64_t)sleepSec * 1000000;
     pmRecordDeepSleep(sleepUs);
     printf("cron: deep sleep %ds\n", sleepSec);
@@ -232,7 +231,7 @@ static void cronDeepSleep() {
 bool cronWakeupHandler() {
     if (esp_sleep_get_wakeup_cause() != ESP_SLEEP_WAKEUP_TIMER)
         return false;
-    if (!rtcValid())
+    if (!rtcRamValid())
         return false;
 
     printf("cron: deep sleep wakeup\n");

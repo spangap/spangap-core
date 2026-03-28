@@ -455,7 +455,7 @@ void logInit() {
 
   /* Ring buffer is static DRAM — no heap allocation needed */
 
-  /* Set INFO as default until nvsRunBoot sets the real level via logApplyLevels() */
+  /* Set INFO as default until boot script sets the real level via logApplyLevels() */
   esp_log_level_set("*", ESP_LOG_INFO);
 
   /* Install ESP-IDF vprintf hook — all logging now flows through our callback */

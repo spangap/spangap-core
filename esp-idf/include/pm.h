@@ -17,7 +17,7 @@ enum pm_lock_type_t {
 typedef struct pm_lock* pm_lock_handle_t;
 
 /** Initialize PM: configure DFS + light sleep, create USB lock.
- *  Call once early in app_main(), after nvsInit(). */
+ *  Call once early in app_main(), after mountFilesystems(). */
 void pmInit();
 
 /** Poll USB connection state, manage USB PM lock.

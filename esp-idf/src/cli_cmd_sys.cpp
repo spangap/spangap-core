@@ -1,8 +1,9 @@
 /** CLI commands: reboot, reset, date, sleep, run, help. */
 #include "cli.h"
 #include "storage.h"
-#include "nvs_config.h"
 #include "esp_littlefs.h"
+
+extern void factoryReset();
 #include "compat.h"
 #include <cstring>
 #include <cstdio>
@@ -25,7 +26,7 @@ static void cmdResetFactory(const char* a) {
     cliPrintf("factory reset: formatting /state and rebooting...\n");
     fflush(stdout);
     esp_littlefs_format("state");
-    nvsFactoryReset();
+    factoryReset();
     delay(100);
     esp_restart();
 }
