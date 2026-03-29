@@ -131,11 +131,6 @@ bool          itsSendAuxByHandle(TaskHandle_t task,
 
 /* ---- Poll ---- */
 
-/** Read one inbox message, dispatch to callback, ACK pickup if requested.
- *  If no message is pending and timeout > 0, blocks (ulTaskNotifyTake)
- *  until notified, then retries. Default portMAX_DELAY = sleep until work.
- *  Returns true if a message was processed.
- *  Typical loop: while (itsPoll()) {} — drains all, blocks on last call. */
 bool          itsPoll(TickType_t timeout = portMAX_DELAY);
 
 /* ---- Data (handle from either side) ---- */
