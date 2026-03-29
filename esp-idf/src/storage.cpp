@@ -430,6 +430,23 @@ void storageCopy(const char* srcPrefix, const char* dstPrefix, bool onlyIfTarget
   }
 }
 
+void storageCopyNoNotify(const char* srcPrefix, const char* dstPrefix, bool onlyIfTargetKeyExists) {
+  size_t srcLen = strlen(srcPrefix);
+  std::vector<std::pair<std::string, CfgEntry>> copies;
+  for (auto it = store.lower_bound(srcPrefix); it != store.end(); ++it) {
+    if (strncmp(it->first.c_str(), srcPrefix, srcLen) != 0) break;
+    std::string dstKey = std::string(dstPrefix) + it->first.substr(srcLen);
+    if (onlyIfTargetKeyExists && store.count(dstKey) == 0) continue;
+    copies.emplace_back(std::move(dstKey), it->second);
+  }
+  bool needSave = false;
+  for (auto& [key, entry] : copies) {
+    store[key] = entry;
+    if (isSaved(key)) needSave = true;
+  }
+  if (needSave) startSaveTimer();
+}
+
 int storageArrayCount(const char* prefix) {
     int count = 0;
     char key[64];

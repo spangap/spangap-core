@@ -45,6 +45,9 @@ void   storageSave();                   /** Force immediate JSON write. */
  *  e.g., storageCopy("s.camera.", "camera.") copies s.camera.img.quality → camera.img.quality.
  *  If onlyIfTargetKeyExists, only overwrites keys that already exist at the destination. */
 void   storageCopy(const char* srcPrefix, const char* dstPrefix, bool onlyIfTargetKeyExists = false);
+
+/** Same as storageCopy but does not fire storageSubscribeChanges / ITS (avoids flooding tasks). */
+void   storageCopyNoNotify(const char* srcPrefix, const char* dstPrefix, bool onlyIfTargetKeyExists = false);
 cfg_type_t storageGetType(const char* key);
 
 /** Count consecutive numbered entries (0, 1, 2, ...) with at least one subkey.
