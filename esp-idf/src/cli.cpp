@@ -161,16 +161,38 @@ static void cliEditRefresh(cli_edit& e, int from, cli_write_fn write) {
 }
 
 void cliRunFile(const char* path) {
-  FILE* f = fopen(path, "r");
-  if (!f) { cliPrintf("%s: file not found\n", path); return; }
-  char line[128];
-  while (fgets(line, sizeof(line), f)) {
-    size_t len = strlen(line);
-    while (len > 0 && (line[len - 1] == '\n' || line[len - 1] == '\r'))
-      line[--len] = '\0';
-    if (len > 0) cliProcess(line);
+  int f = storageFopen(path, "r");
+  if (f < 0) return;  /* silent if file doesn't exist (e.g. optional net_up) */
+  char buf[128];
+  size_t linePos = 0;
+  for (;;) {
+    size_t n = storageFread(buf + linePos, sizeof(buf) - linePos - 1, f);
+    if (n == 0 && linePos == 0) break;
+    size_t end = linePos + n;
+    buf[end] = '\0';
+    /* Process complete lines */
+    size_t start = 0;
+    for (size_t i = 0; i < end; i++) {
+      if (buf[i] == '\n' || buf[i] == '\r') {
+        buf[i] = '\0';
+        if (i > start) cliProcess(buf + start);
+        start = i + 1;
+      }
+    }
+    /* Keep partial line for next read */
+    if (start < end) {
+      linePos = end - start;
+      memmove(buf, buf + start, linePos);
+    } else {
+      linePos = 0;
+    }
+    if (n == 0) {
+      /* EOF — process remaining partial line */
+      if (linePos > 0) { buf[linePos] = '\0'; cliProcess(buf); }
+      break;
+    }
   }
-  fclose(f);
+  storageFclose(f);
 }
 
 static void cronCliWrite(const char* data, size_t len) {

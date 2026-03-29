@@ -10,6 +10,7 @@
 #include "its.h"
 #include "pm.h"
 #include "cli.h"
+#include "net.h"
 #include "compat.h"
 #include "esp_heap_caps.h"
 
@@ -125,10 +126,26 @@ static bool cronMatchField(const char* field, int value, int minVal, int maxVal)
     return (value - num) % step == 0;
 }
 
+/* Cron flags: single-letter flags after the 5 time fields, or "-" for none.
+ * A = awake only (skip on deep sleep wakeup), N = network required (implies A). */
+#define CRON_FLAG_AWAKE   0x01   /* A: skip when waking from deep sleep */
+#define CRON_FLAG_NETWORK 0x02   /* N: only run when network is up (implies A) */
+
+static int parseFlags(const char* s) {
+    if (s[0] == '-' && (s[1] == ' ' || s[1] == '\0')) return 0;
+    int flags = 0;
+    for (const char* p = s; *p && *p != ' '; p++) {
+        if (*p == 'A' || *p == 'a') flags |= CRON_FLAG_AWAKE;
+        else if (*p == 'N' || *p == 'n') flags |= CRON_FLAG_NETWORK | CRON_FLAG_AWAKE;
+    }
+    return flags;
+}
+
 /** Parse a cron line and check if it matches the given time.
- *  Returns pointer to the command string (after the 5 time fields),
- *  or nullptr if no match. */
-static const char* cronMatch(const char* entry, const struct tm* tm) {
+ *  Format: min hour dom mon dow flags command
+ *  Sets *outFlags to the parsed flags.
+ *  Returns pointer to the command string, or nullptr if no match. */
+static const char* cronMatch(const char* entry, const struct tm* tm, int* outFlags) {
     const char* p = entry;
     while (*p == ' ') p++;
 
@@ -142,7 +159,6 @@ static const char* cronMatch(const char* entry, const struct tm* tm) {
     };
 
     for (int i = 0; i < 5; i++) {
-        /* Extract field token */
         while (*p == ' ') p++;
         if (*p == '\0') return nullptr;
         const char* start = p;
@@ -154,12 +170,17 @@ static const char* cronMatch(const char* entry, const struct tm* tm) {
         token[tlen] = '\0';
 
         int val = fields[i].value;
-        /* Day of week: treat 7 as 0 (both Sunday) */
         if (i == 4 && val == 7) val = 0;
 
         if (!cronMatchField(token, val, fields[i].min, fields[i].max))
             return nullptr;
     }
+
+    /* Parse flags field */
+    while (*p == ' ') p++;
+    if (!*p) return nullptr;
+    *outFlags = parseFlags(p);
+    while (*p && *p != ' ') p++;
 
     /* Skip whitespace to command */
     while (*p == ' ') p++;
@@ -167,6 +188,8 @@ static const char* cronMatch(const char* entry, const struct tm* tm) {
 }
 
 /* ---- cronPoll ---- */
+
+static bool isDeepSleepWake = false;
 
 bool cronPoll(bool execute) {
     if (!cronEnabled()) return false;
@@ -180,6 +203,7 @@ bool cronPoll(bool execute) {
     struct tm tm;
     localtime_r(&now, &tm);
 
+    bool netUp = netIsUp();
     bool hasWork = false;
 
     FILE* f = fopen("/state/crontab", "r");
@@ -197,15 +221,20 @@ bool cronPoll(bool execute) {
         while (*p == ' ' || *p == '\t') p++;
         if (!*p || *p == '#') continue;
 
-        const char* cmd = cronMatch(p, &tm);
-        if (cmd) {
-            hasWork = true;
-            if (execute && cronStream) {
-                size_t cmdLen = strlen(cmd);
-                xStreamBufferSend(cronStream, cmd, cmdLen, pdMS_TO_TICKS(100));
-                xStreamBufferSend(cronStream, "\n", 1, pdMS_TO_TICKS(100));
-                printf("[cron] %02d:%02d %s\n", tm.tm_hour, tm.tm_min, cmd);
-            }
+        int flags = 0;
+        const char* cmd = cronMatch(p, &tm, &flags);
+        if (!cmd) continue;
+
+        /* Apply flags */
+        if ((flags & CRON_FLAG_AWAKE) && isDeepSleepWake) continue;
+        if ((flags & CRON_FLAG_NETWORK) && !netUp) continue;
+
+        hasWork = true;
+        if (execute && cronStream) {
+            size_t cmdLen = strlen(cmd);
+            xStreamBufferSend(cronStream, cmd, cmdLen, pdMS_TO_TICKS(100));
+            xStreamBufferSend(cronStream, "\n", 1, pdMS_TO_TICKS(100));
+            printf("[cron] %02d:%02d %s\n", tm.tm_hour, tm.tm_min, cmd);
         }
     }
     fclose(f);
@@ -234,6 +263,7 @@ bool cronWakeupHandler() {
     if (!rtcRamValid())
         return false;
 
+    isDeepSleepWake = true;
     printf("cron: deep sleep wakeup\n");
 
     if (!cronPoll(false)) {

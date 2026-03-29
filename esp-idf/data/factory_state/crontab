@@ -1,3 +1,4 @@
-# seccam crontab — minute-resolution scheduler
-# Format: min hour dom month dow command
-# Example: */10 * * * * net up
+# min hour dom mon dow flags command
+# flags: - (none), A (awake only), N (network required, implies A)
+*/15 * * * * N duckdns update
+0 3 * * 0 N cert acme 30
