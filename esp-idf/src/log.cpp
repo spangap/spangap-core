@@ -23,7 +23,7 @@
 
 static bool logInited = false;
 
-#define LOG_RING_SIZE 2048
+#define LOG_RING_SIZE 16384
 static uint8_t  logRing[LOG_RING_SIZE];   /* static DRAM — no heap alloc to corrupt */
 static volatile uint32_t logRingHead = 0; /* write position (writers) */
 static volatile uint32_t logRingTail = 0; /* read position (log task only) */

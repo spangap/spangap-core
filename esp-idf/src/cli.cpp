@@ -18,10 +18,12 @@
 #include <cstring>
 #include <dirent.h>
 #include <sys/stat.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
 
 /* ---- CLI command registry ---- */
 
-#define CLI_MAX_CMDS 32
+#define CLI_MAX_CMDS 48
 
 struct cli_cmd_entry_t {
     const char* cmd;
@@ -71,6 +73,16 @@ void cliPrintf(const char* fmt, ...) {
     if (n > 0) cliOut(buf, (size_t)n);
 }
 
+void cliWrite(const char* data, size_t len) {
+    if (!cliOut || !data || !len) return;
+    while (len > 0) {
+        size_t chunk = len > 512 ? 512 : len;
+        cliOut(data, chunk);
+        data += chunk;
+        len -= chunk;
+    }
+}
+
 /* ---- Command history (shared across serial + network) ---- */
 static constexpr int HIST_SIZE = 20;
 static char (*histBuf)[128];       /* allocated in PSRAM */
@@ -110,10 +122,126 @@ static struct cli_slot_t {
     cli_edit edit;
     cli_mode_t mode;
     bool ws;
+    bool usbSerial;
     char lineBuf[128];
     int lineLen;
+    char cwd[256];
 } cliSlots[CLI_MAX_CLIENTS];
+
+/** USB serial reconnects after each command when sticky=0 — keep cwd across sessions */
+static char cliUsbPersistCwd[256];
+
+/** Serial task disconnects CLI and reconnects log without "Exiting CLI" banner. */
+static volatile bool cliUsbSerialAutoResumeLog = false;
 static int cliActiveSlot = -1;
+
+/** Collapse /, ., .. in an absolute path in place. */
+static bool cliCollapseAbsolute(char* path, size_t cap) {
+    size_t inLen = strlen(path);
+    if (inLen == 0 || path[0] != '/' || inLen >= cap) return false;
+    char work[256];
+    safeStrncpy(work, path, sizeof(work));
+    char out[256];
+    size_t olen = 1;
+    out[0] = '/';
+    out[1] = '\0';
+    const char* p = work + 1;
+    while (*p) {
+        const char* tok = p;
+        while (*p && *p != '/') p++;
+        size_t tl = (size_t)(p - tok);
+        while (*p == '/') p++;
+        if (tl == 0) continue;
+        if (tl == 1 && tok[0] == '.') continue;
+        if (tl == 2 && tok[0] == '.' && tok[1] == '.') {
+            if (olen <= 1) continue;
+            olen--;
+            while (olen > 1 && out[olen - 1] != '/') olen--;
+            if (olen > 1) olen--;
+            out[olen] = '\0';
+            continue;
+        }
+        if (olen > 1) {
+            if (olen + 1 >= sizeof(out)) return false;
+            out[olen++] = '/';
+        }
+        if (olen + tl + 1 >= sizeof(out)) return false;
+        memcpy(out + olen, tok, tl);
+        olen += tl;
+        out[olen] = '\0';
+    }
+    if (olen + 1 > cap) return false;
+    memcpy(path, out, olen + 1);
+    return true;
+}
+
+/** Resolved s.cli.start_dir — absolute, normalized, existing directory (else /sdcard). */
+static void cliResolvedStartDir(char* out, size_t outLen) {
+    char d[256];
+    storageGetStr("s.cli.start_dir", d, sizeof(d), "/sdcard");
+    if (d[0] != '/') safeStrncpy(d, "/sdcard", sizeof(d));
+    char tmp[256];
+    safeStrncpy(tmp, d, sizeof(tmp));
+    if (!cliCollapseAbsolute(tmp, sizeof(tmp))) safeStrncpy(tmp, "/sdcard", sizeof(tmp));
+    struct stat st;
+    if (stat(tmp, &st) != 0 || !S_ISDIR(st.st_mode)) safeStrncpy(tmp, "/sdcard", sizeof(tmp));
+    safeStrncpy(out, tmp, outLen);
+}
+
+static void cliApplyStartDir(cli_slot_t& cl) { cliResolvedStartDir(cl.cwd, sizeof(cl.cwd)); }
+
+void cliCdToStartDir() {
+    if (cliActiveSlot < 0 || cliActiveSlot >= CLI_MAX_CLIENTS) return;
+    cliApplyStartDir(cliSlots[cliActiveSlot]);
+    if (cliSlots[cliActiveSlot].usbSerial)
+        safeStrncpy(cliUsbPersistCwd, cliSlots[cliActiveSlot].cwd, sizeof(cliUsbPersistCwd));
+}
+
+void cliGetCwd(char* out, size_t outLen) {
+    if (cliActiveSlot >= 0 && cliActiveSlot < CLI_MAX_CLIENTS && cliSlots[cliActiveSlot].itsHandle >= 0 &&
+        cliSlots[cliActiveSlot].cwd[0] == '/')
+        safeStrncpy(out, cliSlots[cliActiveSlot].cwd, outLen);
+    else
+        cliResolvedStartDir(out, outLen);
+}
+
+bool cliSetCwd(const char* absolutePath) {
+    if (cliActiveSlot < 0 || cliActiveSlot >= CLI_MAX_CLIENTS) return false;
+    char tmp[256];
+    safeStrncpy(tmp, absolutePath, sizeof(tmp));
+    if (tmp[0] != '/') return false;
+    if (!cliCollapseAbsolute(tmp, sizeof(tmp))) return false;
+    /* VFS root: stat("/") often fails on ESP-IDF though /fixed, /state, … exist */
+    if (tmp[0] == '/' && tmp[1] == '\0') {
+        safeStrncpy(cliSlots[cliActiveSlot].cwd, "/", sizeof(cliSlots[0].cwd));
+        if (cliSlots[cliActiveSlot].usbSerial) safeStrncpy(cliUsbPersistCwd, "/", sizeof(cliUsbPersistCwd));
+        return true;
+    }
+    struct stat st;
+    if (stat(tmp, &st) != 0 || !S_ISDIR(st.st_mode)) return false;
+    safeStrncpy(cliSlots[cliActiveSlot].cwd, tmp, sizeof(cliSlots[0].cwd));
+    if (cliSlots[cliActiveSlot].usbSerial) safeStrncpy(cliUsbPersistCwd, tmp, sizeof(cliUsbPersistCwd));
+    return true;
+}
+
+bool cliResolveFsPath(const char* userPath, char* out, size_t outLen) {
+    char cwd[256];
+    cliGetCwd(cwd, sizeof(cwd));
+    char work[320];
+    if (!userPath || !*userPath) {
+        safeStrncpy(out, cwd, outLen);
+        return true;
+    }
+    if (userPath[0] == '/') {
+        if (snprintf(work, sizeof(work), "%s", userPath) >= (int)sizeof(work)) return false;
+    } else {
+        if (snprintf(work, sizeof(work), "%s/%s", cwd, userPath) >= (int)sizeof(work)) return false;
+    }
+    if (!cliCollapseAbsolute(work, sizeof(work))) return false;
+    if (strlen(work) >= outLen) return false;
+    safeStrncpy(out, work, outLen);
+    return true;
+}
 
 static int cliAllocSlot(int itsHandle) {
     for (int i = 0; i < CLI_MAX_CLIENTS; i++)
@@ -145,6 +273,14 @@ static bool cliIsAnsi() {
            cliSlots[cliActiveSlot].mode == CLI_ANSI;
 }
 
+/** True if trimmed line ends with ';' — one-shot stay in CLI when s.cli.sticky is 0. */
+static bool cliLineOneShotSticky(const char* line) {
+  const char* p = line;
+  size_t n = strlen(p);
+  while (n > 0 && (p[n - 1] == ' ' || p[n - 1] == '\t')) n--;
+  return n > 0 && p[n - 1] == ';';
+}
+
 /* Redraw buffer from position 'from' to end, clear rest, restore cursor */
 static void cliEditRefresh(cli_edit& e, int from, cli_write_fn write) {
   char tmp[192];
@@ -163,6 +299,9 @@ static void cliEditRefresh(cli_edit& e, int from, cli_write_fn write) {
 void cliRunFile(const char* path) {
   int f = storageFopen(path, "r");
   if (f < 0) return;  /* silent if file doesn't exist (e.g. optional net_up) */
+  /* Log only via info() — printf/cliFlush on USB races the log task and garbles lines.
+   * Message is "cli: …" so the line reads once as [task] + cli: (no nested [cli]). */
+  info("cli: run %s\n", path);
   char buf[128];
   size_t linePos = 0;
   for (;;) {
@@ -175,7 +314,15 @@ void cliRunFile(const char* path) {
     for (size_t i = 0; i < end; i++) {
       if (buf[i] == '\n' || buf[i] == '\r') {
         buf[i] = '\0';
-        if (i > start) cliProcess(buf + start);
+        if (i > start) {
+          const char* ln = buf + start;
+          while (*ln == ' ') ln++;
+          if (*ln && *ln != '#') {
+            info("cli: %s\n", ln);
+            vTaskDelay(pdMS_TO_TICKS(50)); /* let log task drain under WiFi/boot burst */
+          }
+          cliProcess(buf + start);
+        }
         start = i + 1;
       }
     }
@@ -188,11 +335,21 @@ void cliRunFile(const char* path) {
     }
     if (n == 0) {
       /* EOF — process remaining partial line */
-      if (linePos > 0) { buf[linePos] = '\0'; cliProcess(buf); }
+      if (linePos > 0) {
+        buf[linePos] = '\0';
+        const char* ln = buf;
+        while (*ln == ' ') ln++;
+        if (*ln && *ln != '#') {
+          info("cli: %s\n", ln);
+          vTaskDelay(pdMS_TO_TICKS(50));
+        }
+        cliProcess(buf);
+      }
       break;
     }
   }
   storageFclose(f);
+  info("cli: end %s\n", path);
 }
 
 static void cronCliWrite(const char* data, size_t len) {
@@ -226,38 +383,86 @@ static void cliEditReplace(cli_edit& e, const char* text, cli_write_fn write) {
   }
 }
 
-/* Tab completion: find longest common prefix of files matching current word */
+/** Commands whose arguments include filesystem paths (tab-complete files/dirs). */
+static bool cliCmdWantsFileArgs(int cmdIdx) {
+  if (cmdIdx < 0) return false;
+  const char* c = cliCmds[cmdIdx].cmd;
+  static const char* const fs[] = {"ls", "cd", "mkdir", "rm", "cat", "df", "run", "logfile", nullptr};
+  for (int i = 0; fs[i]; i++)
+    if (strcmp(c, fs[i]) == 0) return true;
+  return false;
+}
+
+/** Longest registered command match at start of line (after spaces); returns index or -1. */
+static int cliLongestCmdMatch(const char* line, int* matchedLen) {
+  while (*line == ' ') line++;
+  int bestIdx = -1, bestLen = 0;
+  for (int i = 0; i < cliCmdCount; i++) {
+    auto& en = cliCmds[i];
+    if (strncmp(line, en.cmd, en.cmdLen) == 0 && (line[en.cmdLen] == '\0' || line[en.cmdLen] == ' ')) {
+      if (en.cmdLen > bestLen) {
+        bestIdx = i;
+        bestLen = en.cmdLen;
+      }
+    }
+  }
+  *matchedLen = bestLen;
+  return bestIdx;
+}
+
+/* Tab completion: files when past a path-taking command; dirname via cwd / resolved path */
 static void cliTabComplete(cli_edit& e, cli_write_fn write) {
   e.buf[e.len] = '\0';
-  /* Find the last word (after last space) */
   const char* wordStart = e.buf;
   for (int i = e.cursor - 1; i >= 0; i--) {
-    if (e.buf[i] == ' ') { wordStart = e.buf + i + 1; break; }
+    if (e.buf[i] == ' ') {
+      wordStart = e.buf + i + 1;
+      break;
+    }
   }
-  int wordLen = e.buf + e.cursor - wordStart;
-  if (wordLen <= 0) return;
+  int wordLen = (int)(e.buf + e.cursor - wordStart);
+  if (wordLen < 0) return;
 
-  /* Determine directory and prefix */
-  char dirPath[128] = "/sdcard";
-  char prefix[80] = {};
+  const char* line0 = e.buf;
+  while (*line0 == ' ') line0++;
+
+  int cmdLen = 0;
+  int cmdIdx = cliLongestCmdMatch(line0, &cmdLen);
+  if (!cliCmdWantsFileArgs(cmdIdx)) return;
+  int cmdEndIdx = (int)(line0 - e.buf) + cmdLen;
+  if (e.cursor <= cmdEndIdx) return;
+  /* Option token (e.g. rm -rf, ls -la, mkdir -p) */
+  if (wordLen > 0 && wordStart[0] == '-') return;
+
+  char dirPath[256];
+  char prefix[128];
   const char* lastSlash = nullptr;
   for (const char* p = wordStart; p < wordStart + wordLen; p++)
     if (*p == '/') lastSlash = p;
 
   if (lastSlash) {
-    int dlen = lastSlash - wordStart;
-    if (dlen == 0) { strcpy(dirPath, "/"); }
-    else { memcpy(dirPath, wordStart, dlen); dirPath[dlen] = '\0'; }
-    safeStrncpy(prefix, lastSlash + 1, sizeof(prefix));
+    char dirSeg[256];
+    size_t dlen = (size_t)(lastSlash - wordStart);
+    if (dlen >= sizeof(dirSeg)) return;
+    memcpy(dirSeg, wordStart, dlen);
+    dirSeg[dlen] = '\0';
+    if (!cliResolveFsPath(dirSeg[0] ? dirSeg : ".", dirPath, sizeof(dirPath))) return;
+    size_t pfxLen = (size_t)(wordStart + wordLen - (lastSlash + 1));
+    if (pfxLen >= sizeof(prefix)) return;
+    memcpy(prefix, lastSlash + 1, pfxLen);
+    prefix[pfxLen] = '\0';
   } else {
-    safeStrncpy(prefix, wordStart, sizeof(prefix));
+    cliGetCwd(dirPath, sizeof(dirPath));
+    if ((size_t)wordLen >= sizeof(prefix)) return;
+    memcpy(prefix, wordStart, (size_t)wordLen);
+    prefix[wordLen] = '\0';
   }
 
-  int prefixLen = strlen(prefix);
+  size_t prefixLen = strlen(prefix);
   DIR* dir = opendir(dirPath);
   if (!dir) return;
 
-  char match[80] = {};
+  char match[128] = {};
   int matchCount = 0;
   struct dirent* ent;
   while ((ent = readdir(dir)) != nullptr) {
@@ -266,7 +471,6 @@ static void cliTabComplete(cli_edit& e, cli_write_fn write) {
     if (matchCount == 1) {
       safeStrncpy(match, ent->d_name, sizeof(match));
     } else {
-      /* Shorten match to common prefix */
       int i = 0;
       while (match[i] && match[i] == ent->d_name[i]) i++;
       match[i] = '\0';
@@ -274,16 +478,14 @@ static void cliTabComplete(cli_edit& e, cli_write_fn write) {
   }
   closedir(dir);
 
-  if (matchCount == 0 || (int)strlen(match) <= prefixLen) return;
+  if (matchCount == 0 || strlen(match) <= prefixLen) return;
 
-  /* Insert the completion suffix */
   const char* suffix = match + prefixLen;
-  int suffixLen = strlen(suffix);
+  int suffixLen = (int)strlen(suffix);
   if (e.len + suffixLen >= (int)sizeof(e.buf) - 1) return;
 
-  /* Insert at cursor */
   memmove(e.buf + e.cursor + suffixLen, e.buf + e.cursor, e.len - e.cursor);
-  memcpy(e.buf + e.cursor, suffix, suffixLen);
+  memcpy(e.buf + e.cursor, suffix, (size_t)suffixLen);
   e.len += suffixLen;
   e.cursor += suffixLen;
   cliEditRefresh(e, e.cursor - suffixLen, write);
@@ -337,6 +539,28 @@ static void cliEditChar(cli_edit& e, char c, cli_write_fn write) {
   }
   if (c == '\033') { e.escState = 1; return; }
 
+  /* ^A / ^E — beginning / end of line (readline) */
+  if (c == 0x01) {
+    if (e.cursor > 0) {
+      char tmp[16];
+      int n = snprintf(tmp, sizeof(tmp), "\033[%dD", e.cursor);
+      write(tmp, n);
+      e.cursor = 0;
+      write("\033[0 q", 5);
+    }
+    return;
+  }
+  if (c == 0x05) {
+    if (e.cursor < e.len) {
+      char tmp[16];
+      int n = snprintf(tmp, sizeof(tmp), "\033[%dC", e.len - e.cursor);
+      write(tmp, n);
+      e.cursor = e.len;
+      write("\033[0 q", 5);
+    }
+    return;
+  }
+
   if (c == '\t') {
     cliTabComplete(e, write);
     return;
@@ -346,18 +570,32 @@ static void cliEditChar(cli_edit& e, char c, cli_write_fn write) {
     if (e.len > 0) {
       e.buf[e.len] = '\0';
       histAdd(e.buf);
-      e.histIdx = -1;
-      e.savedValid = false;
+      char lineCopy[128];
+      safeStrncpy(lineCopy, e.buf, sizeof(lineCopy));
       e.len = 0;
       e.cursor = 0;
+      e.buf[0] = '\0';
+      e.histIdx = -1;
+      e.savedValid = false;
+      bool stayCli = true;
+      if (cliActiveSlot >= 0 && cliSlots[cliActiveSlot].usbSerial) {
+        bool sticky = storageGetInt("s.cli.sticky", 0) != 0;
+        stayCli = sticky || cliLineOneShotSticky(lineCopy);
+      }
       write("\r\n", 2);
       cliOut = write;
-      cliProcess(e.buf);
-      if (ansi) {
+      cliProcess(lineCopy);
+      if (stayCli) {
+        if (ansi) {
+          write(RESET, sizeof(RESET) - 1);
+          write("$ ", 2);
+        }
+        write("\033[0 q", 5);
+      } else {
+        /* Reset ANSI before handoff to log; command output already ends with newline */
         write(RESET, sizeof(RESET) - 1);
-        write("$ ", 2);
+        cliUsbSerialAutoResumeLog = true;
       }
-      write("\033[0 q", 5);
     } else {
       /* Empty enter — kick client (session done) */
       if (cliActiveSlot >= 0 && cliSlots[cliActiveSlot].itsHandle >= 0)
@@ -393,7 +631,14 @@ static void cliEditChar(cli_edit& e, char c, cli_write_fn write) {
 /* ---- CLI command dispatcher ---- */
 
 void cliProcess(const char* line) {
+  char trimmed[128];
   while (*line == ' ') line++;
+  safeStrncpy(trimmed, line, sizeof(trimmed));
+  size_t tl = strlen(trimmed);
+  while (tl > 0 && (trimmed[tl - 1] == '\r' || trimmed[tl - 1] == '\n' || trimmed[tl - 1] == ' ' ||
+                    trimmed[tl - 1] == '\t'))
+    trimmed[--tl] = '\0';
+  line = trimmed;
   if (*line == '#' || *line == '\0') return;
   /* Semicolon: split and execute each part */
   const char* semi = strchr(line, ';');
@@ -460,15 +705,41 @@ static int cliOnConnect(int handle, int itsPort, const void* data, size_t len) {
   cl.edit = {};
   cl.lineLen = 0;
   cl.ws = false;
+  cl.usbSerial = false;
   if (len >= sizeof(net_connect_t) && ((const net_connect_t*)data)->ws) {
     if (!wsUpgrade(handle)) return -1;
     cl.ws = true;
     cl.mode = CLI_LINE;  /* WS clients are line-mode */
+  } else if (len >= sizeof(net_connect_t)) {
+    /* Raw TCP/TLS from net — payload is net_connect_t, not cli_connect_t */
+    cl.mode = CLI_LINE;
+    cl.usbSerial = false;
   } else if (len >= sizeof(cli_connect_t)) {
-    cl.mode = ((const cli_connect_t*)data)->mode;
+    const auto* cc = (const cli_connect_t*)data;
+    cl.mode = cc->mode;
+    cl.usbSerial = cc->from_usb_serial != 0;
+  } else if (len >= 1) {
+    cl.mode = *(const cli_mode_t*)data;
+    cl.usbSerial = false;
   } else {
     cl.mode = CLI_LINE;
+    cl.usbSerial = false;
   }
+
+  if (cl.usbSerial) {
+    if (cliUsbPersistCwd[0] == '/') {
+      bool rootOnly = (cliUsbPersistCwd[1] == '\0');
+      struct stat st;
+      if (rootOnly || (stat(cliUsbPersistCwd, &st) == 0 && S_ISDIR(st.st_mode)))
+        safeStrncpy(cl.cwd, cliUsbPersistCwd, sizeof(cl.cwd));
+      else
+        cliApplyStartDir(cl);
+    } else
+      cliApplyStartDir(cl);
+    safeStrncpy(cliUsbPersistCwd, cl.cwd, sizeof(cliUsbPersistCwd));
+  } else
+    cliApplyStartDir(cl);
+
   return slot;
 }
 
@@ -556,6 +827,23 @@ static void cliTaskFn(void* arg) {
 
 /* ---- Serial task: byte shuttle between serial port and log/CLI ---- */
 
+/** USB serial: normalize newlines so raw LF/CR don't confuse host terminals */
+static void serialEmit(const char* p, size_t n) {
+  for (size_t i = 0; i < n; i++) {
+    if (p[i] == '\r') {
+      printf("\r");
+      if (i + 1 < n && p[i + 1] == '\n') {
+        i++;
+        printf("\n");
+      } else
+        printf("\n");
+    } else if (p[i] == '\n')
+      printf("\r\n");
+    else
+      printf("%c", p[i]);
+  }
+}
+
 static void serialTaskFn(void* arg) {
   /* Set stdin non-blocking */
   int flags = fcntl(STDIN_FILENO, F_GETFL, 0);
@@ -582,10 +870,14 @@ static void serialTaskFn(void* arg) {
       if (cliHandle < 0 && c != '\n' && c != '\r') {
         /* Switch from log to CLI */
         if (logHandle >= 0) { itsDisconnect(logHandle); logHandle = -1; }
-        cli_connect_t req = { CLI_ANSI };
+        cli_connect_t req = { CLI_ANSI, 1 };
         cliHandle = itsConnect("cli", 0, &req, sizeof(req), pdMS_TO_TICKS(500));
         if (cliHandle >= 0) {
-          printf("\n\nCLI mode. Press enter on empty line to resume log.\n\n$ ");
+          printf("\033[0m");
+          if (storageGetInt("s.cli.sticky", 0) != 0)
+            printf("\r\n\r\nCLI mode. Press enter on empty line to resume log.\r\n\r\n$ ");
+          else
+            printf("\r\n$ ");
           fflush(stdout); cliFlush();
         }
       }
@@ -599,8 +891,7 @@ static void serialTaskFn(void* arg) {
       for (;;) {
         size_t n = itsRecv(logHandle, buf, sizeof(buf) - 1, 0);
         if (n == 0) break;
-        buf[n] = '\0';
-        printf("%s", buf);
+        serialEmit(buf, n);
       }
       fflush(stdout);
       cliFlush();
@@ -612,17 +903,37 @@ static void serialTaskFn(void* arg) {
       for (;;) {
         size_t n = itsRecv(cliHandle, buf, sizeof(buf) - 1, 0);
         if (n == 0) break;
-        buf[n] = '\0';
-        printf("%s", buf);
+        serialEmit(buf, n);
       }
       fflush(stdout);
       cliFlush();
       /* Check if CLI kicked us */
       if (!itsConnected(cliHandle)) {
         cliHandle = -1;
-        printf("\r\033[K\nExiting CLI, resuming log.\n\n");
+        printf("\033[0m\r\033[K\r\nExiting CLI, resuming log.\r\n\r\n");
         fflush(stdout);
         cliFlush();
+        connectLog();
+      }
+    }
+
+    /* After draining CLI: auto-resume log (must run after itsRecv so command output is not dropped) */
+    if (cliUsbSerialAutoResumeLog) {
+      cliUsbSerialAutoResumeLog = false;
+      if (cliHandle >= 0) {
+        printf("\033[0m");
+        fflush(stdout);
+        cliFlush();
+        char drain[512];
+        for (;;) {
+          size_t m = itsRecv(cliHandle, drain, sizeof(drain) - 1, pdMS_TO_TICKS(30));
+          if (m == 0) break;
+          serialEmit(drain, m);
+        }
+        fflush(stdout);
+        cliFlush();
+        itsDisconnect(cliHandle);
+        cliHandle = -1;
         connectLog();
       }
     }

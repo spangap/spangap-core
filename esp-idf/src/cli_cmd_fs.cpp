@@ -1,141 +1,397 @@
-/** CLI commands: ls, rm, df — filesystem operations. */
+/** CLI commands: ls, cd, mkdir, rm, cat, df — filesystem operations (per-session cwd). */
 #include "cli.h"
 #include "compat.h"
 #include "esp_littlefs.h"
 #include <cstring>
 #include <cstdio>
+#include <cerrno>
 #include <dirent.h>
 #include <sys/stat.h>
 #include <algorithm>
-#include <unistd.h>  /* rmdir */
-#include "ff.h"  /* FATFS */
+#include <unistd.h>
+#include "ff.h" /* FATFS */
 
 static void cmdLs(const char* a) {
-    if (strcmp(a, "help") == 0) { cliPrintf("  %-*s list files\n", CLI_HELP_COL, "ls [-la] [/path]"); return; }
-    const char* arg = a;
-    bool showAll = false, longFmt = false;
-    while (*arg == '-') {
-        for (const char* f = arg + 1; *f && *f != ' '; f++) {
-            if (*f == 'a') showAll = true;
-            else if (*f == 'l') longFmt = true;
-        }
-        while (*arg && *arg != ' ') arg++;
-        while (*arg == ' ') arg++;
+  if (strcmp(a, "help") == 0) {
+    cliPrintf("  %-*s list files (default: cwd)\n", CLI_HELP_COL, "ls [-la] [path]");
+    return;
+  }
+  const char* arg = a;
+  bool showAll = false, longFmt = false;
+  while (*arg == '-') {
+    for (const char* f = arg + 1; *f && *f != ' '; f++) {
+      if (*f == 'a') showAll = true;
+      else if (*f == 'l') longFmt = true;
     }
-    const char* path = *arg ? arg : "/sdcard";
-    DIR* dir = opendir(path);
-    if (!dir) { cliPrintf("ls: cannot open %s\n", path); return; }
-    constexpr int LS_MAX = 128;
-    struct ls_entry { char name[80]; time_t mtime; uint32_t size; bool isDir; };
-    auto* entries = (ls_entry*)malloc(LS_MAX * sizeof(ls_entry));
-    if (!entries) { closedir(dir); cliPrintf("ls: out of memory\n"); return; }
-    int count = 0;
-    struct dirent* ent;
-    while ((ent = readdir(dir)) != nullptr && count < LS_MAX) {
-        if (!showAll && ent->d_name[0] == '.') continue;
-        char fullpath[192];
-        snprintf(fullpath, sizeof(fullpath), "%.80s/%.80s", path, ent->d_name);
-        struct stat st;
-        if (stat(fullpath, &st) == 0) {
-            safeStrncpy(entries[count].name, ent->d_name, sizeof(entries[0].name));
-            entries[count].mtime = st.st_mtime;
-            entries[count].size = (uint32_t)st.st_size;
-            entries[count].isDir = S_ISDIR(st.st_mode);
-            count++;
-        }
+    while (*arg && *arg != ' ') arg++;
+    while (*arg == ' ') arg++;
+  }
+  char path[256];
+  if (*arg) {
+    if (!cliResolveFsPath(arg, path, sizeof(path))) {
+      cliPrintf("ls: path too long\n");
+      return;
     }
+  } else {
+    cliGetCwd(path, sizeof(path));
+  }
+  DIR* dir = opendir(path);
+  if (!dir) {
+    cliPrintf("ls: cannot open %s\n", path);
+    return;
+  }
+  constexpr int LS_MAX = 128;
+  struct ls_entry {
+    char name[80];
+    time_t mtime;
+    uint32_t size;
+    bool isDir;
+  };
+  auto* entries = (ls_entry*)malloc(LS_MAX * sizeof(ls_entry));
+  if (!entries) {
     closedir(dir);
-    std::sort(entries, entries + count, [](const ls_entry& a, const ls_entry& b) {
-        return a.mtime < b.mtime;
-    });
-    for (int i = 0; i < count; i++) {
-        if (longFmt) {
-            struct tm tm;
-            localtime_r(&entries[i].mtime, &tm);
-            char sz[16];
-            if (entries[i].isDir) snprintf(sz, sizeof(sz), "<dir>");
-            else fmtSize(entries[i].size, sz, sizeof(sz));
-            cliPrintf("  %-40s  %04d-%02d-%02d %02d:%02d  %7s\n",
-                entries[i].name, tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday,
-                tm.tm_hour, tm.tm_min, sz);
-        } else {
-            cliPrintf("  %s\n", entries[i].name);
-        }
+    cliPrintf("ls: out of memory\n");
+    return;
+  }
+  int count = 0;
+  struct dirent* ent;
+  while ((ent = readdir(dir)) != nullptr && count < LS_MAX) {
+    if (!showAll && ent->d_name[0] == '.') continue;
+    char fullpath[320];
+    snprintf(fullpath, sizeof(fullpath), "%.200s/%.80s", path, ent->d_name);
+    struct stat st;
+    if (stat(fullpath, &st) == 0) {
+      safeStrncpy(entries[count].name, ent->d_name, sizeof(entries[0].name));
+      entries[count].mtime = st.st_mtime;
+      entries[count].size = (uint32_t)st.st_size;
+      entries[count].isDir = S_ISDIR(st.st_mode);
+      count++;
     }
-    free(entries);
+  }
+  closedir(dir);
+  std::sort(entries, entries + count, [](const ls_entry& a, const ls_entry& b) { return a.mtime < b.mtime; });
+  if (count == 0) cliPrintf("  (empty)\n");
+  for (int i = 0; i < count; i++) {
+    if (longFmt) {
+      struct tm tm;
+      localtime_r(&entries[i].mtime, &tm);
+      char sz[16];
+      if (entries[i].isDir)
+        snprintf(sz, sizeof(sz), "<dir>");
+      else
+        fmtSize(entries[i].size, sz, sizeof(sz));
+      cliPrintf("  %-40s  %04d-%02d-%02d %02d:%02d  %7s\n", entries[i].name, tm.tm_year + 1900,
+                tm.tm_mon + 1, tm.tm_mday, tm.tm_hour, tm.tm_min, sz);
+    } else {
+      cliPrintf("  %s\n", entries[i].name);
+    }
+  }
+  free(entries);
+}
+
+static void cmdCd(const char* a) {
+  if (strcmp(a, "help") == 0) {
+    cliPrintf("  %-*s change cwd (bare cd → s.cli.start_dir)\n", CLI_HELP_COL, "cd [path]");
+    return;
+  }
+  if (!*a) {
+    cliCdToStartDir();
+    return;
+  }
+  char target[256];
+  if (!cliResolveFsPath(a, target, sizeof(target))) {
+    cliPrintf("cd: path too long\n");
+    return;
+  }
+  if (!cliSetCwd(target)) cliPrintf("cd: not a directory: %s\n", target);
+}
+
+static void cmdPwd(const char* a) {
+  if (strcmp(a, "help") == 0) {
+    cliPrintf("  %-*s print current directory\n", CLI_HELP_COL, "pwd");
+    return;
+  }
+  char cwd[256];
+  cliGetCwd(cwd, sizeof(cwd));
+  cliPrintf("%s\n", cwd);
+}
+
+/** Create path and parents; path is absolute normalized. */
+static bool mkdirParents(const char* path) {
+  char tmp[256];
+  safeStrncpy(tmp, path, sizeof(tmp));
+  size_t len = strlen(tmp);
+  for (size_t i = 1; i < len; i++) {
+    if (tmp[i] != '/') continue;
+    tmp[i] = '\0';
+    struct stat st;
+    if (stat(tmp, &st) == 0) {
+      if (!S_ISDIR(st.st_mode)) {
+        tmp[i] = '/';
+        return false;
+      }
+    } else {
+      if (mkdir(tmp, 0755) != 0 && errno != EEXIST) {
+        tmp[i] = '/';
+        return false;
+      }
+    }
+    tmp[i] = '/';
+  }
+  if (mkdir(tmp, 0755) == 0) return true;
+  if (errno != EEXIST) return false;
+  struct stat st;
+  return stat(tmp, &st) == 0 && S_ISDIR(st.st_mode);
+}
+
+static void cmdMkdir(const char* a) {
+  if (strcmp(a, "help") == 0) {
+    cliPrintf("  %-*s create directory\n", CLI_HELP_COL, "mkdir [-p] <path>");
+    return;
+  }
+  const char* p = a;
+  bool parents = false;
+  while (*p == ' ') p++;
+  while (*p == '-') {
+    for (p++; *p && *p != ' '; p++) {
+      if (*p == 'p') parents = true;
+    }
+    while (*p == ' ') p++;
+  }
+  if (!*p) {
+    cliPrintf("usage: mkdir [-p] <path>\n");
+    return;
+  }
+  char full[256];
+  if (!cliResolveFsPath(p, full, sizeof(full))) {
+    cliPrintf("mkdir: path too long\n");
+    return;
+  }
+  bool ok = parents ? mkdirParents(full) : (mkdir(full, 0755) == 0);
+  if (!ok) cliPrintf("mkdir: %s: %s\n", full, strerror(errno));
+}
+
+static bool rmDotSkip(const char* name) {
+  return name[0] == '.' && (name[1] == '\0' || (name[1] == '.' && name[2] == '\0'));
+}
+
+static void rmRecursive(const char* filepath, bool opt_f) {
+  constexpr int RM_PATH = 256, RM_DEPTH = 16;
+  struct rm_frame {
+    DIR* dir;
+    char path[RM_PATH];
+  };
+  auto* stack = (rm_frame*)malloc(RM_DEPTH * sizeof(rm_frame));
+  if (!stack) {
+    cliPrintf("rm: out of memory\n");
+    return;
+  }
+  int depth = 0;
+  safeStrncpy(stack[0].path, filepath, RM_PATH);
+  stack[0].dir = opendir(filepath);
+  if (!stack[0].dir) {
+    free(stack);
+    if (!opt_f) cliPrintf("rm: cannot open %s\n", filepath);
+    return;
+  }
+  while (depth >= 0) {
+    struct dirent* ent = readdir(stack[depth].dir);
+    if (!ent) {
+      closedir(stack[depth].dir);
+      if (rmdir(stack[depth].path) != 0 && !opt_f)
+        cliPrintf("rm: cannot remove %s: %s\n", stack[depth].path, strerror(errno));
+      depth--;
+      continue;
+    }
+    if (rmDotSkip(ent->d_name)) continue;
+    char child[RM_PATH];
+    snprintf(child, RM_PATH, "%.150s/%.80s", stack[depth].path, ent->d_name);
+    if (remove(child) == 0) continue;
+    struct stat cst;
+    if (stat(child, &cst) == 0 && S_ISDIR(cst.st_mode) && depth < RM_DEPTH - 1) {
+      depth++;
+      safeStrncpy(stack[depth].path, child, RM_PATH);
+      stack[depth].dir = opendir(child);
+      if (!stack[depth].dir) {
+        if (!opt_f) cliPrintf("rm: cannot open %s\n", child);
+        depth--;
+      }
+    } else if (!opt_f) {
+      cliPrintf("rm: cannot remove %s\n", child);
+    }
+  }
+  free(stack);
 }
 
 static void cmdRm(const char* a) {
-    if (strcmp(a, "help") == 0) { cliPrintf("  %-*s delete file or directory\n", CLI_HELP_COL, "rm <file|dir>"); return; }
-    if (!*a) { cliPrintf("usage: rm <file>\n"); return; }
-    char filepath[192];
-    if (a[0] == '/') snprintf(filepath, sizeof(filepath), "%s", a);
-    else snprintf(filepath, sizeof(filepath), "/sdcard/%s", a);
-    if (remove(filepath) == 0) return;
+  if (strcmp(a, "help") == 0) {
+    cliPrintf("  %-*s remove files or dirs\n", CLI_HELP_COL, "rm [-rf] <path>...");
+    return;
+  }
+  bool opt_f = false, opt_r = false;
+  char paths[8][256];
+  int np = 0;
+  const char* p = a;
+  while (*p && np < 8) {
+    while (*p == ' ') p++;
+    if (!*p) break;
+    if (*p == '-') {
+      for (p++; *p && *p != ' '; p++) {
+        if (*p == 'f') opt_f = true;
+        else if (*p == 'r') opt_r = true;
+      }
+      continue;
+    }
+    const char* start = p;
+    while (*p && *p != ' ') p++;
+    size_t wl = (size_t)(p - start);
+    if (wl >= sizeof(paths[0])) {
+      cliPrintf("rm: path too long\n");
+      return;
+    }
+    memcpy(paths[np], start, wl);
+    paths[np][wl] = '\0';
+    np++;
+  }
+  if (np == 0) {
+    cliPrintf("usage: rm [-rf] <path>...\n");
+    return;
+  }
+  for (int i = 0; i < np; i++) {
+    char full[256];
+    if (!cliResolveFsPath(paths[i], full, sizeof(full))) {
+      cliPrintf("rm: path too long\n");
+      continue;
+    }
     struct stat st;
-    if (stat(filepath, &st) != 0 || !S_ISDIR(st.st_mode)) {
-        cliPrintf("rm: cannot remove %s\n", filepath);
-        return;
+    if (stat(full, &st) != 0) {
+      if (!opt_f) cliPrintf("rm: cannot stat %s\n", full);
+      continue;
     }
-    constexpr int RM_PATH = 192, RM_DEPTH = 8;
-    struct rm_frame { DIR* dir; char path[RM_PATH]; };
-    auto* stack = (rm_frame*)malloc(RM_DEPTH * sizeof(rm_frame));
-    if (!stack) { cliPrintf("rm: out of memory\n"); return; }
-    int depth = 0;
-    snprintf(stack[0].path, RM_PATH, "%s", filepath);
-    stack[0].dir = opendir(filepath);
-    if (!stack[0].dir) { free(stack); cliPrintf("rm: cannot open %s\n", filepath); return; }
-    while (depth >= 0) {
-        struct dirent* ent = readdir(stack[depth].dir);
-        if (!ent) { closedir(stack[depth].dir); rmdir(stack[depth].path); depth--; continue; }
-        char child[RM_PATH];
-        snprintf(child, RM_PATH, "%.80s/%.80s", stack[depth].path, ent->d_name);
-        if (remove(child) == 0) continue;
-        struct stat cst;
-        if (stat(child, &cst) == 0 && S_ISDIR(cst.st_mode) && depth < RM_DEPTH - 1) {
-            depth++;
-            memcpy(stack[depth].path, child, RM_PATH);
-            stack[depth].dir = opendir(child);
-            if (!stack[depth].dir) { depth--; continue; }
-        }
+    if (S_ISDIR(st.st_mode)) {
+      if (!opt_r) {
+        cliPrintf("rm: %s: is a directory\n", full);
+        continue;
+      }
+      rmRecursive(full, opt_f);
+    } else {
+      if (remove(full) != 0) {
+        if (!(opt_f && errno == ENOENT)) cliPrintf("rm: cannot remove %s: %s\n", full, strerror(errno));
+      }
     }
-    free(stack);
+  }
+}
+
+static void cmdCat(const char* a) {
+  if (strcmp(a, "help") == 0) {
+    cliPrintf("  %-*s print file(s) to CLI\n", CLI_HELP_COL, "cat <file>...");
+    return;
+  }
+  if (!*a) {
+    cliPrintf("usage: cat <file>...\n");
+    return;
+  }
+  char paths[8][256];
+  int np = 0;
+  const char* p = a;
+  while (*p && np < 8) {
+    while (*p == ' ') p++;
+    if (!*p) break;
+    const char* start = p;
+    while (*p && *p != ' ') p++;
+    size_t wl = (size_t)(p - start);
+    if (wl >= sizeof(paths[0])) {
+      cliPrintf("cat: path too long\n");
+      return;
+    }
+    memcpy(paths[np], start, wl);
+    paths[np][wl] = '\0';
+    np++;
+  }
+  for (int i = 0; i < np; i++) {
+    char full[256];
+    if (!cliResolveFsPath(paths[i], full, sizeof(full))) {
+      cliPrintf("cat: path too long\n");
+      continue;
+    }
+    struct stat st;
+    if (stat(full, &st) != 0 || S_ISDIR(st.st_mode)) {
+      cliPrintf("cat: %s: not a regular file\n", full);
+      continue;
+    }
+    FILE* f = fopen(full, "rb");
+    if (!f) {
+      cliPrintf("cat: cannot open %s\n", full);
+      continue;
+    }
+    char buf[512];
+    size_t n;
+    while ((n = fread(buf, 1, sizeof(buf), f)) > 0) cliWrite(buf, n);
+    fclose(f);
+  }
 }
 
 static void cmdDf(const char* a) {
-    if (strcmp(a, "help") == 0) { cliPrintf("  %-*s show disk usage\n", CLI_HELP_COL, "df [/path]"); return; }
-    const char* path = *a ? a : "/sdcard";
-    uint64_t total = 0, used = 0;
-    bool ok = false;
-    const char* lfsLabel = nullptr;
-    if (strcmp(path, "/webroot") == 0) lfsLabel = "webroot";
-    else if (strcmp(path, "/state") == 0) lfsLabel = "state";
-    if (lfsLabel) {
-        size_t t = 0, u = 0;
-        if (esp_littlefs_info(lfsLabel, &t, &u) == ESP_OK) { total = t; used = u; ok = true; }
-    } else {
-        FATFS* fs; DWORD fre_clust;
-        if (f_getfree("0:", &fre_clust, &fs) == FR_OK) {
-            uint64_t cs = (uint64_t)fs->csize * fs->ssize;
-            total = (uint64_t)(fs->n_fatent - 2) * cs;
-            used = total - (uint64_t)fre_clust * cs;
-            ok = true;
-        }
+  if (strcmp(a, "help") == 0) {
+    cliPrintf("  %-*s show disk usage\n", CLI_HELP_COL, "df [/path]");
+    return;
+  }
+  char path[256];
+  if (*a) {
+    if (!cliResolveFsPath(a, path, sizeof(path))) {
+      cliPrintf("df: path too long\n");
+      return;
     }
-    if (!ok) { cliPrintf("df: cannot stat %s\n", path); return; }
-    char tBuf[16], uBuf[16];
-    auto fmt64 = [](uint64_t b, char* buf, size_t len) {
-        if (b <= UINT32_MAX) { fmtSize((uint32_t)b, buf, len); return; }
-        snprintf(buf, len, "%.2fGB", b / (1024.0 * 1024 * 1024));
-    };
-    fmt64(total, tBuf, sizeof(tBuf));
-    fmt64(used, uBuf, sizeof(uBuf));
-    int pctFree = total > 0 ? (int)((total - used) * 100 / total) : 0;
-    cliPrintf("  total  %s\n  used   %s\n  free   %d%%\n", tBuf, uBuf, pctFree);
+  } else
+    cliGetCwd(path, sizeof(path));
+  uint64_t total = 0, used = 0;
+  bool ok = false;
+  const char* lfsLabel = nullptr;
+  if (strcmp(path, "/webroot") == 0 || strncmp(path, "/fixed", 6) == 0)
+    lfsLabel = "webroot";
+  else if (strncmp(path, "/state", 6) == 0)
+    lfsLabel = "state";
+  if (lfsLabel) {
+    size_t t = 0, u = 0;
+    if (esp_littlefs_info(lfsLabel, &t, &u) == ESP_OK) {
+      total = t;
+      used = u;
+      ok = true;
+    }
+  } else {
+    FATFS* fs;
+    DWORD fre_clust;
+    if (f_getfree("0:", &fre_clust, &fs) == FR_OK) {
+      uint64_t cs = (uint64_t)fs->csize * fs->ssize;
+      total = (uint64_t)(fs->n_fatent - 2) * cs;
+      used = total - (uint64_t)fre_clust * cs;
+      ok = true;
+    }
+  }
+  if (!ok) {
+    cliPrintf("df: cannot stat %s\n", path);
+    return;
+  }
+  char tBuf[16], uBuf[16];
+  auto fmt64 = [](uint64_t b, char* buf, size_t len) {
+    if (b <= UINT32_MAX) {
+      fmtSize((uint32_t)b, buf, len);
+      return;
+    }
+    snprintf(buf, len, "%.2fGB", b / (1024.0 * 1024 * 1024));
+  };
+  fmt64(total, tBuf, sizeof(tBuf));
+  fmt64(used, uBuf, sizeof(uBuf));
+  int pctFree = total > 0 ? (int)((total - used) * 100 / total) : 0;
+  cliPrintf("  total  %s\n  used   %s\n  free   %d%%\n", tBuf, uBuf, pctFree);
 }
 
 void cliCmdFsInit() {
-    cliRegisterCmd("ls", cmdLs);
-    cliRegisterCmd("rm", cmdRm);
-    cliRegisterCmd("df", cmdDf);
+  cliRegisterCmd("ls", cmdLs);
+  cliRegisterCmd("cd", cmdCd);
+  cliRegisterCmd("mkdir", cmdMkdir);
+  cliRegisterCmd("pwd", cmdPwd);
+  cliRegisterCmd("rm", cmdRm);
+  cliRegisterCmd("cat", cmdCat);
+  cliRegisterCmd("df", cmdDf);
 }

@@ -4,6 +4,7 @@
 #ifndef SECCAM_CLI_H
 #define SECCAM_CLI_H
 
+#include <stddef.h>
 #include <stdint.h>
 
 /* ---- Connect payload for CLI ITS server ---- */
@@ -14,7 +15,9 @@ enum cli_mode_t : uint8_t {
 };
 
 typedef struct {
-    cli_mode_t mode;
+  cli_mode_t mode;
+  /** 1 if this client is the device USB serial task — honors s.cli.sticky and trailing ';' to stay in CLI. */
+  uint8_t from_usb_serial;
 } cli_connect_t;
 
 /* ---- CLI command API ---- */
@@ -31,6 +34,21 @@ void cliRegisterCmd(const char* cmd, cli_cmd_cb_t cb);
 
 /** printf to the active CLI client (ITS handle or serial). */
 void cliPrintf(const char* fmt, ...) __attribute__((format(printf, 1, 2)));
+
+/** Raw write to active CLI client (e.g. cat). No-op if no session output. */
+void cliWrite(const char* data, size_t len);
+
+/** Session working directory (default /sdcard when no interactive slot, e.g. cron). */
+void cliGetCwd(char* out, size_t outLen);
+
+/** Set cwd to an absolute normalized path; directory must exist. */
+bool cliSetCwd(const char* absolutePath);
+
+/** Reset session cwd to s.cli.start_dir (default /sdcard). No-op if no active CLI slot. */
+void cliCdToStartDir();
+
+/** Resolve path relative to session cwd; empty userPath → cwd. Fails if result too long. */
+bool cliResolveFsPath(const char* userPath, char* out, size_t outLen);
 
 /** Process a single CLI command string (e.g. "set key=value"). */
 void cliProcess(const char* line);

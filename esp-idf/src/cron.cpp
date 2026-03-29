@@ -6,6 +6,7 @@
  * Enabled/disabled via s.cron.enable config. Subscribes via storageSubscribeChanges.
  */
 #include "cron.h"
+#include "log.h"
 #include "storage.h"
 #include "its.h"
 #include "pm.h"
@@ -311,7 +312,10 @@ void cronDrainCommands() {
         if (n == 0) break;
         if (c == '\n') {
             buf[pos] = '\0';
-            if (pos > 0) cliProcess(buf);
+            if (pos > 0) {
+                info("cli: %s\n", buf);
+                cliProcess(buf);
+            }
             pos = 0;
         } else if (pos < sizeof(buf) - 1) {
             buf[pos++] = c;
