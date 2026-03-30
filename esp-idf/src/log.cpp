@@ -177,7 +177,10 @@ static size_t stripAnsi(char* buf, size_t len) {
 }
 
 /* Reformat ESP-IDF log line: "I (12345) tag: msg" → "[taskname] I tag: msg"
- * Input may have ANSI color prefix/suffix. We strip those and add our own. */
+ * Input may have ANSI color prefix/suffix. We strip those and add our own.
+ * When ESP tag equals the FreeRTOS task name, we omit the tag from the output line.
+ * If the message body then still starts with "taskname:" (common printf habit), strip
+ * that duplicate too — keeps subsystem prefixes like "camera:" when tag != task. */
 static int logReformat(const char* src, char* dst, size_t dstSize, bool ansi) {
     const char* p = src;
     /* Strip all leading ANSI escape sequences (CSI: ESC [ params m) */
@@ -274,6 +277,17 @@ static int logReformat(const char* src, char* dst, size_t dstSize, bool ansi) {
     /* Skip empty/whitespace-only messages (ESP wifi emits "I (ts) wifi: \n" then content on next line) */
     while (msgLen > 0 && (msgStart[0] == ' ' || msgStart[0] == '\t')) { msgStart++; msgLen--; }
     if (msgLen == 0) return 0;
+
+    /* ESP_LOGD(task, "task: …") → line is "… task: task: …" — drop the redundant body prefix */
+    if (tag[0] && strcmp(tag, taskName) == 0 && taskName[0] && strcmp(taskName, "?") != 0) {
+        size_t tn = strlen(taskName);
+        while (msgLen > tn + 1 && strncmp(msgStart, taskName, tn) == 0 && msgStart[tn] == ':') {
+            msgStart += tn + 1;
+            msgLen -= tn + 1;
+            while (msgLen > 0 && (msgStart[0] == ' ' || msgStart[0] == '\t')) { msgStart++; msgLen--; }
+        }
+        if (msgLen == 0) return 0;
+    }
 
     /* ANSI color by level */
     const char* color = "";
