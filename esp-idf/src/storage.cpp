@@ -215,6 +215,20 @@ static cJSON* buildKeyJson(const char* key, const CfgEntry& entry) {
   return root;
 }
 
+static cJSON* buildNullJson(const char* key) {
+  auto parts = splitKey(key);
+  if (parts.empty()) return nullptr;
+  cJSON* root = cJSON_CreateObject();
+  cJSON* current = root;
+  for (size_t i = 0; i < parts.size() - 1; i++) {
+    cJSON* child = cJSON_CreateObject();
+    cJSON_AddItemToObject(current, parts[i].c_str(), child);
+    current = child;
+  }
+  cJSON_AddNullToObject(current, parts.back().c_str());
+  return root;
+}
+
 /* readFileLocal: only called from storageLoad() which runs on main's DRAM stack at boot */
 static char* readFileLocal(const char* path) {
   FILE* f = fopen(path, "rb");
@@ -280,7 +294,9 @@ static void startSaveTimer() {
     esp_timer_create(&args, &saveTimer);
   }
   esp_timer_stop(saveTimer);
-  esp_timer_start_once(saveTimer, 500000);
+  int delaySec = storageGetInt("s.storage.flash_delay", 60);
+  if (delaySec < 1) delaySec = 1;
+  esp_timer_start_once(saveTimer, (int64_t)delaySec * 1000000);
   savePending = true;
 }
 
@@ -400,6 +416,50 @@ void storageUnset(const char* key) {
   store.erase(key);
   fireSubscriptions(key, "");
   if (isSaved(key)) startSaveTimer();
+}
+
+static bool eraseKeyOrSubtreeNoNotify(const std::string& keyOrPrefix) {
+  bool removed = false;
+
+  /* Erase exact key if present */
+  auto itExact = store.find(keyOrPrefix);
+  if (itExact != store.end()) {
+    store.erase(itExact);
+    removed = true;
+  }
+
+  /* Erase prefix subtree: "<prefix>." */
+  std::string prefixDot = keyOrPrefix + ".";
+  auto it = store.lower_bound(prefixDot);
+  while (it != store.end() && strncmp(it->first.c_str(), prefixDot.c_str(), prefixDot.size()) == 0) {
+    it = store.erase(it);
+    removed = true;
+  }
+  return removed;
+}
+
+void storageDeleteTree(const char* keyOrPrefix) {
+  if (!keyOrPrefix || !*keyOrPrefix) return;
+
+  bool removed = eraseKeyOrSubtreeNoNotify(keyOrPrefix);
+  if (!removed) return;
+
+  /* Persist if it targets saved settings. (Conservative: only if prefix starts with "s.") */
+  if (strncmp(keyOrPrefix, "s.", 2) == 0)
+    startSaveTimer();
+
+  /* Notify browser WS with `{path: null}` if connected. */
+  if (wsHandle >= 0) {
+    cJSON* json = buildNullJson(keyOrPrefix);
+    if (json) {
+      char* text = cJSON_PrintUnformatted(json);
+      cJSON_Delete(json);
+      if (text) {
+        wsSendText(wsHandle, text, strlen(text));
+        cJSON_free(text);
+      }
+    }
+  }
 }
 
 void storageSave() {
@@ -573,7 +633,7 @@ static void cmdSet(const char* a) {
 static void cmdUnset(const char* a) {
     if (strcmp(a, "help") == 0) { cliPrintf("  %-*s delete config variable\n", CLI_HELP_COL, "unset <key>"); return; }
     if (!*a) { cliPrintf("usage: unset <key>\n"); return; }
-    storageUnset(a);
+    storageDeleteTree(a);
 }
 
 static void cmdShow(const char* a) {
@@ -633,7 +693,12 @@ static void mergeJsonIntoStore(cJSON* obj, const std::string& prefix) {
   cJSON* item;
   cJSON_ArrayForEach(item, obj) {
     std::string key = prefix.empty() ? item->string : prefix + "." + item->string;
-    if (cJSON_IsObject(item)) {
+    if (cJSON_IsNull(item)) {
+      /* Null means delete subtree. Do not fire subscriptions. Do not echo back on WS. */
+      bool removed = eraseKeyOrSubtreeNoNotify(key);
+      if (removed && key.rfind("s.", 0) == 0)
+        startSaveTimer();
+    } else if (cJSON_IsObject(item)) {
       mergeJsonIntoStore(item, key);
     } else if (cJSON_IsNumber(item)) {
       storageSet(key.c_str(), item->valueint);

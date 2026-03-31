@@ -5,6 +5,19 @@
  * Keys starting with "s." are persisted to /state/settings.json.
  * storageSet() for s.* keys auto-queues a JSON write (500ms coalescing timer).
  *
+ * Browser config WebSocket (root path "/"):
+ * - Device→browser: sends a full nested JSON dump on connect, then sends per-key updates.
+ * - Browser→device: sends nested JSON objects to set/update leaf values.
+ * - Deletion: JSON `null` means "delete this key/subtree".
+ *   - Example: `{"wifi":{"scan":null}}` deletes `wifi.scan` and all `wifi.scan.*` keys on device and browser.
+ *   - Deletes are intentionally *silent* for tasks that subscribed via storageSubscribeChanges()
+ *     (no callbacks fired on delete). Tasks will observe the disappearance only indirectly
+ *     when a new value later appears (via storageSet callbacks).
+ *
+ * JS merge semantics (web UI):
+ * - `null` deletes a property.
+ * - Arrays replace (are not deep-merged).
+ *
  * File I/O: POSIX-like API that runs on storage's DRAM stack.
  * PSRAM-stack tasks can safely call storageFopen/Fread/Fwrite/Fclose — the
  * actual SPI flash operations happen on the storage task via ITS streaming.
@@ -38,7 +51,14 @@ int    storageGetInt(const char* key, int def = 0);
 void   storageGetStr(const char* key, char* out, size_t outLen, const char* def = "");
 void   storageSet(const char* key, int val);
 void   storageSet(const char* key, const char* val);
+/** Delete a single key.
+ *  Fires storageSubscribeChanges callbacks for that exact key with `val=""`.
+ *  (Use storageDeleteTree() for silent subtree deletes + browser WS null-delete.) */
 void   storageUnset(const char* key);
+/** Delete a key and all children (prefix match) without firing change callbacks.
+ *  Also updates the browser config WS (sends `{path: null}`) if connected.
+ *  Intended for dynamic UI state like WiFi scans. */
+void   storageDeleteTree(const char* keyOrPrefix);
 void   storageSave();                   /** Force immediate JSON write. */
 
 /** Copy all keys matching srcPrefix to dstPrefix.
