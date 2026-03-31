@@ -22,6 +22,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <sys/stat.h>
 #include "cJSON.h"
 #include "esp_timer.h"
 #include "esp_heap_caps.h"
@@ -157,12 +158,21 @@ static std::vector<std::string> splitKey(const std::string& key) {
   return parts;
 }
 
+/** Keys under these prefixes are kept in JSON on flash but not loaded into the
+ *  in-memory store. They are served to the browser via the JSON dump but don't
+ *  consume DRAM. The browser handles them client-side. */
+static bool skipInMemory(const std::string& key) {
+  return key.rfind("s.time.zones.", 0) == 0;
+}
+
 static void flattenJson(cJSON* obj, const std::string& prefix) {
   cJSON* item;
   cJSON_ArrayForEach(item, obj) {
     std::string key = prefix.empty() ? item->string : prefix + "." + item->string;
     if (cJSON_IsObject(item)) {
       flattenJson(item, key);
+    } else if (skipInMemory(key)) {
+      continue;  /* flash-only data, not loaded into RAM */
     } else if (cJSON_IsNumber(item)) {
       char buf[16];
       snprintf(buf, sizeof(buf), "%d", item->valueint);
@@ -259,7 +269,12 @@ static bool loadJsonFile(const char* path) {
 /* ---- Settings file write ---- */
 
 static bool isSaved(const std::string& key) {
-  return key.size() > 2 && key[0] == 's' && key[1] == '.';
+  return (key.size() > 2 && key[0] == 's' && key[1] == '.')
+      || (key.size() > 8 && key.rfind("secrets.", 0) == 0);
+}
+
+static bool isSecret(const std::string& key) {
+  return key.size() > 8 && key.rfind("secrets.", 0) == 0;
 }
 
 static void writeSettingsFile() {
@@ -351,7 +366,10 @@ void storageSubscribeChanges(const char* scope, storage_change_cb_t cb) {
 static void fireSubscriptions(const char* key, const char* val) {
   storage_change_msg_t msg = {};
   safeStrncpy(msg.key, key, sizeof(msg.key));
-  safeStrncpy(msg.val, val, sizeof(msg.val));
+  /* val is best-effort: silently truncated if too long. Callbacks needing
+     full values (e.g. base64 keys) should read from storage directly. */
+  strncpy(msg.val, val, sizeof(msg.val) - 1);
+  msg.val[sizeof(msg.val) - 1] = '\0';
 
   for (int i = 0; i < subCount; i++) {
     size_t scopeLen = strlen(subs[i].scope);
@@ -375,6 +393,64 @@ static cfg_type_t inferType(const char* val) {
   return CFG_INT;
 }
 
+/* ---- Flash-only key lookup ---- */
+
+/** Look up a key that was skipped from in-memory store by parsing settings.json.
+ *  Tries /state first (user overrides), then /fixed (factory defaults).
+ *  Returns true if found, writing the value into out. */
+static bool lookupFromFlash(const char* key, char* out, size_t outLen) {
+  if (!out || outLen == 0) return false;
+
+  auto parts = splitKey(key);
+  if (parts.empty()) return false;
+
+  /* Try user settings first, then factory defaults */
+  static const char* paths[] = { "/state/settings.json", "/fixed/factory_state/settings.json" };
+  for (const char* path : paths) {
+    char* buf;
+    if (!fsQueue) {
+      /* Early boot (no fs worker yet) — direct I/O, safe on app_main's DRAM stack */
+      buf = readFileLocal(path);
+    } else {
+      /* Post-boot — use fs worker (safe from PSRAM-stack tasks) */
+      struct stat st;
+      if (storageStat(path, &st) != 0 || st.st_size <= 0 || st.st_size > 300000) continue;
+      long sz = st.st_size;
+      int f = storageFopen(path, "rb");
+      if (f < 0) continue;
+      buf = (char*)heap_caps_malloc(sz + 1, MALLOC_CAP_SPIRAM);
+      if (!buf) { storageFclose(f); continue; }
+      size_t got = storageFread(buf, sz, f);
+      buf[got] = '\0';
+      storageFclose(f);
+    }
+    if (!buf) continue;
+
+    cJSON* root = cJSON_Parse(buf);
+    heap_caps_free(buf);
+    if (!root) continue;
+
+    cJSON* node = root;
+    for (auto& p : parts) {
+      node = cJSON_GetObjectItem(node, p.c_str());
+      if (!node) break;
+    }
+
+    if (node && cJSON_IsString(node) && node->valuestring[0]) {
+      safeStrncpy(out, node->valuestring, outLen);
+      cJSON_Delete(root);
+      return true;
+    }
+    if (node && cJSON_IsNumber(node)) {
+      snprintf(out, outLen, "%d", node->valueint);
+      cJSON_Delete(root);
+      return true;
+    }
+    cJSON_Delete(root);
+  }
+  return false;
+}
+
 /* ---- Public Config API ---- */
 
 void storageLoad() {
@@ -387,15 +463,20 @@ bool storageExists(const char* key) { return store.count(key) > 0; }
 
 int storageGetInt(const char* key, int def) {
   auto it = store.find(key);
-  if (it == store.end()) return def;
-  return atoi(it->second.value.c_str());
+  if (it != store.end()) return atoi(it->second.value.c_str());
+  if (skipInMemory(key)) {
+    char buf[16];
+    if (lookupFromFlash(key, buf, sizeof(buf))) return atoi(buf);
+  }
+  return def;
 }
 
 void storageGetStr(const char* key, char* out, size_t outLen, const char* def) {
   if (outLen == 0) return;
   auto it = store.find(key);
-  const char* src = (it != store.end()) ? it->second.value.c_str() : def;
-  safeStrncpy(out, src, outLen);
+  if (it != store.end()) { safeStrncpy(out, it->second.value.c_str(), outLen); return; }
+  if (skipInMemory(key) && lookupFromFlash(key, out, outLen)) return;
+  safeStrncpy(out, def, outLen);
 }
 
 void storageSet(const char* key, int val) {
@@ -666,9 +747,11 @@ void storageRegisterCmds() {
 
 /* ---- Config WebSocket handling ---- */
 
+static bool notSecret(const std::string& key) { return !isSecret(key); }
+
 static void wsSendFullDump() {
     if (wsHandle < 0) return;
-    cJSON* root = buildNestedJson(nullptr);
+    cJSON* root = buildNestedJson(notSecret);
     char* text = cJSON_PrintUnformatted(root);
     cJSON_Delete(root);
     if (!text) return;
@@ -678,6 +761,7 @@ static void wsSendFullDump() {
 
 static void wsSendKeyChange(const char* key) {
     if (wsHandle < 0) return;
+    if (isSecret(key)) return;
     auto it = store.find(key);
     if (it == store.end()) return;
     cJSON* json = buildKeyJson(key, it->second);
@@ -693,6 +777,7 @@ static void mergeJsonIntoStore(cJSON* obj, const std::string& prefix) {
   cJSON* item;
   cJSON_ArrayForEach(item, obj) {
     std::string key = prefix.empty() ? item->string : prefix + "." + item->string;
+    if (isSecret(key)) continue;  /* browser cannot read or write secrets */
     if (cJSON_IsNull(item)) {
       /* Null means delete subtree. Do not fire subscriptions. Do not echo back on WS. */
       bool removed = eraseKeyOrSubtreeNoNotify(key);
