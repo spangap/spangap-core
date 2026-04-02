@@ -5,7 +5,6 @@
 #include "log.h"
 #include "esp_littlefs.h"
 
-extern void factoryReset();
 #include "compat.h"
 #include <cstring>
 #include <cstdio>
@@ -26,7 +25,6 @@ static void cmdResetFactory(const char* a) {
     cliPrintf("factory reset: formatting /state and rebooting...\n");
     fflush(stdout);
     esp_littlefs_format("state");
-    factoryReset();
     delay(100);
     esp_restart();
 }
