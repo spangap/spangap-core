@@ -1,28 +1,26 @@
 /**
  * storage — config store + file I/O service.
  *
- * Config: in-memory std::map with dot-notation keys, backed by JSON on /state.
+ * Config: cJSON tree in RAM, backed by JSON on /state.
+ * All writes go through a patch tree (RFC 7396 merge-patch format).
+ * commit() merges the patch into cfgRoot, fires subscriptions, coalesces
+ * WS output, and triggers the save timer — atomically.
+ *
+ * storageBegin()/storageEnd() bracket explicit transactions. Without them,
+ * storageSet() is auto-commit (one patch per call). Reads within a
+ * transaction see their own writes.
+ *
  * Keys starting with "s." are persisted to /state/settings.json.
- * storageSet() for s.* keys auto-queues a JSON write (500ms coalescing timer).
+ * Keys starting with "secrets." are persisted but never sent to the browser.
+ * All other keys are ephemeral (in-memory only, lost on reboot).
  *
  * Browser config WebSocket (root path "/"):
- * - Device→browser: sends a full nested JSON dump on connect, then sends per-key updates.
- * - Browser→device: sends nested JSON objects to set/update leaf values.
- * - Deletion: JSON `null` means "delete this key/subtree".
- *   - Example: `{"wifi":{"scan":null}}` deletes `wifi.scan` and all `wifi.scan.*` keys on device and browser.
- *   - Deletes are intentionally *silent* for tasks that subscribed via storageSubscribeChanges()
- *     (no callbacks fired on delete). Tasks will observe the disappearance only indirectly
- *     when a new value later appears (via storageSet callbacks).
+ * - Device→browser: full nested JSON dump on connect, then coalesced merge-patches.
+ * - Browser→device: nested JSON merge-patches. null = delete subtree (silent).
+ * - Deletes via storageDeleteTree() do not fire storageSubscribeChanges callbacks.
  *
- * JS merge semantics (web UI):
- * - `null` deletes a property.
- * - Arrays replace (are not deep-merged).
- *
- * File I/O: POSIX-like API that runs on storage's DRAM stack.
- * PSRAM-stack tasks can safely call storageFopen/Fread/Fwrite/Fclose — the
- * actual SPI flash operations happen on the storage task via ITS streaming.
- *
- * ITS server: owns the browser config WebSocket (root path "/") and file I/O handles.
+ * File I/O: POSIX-like API proxied to a DRAM-stack worker task.
+ * PSRAM-stack tasks can safely call storageFopen/Fread/Fwrite/Fclose.
  */
 #ifndef SECCAM_STORAGE_H
 #define SECCAM_STORAGE_H
@@ -51,27 +49,32 @@ int    storageGetInt(const char* key, int def = 0);
 void   storageGetStr(const char* key, char* out, size_t outLen, const char* def = "");
 void   storageSet(const char* key, int val);
 void   storageSet(const char* key, const char* val);
-/** Delete a single key.
- *  Fires storageSubscribeChanges callbacks for that exact key with `val=""`.
- *  (Use storageDeleteTree() for silent subtree deletes + browser WS null-delete.) */
+/** Delete a single key via patch/commit. Fires storageSubscribeChanges with val="". */
 void   storageUnset(const char* key);
-/** Delete a key and all children (prefix match) without firing change callbacks.
- *  Also updates the browser config WS (sends `{path: null}`) if connected.
- *  Intended for dynamic UI state like WiFi scans. */
+/** Delete a key/subtree directly. No change callbacks. Sends null on WS. */
 void   storageDeleteTree(const char* keyOrPrefix);
 void   storageSave();                   /** Force immediate JSON write. */
 
+/** Begin a transaction. All storageSet/Unset calls accumulate in a patch tree.
+ *  storageEnd() commits atomically: one merge, one WS message, subscriptions
+ *  fire once per key (final state only). Nestable. */
+void   storageBegin();
+void   storageEnd();
+
 /** Copy all keys matching srcPrefix to dstPrefix.
  *  e.g., storageCopy("s.camera.", "camera.") copies s.camera.img.quality → camera.img.quality.
- *  If onlyIfTargetKeyExists, only overwrites keys that already exist at the destination. */
+ *  If onlyIfTargetKeyExists, only overwrites keys that already exist at the destination.
+ *  Uses begin/end internally for atomic commit. */
 void   storageCopy(const char* srcPrefix, const char* dstPrefix, bool onlyIfTargetKeyExists = false);
 
-/** Same as storageCopy but does not fire storageSubscribeChanges / ITS (avoids flooding tasks). */
+/** Same as storageCopy but merges directly into cfgRoot without firing
+ *  subscriptions or WS output. */
 void   storageCopyNoNotify(const char* srcPrefix, const char* dstPrefix, bool onlyIfTargetKeyExists = false);
 cfg_type_t storageGetType(const char* key);
 
-/** Count consecutive numbered entries (0, 1, 2, ...) with at least one subkey.
- *  Prefix must end with dot, e.g., "s.web.map." → checks .0.*, .1.*, ... */
+/** Count consecutive numbered entries (0, 1, 2, ...) under a path.
+ *  Works with both JSON arrays and objects with numeric keys.
+ *  Prefix should end with dot, e.g., "s.web.map." → checks .0, .1, ... */
 int    storageArrayCount(const char* prefix);
 
 void   storageForEach(const char* prefix, void (*cb)(const char* key, const char* val));
@@ -89,9 +92,9 @@ typedef void (*storage_change_cb_t)(const char* key, const char* val);
 
 /** Subscribe to config changes matching a scope prefix.
  *  Callback fires on the calling task's own stack (via itsPoll).
- *  Scope is prefix-matched: "s.camera.img" matches "s.camera.img.quality", "s.camera.img.brightness", etc.
+ *  Scope is prefix-matched: "s.camera.img" matches "s.camera.img.quality", etc.
  *  Empty scope "" matches all changes.
- *  Call from the task that should receive the callback (during init, before main loop). */
+ *  Call from the task that should receive the callback (during init). */
 void storageSubscribeChanges(const char* scope, storage_change_cb_t cb);
 
 /** Convenience: lambda-friendly callback type */
@@ -99,9 +102,7 @@ void storageSubscribeChanges(const char* scope, storage_change_cb_t cb);
 
 /* ---- File I/O API ---- */
 
-/** Open a file via storage task. Returns handle (>= 0) or -1 on error.
- *  Blocks until the file is opened on the storage task's DRAM stack.
- *  Supports any path: /state/, /fixed/, /sdcard/. */
+/** Open a file via storage task. Returns handle (>= 0) or -1 on error. */
 int    storageFopen(const char* path, const char* mode);
 
 /** Read from an open file handle. Returns bytes read, 0 on EOF. */

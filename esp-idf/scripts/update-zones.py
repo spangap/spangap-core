@@ -28,6 +28,9 @@ def fetch_zones(force=False):
             print("zones.json: not modified")
             return None, None
         raise
+    except (urllib.error.URLError, OSError) as e:
+        print(f"zones.json: skipped (no network: {e.reason})")
+        return None, None
 
     etag = resp.headers.get("ETag", "")
     if etag:
