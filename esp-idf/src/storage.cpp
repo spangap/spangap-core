@@ -13,12 +13,16 @@
  *   LittleFS paths → proxied to a small DRAM-stack worker (SPI flash ops
  *   disable the PSRAM cache, so the call stack must be in DRAM).
  *
- * Browser config WebSocket (root path "/"):
+ * Thread safety: a recursive mutex (cfgMux) protects cfgRoot, txPatch, and
+ * txDepth.  storageBegin() acquires, storageEnd() releases.  All public
+ * readers (storageGetInt, storageGetStr, …) lock around tree access.
+ *
+ * Browser config WebSocket (path "/epl"):
  * - Device→browser: full dump on connect, then coalesced merge-patches.
  * - Browser→device: nested JSON merge-patches. null = delete subtree.
  * - Secrets (secrets.*) are never sent to browser and browser writes are ignored.
  *
- * ITS server: handle 0 = browser config WS (root path "/").
+ * ITS server: handle 0 = browser config WS (path "/epl").
  */
 #include "storage.h"
 #include "log.h"
@@ -42,6 +46,10 @@
 static cJSON* cfgRoot = nullptr;        /* committed config (the truth) */
 static cJSON* txPatch = nullptr;        /* transaction write accumulator */
 static int txDepth = 0;                 /* transaction nesting depth */
+static SemaphoreHandle_t cfgMux = nullptr;  /* recursive mutex protecting cfgRoot + txPatch */
+
+#define CFG_LOCK()   xSemaphoreTakeRecursive(cfgMux, portMAX_DELAY)
+#define CFG_UNLOCK() xSemaphoreGiveRecursive(cfgMux)
 
 static bool savePending = false;
 static esp_timer_handle_t saveTimer = nullptr;
@@ -361,11 +369,13 @@ static char* readFileLocal(const char* path) {
 }
 
 static void writeSettingsFile() {
+  CFG_LOCK();
   cJSON* out = cJSON_CreateObject();
   cJSON* s = cJSON_GetObjectItem(cfgRoot, "s");
   cJSON* sec = cJSON_GetObjectItem(cfgRoot, "secrets");
   if (s) cJSON_AddItemToObject(out, "s", cJSON_Duplicate(s, true));
   if (sec) cJSON_AddItemToObject(out, "secrets", cJSON_Duplicate(sec, true));
+  CFG_UNLOCK();
   char* text = cJSON_Print(out);
   cJSON_Delete(out);
   if (!text) return;
@@ -522,38 +532,39 @@ static void firePatchSubscriptions(cJSON* node, char* path, size_t pathSize, siz
 }
 
 static void commitPatch() {
+  /* Caller holds CFG_LOCK — protects cfgRoot, txPatch, txDepth from
+     concurrent access.  ITS aux sends (10ms timeout) are bounded. */
   if (!txPatch) return;
 
-  /* 1. Merge into cfgRoot */
   deepMerge(cfgRoot, txPatch);
 
-  /* 2. Fire subscriptions (only final state per key) */
   char pathBuf[128] = "";
   firePatchSubscriptions(txPatch, pathBuf, sizeof(pathBuf), 0);
 
-  /* 3. Start save timer if patch touches saved keys */
   if (cJSON_GetObjectItem(txPatch, "s") || cJSON_GetObjectItem(txPatch, "secrets"))
     startSaveTimer();
 
-  /* 4. Clean up */
   cJSON_Delete(txPatch);
   txPatch = nullptr;
 }
 
 void storageBegin() {
+  CFG_LOCK();
   if (txDepth++ == 0)
     txPatch = cJSON_CreateObject();
 }
 
 void storageEnd() {
-  if (txDepth <= 0) return;
+  if (txDepth <= 0) { CFG_UNLOCK(); return; }
   if (--txDepth == 0)
     commitPatch();
+  CFG_UNLOCK();
 }
 
 /* ---- Public Config API ---- */
 
 void storageLoad() {
+  if (!cfgMux) cfgMux = xSemaphoreCreateRecursiveMutex();
   if (cfgRoot) cJSON_Delete(cfgRoot);
 
   /* /state/settings.json is the single source of truth.
@@ -569,30 +580,40 @@ void storageLoad() {
 }
 
 bool storageExists(const char* key) {
+  CFG_LOCK();
   cJSON* node = resolveKey(key);
-  return node && !cJSON_IsObject(node) && !cJSON_IsArray(node);
+  bool exists = node && !cJSON_IsObject(node) && !cJSON_IsArray(node);
+  CFG_UNLOCK();
+  return exists;
 }
 
 int storageGetInt(const char* key, int def) {
+  CFG_LOCK();
   cJSON* node = resolveKey(key);
-  if (!node) return def;
-  if (cJSON_IsNumber(node)) return node->valueint;
-  if (cJSON_IsString(node)) return atoi(node->valuestring);
-  return def;
+  int result = def;
+  if (node) {
+    if (cJSON_IsNumber(node)) result = node->valueint;
+    else if (cJSON_IsString(node)) result = atoi(node->valuestring);
+  }
+  CFG_UNLOCK();
+  return result;
 }
 
 void storageGetStr(const char* key, char* out, size_t outLen, const char* def) {
   if (outLen == 0) return;
+  CFG_LOCK();
   cJSON* node = resolveKey(key);
-  if (!node) { safeStrncpy(out, def, outLen); return; }
-  if (cJSON_IsString(node)) { safeStrncpy(out, node->valuestring, outLen); return; }
-  if (cJSON_IsNumber(node)) { snprintf(out, outLen, "%d", node->valueint); return; }
+  if (!node) { CFG_UNLOCK(); safeStrncpy(out, def, outLen); return; }
+  if (cJSON_IsString(node)) { safeStrncpy(out, node->valuestring, outLen); CFG_UNLOCK(); return; }
+  if (cJSON_IsNumber(node)) { snprintf(out, outLen, "%d", node->valueint); CFG_UNLOCK(); return; }
+  CFG_UNLOCK();
   safeStrncpy(out, def, outLen);
 }
 
 void storageSet(const char* key, int val) {
+  CFG_LOCK();
   bool autoCommit = (txDepth == 0);
-  if (autoCommit) storageBegin();
+  if (autoCommit) storageBegin();  /* takes lock again (recursive) */
 
   char leaf[48];
   cJSON* parent = navigateOrCreate(txPatch, key, leaf, sizeof(leaf));
@@ -601,10 +622,12 @@ void storageSet(const char* key, int val) {
     cJSON_AddNumberToObject(parent, leaf, val);
   }
 
-  if (autoCommit) storageEnd();
+  if (autoCommit) storageEnd();  /* commits + releases inner lock */
+  CFG_UNLOCK();
 }
 
 void storageSet(const char* key, const char* val) {
+  CFG_LOCK();
   bool autoCommit = (txDepth == 0);
   if (autoCommit) storageBegin();
 
@@ -619,9 +642,11 @@ void storageSet(const char* key, const char* val) {
   }
 
   if (autoCommit) storageEnd();
+  CFG_UNLOCK();
 }
 
 void storageUnset(const char* key) {
+  CFG_LOCK();
   bool autoCommit = (txDepth == 0);
   if (autoCommit) storageBegin();
 
@@ -633,6 +658,7 @@ void storageUnset(const char* key) {
   }
 
   if (autoCommit) storageEnd();
+  CFG_UNLOCK();
 }
 
 /** Build nested JSON with a null at the given dot-path. */
@@ -666,7 +692,9 @@ static bool deleteFromTree(cJSON* root, const char* dotPath) {
 void storageDeleteTree(const char* keyOrPrefix) {
   if (!keyOrPrefix || !*keyOrPrefix) return;
 
+  CFG_LOCK();
   bool removed = deleteFromTree(cfgRoot, keyOrPrefix);
+  CFG_UNLOCK();
   if (!removed) return;
 
   if (strncmp(keyOrPrefix, "s.", 2) == 0)
@@ -692,10 +720,11 @@ void storageSave() {
 }
 
 cfg_type_t storageGetType(const char* key) {
+  CFG_LOCK();
   cJSON* node = resolveKey(key);
-  if (!node) return CFG_STR;
-  if (cJSON_IsNumber(node)) return CFG_INT;
-  return CFG_STR;
+  cfg_type_t t = (node && cJSON_IsNumber(node)) ? CFG_INT : CFG_STR;
+  CFG_UNLOCK();
+  return t;
 }
 
 /* ---- Bulk operations ---- */
@@ -728,36 +757,40 @@ void storageCopy(const char* srcPrefix, const char* dstPrefix, bool onlyIfTarget
   std::string src = stripDots(srcPrefix);
   std::string dst = stripDots(dstPrefix);
 
+  CFG_LOCK();
   cJSON* srcNode = navigatePath(cfgRoot, src.c_str());
-  if (!srcNode) return;
+  if (!srcNode) { CFG_UNLOCK(); return; }
 
   if (!cJSON_IsObject(srcNode) && !cJSON_IsArray(srcNode)) {
     /* Single leaf copy */
-    if (onlyIfTargetKeyExists && !navigatePath(cfgRoot, dst.c_str())) return;
+    if (onlyIfTargetKeyExists && !navigatePath(cfgRoot, dst.c_str())) { CFG_UNLOCK(); return; }
     if (cJSON_IsNumber(srcNode))
       storageSet(dst.c_str(), srcNode->valueint);
     else if (cJSON_IsString(srcNode))
       storageSet(dst.c_str(), srcNode->valuestring);
+    CFG_UNLOCK();
     return;
   }
 
   storageBegin();
   walkAndCopy(srcNode, src, dst, onlyIfTargetKeyExists);
   storageEnd();
+  CFG_UNLOCK();
 }
 
 void storageCopyNoNotify(const char* srcPrefix, const char* dstPrefix, bool onlyIfTargetKeyExists) {
   std::string src = stripDots(srcPrefix);
   std::string dst = stripDots(dstPrefix);
 
+  CFG_LOCK();
   cJSON* srcNode = navigatePath(cfgRoot, src.c_str());
-  if (!srcNode) return;
+  if (!srcNode) { CFG_UNLOCK(); return; }
 
-  if (onlyIfTargetKeyExists) return;  /* not used — would need per-leaf existence check */
+  if (onlyIfTargetKeyExists) { CFG_UNLOCK(); return; }
 
   /* Clone src subtree, deep-merge at dst */
   cJSON* clone = cJSON_Duplicate(srcNode, true);
-  if (!clone) return;
+  if (!clone) { CFG_UNLOCK(); return; }
 
   /* Build a wrapper so deepMerge places the clone at the right path */
   cJSON* wrapper = cJSON_CreateObject();
@@ -769,6 +802,7 @@ void storageCopyNoNotify(const char* srcPrefix, const char* dstPrefix, bool only
   } else {
     cJSON_Delete(clone);
   }
+  CFG_UNLOCK();
   cJSON_Delete(wrapper);
 
   if (isSaved(dst.c_str())) startSaveTimer();
@@ -776,24 +810,30 @@ void storageCopyNoNotify(const char* srcPrefix, const char* dstPrefix, bool only
 
 int storageArrayCount(const char* prefix) {
   std::string pre = stripDots(prefix);
+  CFG_LOCK();
   cJSON* node = navigatePath(cfgRoot, pre.c_str());
-  if (!node) return 0;
-  if (cJSON_IsArray(node)) return cJSON_GetArraySize(node);
-  /* Object with numeric keys: count consecutive 0, 1, 2, ... */
-  int count = 0;
-  char key[12];
-  for (;;) {
-    snprintf(key, sizeof(key), "%d", count);
-    if (!cJSON_GetObjectItem(node, key)) break;
-    count++;
+  if (!node) { CFG_UNLOCK(); return 0; }
+  int count;
+  if (cJSON_IsArray(node)) {
+    count = cJSON_GetArraySize(node);
+  } else {
+    count = 0;
+    char key[12];
+    for (;;) {
+      snprintf(key, sizeof(key), "%d", count);
+      if (!cJSON_GetObjectItem(node, key)) break;
+      count++;
+    }
   }
+  CFG_UNLOCK();
   return count;
 }
 
 void storageForEach(const char* prefix, void (*cb)(const char* key, const char* val)) {
   std::string pre = stripDots(prefix);
+  CFG_LOCK();
   cJSON* node = pre.empty() ? cfgRoot : navigatePath(cfgRoot, pre.c_str());
-  if (!node) return;
+  if (!node) { CFG_UNLOCK(); return; }
   if (cJSON_IsObject(node) || cJSON_IsArray(node)) {
     walkLeaves(node, pre.c_str(), [](const char* key, const char* val, void* ctx) {
       auto cb = (void (*)(const char*, const char*))ctx;
@@ -804,17 +844,21 @@ void storageForEach(const char* prefix, void (*cb)(const char* key, const char* 
     const char* val;
     if (cJSON_IsString(node)) val = node->valuestring;
     else if (cJSON_IsNumber(node)) { snprintf(valBuf, sizeof(valBuf), "%d", node->valueint); val = valBuf; }
-    else return;
+    else { CFG_UNLOCK(); return; }
     cb(pre.c_str(), val);
   }
+  CFG_UNLOCK();
 }
 
 void storageList(cli_write_fn write) {
+  CFG_LOCK();
   if (!cfgRoot || !cfgRoot->child) {
+    CFG_UNLOCK();
     write("(empty)\n", 8);
     return;
   }
   walkTreePrint(cfgRoot, "", write);
+  CFG_UNLOCK();
 }
 
 /* ---- Public File I/O API ---- */
@@ -925,6 +969,7 @@ static void cmdShow(const char* a) {
         return;
     }
 
+    CFG_LOCK();
     /* Try exact path first */
     cJSON* node = navigatePath(cfgRoot, a);
     if (node) {
@@ -937,6 +982,7 @@ static void cmdShow(const char* a) {
             else if (cJSON_IsNumber(node)) { snprintf(valBuf, sizeof(valBuf), "%d", node->valueint); val = valBuf; }
             if (val) cliPrintf("  %s = %s\n", a, val);
         }
+        CFG_UNLOCK();
         return;
     }
 
@@ -946,7 +992,7 @@ static void cmdShow(const char* a) {
     if (lastDot) {
         char parentPath[64];
         size_t parentLen = lastDot - a;
-        if (parentLen >= sizeof(parentPath)) { cliPrintf("  (prefix too long)\n"); return; }
+        if (parentLen >= sizeof(parentPath)) { CFG_UNLOCK(); cliPrintf("  (prefix too long)\n"); return; }
         memcpy(parentPath, a, parentLen);
         parentPath[parentLen] = '\0';
         cJSON* parent = navigatePath(cfgRoot, parentPath);
@@ -990,6 +1036,7 @@ static void cmdShow(const char* a) {
             }
         }
     }
+    CFG_UNLOCK();
     if (!found) cliPrintf("  (no matches)\n");
 }
 
@@ -1009,7 +1056,9 @@ void storageRegisterCmds() {
 
 static void wsSendFullDump() {
     if (wsHandle < 0) return;
+    CFG_LOCK();
     cJSON* clone = cJSON_Duplicate(cfgRoot, true);
+    CFG_UNLOCK();
     if (!clone) return;
 
     /* Remove secrets from the dump */
@@ -1032,17 +1081,19 @@ static void wsAccumulateChange(const char* key, const char* val) {
     /* Check cfgRoot — storageUnset removes the key before firing callbacks,
        so if the key is gone we skip (matches current behavior: unset is not
        echoed to browser). */
+    CFG_LOCK();
     cJSON* node = navigatePath(cfgRoot, key);
-    if (!node) return;
+    if (!node) { CFG_UNLOCK(); return; }
 
     if (!wsPendingPatch) wsPendingPatch = cJSON_CreateObject();
 
     char leaf[48];
     cJSON* parent = navigateOrCreate(wsPendingPatch, key, leaf, sizeof(leaf));
-    if (!parent) return;
+    if (!parent) { CFG_UNLOCK(); return; }
 
     cJSON_DeleteItemFromObject(parent, leaf);
     cJSON_AddItemToObject(parent, leaf, cJSON_Duplicate(node, false));
+    CFG_UNLOCK();
 }
 
 /** Flush accumulated WS changes to browser. */
@@ -1064,7 +1115,9 @@ static void mergeIncomingWs(cJSON* obj, const std::string& prefix) {
     if (isSecret(key.c_str())) continue;
     if (cJSON_IsNull(item)) {
       /* Silent delete (no subscription callbacks) */
+      CFG_LOCK();
       deleteFromTree(cfgRoot, key.c_str());
+      CFG_UNLOCK();
       if (strncmp(key.c_str(), "s.", 2) == 0) startSaveTimer();
     } else if (cJSON_IsObject(item)) {
       mergeIncomingWs(item, key);
@@ -1160,7 +1213,7 @@ static void storageTaskFn(void* arg) {
 
     web_path_msg_t reg = {};
     reg.itsPort = 0;
-    reg.path[0] = '\0';
+    safeStrncpy(reg.path, "epl", sizeof(reg.path));
     while (!itsSendAux("web", &reg, sizeof(reg), pdMS_TO_TICKS(500)))
         vTaskDelay(pdMS_TO_TICKS(100));
 

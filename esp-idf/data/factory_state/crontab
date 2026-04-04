@@ -1,4 +1,12 @@
-# min hour dom mon dow flags command
-# flags: - (none), A (awake only), N (network required, implies A)
-*/15 * * * * N duckdns update
-0 3 * * 0 N cert acme 30
+# crontab: periodic tasks
+
+
+# flags:
+#
+#   -   none
+#   A   When awake, not on deepsleep wakeup
+#   N   When connected to on network
+
+# min hour  dom   mon   dow flags   command
+*/15  *     *     *     *     N     duckdns update
+0     3     *     *     *     N     cert acme 30
