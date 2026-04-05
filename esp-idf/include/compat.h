@@ -48,13 +48,15 @@ static inline const char* fmtWallClock(char* buf, size_t len) {
     return buf;
 }
 
-/** Format elapsed seconds as "3s", "1m22s", "2h3m7s", "3d5h12m7s". */
+/** Format elapsed seconds as "3s", "1m22s", "2h3m", "3d5h". Zero components omitted. */
 static inline const char* fmtElapsed(uint32_t secs, char* buf, size_t len) {
     unsigned d = secs / 86400, h = (secs % 86400) / 3600, m = (secs % 3600) / 60, s = secs % 60;
-    if (d > 0)      snprintf(buf, len, "%ud%uh%um%us", d, h, m, s);
-    else if (h > 0) snprintf(buf, len, "%uh%um%us", h, m, s);
-    else if (m > 0) snprintf(buf, len, "%um%us", m, s);
-    else            snprintf(buf, len, "%us", s);
+    char* p = buf;
+    char* end = buf + len;
+    if (d) p += snprintf(p, end - p, "%ud", d);
+    if (h) p += snprintf(p, end - p, "%uh", h);
+    if (m) p += snprintf(p, end - p, "%um", m);
+    if (s || p == buf) snprintf(p, end - p, "%us", s);
     return buf;
 }
 

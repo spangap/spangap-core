@@ -25,6 +25,7 @@
  * ITS server: handle 0 = browser config WS (path "/epl").
  */
 #include "storage.h"
+#include "auth.h"
 #include "log.h"
 #include "cli.h"
 #include "its.h"
@@ -428,8 +429,8 @@ static int           subCount = 0;
 /* Payload for aux message on STORAGE_CHANGE_PORT */
 struct storage_change_msg_t {
   storage_change_cb_t cb;
-  char                key[28];
-  char                val[32];
+  char                key[48];
+  char                val[44];
 };
 
 /* Aux handler installed on each subscribing task — unpacks and calls */
@@ -1052,10 +1053,18 @@ void storageRegisterCmds() {
     cliRegisterCmd("save", cmdSave);
 }
 
-/* ---- Config WebSocket handling ---- */
+/* ---- Config WebSocket handling (multi-client) ---- */
 
-static void wsSendFullDump() {
-    if (wsHandle < 0) return;
+#define WS_MAX_CLIENTS 4
+static int wsHandles[WS_MAX_CLIENTS] = {-1, -1, -1, -1};
+
+static bool wsAnyClient() {
+    for (int i = 0; i < WS_MAX_CLIENTS; i++)
+        if (wsHandles[i] >= 0) return true;
+    return false;
+}
+
+static void wsSendFullDump(int handle) {
     CFG_LOCK();
     cJSON* clone = cJSON_Duplicate(cfgRoot, true);
     CFG_UNLOCK();
@@ -1068,14 +1077,14 @@ static void wsSendFullDump() {
     char* text = cJSON_PrintUnformatted(clone);
     cJSON_Delete(clone);
     if (!text) return;
-    wsSendText(wsHandle, text, strlen(text));
+    wsSendText(handle, text, strlen(text));
     cJSON_free(text);
 }
 
 /** Accumulate a changed key into wsPendingPatch for coalesced WS output.
  *  Called from storage task's "" subscription callback. */
 static void wsAccumulateChange(const char* key, const char* val) {
-    if (wsHandle < 0) return;
+    if (!wsAnyClient()) return;
     if (isSecret(key)) return;
 
     /* Check cfgRoot — storageUnset removes the key before firing callbacks,
@@ -1096,14 +1105,16 @@ static void wsAccumulateChange(const char* key, const char* val) {
     CFG_UNLOCK();
 }
 
-/** Flush accumulated WS changes to browser. */
+/** Flush accumulated WS changes to all connected browsers. */
 static void wsFlushPatch() {
-    if (!wsPendingPatch || wsHandle < 0) return;
+    if (!wsPendingPatch || !wsAnyClient()) return;
     char* text = cJSON_PrintUnformatted(wsPendingPatch);
     cJSON_Delete(wsPendingPatch);
     wsPendingPatch = nullptr;
     if (!text) return;
-    wsSendText(wsHandle, text, strlen(text));
+    size_t len = strlen(text);
+    for (int i = 0; i < WS_MAX_CLIENTS; i++)
+        if (wsHandles[i] >= 0) wsSendText(wsHandles[i], text, len);
     cJSON_free(text);
 }
 
@@ -1129,10 +1140,9 @@ static void mergeIncomingWs(cJSON* obj, const std::string& prefix) {
   }
 }
 
-static void wsHandleMessage(const char* text, size_t len) {
+static void wsHandleMessage(int handle, const char* text, size_t len) {
     if (len == 10 && memcmp(text, "{\"ping\":1}", 10) == 0) {
-        if (wsHandle >= 0)
-            wsSendText(wsHandle, "{\"pong\":1}", 10);
+        wsSendText(handle, "{\"pong\":1}", 10);
         return;
     }
     if (len == 10 && memcmp(text, "{\"save\":1}", 10) == 0) {
@@ -1146,14 +1156,16 @@ static void wsHandleMessage(const char* text, size_t len) {
 }
 
 static void wsPollConfig() {
-    if (wsHandle < 0) return;
     uint8_t buf[1024];
-    size_t outLen = 0;
-    int op = wsReadFrame(wsHandle, buf, sizeof(buf), &outLen);
-    if (op == 1) {
-        wsHandleMessage((const char*)buf, outLen);
-    } else if (op < 0) {
-        wsHandle = -1;
+    for (int i = 0; i < WS_MAX_CLIENTS; i++) {
+        if (wsHandles[i] < 0) continue;
+        size_t outLen = 0;
+        int op = wsReadFrame(wsHandles[i], buf, sizeof(buf), &outLen);
+        if (op == 1) {
+            wsHandleMessage(wsHandles[i], (const char*)buf, outLen);
+        } else if (op < 0) {
+            wsHandles[i] = -1;
+        }
     }
 }
 
@@ -1164,25 +1176,40 @@ static int storageItsConnect(int handle, int itsPort, const void* data, size_t l
     auto* cd = (const net_connect_t*)data;
     if (!cd->ws) return -1;
 
-    if (wsHandle >= 0) {
-        wsSendClose(wsHandle);
-        itsServerKick(wsHandle);
-    }
-    wsHandle = handle;
+    /* Read headers once — used for both auth check and WS upgrade */
+    char hdr[1024];
+    int hdrLen = webGetHeader(handle, hdr, sizeof(hdr));
+    if (hdrLen <= 0) return -1;
 
-    if (!wsUpgrade(handle)) {
-        wsHandle = -1;
+    if (!wsUpgrade(handle, hdr, hdrLen)) return -1;
+
+    if (authEnabled()) {
+        char cookie[64] = {};
+        webExtractCookie(hdr, hdrLen, "session", cookie, sizeof(cookie));
+        if (authCheck(cookie).empty()) {
+            wsSendClose(handle, 4401);
+            return -1;
+        }
+    }
+
+    /* Find a free slot */
+    int slot = -1;
+    for (int i = 0; i < WS_MAX_CLIENTS; i++)
+        if (wsHandles[i] < 0) { slot = i; break; }
+    if (slot < 0) {
+        wsSendClose(handle, 1013);  /* try again later */
         return -1;
     }
-    wsSendFullDump();
-    return 0;
+    wsHandles[slot] = handle;
+    wsSendFullDump(handle);
+    return slot;
 }
 
 static void storageItsDisconnect(int ref) {
-    (void)ref;
-    wsHandle = -1;
-    /* Discard any pending WS patch */
-    if (wsPendingPatch) {
+    if (ref >= 0 && ref < WS_MAX_CLIENTS)
+        wsHandles[ref] = -1;
+    /* Discard pending patch if no clients left */
+    if (!wsAnyClient() && wsPendingPatch) {
         cJSON_Delete(wsPendingPatch);
         wsPendingPatch = nullptr;
     }
@@ -1195,7 +1222,7 @@ static void storageSaveAux(TaskHandle_t, uint16_t, const void*, size_t) {
 }
 
 static void storageTaskFn(void* arg) {
-    itsServerInit(1, 2048, 4096);
+    itsServerInit(WS_MAX_CLIENTS, 2048, 4096);
     itsServerOnConnect(storageItsConnect);
     itsServerOnDisconnect(storageItsDisconnect);
     itsOnAux(storageSaveAux, STORAGE_SAVE_PORT);
@@ -1205,9 +1232,13 @@ static void storageTaskFn(void* arg) {
         wsAccumulateChange(key, val);
     });
     storageSubscribeChanges("net.up", ON_CHANGE {
-        if (atoi(val) == 0 && wsHandle >= 0) {
-            itsServerKick(wsHandle);
-            wsHandle = -1;
+        if (atoi(val) == 0) {
+            for (int i = 0; i < WS_MAX_CLIENTS; i++) {
+                if (wsHandles[i] >= 0) {
+                    itsServerKick(wsHandles[i]);
+                    wsHandles[i] = -1;
+                }
+            }
         }
     });
 
@@ -1220,7 +1251,7 @@ static void storageTaskFn(void* arg) {
     info("ready\n");
 
     for (;;) {
-        TickType_t timeout = wsHandle >= 0 ? pdMS_TO_TICKS(10) : portMAX_DELAY;
+        TickType_t timeout = wsAnyClient() ? pdMS_TO_TICKS(10) : portMAX_DELAY;
         while (itsPoll(timeout)) { timeout = 0; }
         wsPollConfig();
         wsFlushPatch();

@@ -26,7 +26,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
-#define ITS_MAX_MSG_DATA      64
+#define ITS_MAX_MSG_DATA      96
 
 /** Timeout waits for delivery into inbox (default) or pickup by receiver's itsPoll. */
 enum its_wait_t {
