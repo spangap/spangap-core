@@ -30,6 +30,19 @@ static inline void delay(uint32_t ms) {
     vTaskDelay(pdMS_TO_TICKS(ms));
 }
 
+/** UTC offset in minutes from epoch seconds (compares localtime vs gmtime). */
+static inline int16_t utcOffsetMinutes(time_t t) {
+    struct tm lt, gt;
+    localtime_r(&t, &lt);
+    gmtime_r(&t, &gt);
+    int diff = (lt.tm_hour - gt.tm_hour) * 60 + (lt.tm_min - gt.tm_min);
+    int dday = lt.tm_mday - gt.tm_mday;
+    if (dday > 1) dday = -1;   /* month wrap */
+    if (dday < -1) dday = 1;
+    diff += dday * 24 * 60;
+    return (int16_t)diff;
+}
+
 /** Convert fps config setting to interval in ms.
  *  x > 0: x fps → 1000/x ms.  x < 0: 1/(-x) fps → -x*1000 ms.  0 → 0 (disabled). */
 static inline uint32_t fpsToIntervalMs(int fps) {
