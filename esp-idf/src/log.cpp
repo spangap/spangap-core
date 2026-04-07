@@ -96,6 +96,33 @@ static char lineLevel(const char* line, size_t len) {
     return 'I';
 }
 
+/* ---- Configurable ANSI colors per level + timestamp ---- */
+
+static char logColors[6][16];  /* E, W, I, D, V, timestamp */
+
+static void logLoadColors() {
+    auto load = [](int idx, const char* key, const char* def) {
+        storageGetStr(key, logColors[idx], sizeof(logColors[idx]), def);
+    };
+    load(0, "s.log.colors.error",   "0;31");  /* red */
+    load(1, "s.log.colors.warn",    "0;33");  /* yellow */
+    load(2, "s.log.colors.info",    "0;32");  /* green */
+    load(3, "s.log.colors.debug",   "0;37");  /* light grey */
+    load(4, "s.log.colors.verbose", "0;90");  /* dark grey */
+    load(5, "s.log.colors.timestamp", "0;90"); /* dark grey */
+}
+
+static const char* logColor(char level) {
+    switch (level) {
+        case 'E': return logColors[0];
+        case 'W': return logColors[1];
+        case 'I': return logColors[2];
+        case 'D': return logColors[3];
+        case 'V': return logColors[4];
+        default:  return logColors[2];
+    }
+}
+
 static void logFileMsg(const char* msg) {
     if (!logFile) return;
     char ts[24]; fmtWallClock(ts, sizeof(ts));
@@ -212,22 +239,17 @@ static int logReformat(const char* src, char* dst, size_t dstSize, bool ansi) {
           while (cl > 0 && (*ck == ' ' || *ck == '\t')) { ck++; cl--; }
           if (cl == 0) return 0;
         }
-        const char* color = "";
+        char color[24] = "";
         const char* reset = "";
         if (ansi) {
-            switch (lastLevel) {
-                case 'E': color = "\033[0;31m"; break;
-                case 'W': color = "\033[0;33m"; break;
-                case 'I': color = "\033[0;32m"; break;
-                default: break;
-            }
-            if (*color) reset = "\033[0m";
+            snprintf(color, sizeof(color), "\033[%sm", logColor(lastLevel));
+            reset = "\033[0m";
         }
         bool showTs = storageGetInt("s.log.timestamp", 0) != 0;
-        char tsBuf[36] = "";
+        char tsBuf[48] = "";
         if (showTs) {
             char ts[24]; fmtWallClock(ts, sizeof(ts));
-            if (ansi) snprintf(tsBuf, sizeof(tsBuf), "\033[0;90m%s\033[0m ", ts);
+            if (ansi) snprintf(tsBuf, sizeof(tsBuf), "\033[%sm%s\033[0m ", logColors[5], ts);
             else snprintf(tsBuf, sizeof(tsBuf), "%s ", ts);
         }
         return snprintf(dst, dstSize, "%s%s%c [%s] %.*s%s\n",
@@ -290,24 +312,19 @@ static int logReformat(const char* src, char* dst, size_t dstSize, bool ansi) {
     }
 
     /* ANSI color by level */
-    const char* color = "";
+    char color[24] = "";
     const char* reset = "";
     if (ansi) {
-        switch (level) {
-            case 'E': color = "\033[0;31m"; break;  /* red */
-            case 'W': color = "\033[0;33m"; break;  /* yellow */
-            case 'I': color = "\033[0;32m"; break;  /* green */
-            default: break;
-        }
-        if (*color) reset = "\033[0m";
+        snprintf(color, sizeof(color), "\033[%sm", logColor(level));
+        reset = "\033[0m";
     }
 
     /* Format: "Mar 27 16:23:15.342 L [task] msg" or "L [task] msg" */
-    char tsBuf[36] = "";
+    char tsBuf[48] = "";
     if (showTimestamp) {
         char ts[24];
         fmtWallClock(ts, sizeof(ts));
-        if (ansi) snprintf(tsBuf, sizeof(tsBuf), "\033[0;90m%s\033[0m ", ts);
+        if (ansi) snprintf(tsBuf, sizeof(tsBuf), "\033[%sm%s\033[0m ", logColors[5], ts);
         else snprintf(tsBuf, sizeof(tsBuf), "%s ", ts);
     }
 
@@ -349,6 +366,62 @@ static int logVprintf(const char* fmt, va_list args) {
     return rawLen;
 }
 
+/* ---- Log paste-back: send tail of log file to new WS client ---- */
+
+static void logPasteBack(int handle) {
+  int pasteKB = storageGetInt("s.log.file.paste", 48);
+  if (pasteKB <= 0 || !logFilePath[0]) return;
+
+  /* Flush current file so all recent data is on disk */
+  if (logFile) { fflush(logFile); fsync(fileno(logFile)); }
+
+  FILE* f = fopen(logFilePath, "r");
+  if (!f) return;
+
+  fseek(f, 0, SEEK_END);
+  long fileSize = ftell(f);
+  long readSize = (long)pasteKB * 1024;
+  long offset = fileSize > readSize ? fileSize - readSize : 0;
+  fseek(f, offset, SEEK_SET);
+
+  /* If starting mid-file, skip to first newline */
+  if (offset > 0) {
+    int c;
+    while ((c = fgetc(f)) != EOF && c != '\n') {}
+  }
+
+  /* Colorize each line: timestamp in timestamp color, rest in level color.
+   * Line format: "Apr 07 16:41:01.139 I [task] msg\n"
+   * lineLevel finds X before " [", so the timestamp is everything before that char. */
+  char tsColor[24], lvlColor[24];
+  snprintf(tsColor, sizeof(tsColor), "\033[%sm", logColors[5]);
+  char line[512];
+  while (fgets(line, sizeof(line), f)) {
+    size_t len = strlen(line);
+    /* Find level position — same scan as lineLevel */
+    int lvlPos = -1;
+    for (size_t i = 1; i + 1 < len && line[i] != '\n'; i++) {
+      if (line[i] == ' ' && line[i + 1] == '[') {
+        char c = line[i - 1];
+        if (c == 'E' || c == 'W' || c == 'I' || c == 'D' || c == 'V') { lvlPos = i - 1; break; }
+      }
+    }
+    if (lvlPos > 0) {
+      snprintf(lvlColor, sizeof(lvlColor), "\033[%sm", logColor(line[lvlPos]));
+      /* Timestamp portion (before level char) */
+      if (!wsSendText(handle, tsColor, strlen(tsColor))) break;
+      if (!wsSendText(handle, line, lvlPos)) break;
+      /* Level + rest of line */
+      if (!wsSendText(handle, lvlColor, strlen(lvlColor))) break;
+      if (!wsSendText(handle, line + lvlPos, len - lvlPos)) break;
+      wsSendText(handle, "\033[0m", 4);
+    } else {
+      if (!wsSendText(handle, line, len)) break;
+    }
+  }
+  fclose(f);
+}
+
 /* ---- Log ITS server callbacks ---- */
 
 static int logOnConnect(int handle, int itsPort, const void* data, size_t len) {
@@ -358,7 +431,8 @@ static int logOnConnect(int handle, int itsPort, const void* data, size_t len) {
   if (len >= sizeof(net_connect_t) && ((const net_connect_t*)data)->ws) {
     if (!wsUpgrade(handle)) { logSlots[s].itsHandle = -1; return -1; }
     logSlots[s].ws = true;
-    logSlots[s].ansi = LOG_NO_ANSI;
+    logSlots[s].ansi = LOG_ANSI;
+    logPasteBack(handle);
   } else if (len >= sizeof(log_connect_t)) {
     logSlots[s].ansi = ((const log_connect_t*)data)->ansi;
   } else {
@@ -394,18 +468,31 @@ static void logTaskFn(void* arg) {
       vTaskDelay(pdMS_TO_TICKS(100));
   }
 
+  logLoadColors();
+  storageSubscribeChanges("s.log.colors.", ON_CHANGE { logLoadColors(); });
+
   /* Open log file if configured */
   { char lvl[16];
     storageGetStr("s.log.file.level", lvl, sizeof(lvl), "verbose");
     logFileLevelMax = parseLevelNum(lvl);
-    char path[128];
-    storageGetStr("s.log.file.path", path, sizeof(path));
-    if (path[0]) logFileOpen(path);
+    char name[64];
+    storageGetStr("s.log.file.name", name, sizeof(name));
+    if (name[0]) {
+      char dir[64]; storageGetStr("s.log.dir", dir, sizeof(dir), "/sdcard/log");
+      mkdir(dir, 0755);
+      char path[128]; snprintf(path, sizeof(path), "%s/%s", dir, name);
+      logFileOpen(path);
+    }
   }
 
-  storageSubscribeChanges("s.log.file.path", ON_CHANGE {
+  storageSubscribeChanges("s.log.file.name", ON_CHANGE {
     logFileClose();
-    if (val[0]) logFileOpen(val);
+    if (val[0]) {
+      char dir[64]; storageGetStr("s.log.dir", dir, sizeof(dir), "/sdcard/log");
+      mkdir(dir, 0755);
+      char path[128]; snprintf(path, sizeof(path), "%s/%s", dir, val);
+      logFileOpen(path);
+    }
   });
   storageSubscribeChanges("s.log.file.level", ON_CHANGE {
     logFileLevelMax = parseLevelNum(val);
@@ -550,14 +637,14 @@ const char* cfd(int fd) {
 
 static void cmdLogfile(const char* a) {
     if (strcmp(a, "help") == 0) {
-        cliPrintf("  %-*s start/stop logging to file\n", CLI_HELP_COL, "logfile [level] [path|off]");
+        cliPrintf("  %-*s start/stop logging to file\n", CLI_HELP_COL, "logfile [level] [name|off]");
         return;
     }
 
     /* logfile off — stop logging */
-    if (strcmp(a, "off") == 0) { storageSet("s.log.file.path", ""); return; }
+    if (strcmp(a, "off") == 0) { storageSet("s.log.file.name", ""); return; }
 
-    /* Parse optional level, then optional path */
+    /* Parse optional level, then optional name */
     char first[24] = {};
     int i = 0;
     while (a[i] && a[i] != ' ' && i < 23) { first[i] = a[i]; i++; }
@@ -566,39 +653,34 @@ static void cmdLogfile(const char* a) {
     while (*rest == ' ') rest++;
 
     const char* level = "verbose";
-    const char* pathArg = nullptr;
+    const char* nameArg = nullptr;
 
     if (first[0] && isLevelArg(first)) {
         level = first;
-        if (*rest) pathArg = rest;
+        if (*rest) nameArg = rest;
     } else if (first[0]) {
-        pathArg = a;  /* no level, entire arg is the path */
+        nameArg = a;  /* no level, entire arg is the name */
     }
 
     storageSet("s.log.file.level", level);
 
-    char path[128];
-    if (!pathArg) {
-        /* Default: /sdcard/log/YYYYMMDD.log */
-        char dir[64];
-        storageGetStr("s.log.dir", dir, sizeof(dir), "/sdcard/log");
-        mkdir(dir, 0755);  /* create if needed, ignore EEXIST */
+    char name[64];
+    if (!nameArg) {
+        /* Default: YYYYMMDD.log */
         time_t now = time(nullptr);
         struct tm tm;
         localtime_r(&now, &tm);
-        snprintf(path, sizeof(path), "%s/%04d%02d%02d.log", dir,
+        snprintf(name, sizeof(name), "%04d%02d%02d.log",
             tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday);
-    } else if (pathArg[0] == '/') {
-        snprintf(path, sizeof(path), "%s", pathArg);
     } else {
-        char dir[64];
-        storageGetStr("s.log.dir", dir, sizeof(dir), "/sdcard/log");
-        mkdir(dir, 0755);
-        snprintf(path, sizeof(path), "%s/%s", dir, pathArg);
+        /* Extract basename if full path given */
+        const char* base = strrchr(nameArg, '/');
+        safeStrncpy(name, base ? base + 1 : nameArg, sizeof(name));
     }
 
-    storageSet("s.log.file.path", path);
-    cliPrintf("  %s (%s)\n", path, level);
+    storageSet("s.log.file.name", name);
+    char dir[64]; storageGetStr("s.log.dir", dir, sizeof(dir), "/sdcard/log");
+    cliPrintf("  %s/%s (%s)\n", dir, name, level);
 }
 
 /* ---- CLI command: logrotate ---- */
@@ -630,24 +712,21 @@ static void cmdLogrotate(const char* a) {
     /* Check current log file is in date format */
     char dir[64];
     storageGetStr("s.log.dir", dir, sizeof(dir), "/sdcard/log");
-    char curFile[128];
-    storageGetStr("s.log.file.path", curFile, sizeof(curFile));
-    /* Extract basename from current file */
-    const char* curBase = strrchr(curFile, '/');
-    curBase = curBase ? curBase + 1 : curFile;
-    if (curFile[0] && !isLogDateFile(curBase)) {
+    char curName[64];
+    storageGetStr("s.log.file.name", curName, sizeof(curName));
+    if (curName[0] && !isLogDateFile(curName)) {
         cliPrintf("logrotate: current log file is not a date-format log\n");
         return;
     }
 
-    /* Set log path to today's date */
+    /* Set log name to today's date */
     time_t now = time(nullptr);
     struct tm tm;
     localtime_r(&now, &tm);
-    char path[128];
-    snprintf(path, sizeof(path), "%s/%04d%02d%02d.log", dir,
+    char name[64];
+    snprintf(name, sizeof(name), "%04d%02d%02d.log",
         tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday);
-    storageSet("s.log.file.path", path);
+    storageSet("s.log.file.name", name);
 
     /* Delete expired files if days specified */
     int days = *a ? atoi(a) : 0;

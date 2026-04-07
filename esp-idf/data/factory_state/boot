@@ -1,3 +1,4 @@
 # Startup commands — runs on every boot (including deep sleep wake)
 # *_rec.avi repair is scheduled from recInit (SD mount) so it is not blocked by rec_bootcv.
 cert self-signed
+logfile

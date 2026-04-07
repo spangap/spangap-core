@@ -460,6 +460,13 @@ void itsOnAux(its_aux_cb_t cb, uint16_t port) {
         e = taskFindOrCreate(xTaskGetCurrentTaskHandle(), 0, 0);
         if (!e) return;
     }
+    /* Replace existing handler for same port (idempotent per port) */
+    for (int i = 0; i < e->auxCount; i++) {
+        if (e->auxCallbacks[i].port == port) {
+            e->auxCallbacks[i].cb = cb;
+            return;
+        }
+    }
     if (e->auxCount >= ITS_MAX_AUX_CALLBACKS) return;
     e->auxCallbacks[e->auxCount++] = { cb, port };
 }

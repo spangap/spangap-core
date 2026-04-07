@@ -597,9 +597,16 @@ static void cliEditChar(cli_edit& e, char c, cli_write_fn write) {
         cliUsbSerialAutoResumeLog = true;
       }
     } else {
-      /* Empty enter — kick client (session done) */
-      if (cliActiveSlot >= 0 && cliSlots[cliActiveSlot].itsHandle >= 0)
+      /* Empty enter */
+      if (cliActiveSlot >= 0 && cliSlots[cliActiveSlot].usbSerial) {
+        /* Serial: kick back to log view */
+        if (cliSlots[cliActiveSlot].itsHandle >= 0)
           itsServerKick(cliSlots[cliActiveSlot].itsHandle);
+      } else if (ansi) {
+        /* WS/TCP ANSI: just re-prompt */
+        write("\r\n$ ", 4);
+        write("\033[0 q", 5);
+      }
     }
   } else if (c == 0x7F || c == 0x08) {
     if (e.cursor > 0) {
@@ -709,7 +716,7 @@ static int cliOnConnect(int handle, int itsPort, const void* data, size_t len) {
   if (len >= sizeof(net_connect_t) && ((const net_connect_t*)data)->ws) {
     if (!wsUpgrade(handle)) return -1;
     cl.ws = true;
-    cl.mode = CLI_LINE;  /* WS clients are line-mode */
+    cl.mode = CLI_ANSI;  /* WS clients get full terminal (xterm.js) */
   } else if (len >= sizeof(net_connect_t)) {
     /* Raw TCP/TLS from net — payload is net_connect_t, not cli_connect_t */
     cl.mode = CLI_LINE;
@@ -739,6 +746,14 @@ static int cliOnConnect(int handle, int itsPort, const void* data, size_t len) {
     safeStrncpy(cliUsbPersistCwd, cl.cwd, sizeof(cliUsbPersistCwd));
   } else
     cliApplyStartDir(cl);
+
+  /* Send initial prompt for ANSI clients */
+  if (cl.mode == CLI_ANSI && !cl.usbSerial) {
+    cliActiveSlot = slot;
+    itsCliWrite("$ ", 2);
+    itsCliWrite("\033[0 q", 5);
+    cliActiveSlot = -1;
+  }
 
   return slot;
 }

@@ -10,3 +10,4 @@
 # min hour  dom   mon   dow flags   command
 */15  *     *     *     *     N     duckdns update
 0     3     *     *     *     N     cert acme 30
+0     0     *     *     *     A     logrotate 7
