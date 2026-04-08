@@ -351,6 +351,9 @@ static void onStreamFlush(TaskHandle_t sender, uint16_t port,
   if (!s || !s->f || !s->isWrite) return;
   drainWriteStream(*s);
   fflush(s->f);
+  /* Top up read streams before the potentially long fsync — otherwise a
+   * 300ms+ SD card sync can empty the read buffer and cause play underruns. */
+  serviceStreams();
   fsync(fileno(s->f));
 }
 
