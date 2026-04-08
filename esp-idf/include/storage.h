@@ -126,4 +126,42 @@ int    storageRename(const char* oldPath, const char* newPath);
 /** remove() via storage task. */
 int    storageRemove(const char* path);
 
+/* ---- Streaming File I/O ----
+ *
+ * One-way read stream: fs worker fills an ITS stream buffer from SD,
+ * consumer reads via storageStreamRead(). Consumer never touches SD.
+ *
+ * Buffer is an ITS pool buffer (PSRAM). The fs worker refills when
+ * nudged by the consumer (storageStreamRead checks free space against
+ * lowWater).
+ */
+
+/** Open a file for streaming read. Returns handle >= 0, or -1 on error.
+ *  Fs worker proactively keeps the ITS buffer filled from SD. */
+int    storageStreamOpen(const char* path);
+
+/** Read from a streaming file. Returns bytes read (partial OK), 0 if empty.
+ *  Nudges fs worker to refill when buffer drops below low-water mark. */
+size_t storageStreamRead(int handle, void* buf, size_t len);
+
+/** Seek to absolute file offset. Blocks until fs worker has reset the
+ *  buffer, repositioned the file, and pre-filled. */
+bool   storageStreamSeek(int handle, long offset);
+
+/** Open a file for streaming write. mode defaults to "wb"; pass "r+b" for read-modify-write.
+ *  Returns handle >= 0, or -1. */
+int    storageStreamOpenWrite(const char* path, const char* mode = nullptr);
+
+/** Write to a streaming file. Returns bytes written (buffered in ITS stream). */
+size_t storageStreamWrite(int handle, const void* data, size_t len);
+
+/** Flush all buffered write data to SD + fsync. Blocks until complete. */
+bool   storageStreamFlush(int handle);
+
+/** Get current file position (for write streams: includes buffered data). Blocks. */
+long   storageStreamTell(int handle);
+
+/** Close streaming file. Flushes writes, disconnects, releases ITS buffer. */
+void   storageStreamClose(int handle);
+
 #endif

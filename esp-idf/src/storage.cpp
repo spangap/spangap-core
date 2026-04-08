@@ -71,11 +71,21 @@ static cJSON* wsPendingPatch = nullptr; /* WS outgoing coalescing */
  * cache re-enable).
  */
 
-#define MAX_FILE_SLOTS 6
+#define MAX_FILE_SLOTS     6
+#define FS_FILE_PORT       1    /* ITS aux port for file ops */
+#define FS_STREAM_RD_PORT  2    /* ITS port for streaming read connections */
+#define FS_STREAM_WR_PORT  3    /* ITS port for streaming write connections */
+#define FS_STREAM_BUFSZ    (256 * 1024)
+#define FS_STREAM_CHUNK    (32 * 1024)   /* individual SD read/write unit */
+#define FS_READ_PREFILL    (64 * 1024)   /* blocking pre-fill on open/seek */
+#define FS_READ_REFILL     (64 * 1024)   /* refill-to-capacity when bytes avail < this */
+#define FS_WRITE_DRAIN     (196 * 1024)  /* drain to SD when buffer reaches this */
+#define FS_MAX_STREAMS     2
 
 static FILE* fileFps[MAX_FILE_SLOTS];
 static bool fileActive[MAX_FILE_SLOTS];
-static QueueHandle_t fsQueue = nullptr;
+static TaskHandle_t fsWorkerTask = nullptr;
+static SemaphoreHandle_t fsReady = nullptr;
 
 struct storage_file_op_t {
   enum Op { OPEN, READ, WRITE, TELL, CLOSE, STAT, RENAME, REMOVE } op;
@@ -86,7 +96,6 @@ struct storage_file_op_t {
   size_t len;
   struct stat* st;
   int result;
-  SemaphoreHandle_t done;
 };
 
 static void handleFileOp(storage_file_op_t* req) {
@@ -136,23 +145,22 @@ static void handleFileOp(storage_file_op_t* req) {
       req->result = remove(req->path);
       break;
   }
-  xSemaphoreGive(req->done);
 }
 
-static void fsWorkerFn(void*) {
-  for (;;) {
-    storage_file_op_t* op;
-    if (xQueueReceive(fsQueue, &op, portMAX_DELAY))
-      handleFileOp(op);
-  }
+static void onFileOp(TaskHandle_t sender, uint16_t port,
+                     const void* data, size_t len) {
+  if (len < sizeof(storage_file_op_t*)) return;
+  storage_file_op_t* op;
+  memcpy(&op, data, sizeof(op));
+  handleFileOp(op);
 }
+
+/* fsWorkerFn defined after stream handlers (below) */
 
 static int fsOp(storage_file_op_t& req) {
-  req.done = xSemaphoreCreateBinary();
   storage_file_op_t* ptr = &req;
-  xQueueSend(fsQueue, &ptr, portMAX_DELAY);
-  xSemaphoreTake(req.done, portMAX_DELAY);
-  vSemaphoreDelete(req.done);
+  itsSendAuxByHandle(fsWorkerTask, &ptr, sizeof(ptr),
+                     portMAX_DELAY, FS_FILE_PORT, ITS_WAIT_PICKUP);
   return req.result;
 }
 
@@ -161,6 +169,277 @@ static int allocSlot() {
     if (!fileActive[i]) { fileActive[i] = true; return i; }
   }
   return -1;
+}
+
+/* ---- Streaming file I/O ---- */
+
+struct stream_state_t {
+  int itsHandle = -1;
+  FILE* f = nullptr;
+  bool atEof = false;
+  bool isWrite = false;
+  long writePos = 0;          /* tracked file position for write streams (ftell equivalent) */
+};
+static stream_state_t streams[FS_MAX_STREAMS];
+
+static void drainWriteStream(stream_state_t& s);
+
+static stream_state_t* streamByHandle(int h) {
+  for (auto& s : streams)
+    if (s.itsHandle == h) return &s;
+  return nullptr;
+}
+
+static uint8_t* streamFillBuf = nullptr;  /* PSRAM, allocated once in storageInit */
+
+/** Service active streams. Batches reads then writes — sequential SD access
+ *  within each phase, one seek when switching. Yields between chunks so the
+ *  play task can deliver audio during fill/drain bursts. */
+static void serviceStreams() {
+  if (!streamFillBuf) return;
+
+  /* Phase 1: fill read streams to capacity (sequential reads, no seeks) */
+  for (auto& s : streams) {
+    if (s.itsHandle < 0 || !s.f || s.isWrite || s.atEof) continue;
+    /* Check outgoing buffer fill (itsSpacesAvailable = send direction = server→client) */
+    { size_t sp = itsSpacesAvailable(s.itsHandle);
+      if (sp < FS_STREAM_BUFSZ && (FS_STREAM_BUFSZ - sp) >= FS_READ_REFILL) continue; }
+    while (!s.atEof && itsSpacesAvailable(s.itsHandle) >= FS_STREAM_CHUNK) {
+      size_t got = fread(streamFillBuf, 1, FS_STREAM_CHUNK, s.f);
+      if (got > 0) itsSend(s.itsHandle, streamFillBuf, got, portMAX_DELAY);
+      if (got < FS_STREAM_CHUNK) s.atEof = true;
+      taskYIELD();
+    }
+  }
+
+  /* Phase 2: drain write streams — but read has right of way */
+  for (auto& s : streams) {
+    if (s.itsHandle < 0 || !s.f || !s.isWrite) continue;
+    size_t avail = itsBytesAvailable(s.itsHandle);
+    if (avail < FS_WRITE_DRAIN) continue;
+    while (avail > 0) {
+      /* Read right of way: if any read buffer is low, stop writing and go refill */
+      bool readUrgent = false;
+      for (auto& r : streams) {
+        if (r.itsHandle >= 0 && r.f && !r.isWrite && !r.atEof) {
+          size_t sp = itsSpacesAvailable(r.itsHandle);
+          if (sp >= FS_STREAM_BUFSZ || (FS_STREAM_BUFSZ - sp) < FS_READ_REFILL) {
+            readUrgent = true;
+            break;
+          }
+        }
+      }
+      if (readUrgent) break;  /* next serviceStreams call will fill reads first */
+
+      size_t toWrite = avail < FS_STREAM_CHUNK ? avail : FS_STREAM_CHUNK;
+      size_t got = itsRecv(s.itsHandle, streamFillBuf, toWrite, 0);
+      if (got == 0) break;
+      fwrite(streamFillBuf, 1, got, s.f);
+      s.writePos += got;
+      avail = itsBytesAvailable(s.itsHandle);
+      taskYIELD();
+    }
+  }
+}
+
+/* Aux message structs for stream commands */
+struct stream_open_msg_t {
+  const char* path;
+  const char* mode;       /* nullptr defaults to "rb"/"wb" per port */
+  int result;             /* set by fs worker: ITS handle or -1 */
+};
+
+struct stream_seek_msg_t {
+  int itsHandle;
+  long offset;
+  bool result;
+};
+
+static int onStreamConnect(int handle, int itsPort, const void* data, size_t len) {
+  if (len < sizeof(stream_open_msg_t*)) return -1;
+  stream_open_msg_t* msg;
+  memcpy(&msg, data, sizeof(msg));
+
+  /* Find a free stream slot */
+  stream_state_t* s = nullptr;
+  for (auto& slot : streams)
+    if (slot.itsHandle < 0) { s = &slot; break; }
+  if (!s) { msg->result = -1; return -1; }
+
+  bool writing = (itsPort == FS_STREAM_WR_PORT);
+  const char* mode = msg->mode ? msg->mode : (writing ? "wb" : "rb");
+  FILE* f = fopen(msg->path, mode);
+  if (!f) { msg->result = -1; return -1; }
+
+  s->itsHandle = handle;
+  s->f = f;
+  s->atEof = false;
+  s->isWrite = writing;
+  s->writePos = 0;
+  msg->result = handle;
+  return 0;  /* serverRef */
+}
+
+static void onStreamDisconnect(int ref) {
+  /* ref is serverRef (0 from onStreamConnect). Find by scanning. */
+  for (auto& s : streams) {
+    if (s.itsHandle >= 0 && !itsConnected(s.itsHandle)) {
+      if (s.f) fclose(s.f);
+      s = {};
+      s.itsHandle = -1;
+    }
+  }
+}
+
+static void onStreamNudge(TaskHandle_t, uint16_t, const void*, size_t) {
+  /* Just a wake-up — serviceStreams fills based on available space */
+}
+
+static void onStreamSeek(TaskHandle_t sender, uint16_t port,
+                         const void* data, size_t len) {
+  if (len < sizeof(stream_seek_msg_t*)) return;
+  stream_seek_msg_t* msg;
+  memcpy(&msg, data, sizeof(msg));
+
+  stream_state_t* s = streamByHandle(msg->itsHandle);
+  if (!s || !s->f) { msg->result = false; return; }
+
+  if (s->isWrite) {
+    /* Write stream: drain buffer before seeking */
+    drainWriteStream(*s);
+    fflush(s->f);
+  }
+
+  itsReset(s->itsHandle);
+  msg->result = (fseek(s->f, msg->offset, SEEK_SET) == 0);
+
+  if (s->isWrite) {
+    s->writePos = msg->offset;
+  } else {
+    s->atEof = false;
+    /* Pre-fill 64KB before releasing caller — covers first frame + headers */
+    if (msg->result && streamFillBuf) {
+      size_t filled = 0;
+      while (filled < FS_READ_PREFILL && !s->atEof) {
+        size_t got = fread(streamFillBuf, 1, FS_STREAM_CHUNK, s->f);
+        if (got > 0) { itsSend(s->itsHandle, streamFillBuf, got, portMAX_DELAY); filled += got; }
+        if (got < FS_STREAM_CHUNK) s->atEof = true;
+      }
+    }
+  }
+}
+
+/** Drain all remaining write buffer data to SD, then fflush + fsync. */
+static void drainWriteStream(stream_state_t& s) {
+  if (!s.f || !streamFillBuf) return;
+  for (;;) {
+    size_t avail = itsBytesAvailable(s.itsHandle);
+    if (avail == 0) break;
+    size_t got = itsRecv(s.itsHandle, streamFillBuf, avail < FS_STREAM_CHUNK ? avail : FS_STREAM_CHUNK, 0);
+    if (got == 0) break;
+    fwrite(streamFillBuf, 1, got, s.f);
+    s.writePos += got;
+  }
+}
+
+static void onStreamFlush(TaskHandle_t sender, uint16_t port,
+                          const void* data, size_t len) {
+  if (len < sizeof(int)) return;
+  int handle;
+  memcpy(&handle, data, sizeof(handle));
+  stream_state_t* s = streamByHandle(handle);
+  if (!s || !s->f || !s->isWrite) return;
+  drainWriteStream(*s);
+  fflush(s->f);
+  fsync(fileno(s->f));
+}
+
+struct stream_tell_msg_t {
+  int itsHandle;
+  long result;
+};
+
+static void onStreamTell(TaskHandle_t sender, uint16_t port,
+                         const void* data, size_t len) {
+  if (len < sizeof(stream_tell_msg_t*)) return;
+  stream_tell_msg_t* msg;
+  memcpy(&msg, data, sizeof(msg));
+  stream_state_t* s = streamByHandle(msg->itsHandle);
+  if (!s || !s->f) { msg->result = -1; return; }
+  if (s->isWrite) {
+    /* Drain first so writePos reflects all buffered data */
+    drainWriteStream(*s);
+    msg->result = s->writePos;
+  } else {
+    msg->result = ftell(s->f);
+  }
+}
+
+/* Aux sub-ports for stream commands */
+#define STREAM_AUX_NUDGE 2
+#define STREAM_AUX_SEEK  3
+#define STREAM_AUX_FLUSH 4
+#define STREAM_AUX_TELL  5
+
+static void fsWorkerFn(void*) {
+  itsServerInit(4, 0, 0);
+  itsServerPortInit(FS_STREAM_RD_PORT, 1, 0, FS_STREAM_BUFSZ);
+  itsServerPortInit(FS_STREAM_WR_PORT, 1, FS_STREAM_BUFSZ, 0);
+  itsServerOnConnect(onStreamConnect);
+  itsServerOnDisconnect(onStreamDisconnect);
+  itsOnAux(onFileOp, FS_FILE_PORT);
+  itsOnAux(onStreamNudge, STREAM_AUX_NUDGE);
+  itsOnAux(onStreamSeek, STREAM_AUX_SEEK);
+  itsOnAux(onStreamFlush, STREAM_AUX_FLUSH);
+  itsOnAux(onStreamTell, STREAM_AUX_TELL);
+  for (auto& s : streams) s.itsHandle = -1;
+  xSemaphoreGive(fsReady);
+  for (;;) {
+    while (itsPoll(0)) {}
+    serviceStreams();
+    /* If a read stream is low, loop back immediately to refill
+     * (write drain may have been interrupted for read priority) */
+    bool readLow = false, writeActive = false;
+    for (auto& s : streams) {
+      if (s.itsHandle < 0 || !s.f) continue;
+      /* Clean up stale streams (disconnect not yet processed) */
+      if (!itsConnected(s.itsHandle)) {
+        if (s.f) fclose(s.f);
+        s = {};
+        s.itsHandle = -1;
+        continue;
+      }
+      if (!s.isWrite && !s.atEof) {
+        /* For read streams, check the OUTGOING buffer (server→client).
+         * itsBytesAvailable checks incoming (client→server) which is always 0. */
+        size_t space = itsSpacesAvailable(s.itsHandle);
+        size_t filled = (space < FS_STREAM_BUFSZ) ? FS_STREAM_BUFSZ - space : 0;
+        if (filled < FS_READ_REFILL) readLow = true;
+      }
+      if (s.isWrite)
+        writeActive = true;
+    }
+    if (readLow) {
+      static uint32_t rlCount = 0;
+      if (++rlCount == 10000) {
+        for (auto& s : streams) {
+          if (s.itsHandle < 0 || s.isWrite) continue;
+          warn("fs: readLow spin h=%d conn=%d eof=%d f=%p avail=%u space=%u\n",
+               s.itsHandle, itsConnected(s.itsHandle), s.atEof, s.f,
+               (unsigned)itsBytesAvailable(s.itsHandle),
+               (unsigned)itsSpacesAvailable(s.itsHandle));
+        }
+        rlCount = 0;
+      }
+      taskYIELD();
+    } else if (writeActive) {
+      vTaskDelay(pdMS_TO_TICKS(10));
+    } else {
+      static uint32_t idleCount = 0;
+      if (++idleCount == 10000) { warn("fs: idle spin\n"); idleCount = 0; }
+      itsPoll();
+    }
+  }
 }
 
 /* ---- Path navigation ---- */
@@ -937,6 +1216,109 @@ int storageRemove(const char* path) {
   return fsOp(req);
 }
 
+/* ---- Streaming file API (consumer side, runs on caller's task) ---- */
+
+/* Consumer-side state per stream type (single of each for now) */
+static int    streamHandle = -1;
+static int    streamWriteHandle = -1;
+static long   streamWritePos = 0;    /* client-side position tracking (avoids round-trip for tell) */
+static size_t streamWriteSinceNudge = 0;  /* bytes written since last drain nudge */
+
+int storageStreamOpen(const char* path) {
+  itsClientInit(2);
+
+  stream_open_msg_t msg = { path, nullptr, -1 };
+  stream_open_msg_t* ptr = &msg;
+
+  int handle = itsConnect("fs", FS_STREAM_RD_PORT, &ptr, sizeof(ptr),
+                          pdMS_TO_TICKS(5000));
+  if (handle < 0) return -1;
+
+  /* onStreamConnect wrote msg.result — check if file opened */
+  if (msg.result < 0) {
+    itsDisconnect(handle);
+    return -1;
+  }
+  streamHandle = handle;
+  return handle;
+}
+
+size_t storageStreamRead(int handle, void* buf, size_t len) {
+  size_t got = itsRecv(handle, buf, len, pdMS_TO_TICKS(500));
+
+  /* Nudge fs worker to refill when buffer is getting low */
+  if (itsBytesAvailable(handle) < FS_READ_REFILL) {
+    int h = handle;
+    itsSendAuxByHandle(fsWorkerTask, &h, sizeof(h), 0, STREAM_AUX_NUDGE);
+  }
+  return got;
+}
+
+bool storageStreamSeek(int handle, long offset) {
+  stream_seek_msg_t msg = { handle, offset, false };
+  stream_seek_msg_t* ptr = &msg;
+  itsSendAuxByHandle(fsWorkerTask, &ptr, sizeof(ptr),
+                     portMAX_DELAY, STREAM_AUX_SEEK, ITS_WAIT_PICKUP);
+  if (msg.result && handle == streamWriteHandle) streamWritePos = offset;
+  return msg.result;
+}
+
+int storageStreamOpenWrite(const char* path, const char* mode) {
+  itsClientInit(2);
+
+  stream_open_msg_t msg = { path, mode, -1 };
+  stream_open_msg_t* ptr = &msg;
+
+  int handle = itsConnect("fs", FS_STREAM_WR_PORT, &ptr, sizeof(ptr),
+                          pdMS_TO_TICKS(5000));
+  if (handle < 0) return -1;
+  if (msg.result < 0) { itsDisconnect(handle); return -1; }
+  streamWriteHandle = handle;
+  streamWritePos = 0;
+  streamWriteSinceNudge = 0;
+  return handle;
+}
+
+size_t storageStreamWrite(int handle, const void* data, size_t len) {
+  size_t sent = itsSendSilent(handle, data, len, portMAX_DELAY);
+  streamWritePos += (long)sent;
+  /* Nudge fs worker only when enough data has accumulated for a drain.
+   * Avoids waking it on every small write (which caused 97% CPU spin). */
+  streamWriteSinceNudge += sent;
+  if (streamWriteSinceNudge >= FS_WRITE_DRAIN) {
+    streamWriteSinceNudge = 0;
+    int h = handle;
+    itsSendAuxByHandle(fsWorkerTask, &h, sizeof(h), 0, STREAM_AUX_NUDGE);
+  }
+  return sent;
+}
+
+bool storageStreamFlush(int handle) {
+  int h = handle;
+  itsSendAuxByHandle(fsWorkerTask, &h, sizeof(h),
+                     portMAX_DELAY, STREAM_AUX_FLUSH, ITS_WAIT_PICKUP);
+  return true;
+}
+
+long storageStreamTell(int handle) {
+  /* Write streams: return client-tracked position (no round-trip) */
+  if (handle == streamWriteHandle) return streamWritePos;
+  /* Read streams: ask fs worker */
+  stream_tell_msg_t msg = { handle, -1 };
+  stream_tell_msg_t* ptr = &msg;
+  itsSendAuxByHandle(fsWorkerTask, &ptr, sizeof(ptr),
+                     portMAX_DELAY, STREAM_AUX_TELL, ITS_WAIT_PICKUP);
+  return msg.result;
+}
+
+void storageStreamClose(int handle) {
+  /* Flush write data if this is a write stream */
+  if (handle == streamWriteHandle) storageStreamFlush(handle);
+  itsDisconnect(handle);
+  if (handle == streamHandle) streamHandle = -1;
+  if (handle == streamWriteHandle) { streamWriteHandle = -1; streamWritePos = 0; streamWriteSinceNudge = 0; }
+}
+
 /* ---- CLI commands ---- */
 
 static void cmdSet(const char* a) {
@@ -1259,9 +1641,13 @@ static void storageTaskFn(void* arg) {
 }
 
 void storageInit() {
-    /* fs worker: small DRAM-stack task for LittleFS file I/O */
-    fsQueue = xQueueCreate(4, sizeof(storage_file_op_t*));
-    xTaskCreatePinnedToCore(fsWorkerFn, "fs", 3072, nullptr, 1, nullptr, 1);
+    /* fs worker: small DRAM-stack task for LittleFS/SD file I/O via ITS */
+    streamFillBuf = (uint8_t*)heap_caps_malloc(FS_STREAM_CHUNK, MALLOC_CAP_SPIRAM);
+    fsReady = xSemaphoreCreateBinary();
+    xTaskCreatePinnedToCore(fsWorkerFn, "fs", 3072, nullptr, 1, &fsWorkerTask, 1);
+    xSemaphoreTake(fsReady, portMAX_DELAY);  /* wait until ITS server is up */
+    vSemaphoreDelete(fsReady);
+    fsReady = nullptr;
 
     /* storage task: PSRAM stack (config WS + ITS, no direct file I/O) */
     xTaskCreatePinnedToCoreWithCaps(storageTaskFn, "storage", 4096, NULL, 1, &storageHandle, 1, MALLOC_CAP_SPIRAM);

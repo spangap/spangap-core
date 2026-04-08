@@ -78,6 +78,12 @@ void          itsServerOnDisconnect(its_disconnect_cb_t cb);
  *  Port 0 is the default catch-all (matches aux messages with no specific port). */
 void          itsOnAux(its_aux_cb_t cb, uint16_t port = 0);
 
+/** Per-port buffer sizes and connection limit. Overrides itsServerInit defaults.
+ *  Up to 4 port configs per server. toSize/fromSize 0 = no buffer (one-way/aux-only).
+ *  Call after itsServerInit(). */
+bool          itsServerPortInit(uint16_t itsPort, int maxHandles,
+                                size_t toSize, size_t fromSize);
+
 void          itsServerKick(int handle);
 int           itsServerActive(void);
 int           itsActiveTotal(void);
@@ -137,6 +143,11 @@ bool          itsPoll(TickType_t timeout = portMAX_DELAY);
 
 size_t        itsSend(int handle, const void* data, size_t len,
                       TickType_t timeout);
+/** Like itsSend but without waking the remote task's itsPoll.
+ *  Use for buffered writes where the caller manages wake-up
+ *  (e.g. threshold-based nudge for streaming writes). */
+size_t        itsSendSilent(int handle, const void* data, size_t len,
+                            TickType_t timeout);
 size_t        itsRecv(int handle, void* buf, size_t maxLen,
                       TickType_t timeout);
 bool          itsConnected(int handle);

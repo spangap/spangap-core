@@ -200,6 +200,15 @@ struct its_aux_entry_t {
     uint16_t     port;
 };
 
+#define ITS_MAX_PORT_CONFIGS 4
+
+struct its_port_config_t {
+    uint16_t port;
+    int      maxHandles;
+    size_t   toSize;
+    size_t   fromSize;
+};
+
 struct its_task_t {
     TaskHandle_t          task;
     int                   maxHandles;
@@ -214,6 +223,8 @@ struct its_task_t {
     int                   ackHandle;
     its_aux_entry_t       auxCallbacks[ITS_MAX_AUX_CALLBACKS];
     int                   auxCount;
+    its_port_config_t     portConfigs[ITS_MAX_PORT_CONFIGS];
+    int                   portConfigCount;
     QueueHandle_t         inbox;
     size_t                inboxItemSize; /* max message size (header + payload) */
     bool                  isServer;
@@ -309,6 +320,22 @@ static int serverActiveCount(its_task_t* t) {
     return count;
 }
 
+static int serverPortActiveCount(its_task_t* t, int itsPort) {
+    int count = 0;
+    for (int i = 0; i < ITS_MAX_CONNS; i++)
+        if (connTable[i].active && connTable[i].serverTask == t->task
+            && connTable[i].itsPort == itsPort)
+            count++;
+    return count;
+}
+
+static const its_port_config_t* portConfigFind(its_task_t* t, int itsPort) {
+    for (int i = 0; i < t->portConfigCount; i++)
+        if (t->portConfigs[i].port == (uint16_t)itsPort)
+            return &t->portConfigs[i];
+    return nullptr;
+}
+
 /* ---- itsPoll ---- */
 
 bool itsPoll(TickType_t timeout) {
@@ -335,12 +362,21 @@ bool itsPoll(TickType_t timeout) {
     int pickupIdx = hdr->pickupIdx;
 
     if (hdr->msg == ITS_MSG_CONNECT && me->isServer) {
+        /* Per-port config: sizes + limit override global defaults */
+        const its_port_config_t* pc = portConfigFind(me, hdr->itsPort);
+        size_t toSz   = pc ? pc->toSize   : me->toSize;
+        size_t fromSz = pc ? pc->fromSize  : me->fromSize;
+        int portMax   = pc ? pc->maxHandles : -1;  /* -1 = no per-port limit */
+
         int active = serverActiveCount(me);
         bool full = active >= me->maxHandles;
+        if (!full && portMax >= 0)
+            full = serverPortActiveCount(me, hdr->itsPort) >= portMax;
 
         if (full && me->onBusy) {
             if (!me->onBusy(hdr->itsPort, payload, hdr->len))
-                full = false;
+                full = (serverActiveCount(me) >= me->maxHandles)
+                    || (portMax >= 0 && serverPortActiveCount(me, hdr->itsPort) >= portMax);
         }
 
         its_task_t* cli = taskFind(hdr->sender);
@@ -354,8 +390,8 @@ bool itsPoll(TickType_t timeout) {
             c->clientTask = hdr->sender;
             c->serverTask = me->task;
             c->itsPort = hdr->itsPort;
-            if (me->toSize > 0)   c->toPoolIdx = poolGet(me->toSize);
-            if (me->fromSize > 0) c->fromPoolIdx = poolGet(me->fromSize);
+            if (toSz > 0)   c->toPoolIdx = poolGet(toSz);
+            if (fromSz > 0) c->fromPoolIdx = poolGet(fromSz);
 
             if (!me->onConnect) {
                 accepted = true;
@@ -435,6 +471,22 @@ bool itsServerInit(int maxHandles, size_t toSize, size_t fromSize,
     entry->toSize = toSize;
     entry->fromSize = fromSize;
     entry->isServer = true;
+    return true;
+}
+
+bool itsServerPortInit(uint16_t itsPort, int maxHandles,
+                       size_t toSize, size_t fromSize) {
+    its_task_t* e = myTask();
+    if (!e || !e->isServer) return false;
+    /* Update existing entry for this port */
+    for (int i = 0; i < e->portConfigCount; i++) {
+        if (e->portConfigs[i].port == itsPort) {
+            e->portConfigs[i] = { itsPort, maxHandles, toSize, fromSize };
+            return true;
+        }
+    }
+    if (e->portConfigCount >= ITS_MAX_PORT_CONFIGS) return false;
+    e->portConfigs[e->portConfigCount++] = { itsPort, maxHandles, toSize, fromSize };
     return true;
 }
 
@@ -531,11 +583,18 @@ int itsServerForwardByHandle(int handle, TaskHandle_t targetTask, int itsPort,
     its_task_t* te = taskFind(targetTask);
     if (!te || !te->isServer) return -1;
 
-    int active = serverActiveCount(te);
-    if (active >= te->maxHandles && te->onBusy) {
+    const its_port_config_t* pc = portConfigFind(te, itsPort);
+    int portMax = pc ? pc->maxHandles : -1;
+
+    auto isFull = [&]() {
+        if (serverActiveCount(te) >= te->maxHandles) return true;
+        if (portMax >= 0 && serverPortActiveCount(te, itsPort) >= portMax) return true;
+        return false;
+    };
+
+    if (isFull() && te->onBusy) {
         if (te->onBusy(itsPort, data, dataLen)) return -1;
-        active = serverActiveCount(te);
-        if (active >= te->maxHandles) return -1;
+        if (isFull()) return -1;
     }
 
     c->serverTask = targetTask;
@@ -731,10 +790,20 @@ size_t itsSend(int handle, const void* data, size_t len, TickType_t timeout) {
     StreamBufferHandle_t buf = sendBuf(handle);
     if (!buf) return 0;
     size_t sent = xStreamBufferSend(buf, data, len, timeout);
+    /* Explicit notify needed: xStreamBufferSend only notifies tasks blocked on
+     * xStreamBufferReceive, not tasks waiting in itsPoll/ulTaskNotifyTake. */
     TaskHandle_t remote = remoteOf(handle);
     if (remote && sent > 0) xTaskNotifyGive(remote);
     return sent;
 }
+
+size_t itsSendSilent(int handle, const void* data, size_t len, TickType_t timeout) {
+    StreamBufferHandle_t buf = sendBuf(handle);
+    if (!buf) return 0;
+    /* No notify — caller manages wake-up (e.g. threshold nudge for write streams). */
+    return xStreamBufferSend(buf, data, len, timeout);
+}
+
 
 size_t itsRecv(int handle, void* buf, size_t maxLen, TickType_t timeout) {
     StreamBufferHandle_t sb = recvBuf(handle);
