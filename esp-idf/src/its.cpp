@@ -8,6 +8,15 @@
 
 static const char* TAG = "its";
 
+/* Prepend the calling task's name to every error log so consumers without
+ * a custom log reformatter still see WHO triggered the ITS error. ITS by
+ * definition runs on the stack of whichever task is using it, so the
+ * caller-task identity is the most important breadcrumb. */
+#define ITS_LOGE(fmt, ...) \
+    ESP_LOGE(TAG, "[%s] " fmt, pcTaskGetName(NULL), ##__VA_ARGS__)
+#define ITS_LOGW(fmt, ...) \
+    ESP_LOGW(TAG, "[%s] " fmt, pcTaskGetName(NULL), ##__VA_ARGS__)
+
 static inline uint32_t millis() { return (uint32_t)(esp_timer_get_time() / 1000); }
 
 /* ---- Stream buffer pool ---- */
@@ -262,7 +271,7 @@ static its_task_t* taskFindOrCreate(TaskHandle_t task, size_t inboxMaxMsgLen, si
     its_task_t* e = taskFind(task);
     if (e) return e;
     if (s_taskCount >= ITS_MAX_TASKS) {
-        ESP_LOGE(TAG, "task table full (max %d)", ITS_MAX_TASKS);
+        ITS_LOGE("task table full (max %d)", ITS_MAX_TASKS);
         return nullptr;
     }
     if (!pickupInited) { pickupInit(); pickupInited = true; }
@@ -371,8 +380,8 @@ static void processInboxMsg(its_task_t* me, uint8_t* buf) {
     if (hdr->msg == ITS_MSG_CONNECT && me->isServer) {
         its_server_port_t* sp = portFind(me, hdr->itsPort);
         if (!sp) {
-            ESP_LOGE(TAG, "%s: connect to unopened port %u",
-                     pcTaskGetName(me->task), hdr->itsPort);
+            ITS_LOGE("connect to unopened port %u (from [%s])",
+                     hdr->itsPort, pcTaskGetName(hdr->sender));
             its_task_t* cli = taskFind(hdr->sender);
             if (cli) { cli->ackHandle = -1; xSemaphoreGive(cli->ackSem); }
             goto done;
@@ -453,8 +462,8 @@ static void processInboxMsg(its_task_t* me, uint8_t* buf) {
         if (c && c->serverTask == me->task) {
             its_server_port_t* sp = portFind(me, hdr->itsPort);
             if (!sp) {
-                ESP_LOGE(TAG, "%s: forward to unopened port %u",
-                         pcTaskGetName(me->task), hdr->itsPort);
+                ITS_LOGE("forwarded conn arrived for unopened port %u (from [%s])",
+                         hdr->itsPort, pcTaskGetName(hdr->sender));
                 itsDisconnect(handle);
             } else if (sp->onConnect && sp->onConnect(handle, payload, hdr->len) < 0) {
                 itsDisconnect(handle);
@@ -470,8 +479,8 @@ static void processInboxMsg(its_task_t* me, uint8_t* buf) {
             }
         }
         if (cb) cb(hdr->sender, payload, hdr->len);
-        else ESP_LOGE(TAG, "%s: aux to unregistered port %u",
-                      pcTaskGetName(me->task), hdr->itsPort);
+        else ITS_LOGE("aux to unregistered port %u (from [%s])",
+                      hdr->itsPort, pcTaskGetName(hdr->sender));
     }
 
 done:
@@ -553,7 +562,7 @@ bool itsServerPortOpen(uint16_t port, int maxHandles,
                        size_t toSize, size_t fromSize) {
     its_task_t* e = myTask();
     if (!e || !e->isServer) {
-        ESP_LOGE(TAG, "PortOpen on non-server task");
+        ITS_LOGE("PortOpen on non-server task");
         return false;
     }
     its_server_port_t* sp = portFind(e, port);
@@ -575,8 +584,7 @@ bool itsServerPortOpen(uint16_t port, int maxHandles,
             return true;
         }
     }
-    ESP_LOGE(TAG, "%s: PortOpen %u: no free port slot (max %d)",
-             pcTaskGetName(NULL), port, ITS_MAX_PORTS);
+    ITS_LOGE("PortOpen %u: no free port slot (max %d)", port, ITS_MAX_PORTS);
     return false;
 }
 
@@ -604,8 +612,7 @@ void itsServerOnConnect(uint16_t port, its_connect_cb_t cb) {
     if (!e) return;
     its_server_port_t* sp = portFind(e, port);
     if (!sp) {
-        ESP_LOGE(TAG, "%s: OnConnect for unopened port %u",
-                 pcTaskGetName(NULL), port);
+        ITS_LOGE("OnConnect for unopened port %u", port);
         return;
     }
     sp->onConnect = cb;
@@ -616,8 +623,7 @@ void itsServerOnBusy(uint16_t port, its_busy_cb_t cb) {
     if (!e) return;
     its_server_port_t* sp = portFind(e, port);
     if (!sp) {
-        ESP_LOGE(TAG, "%s: OnBusy for unopened port %u",
-                 pcTaskGetName(NULL), port);
+        ITS_LOGE("OnBusy for unopened port %u", port);
         return;
     }
     sp->onBusy = cb;
@@ -628,8 +634,7 @@ void itsServerOnDisconnect(uint16_t port, its_disconnect_cb_t cb) {
     if (!e) return;
     its_server_port_t* sp = portFind(e, port);
     if (!sp) {
-        ESP_LOGE(TAG, "%s: OnDisconnect for unopened port %u",
-                 pcTaskGetName(NULL), port);
+        ITS_LOGE("OnDisconnect for unopened port %u", port);
         return;
     }
     sp->onDisconnect = cb;
@@ -640,8 +645,7 @@ void itsServerOnRecv(uint16_t port, its_recv_cb_t cb) {
     if (!e) return;
     its_server_port_t* sp = portFind(e, port);
     if (!sp) {
-        ESP_LOGE(TAG, "%s: OnRecv for unopened port %u",
-                 pcTaskGetName(NULL), port);
+        ITS_LOGE("OnRecv for unopened port %u", port);
         return;
     }
     sp->onRecv = cb;
@@ -661,8 +665,7 @@ void itsOnAux(uint16_t port, its_aux_cb_t cb) {
         }
     }
     if (e->auxCount >= ITS_MAX_PORTS) {
-        ESP_LOGE(TAG, "%s: OnAux %u: aux table full (max %d)",
-                 pcTaskGetName(NULL), port, ITS_MAX_PORTS);
+        ITS_LOGE("OnAux %u: aux table full (max %d)", port, ITS_MAX_PORTS);
         return;
     }
     e->auxCallbacks[e->auxCount].active = true;
@@ -755,7 +758,7 @@ int itsServerForwardByTaskHandle(int handle, TaskHandle_t targetTask, uint16_t p
 
     its_server_port_t* sp = portFind(te, port);
     if (!sp) {
-        ESP_LOGE(TAG, "forward to unopened port %u on %s",
+        ITS_LOGE("forward to unopened port %u on [%s]",
                  port, pcTaskGetName(targetTask));
         return -1;
     }
@@ -773,7 +776,7 @@ int itsServerForwardByTaskHandle(int handle, TaskHandle_t targetTask, uint16_t p
     c->itsPort = port;
 
     if (dataLen > ITS_MAX_MSG_DATA) {
-        ESP_LOGE(TAG, "forward data truncated: %u > %u",
+        ITS_LOGE("forward data truncated: %u > %u",
                  (unsigned)dataLen, ITS_MAX_MSG_DATA);
         dataLen = ITS_MAX_MSG_DATA;
     }
@@ -839,8 +842,8 @@ int itsConnectByTaskHandle(TaskHandle_t serverTask, uint16_t port,
 
     /* Pre-flight: ensure the server has actually opened this port. */
     if (!portFind(se, port)) {
-        ESP_LOGE(TAG, "%s: connect to unopened port %u on %s",
-                 pcTaskGetName(NULL), port, pcTaskGetName(serverTask));
+        ITS_LOGE("connect to unopened port %u on [%s]",
+                 port, pcTaskGetName(serverTask));
         return -1;
     }
 
@@ -848,7 +851,7 @@ int itsConnectByTaskHandle(TaskHandle_t serverTask, uint16_t port,
     me->ackHandle = -1;
 
     if (dataLen > ITS_MAX_MSG_DATA) {
-        ESP_LOGE(TAG, "connect data truncated: %u > %u",
+        ITS_LOGE("connect data truncated: %u > %u",
                  (unsigned)dataLen, ITS_MAX_MSG_DATA);
         dataLen = ITS_MAX_MSG_DATA;
     }
@@ -972,8 +975,8 @@ static bool itsSendAuxInternal(TaskHandle_t task, uint16_t port,
         }
     }
     if (!registered) {
-        ESP_LOGE(TAG, "%s: aux send to unregistered port %u on %s",
-                 pcTaskGetName(NULL), port, pcTaskGetName(task));
+        ITS_LOGE("aux send to unregistered port %u on [%s]",
+                 port, pcTaskGetName(task));
         return false;
     }
 
@@ -981,7 +984,7 @@ static bool itsSendAuxInternal(TaskHandle_t task, uint16_t port,
     size_t maxPayload = te->inboxItemSize > sizeof(its_header_t)
                       ? te->inboxItemSize - sizeof(its_header_t) : ITS_MAX_MSG_DATA;
     if (dataLen > maxPayload) {
-        ESP_LOGE(TAG, "aux data truncated: %u > %u",
+        ITS_LOGE("aux data truncated: %u > %u",
                  (unsigned)dataLen, (unsigned)maxPayload);
         dataLen = maxPayload;
     }

@@ -60,7 +60,7 @@ By default `itsSendAux` returns once the message is in the receiver's inbox queu
 
 ## API
 
-All functions are in [`its.h`](../main/its.h). Errors are logged via `ESP_LOGE("its", ...)` — ITS is intentionally seccam-agnostic and uses ESP-IDF's logging directly so it can be lifted into other projects.
+All functions are in [`its.h`](../main/its.h). Errors are logged via `ESP_LOGE("its", "[%s] ...", pcTaskGetName(NULL), ...)` — ITS is intentionally seccam-agnostic and uses ESP-IDF's logging directly so it can be lifted into other projects. The calling task's name is prepended to every error log so consumers without a custom reformatter can still see who triggered the failure (ITS by definition runs on whatever task is using it, so the caller-task identity is the most important breadcrumb). Errors that involve a *second* task — connect/forward/aux send targeting another task — also embed the remote task name in the message body in `[brackets]`.
 
 ### Stream buffer pool
 
