@@ -1,8 +1,9 @@
-/** CLI commands: reboot, reset, sleep, run. */
+/** CLI commands: reboot, reset, sleep, run, its. */
 #include "cli.h"
 #include "storage.h"
 #include "pm.h"
 #include "log.h"
+#include "its.h"
 #include "esp_littlefs.h"
 
 #include "compat.h"
@@ -41,6 +42,11 @@ static void cmdRun(const char* a) {
     cliRunFile(a);
 }
 
+static void cmdIts(const char* a) {
+    if (strcmp(a, "help") == 0) { cliPrintf("  %-*s show ITS connection + stream pool status\n", CLI_HELP_COL, "its"); return; }
+    itsStatus();
+}
+
 /* help is special — declared here but needs access to the cmd registry.
  * We call cliProcess("help") which handles it in the dispatcher. */
 
@@ -49,4 +55,5 @@ void cliCmdSysInit() {
     cliRegisterCmd("reset factory", cmdResetFactory);
     cliRegisterCmd("sleep", cmdSleep);
     cliRegisterCmd("run", cmdRun);
+    cliRegisterCmd("its", cmdIts);
 }

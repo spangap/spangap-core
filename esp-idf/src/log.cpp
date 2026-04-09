@@ -296,9 +296,12 @@ static int logReformat(const char* src, char* dst, size_t dstSize, bool ansi) {
         while (i > 0 && ((msgStart[i] >= '0' && msgStart[i] <= '9') || msgStart[i] == ';' || msgStart[i] == '[')) i--;
         if (msgStart[i] == '\033') { msgLen = i; } else break;
     }
-    /* Skip empty/whitespace-only messages (ESP wifi emits "I (ts) wifi: \n" then content on next line) */
-    while (msgLen > 0 && (msgStart[0] == ' ' || msgStart[0] == '\t')) { msgStart++; msgLen--; }
-    if (msgLen == 0) return 0;
+    /* Drop whitespace-only messages (ESP wifi emits "I (ts) wifi: \n" then content on next line)
+     * but preserve leading whitespace on real content — itsStatus() and similar use it for indentation. */
+    { bool allWhite = true;
+      for (size_t i = 0; i < msgLen; i++)
+        if (msgStart[i] != ' ' && msgStart[i] != '\t') { allWhite = false; break; }
+      if (allWhite) return 0; }
 
     /* ESP_LOGD(task, "task: …") → line is "… task: task: …" — drop the redundant body prefix */
     if (tag[0] && strcmp(tag, taskName) == 0 && taskName[0] && strcmp(taskName, "?") != 0) {
