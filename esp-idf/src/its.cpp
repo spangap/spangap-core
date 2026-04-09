@@ -1,10 +1,12 @@
 #include "its.h"
-#include "log.h"
+#include "esp_log.h"
 #include "freertos/queue.h"
 #include "freertos/semphr.h"
 #include "esp_heap_caps.h"
 #include "esp_timer.h"
 #include <string.h>
+
+static const char* TAG = "its";
 
 static inline uint32_t millis() { return (uint32_t)(esp_timer_get_time() / 1000); }
 
@@ -15,6 +17,7 @@ static inline uint32_t millis() { return (uint32_t)(esp_timer_get_time() / 1000)
 struct its_pool_entry_t {
     StreamBufferHandle_t handle;
     size_t               size;
+    size_t               triggerLevel;   /* notify-on-send threshold (bytes) */
     volatile bool        inUse;
 };
 
@@ -27,6 +30,7 @@ void itsReserveStreams(int count, size_t size) {
         auto& e = itsPool[itsPoolCount++];
         e.handle = xStreamBufferCreateWithCaps(size, 1, MALLOC_CAP_SPIRAM);
         e.size = size;
+        e.triggerLevel = 1;
         e.inUse = false;
     }
 }
@@ -42,17 +46,25 @@ static int poolGet(size_t minSize) {
             bestSize = itsPool[i].size;
         }
     }
-    if (best >= 0) itsPool[best].inUse = true;
+    if (best >= 0) {
+        itsPool[best].inUse = true;
+        itsPool[best].triggerLevel = 1;
+    }
     portEXIT_CRITICAL(&itsPoolMux);
-    if (best >= 0) xStreamBufferReset(itsPool[best].handle);
+    if (best >= 0) {
+        xStreamBufferReset(itsPool[best].handle);
+        xStreamBufferSetTriggerLevel(itsPool[best].handle, 1);
+    }
     return best;
 }
 
 static void poolFree(int idx) {
     if (idx < 0 || idx >= itsPoolCount) return;
     xStreamBufferReset(itsPool[idx].handle);
+    xStreamBufferSetTriggerLevel(itsPool[idx].handle, 1);
     portENTER_CRITICAL(&itsPoolMux);
     itsPool[idx].inUse = false;
+    itsPool[idx].triggerLevel = 1;
     portEXIT_CRITICAL(&itsPoolMux);
 }
 
@@ -75,17 +87,14 @@ static void pickupInit() {
     }
 }
 
-/** Acquire a pickup semaphore. Returns pool index or -1. */
 static int pickupAcquire() {
-    /* Scan for free (stamp == 0) */
     for (int i = 0; i < ITS_MAX_PICKUP; i++) {
         if (pickupStamps[i] == 0) {
-            xSemaphoreTake(pickupSems[i], 0);  /* ensure taken state */
-            pickupStamps[i] = millis() | 1;    /* never zero (| 1 guards millis()==0) */
+            xSemaphoreTake(pickupSems[i], 0);
+            pickupStamps[i] = millis() | 1;
             return i;
         }
     }
-    /* No free slot — reclaim oldest */
     int oldest = 0;
     uint32_t oldestStamp = pickupStamps[0];
     for (int i = 1; i < ITS_MAX_PICKUP; i++) {
@@ -94,23 +103,21 @@ static int pickupAcquire() {
             oldestStamp = pickupStamps[i];
         }
     }
-    xSemaphoreTake(pickupSems[oldest], 0);  /* drain any stale give */
+    xSemaphoreTake(pickupSems[oldest], 0);
     pickupStamps[oldest] = millis() | 1;
     return oldest;
 }
 
-/** Receiver calls this after processing — gives semaphore, zeros stamp. */
 static void pickupRelease(int idx) {
     if (idx < 0 || idx >= ITS_MAX_PICKUP) return;
     xSemaphoreGive(pickupSems[idx]);
     pickupStamps[idx] = 0;
 }
 
-/** Sender calls this to wait for pickup. */
 static bool pickupWait(int idx, TickType_t timeout) {
     if (idx < 0 || idx >= ITS_MAX_PICKUP) return false;
     bool ok = xSemaphoreTake(pickupSems[idx], timeout) == pdTRUE;
-    pickupStamps[idx] = 0;   /* free regardless of success */
+    pickupStamps[idx] = 0;
     return ok;
 }
 
@@ -119,14 +126,18 @@ static bool pickupWait(int idx, TickType_t timeout) {
 #define ITS_MAX_CONNS 64
 
 struct its_conn_t {
-    volatile bool  active;
-    TaskHandle_t   clientTask;
-    TaskHandle_t   serverTask;
-    int            toPoolIdx;
-    int            fromPoolIdx;
-    int            itsPort;
-    int8_t         clientRef;
-    int8_t         serverRef;
+    volatile bool       active;
+    TaskHandle_t        clientTask;
+    TaskHandle_t        serverTask;
+    int                 toPoolIdx;
+    int                 fromPoolIdx;
+    uint16_t            itsPort;
+    int8_t              clientRef;
+    int8_t              serverRef;
+    /* Per-connection client-side callbacks. Set by itsConnect, used by
+     * the client task only. The server side uses per-port callbacks. */
+    its_recv_cb_t       cliRecvCb;
+    its_disconnect_cb_t cliDisconnectCb;
 };
 
 static its_conn_t    connTable[ITS_MAX_CONNS];
@@ -139,6 +150,7 @@ static int connAlloc() {
     for (int i = 0; i < ITS_MAX_CONNS; i++) {
         int idx = (start + i) % ITS_MAX_CONNS;
         if (!connTable[idx].active) {
+            connTable[idx] = {};
             connTable[idx].active = true;
             connTable[idx].toPoolIdx = -1;
             connTable[idx].fromPoolIdx = -1;
@@ -182,7 +194,7 @@ enum {
 typedef struct {
     TaskHandle_t sender;
     uint8_t      msg;
-    int8_t       pickupIdx;   /* pickup pool index, -1 = no pickup requested */
+    int8_t       pickupIdx;
     uint16_t     itsPort;
     uint16_t     len;
     int16_t      handle;
@@ -190,43 +202,48 @@ typedef struct {
 
 #define ITS_DEFAULT_INBOX_SIZE  (sizeof(its_header_t) + ITS_MAX_MSG_DATA + 4)
 
-/* ---- Task registry ---- */
+/* ---- Per-task registry ---- */
 
-#define ITS_MAX_TASKS          24
-#define ITS_MAX_AUX_CALLBACKS  8
+#define ITS_MAX_TASKS  24
 
 struct its_aux_entry_t {
-    its_aux_cb_t cb;
+    bool         active;
     uint16_t     port;
+    its_aux_cb_t cb;
 };
 
-#define ITS_MAX_PORT_CONFIGS 4
-
-struct its_port_config_t {
-    uint16_t port;
-    int      maxHandles;
-    size_t   toSize;
-    size_t   fromSize;
-};
-
-struct its_task_t {
-    TaskHandle_t          task;
+struct its_server_port_t {
+    bool                  active;
+    uint16_t              port;
     int                   maxHandles;
     size_t                toSize;
     size_t                fromSize;
     its_connect_cb_t      onConnect;
     its_busy_cb_t         onBusy;
-    its_disconnect_cb_t   srvDisconnect;
+    its_disconnect_cb_t   onDisconnect;
+    its_recv_cb_t         onRecv;
+};
+
+struct its_task_t {
+    TaskHandle_t          task;
+
+    /* Server side */
+    its_server_port_t     serverPorts[ITS_MAX_PORTS];
+    int                   serverPortCount;
+
+    /* Client side */
     int                   maxConns;
-    its_disconnect_cb_t   cliDisconnect;
     SemaphoreHandle_t     ackSem;
     int                   ackHandle;
-    its_aux_entry_t       auxCallbacks[ITS_MAX_AUX_CALLBACKS];
+
+    /* Aux callbacks (per-task, per-port) */
+    its_aux_entry_t       auxCallbacks[ITS_MAX_PORTS];
     int                   auxCount;
-    its_port_config_t     portConfigs[ITS_MAX_PORT_CONFIGS];
-    int                   portConfigCount;
+
+    /* Inbox */
     QueueHandle_t         inbox;
-    size_t                inboxItemSize; /* max message size (header + payload) */
+    size_t                inboxItemSize;
+
     bool                  isServer;
     bool                  isClient;
 };
@@ -244,8 +261,10 @@ static its_task_t* taskFind(TaskHandle_t task) {
 static its_task_t* taskFindOrCreate(TaskHandle_t task, size_t inboxMaxMsgLen, size_t inboxDepth) {
     its_task_t* e = taskFind(task);
     if (e) return e;
-    if (s_taskCount >= ITS_MAX_TASKS) return nullptr;
-
+    if (s_taskCount >= ITS_MAX_TASKS) {
+        ESP_LOGE(TAG, "task table full (max %d)", ITS_MAX_TASKS);
+        return nullptr;
+    }
     if (!pickupInited) { pickupInit(); pickupInited = true; }
 
     e = &s_tasks[s_taskCount++];
@@ -254,7 +273,7 @@ static its_task_t* taskFindOrCreate(TaskHandle_t task, size_t inboxMaxMsgLen, si
     e->ackHandle = -1;
 
     size_t itemSize = inboxMaxMsgLen > 0 ? (sizeof(its_header_t) + inboxMaxMsgLen)
-                                        : ITS_DEFAULT_INBOX_SIZE;
+                                         : ITS_DEFAULT_INBOX_SIZE;
     int depth = inboxDepth > 0 ? (int)inboxDepth : 8;
     e->inboxItemSize = itemSize;
     e->inbox = xQueueCreate(depth, itemSize);
@@ -263,6 +282,13 @@ static its_task_t* taskFindOrCreate(TaskHandle_t task, size_t inboxMaxMsgLen, si
 
 static its_task_t* myTask() {
     return taskFind(xTaskGetCurrentTaskHandle());
+}
+
+static its_server_port_t* portFind(its_task_t* t, uint16_t port) {
+    for (int i = 0; i < t->serverPortCount; i++)
+        if (t->serverPorts[i].active && t->serverPorts[i].port == port)
+            return &t->serverPorts[i];
+    return nullptr;
 }
 
 /* ---- Inbox helpers ---- */
@@ -285,22 +311,36 @@ static bool inboxSend(its_task_t* target, const void* data, size_t len,
 
 /* ---- Handle resolution ---- */
 
-static StreamBufferHandle_t sendBuf(int handle) {
+static StreamBufferHandle_t sendBufWithPool(int handle, its_pool_entry_t** outPe) {
     its_conn_t* c = conn(handle);
     if (!c) return nullptr;
+    int idx = -1;
     TaskHandle_t me = xTaskGetCurrentTaskHandle();
-    if (me == c->clientTask) return poolHandle(c->toPoolIdx);
-    if (me == c->serverTask) return poolHandle(c->fromPoolIdx);
-    return nullptr;
+    if (me == c->clientTask) idx = c->toPoolIdx;
+    else if (me == c->serverTask) idx = c->fromPoolIdx;
+    if (idx < 0 || idx >= itsPoolCount) return nullptr;
+    if (outPe) *outPe = &itsPool[idx];
+    return itsPool[idx].handle;
+}
+
+static StreamBufferHandle_t sendBuf(int handle) {
+    return sendBufWithPool(handle, nullptr);
+}
+
+static StreamBufferHandle_t recvBufWithPool(int handle, its_pool_entry_t** outPe) {
+    its_conn_t* c = conn(handle);
+    if (!c) return nullptr;
+    int idx = -1;
+    TaskHandle_t me = xTaskGetCurrentTaskHandle();
+    if (me == c->clientTask) idx = c->fromPoolIdx;
+    else if (me == c->serverTask) idx = c->toPoolIdx;
+    if (idx < 0 || idx >= itsPoolCount) return nullptr;
+    if (outPe) *outPe = &itsPool[idx];
+    return itsPool[idx].handle;
 }
 
 static StreamBufferHandle_t recvBuf(int handle) {
-    its_conn_t* c = conn(handle);
-    if (!c) return nullptr;
-    TaskHandle_t me = xTaskGetCurrentTaskHandle();
-    if (me == c->clientTask) return poolHandle(c->fromPoolIdx);
-    if (me == c->serverTask) return poolHandle(c->toPoolIdx);
-    return nullptr;
+    return recvBufWithPool(handle, nullptr);
 }
 
 static TaskHandle_t remoteOf(int handle) {
@@ -312,71 +352,36 @@ static TaskHandle_t remoteOf(int handle) {
     return nullptr;
 }
 
-static int serverActiveCount(its_task_t* t) {
-    int count = 0;
-    for (int i = 0; i < ITS_MAX_CONNS; i++)
-        if (connTable[i].active && connTable[i].serverTask == t->task)
-            count++;
-    return count;
-}
-
-static int serverPortActiveCount(its_task_t* t, int itsPort) {
+static int serverPortActiveCount(its_task_t* t, uint16_t port) {
     int count = 0;
     for (int i = 0; i < ITS_MAX_CONNS; i++)
         if (connTable[i].active && connTable[i].serverTask == t->task
-            && connTable[i].itsPort == itsPort)
+            && connTable[i].itsPort == port)
             count++;
     return count;
 }
 
-static const its_port_config_t* portConfigFind(its_task_t* t, int itsPort) {
-    for (int i = 0; i < t->portConfigCount; i++)
-        if (t->portConfigs[i].port == (uint16_t)itsPort)
-            return &t->portConfigs[i];
-    return nullptr;
-}
+/* ---- Inbox message dispatch ---- */
 
-/* ---- itsPoll ---- */
-
-bool itsPoll(TickType_t timeout) {
-    its_task_t* me = myTask();
-    if (!me) {
-        /* Not registered yet — just sleep if requested */
-        if (timeout > 0) ulTaskNotifyTake(pdTRUE, timeout);
-        return false;
-    }
-
-    uint8_t* buf = (uint8_t*)alloca(me->inboxItemSize);
-
-    /* Try non-blocking read first */
-    if (xQueueReceive(me->inbox, buf, 0) != pdTRUE) {
-        if (timeout == 0) return false;
-        /* No message pending — block until notification, then retry */
-        ulTaskNotifyTake(pdTRUE, timeout);
-        if (xQueueReceive(me->inbox, buf, 0) != pdTRUE)
-            return false;
-    }
-
+static void processInboxMsg(its_task_t* me, uint8_t* buf) {
     auto* hdr = (its_header_t*)buf;
     void* payload = buf + sizeof(its_header_t);
     int pickupIdx = hdr->pickupIdx;
 
     if (hdr->msg == ITS_MSG_CONNECT && me->isServer) {
-        /* Per-port config: sizes + limit override global defaults */
-        const its_port_config_t* pc = portConfigFind(me, hdr->itsPort);
-        size_t toSz   = pc ? pc->toSize   : me->toSize;
-        size_t fromSz = pc ? pc->fromSize  : me->fromSize;
-        int portMax   = pc ? pc->maxHandles : -1;  /* -1 = no per-port limit */
+        its_server_port_t* sp = portFind(me, hdr->itsPort);
+        if (!sp) {
+            ESP_LOGE(TAG, "%s: connect to unopened port %u",
+                     pcTaskGetName(me->task), hdr->itsPort);
+            its_task_t* cli = taskFind(hdr->sender);
+            if (cli) { cli->ackHandle = -1; xSemaphoreGive(cli->ackSem); }
+            goto done;
+        }
 
-        int active = serverActiveCount(me);
-        bool full = active >= me->maxHandles;
-        if (!full && portMax >= 0)
-            full = serverPortActiveCount(me, hdr->itsPort) >= portMax;
-
-        if (full && me->onBusy) {
-            if (!me->onBusy(hdr->itsPort, payload, hdr->len))
-                full = (serverActiveCount(me) >= me->maxHandles)
-                    || (portMax >= 0 && serverPortActiveCount(me, hdr->itsPort) >= portMax);
+        bool full = serverPortActiveCount(me, hdr->itsPort) >= sp->maxHandles;
+        if (full && sp->onBusy) {
+            if (!sp->onBusy(payload, hdr->len))
+                full = serverPortActiveCount(me, hdr->itsPort) >= sp->maxHandles;
         }
 
         its_task_t* cli = taskFind(hdr->sender);
@@ -390,13 +395,13 @@ bool itsPoll(TickType_t timeout) {
             c->clientTask = hdr->sender;
             c->serverTask = me->task;
             c->itsPort = hdr->itsPort;
-            if (toSz > 0)   c->toPoolIdx = poolGet(toSz);
-            if (fromSz > 0) c->fromPoolIdx = poolGet(fromSz);
+            if (sp->toSize > 0)   c->toPoolIdx = poolGet(sp->toSize);
+            if (sp->fromSize > 0) c->fromPoolIdx = poolGet(sp->fromSize);
 
-            if (!me->onConnect) {
+            if (!sp->onConnect) {
                 accepted = true;
             } else {
-                int sRef = me->onConnect(handle, hdr->itsPort, payload, hdr->len);
+                int sRef = sp->onConnect(handle, payload, hdr->len);
                 accepted = sRef >= 0;
                 if (accepted) c->serverRef = (int8_t)sRef;
             }
@@ -411,144 +416,272 @@ bool itsPoll(TickType_t timeout) {
     } else if (hdr->msg == ITS_MSG_DISCONNECT && me->isServer) {
         int handle = hdr->handle;
         int8_t ref = -1;
+        uint16_t port = hdr->itsPort;
         its_conn_t* c = conn(handle);
         if (c && c->serverTask == me->task && c->clientTask == hdr->sender) {
             ref = c->serverRef;
+            port = c->itsPort;
             connFree(handle);
         } else if (hdr->len >= 1) {
             ref = (int8_t)((uint8_t*)payload)[0];
         }
-        if (ref >= 0 && me->srvDisconnect) me->srvDisconnect(ref);
+        its_server_port_t* sp = portFind(me, port);
+        if (sp && sp->onDisconnect && ref >= 0) sp->onDisconnect(ref);
 
     } else if (hdr->msg == ITS_MSG_DISCONNECT && me->isClient) {
         int handle = hdr->handle;
         int8_t ref = -1;
+        its_disconnect_cb_t cb = nullptr;
         its_conn_t* c = conn(handle);
         if (c && c->clientTask == me->task && c->serverTask == hdr->sender) {
+            /* Conn still exists — read cb from connection table */
             ref = c->clientRef;
+            cb = c->cliDisconnectCb;
             connFree(handle);
+        } else if (hdr->len >= 1 + sizeof(cb)) {
+            /* Conn already freed (server disconnected) — cb embedded in payload */
+            ref = (int8_t)((uint8_t*)payload)[0];
+            memcpy(&cb, (uint8_t*)payload + 1, sizeof(cb));
         } else if (hdr->len >= 1) {
-            /* Conn already freed (server kicked) — ref embedded in payload */
             ref = (int8_t)((uint8_t*)payload)[0];
         }
-        if (ref >= 0 && me->cliDisconnect) me->cliDisconnect(ref);
+        if (ref >= 0 && cb) cb(ref);
 
     } else if (hdr->msg == ITS_MSG_FORWARD && me->isServer) {
         int handle = hdr->handle;
         its_conn_t* c = conn(handle);
         if (c && c->serverTask == me->task) {
-            if (me->onConnect && me->onConnect(handle, hdr->itsPort, payload, hdr->len) < 0)
-                itsServerKick(handle);
+            its_server_port_t* sp = portFind(me, hdr->itsPort);
+            if (!sp) {
+                ESP_LOGE(TAG, "%s: forward to unopened port %u",
+                         pcTaskGetName(me->task), hdr->itsPort);
+                itsDisconnect(handle);
+            } else if (sp->onConnect && sp->onConnect(handle, payload, hdr->len) < 0) {
+                itsDisconnect(handle);
+            }
         }
 
     } else if (hdr->msg == ITS_MSG_AUX) {
-        /* Dispatch to port-matched callback, fall back to port-0 catch-all */
         its_aux_cb_t cb = nullptr;
-        its_aux_cb_t catchAll = nullptr;
         for (int i = 0; i < me->auxCount; i++) {
-            if (me->auxCallbacks[i].port == hdr->itsPort) { cb = me->auxCallbacks[i].cb; break; }
-            if (me->auxCallbacks[i].port == 0) catchAll = me->auxCallbacks[i].cb;
+            if (me->auxCallbacks[i].active && me->auxCallbacks[i].port == hdr->itsPort) {
+                cb = me->auxCallbacks[i].cb;
+                break;
+            }
         }
-        if (!cb) cb = catchAll;
-        if (cb) cb(hdr->sender, hdr->itsPort, payload, hdr->len);
+        if (cb) cb(hdr->sender, payload, hdr->len);
+        else ESP_LOGE(TAG, "%s: aux to unregistered port %u",
+                      pcTaskGetName(me->task), hdr->itsPort);
     }
 
-    /* ACK pickup AFTER callback has fully returned */
+done:
     if (pickupIdx >= 0) pickupRelease(pickupIdx);
+}
 
-    return true;
+/* ---- Receive callback dispatch ---- */
+
+static bool dispatchRecvCallbacks(its_task_t* me) {
+    bool any = false;
+    for (int i = 0; i < ITS_MAX_CONNS; i++) {
+        its_conn_t* c = &connTable[i];
+        if (!c->active) continue;
+        bool isServer = (c->serverTask == me->task);
+        bool isClient = (c->clientTask == me->task);
+        if (!isServer && !isClient) continue;
+
+        its_recv_cb_t cb = nullptr;
+        StreamBufferHandle_t buf = nullptr;
+        if (isServer) {
+            its_server_port_t* sp = portFind(me, c->itsPort);
+            if (sp) cb = sp->onRecv;
+            buf = poolHandle(c->toPoolIdx);
+        } else {
+            cb = c->cliRecvCb;
+            buf = poolHandle(c->fromPoolIdx);
+        }
+        if (!cb || !buf) continue;
+        size_t avail = xStreamBufferBytesAvailable(buf);
+        if (avail > 0) { cb(i, avail); any = true; }
+    }
+    return any;
+}
+
+/* ---- itsPoll ---- */
+
+bool itsPoll(TickType_t timeout) {
+    its_task_t* me = myTask();
+    if (!me) {
+        if (timeout > 0) ulTaskNotifyTake(pdTRUE, timeout);
+        return false;
+    }
+
+    uint8_t* buf = (uint8_t*)alloca(me->inboxItemSize);
+    bool any = false;
+
+    if (xQueueReceive(me->inbox, buf, 0) == pdTRUE) {
+        processInboxMsg(me, buf);
+        any = true;
+    }
+
+    if (dispatchRecvCallbacks(me)) any = true;
+
+    if (any) return true;
+    if (timeout == 0) return false;
+
+    /* Block until notification, then retry once */
+    ulTaskNotifyTake(pdTRUE, timeout);
+
+    if (xQueueReceive(me->inbox, buf, 0) == pdTRUE) {
+        processInboxMsg(me, buf);
+        any = true;
+    }
+    if (dispatchRecvCallbacks(me)) any = true;
+    return any;
 }
 
 /* ---- Server API ---- */
 
-bool itsServerInit(int maxHandles, size_t toSize, size_t fromSize,
-                   size_t inboxMaxMsgLen, size_t inboxDepth) {
+bool itsServerInit(size_t inboxMaxMsgLen, size_t inboxDepth) {
     TaskHandle_t me = xTaskGetCurrentTaskHandle();
     its_task_t* entry = taskFindOrCreate(me, inboxMaxMsgLen, inboxDepth);
     if (!entry || entry->isServer) return false;
-
-    entry->maxHandles = maxHandles;
-    entry->toSize = toSize;
-    entry->fromSize = fromSize;
     entry->isServer = true;
     return true;
 }
 
-bool itsServerPortInit(uint16_t itsPort, int maxHandles,
+bool itsServerPortOpen(uint16_t port, int maxHandles,
                        size_t toSize, size_t fromSize) {
     its_task_t* e = myTask();
-    if (!e || !e->isServer) return false;
-    /* Update existing entry for this port */
-    for (int i = 0; i < e->portConfigCount; i++) {
-        if (e->portConfigs[i].port == itsPort) {
-            e->portConfigs[i] = { itsPort, maxHandles, toSize, fromSize };
+    if (!e || !e->isServer) {
+        ESP_LOGE(TAG, "PortOpen on non-server task");
+        return false;
+    }
+    its_server_port_t* sp = portFind(e, port);
+    if (sp) {
+        sp->maxHandles = maxHandles;
+        sp->toSize = toSize;
+        sp->fromSize = fromSize;
+        return true;
+    }
+    for (int i = 0; i < ITS_MAX_PORTS; i++) {
+        if (!e->serverPorts[i].active) {
+            e->serverPorts[i] = {};
+            e->serverPorts[i].active = true;
+            e->serverPorts[i].port = port;
+            e->serverPorts[i].maxHandles = maxHandles;
+            e->serverPorts[i].toSize = toSize;
+            e->serverPorts[i].fromSize = fromSize;
+            if (i + 1 > e->serverPortCount) e->serverPortCount = i + 1;
             return true;
         }
     }
-    if (e->portConfigCount >= ITS_MAX_PORT_CONFIGS) return false;
-    e->portConfigs[e->portConfigCount++] = { itsPort, maxHandles, toSize, fromSize };
-    return true;
+    ESP_LOGE(TAG, "%s: PortOpen %u: no free port slot (max %d)",
+             pcTaskGetName(NULL), port, ITS_MAX_PORTS);
+    return false;
 }
 
-void itsServerOnConnect(its_connect_cb_t cb) {
+void itsServerPortClose(uint16_t port) {
     its_task_t* e = myTask();
-    if (e) e->onConnect = cb;
+    if (!e) return;
+    its_server_port_t* sp = portFind(e, port);
+    if (!sp) return;
+    /* Disconnect existing connections on this port */
+    for (int i = 0; i < ITS_MAX_CONNS; i++) {
+        if (connTable[i].active && connTable[i].serverTask == e->task
+            && connTable[i].itsPort == port) {
+            itsDisconnect(i);
+        }
+    }
+    sp->active = false;
+    sp->onConnect = nullptr;
+    sp->onBusy = nullptr;
+    sp->onDisconnect = nullptr;
+    sp->onRecv = nullptr;
 }
 
-void itsServerOnBusy(its_busy_cb_t cb) {
+void itsServerOnConnect(uint16_t port, its_connect_cb_t cb) {
     its_task_t* e = myTask();
-    if (e) e->onBusy = cb;
+    if (!e) return;
+    its_server_port_t* sp = portFind(e, port);
+    if (!sp) {
+        ESP_LOGE(TAG, "%s: OnConnect for unopened port %u",
+                 pcTaskGetName(NULL), port);
+        return;
+    }
+    sp->onConnect = cb;
 }
 
-void itsServerOnDisconnect(its_disconnect_cb_t cb) {
+void itsServerOnBusy(uint16_t port, its_busy_cb_t cb) {
     its_task_t* e = myTask();
-    if (e) e->srvDisconnect = cb;
+    if (!e) return;
+    its_server_port_t* sp = portFind(e, port);
+    if (!sp) {
+        ESP_LOGE(TAG, "%s: OnBusy for unopened port %u",
+                 pcTaskGetName(NULL), port);
+        return;
+    }
+    sp->onBusy = cb;
 }
 
-void itsOnAux(its_aux_cb_t cb, uint16_t port) {
+void itsServerOnDisconnect(uint16_t port, its_disconnect_cb_t cb) {
+    its_task_t* e = myTask();
+    if (!e) return;
+    its_server_port_t* sp = portFind(e, port);
+    if (!sp) {
+        ESP_LOGE(TAG, "%s: OnDisconnect for unopened port %u",
+                 pcTaskGetName(NULL), port);
+        return;
+    }
+    sp->onDisconnect = cb;
+}
+
+void itsServerOnRecv(uint16_t port, its_recv_cb_t cb) {
+    its_task_t* e = myTask();
+    if (!e) return;
+    its_server_port_t* sp = portFind(e, port);
+    if (!sp) {
+        ESP_LOGE(TAG, "%s: OnRecv for unopened port %u",
+                 pcTaskGetName(NULL), port);
+        return;
+    }
+    sp->onRecv = cb;
+}
+
+void itsOnAux(uint16_t port, its_aux_cb_t cb) {
     its_task_t* e = myTask();
     if (!e) {
-        /* Not yet registered — create entry */
         e = taskFindOrCreate(xTaskGetCurrentTaskHandle(), 0, 0);
         if (!e) return;
     }
     /* Replace existing handler for same port (idempotent per port) */
     for (int i = 0; i < e->auxCount; i++) {
-        if (e->auxCallbacks[i].port == port) {
+        if (e->auxCallbacks[i].active && e->auxCallbacks[i].port == port) {
             e->auxCallbacks[i].cb = cb;
             return;
         }
     }
-    if (e->auxCount >= ITS_MAX_AUX_CALLBACKS) return;
-    e->auxCallbacks[e->auxCount++] = { cb, port };
-}
-
-void itsServerKick(int handle) {
-    its_conn_t* c = conn(handle);
-    if (!c) return;
-    if (c->serverTask != xTaskGetCurrentTaskHandle()) return;
-    TaskHandle_t client = c->clientTask;
-    int8_t clientRef = c->clientRef;
-    connFree(handle);
-    /* Notify client with their ref embedded in the message */
-    its_task_t* ce = taskFind(client);
-    if (ce) {
-        uint8_t buf[sizeof(its_header_t) + 1];
-        auto* hdr = (its_header_t*)buf;
-        *hdr = {};
-        hdr->sender = xTaskGetCurrentTaskHandle();
-        hdr->msg = ITS_MSG_DISCONNECT;
-        hdr->handle = (int16_t)handle;
-        hdr->pickupIdx = -1;
-        hdr->len = 1;
-        buf[sizeof(its_header_t)] = (uint8_t)clientRef;
-        inboxSend(ce, buf, sizeof(buf), 0);
+    if (e->auxCount >= ITS_MAX_PORTS) {
+        ESP_LOGE(TAG, "%s: OnAux %u: aux table full (max %d)",
+                 pcTaskGetName(NULL), port, ITS_MAX_PORTS);
+        return;
     }
+    e->auxCallbacks[e->auxCount].active = true;
+    e->auxCallbacks[e->auxCount].port = port;
+    e->auxCallbacks[e->auxCount].cb = cb;
+    e->auxCount++;
 }
 
-int itsServerActive(void) {
+int itsServerActive(int port) {
     its_task_t* me = myTask();
-    return me ? serverActiveCount(me) : 0;
+    if (!me) return 0;
+    int count = 0;
+    for (int i = 0; i < ITS_MAX_CONNS; i++) {
+        if (!connTable[i].active) continue;
+        if (connTable[i].serverTask != me->task) continue;
+        if (port >= 0 && connTable[i].itsPort != (uint16_t)port) continue;
+        count++;
+    }
+    return count;
 }
 
 int itsActiveTotal(void) {
@@ -556,6 +689,43 @@ int itsActiveTotal(void) {
     for (int i = 0; i < ITS_MAX_CONNS; i++)
         if (connTable[i].active) n++;
     return n;
+}
+
+void itsStatus(void) {
+    int active = 0;
+    for (int i = 0; i < ITS_MAX_CONNS; i++)
+        if (connTable[i].active) active++;
+
+    ESP_LOGI(TAG, "ITS System Status Report");
+    ESP_LOGI(TAG, "Connections (%d/%d in use)", active, ITS_MAX_CONNS);
+    for (int i = 0; i < ITS_MAX_CONNS; i++) {
+        its_conn_t* c = &connTable[i];
+        if (!c->active) continue;
+        const char* cn = c->clientTask ? pcTaskGetName(c->clientTask) : "?";
+        const char* sn = c->serverTask ? pcTaskGetName(c->serverTask) : "?";
+        ESP_LOGI(TAG, "    [%s] -> [%s:%u]", cn, sn, c->itsPort);
+    }
+
+    ESP_LOGI(TAG, "Streams");
+    bool seen[ITS_MAX_POOL] = {};
+    for (int i = 0; i < itsPoolCount; i++) {
+        if (seen[i]) continue;
+        size_t sz = itsPool[i].size;
+        int total = 0, used = 0;
+        for (int j = i; j < itsPoolCount; j++) {
+            if (itsPool[j].size == sz) {
+                seen[j] = true;
+                total++;
+                if (itsPool[j].inUse) used++;
+            }
+        }
+        if (sz >= 1024)
+            ESP_LOGI(TAG, "    %u kB (%d/%d in use)",
+                     (unsigned)(sz / 1024), used, total);
+        else
+            ESP_LOGI(TAG, "    %u B (%d/%d in use)",
+                     (unsigned)sz, used, total);
+    }
 }
 
 int itsRef(int handle) {
@@ -575,42 +745,46 @@ size_t itsServerInject(int handle, const void* data, size_t len) {
     return xStreamBufferSend(sb, data, len, 0);
 }
 
-int itsServerForwardByHandle(int handle, TaskHandle_t targetTask, int itsPort,
-                             const void* data, size_t dataLen) {
+int itsServerForwardByTaskHandle(int handle, TaskHandle_t targetTask, uint16_t port,
+                                 const void* data, size_t dataLen) {
     its_conn_t* c = conn(handle);
     if (!c || c->serverTask != xTaskGetCurrentTaskHandle()) return -1;
 
     its_task_t* te = taskFind(targetTask);
     if (!te || !te->isServer) return -1;
 
-    const its_port_config_t* pc = portConfigFind(te, itsPort);
-    int portMax = pc ? pc->maxHandles : -1;
+    its_server_port_t* sp = portFind(te, port);
+    if (!sp) {
+        ESP_LOGE(TAG, "forward to unopened port %u on %s",
+                 port, pcTaskGetName(targetTask));
+        return -1;
+    }
 
     auto isFull = [&]() {
-        if (serverActiveCount(te) >= te->maxHandles) return true;
-        if (portMax >= 0 && serverPortActiveCount(te, itsPort) >= portMax) return true;
-        return false;
+        return serverPortActiveCount(te, port) >= sp->maxHandles;
     };
 
-    if (isFull() && te->onBusy) {
-        if (te->onBusy(itsPort, data, dataLen)) return -1;
+    if (isFull() && sp->onBusy) {
+        if (sp->onBusy(data, dataLen)) return -1;
         if (isFull()) return -1;
     }
 
     c->serverTask = targetTask;
-    c->itsPort = itsPort;
+    c->itsPort = port;
 
     if (dataLen > ITS_MAX_MSG_DATA) {
-        err("forward data truncated: %u > %u", (unsigned)dataLen, ITS_MAX_MSG_DATA);
+        ESP_LOGE(TAG, "forward data truncated: %u > %u",
+                 (unsigned)dataLen, ITS_MAX_MSG_DATA);
         dataLen = ITS_MAX_MSG_DATA;
     }
     uint8_t buf[sizeof(its_header_t) + ITS_MAX_MSG_DATA];
     auto* fhdr = (its_header_t*)buf;
+    *fhdr = {};
     fhdr->sender = xTaskGetCurrentTaskHandle();
     fhdr->msg = ITS_MSG_FORWARD;
     fhdr->pickupIdx = -1;
-    fhdr->itsPort = (uint16_t)itsPort;
-    fhdr->len = dataLen;
+    fhdr->itsPort = port;
+    fhdr->len = (uint16_t)dataLen;
     fhdr->handle = (int16_t)handle;
     if (data && dataLen > 0)
         memcpy(buf + sizeof(its_header_t), data, dataLen);
@@ -619,11 +793,11 @@ int itsServerForwardByHandle(int handle, TaskHandle_t targetTask, int itsPort,
     return handle;
 }
 
-int itsServerForward(int handle, const char* targetServer, int itsPort,
+int itsServerForward(int handle, const char* targetServer, uint16_t port,
                      const void* data, size_t dataLen) {
     TaskHandle_t task = xTaskGetHandle(targetServer);
     if (!task) return -1;
-    return itsServerForwardByHandle(handle, task, itsPort, data, dataLen);
+    return itsServerForwardByTaskHandle(handle, task, port, data, dataLen);
 }
 
 int itsServerPort(int handle) {
@@ -635,22 +809,22 @@ int itsServerPort(int handle) {
 /* ---- Client API ---- */
 
 void itsClientInit(int maxConns,
-                   its_disconnect_cb_t onDisconnect,
                    size_t inboxMaxMsgLen, size_t inboxDepth) {
     TaskHandle_t me = xTaskGetCurrentTaskHandle();
     its_task_t* entry = taskFindOrCreate(me, inboxMaxMsgLen, inboxDepth);
     if (!entry || entry->isClient) return;
 
     entry->maxConns = maxConns;
-    entry->cliDisconnect = onDisconnect;
     entry->isClient = true;
     entry->ackSem = xSemaphoreCreateBinary();
     entry->ackHandle = -1;
 }
 
-int itsConnectByHandle(TaskHandle_t serverTask, int itsPort,
-                       const void* data, size_t dataLen, TickType_t timeout,
-                       int ref) {
+int itsConnectByTaskHandle(TaskHandle_t serverTask, uint16_t port,
+                           const void* data, size_t dataLen, TickType_t timeout,
+                           int ref,
+                           its_recv_cb_t onRecv,
+                           its_disconnect_cb_t onDisconnect) {
     its_task_t* me = myTask();
     if (!me || !me->isClient) return -1;
 
@@ -663,20 +837,29 @@ int itsConnectByHandle(TaskHandle_t serverTask, int itsPort,
     its_task_t* se = taskFind(serverTask);
     if (!se || !se->isServer) return -1;
 
+    /* Pre-flight: ensure the server has actually opened this port. */
+    if (!portFind(se, port)) {
+        ESP_LOGE(TAG, "%s: connect to unopened port %u on %s",
+                 pcTaskGetName(NULL), port, pcTaskGetName(serverTask));
+        return -1;
+    }
+
     xSemaphoreTake(me->ackSem, 0);
     me->ackHandle = -1;
 
     if (dataLen > ITS_MAX_MSG_DATA) {
-        err("connect data truncated: %u > %u", (unsigned)dataLen, ITS_MAX_MSG_DATA);
+        ESP_LOGE(TAG, "connect data truncated: %u > %u",
+                 (unsigned)dataLen, ITS_MAX_MSG_DATA);
         dataLen = ITS_MAX_MSG_DATA;
     }
     uint8_t buf[sizeof(its_header_t) + ITS_MAX_MSG_DATA];
     auto* hdr = (its_header_t*)buf;
+    *hdr = {};
     hdr->sender = me->task;
     hdr->msg = ITS_MSG_CONNECT;
     hdr->pickupIdx = -1;
-    hdr->itsPort = (uint16_t)itsPort;
-    hdr->len = dataLen;
+    hdr->itsPort = port;
+    hdr->len = (uint16_t)dataLen;
     hdr->handle = -1;
     if (data && dataLen > 0)
         memcpy(buf + sizeof(its_header_t), data, dataLen);
@@ -686,55 +869,120 @@ int itsConnectByHandle(TaskHandle_t serverTask, int itsPort,
 
     if (xSemaphoreTake(me->ackSem, timeout) != pdTRUE)
         return -1;
+
     int handle = me->ackHandle;
-    if (handle >= 0 && ref >= 0) connTable[handle].clientRef = (int8_t)ref;
+    if (handle >= 0) {
+        its_conn_t* c = &connTable[handle];
+        if (ref >= 0)        c->clientRef       = (int8_t)ref;
+        if (onRecv)          c->cliRecvCb       = onRecv;
+        if (onDisconnect)    c->cliDisconnectCb = onDisconnect;
+    }
     return handle;
 }
 
-int itsConnect(const char* serverName, int itsPort,
-               const void* data, size_t dataLen, TickType_t timeout, int ref) {
+int itsConnect(const char* serverName, uint16_t port,
+               const void* data, size_t dataLen, TickType_t timeout, int ref,
+               its_recv_cb_t onRecv, its_disconnect_cb_t onDisconnect) {
     TaskHandle_t task = xTaskGetHandle(serverName);
     if (!task) return -1;
-    return itsConnectByHandle(task, itsPort, data, dataLen, timeout, ref);
+    return itsConnectByTaskHandle(task, port, data, dataLen, timeout, ref,
+                                  onRecv, onDisconnect);
 }
 
+/* ---- Disconnect (works from either side; -1 = all of this task's conns) ---- */
+
 void itsDisconnect(int handle) {
+    TaskHandle_t me = xTaskGetCurrentTaskHandle();
+
+    if (handle == -1) {
+        /* Disconnect every connection (server- or client-owned) held by us */
+        for (int i = 0; i < ITS_MAX_CONNS; i++) {
+            its_conn_t* c = &connTable[i];
+            if (!c->active) continue;
+            if (c->serverTask == me || c->clientTask == me)
+                itsDisconnect(i);
+        }
+        return;
+    }
+
     its_conn_t* c = conn(handle);
-    if (!c || c->clientTask != xTaskGetCurrentTaskHandle()) return;
+    if (!c) return;
 
-    TaskHandle_t serverTask = c->serverTask;
-    int8_t serverRef = c->serverRef;
-    connFree(handle);
-
-    its_task_t* se = taskFind(serverTask);
-    if (se) {
-        uint8_t buf[sizeof(its_header_t) + 1];
-        auto* hdr = (its_header_t*)buf;
-        *hdr = {};
-        hdr->sender = xTaskGetCurrentTaskHandle();
-        hdr->msg = ITS_MSG_DISCONNECT;
-        hdr->pickupIdx = -1;
-        hdr->handle = (int16_t)handle;
-        hdr->len = 1;
-        buf[sizeof(its_header_t)] = (uint8_t)serverRef;
-        inboxSend(se, buf, sizeof(buf), pdMS_TO_TICKS(100));
+    if (c->serverTask == me) {
+        /* Server side closes — embed client cb pointer in the kick message
+         * since the conn entry will be freed before the client wakes. */
+        TaskHandle_t client = c->clientTask;
+        int8_t clientRef = c->clientRef;
+        uint16_t port = c->itsPort;
+        its_disconnect_cb_t cb = c->cliDisconnectCb;
+        connFree(handle);
+        its_task_t* ce = taskFind(client);
+        if (ce) {
+            uint8_t buf[sizeof(its_header_t) + 1 + sizeof(cb)];
+            auto* hdr = (its_header_t*)buf;
+            *hdr = {};
+            hdr->sender = me;
+            hdr->msg = ITS_MSG_DISCONNECT;
+            hdr->handle = (int16_t)handle;
+            hdr->itsPort = port;
+            hdr->pickupIdx = -1;
+            hdr->len = 1 + sizeof(cb);
+            buf[sizeof(its_header_t)] = (uint8_t)clientRef;
+            memcpy(buf + sizeof(its_header_t) + 1, &cb, sizeof(cb));
+            inboxSend(ce, buf, sizeof(buf), 0);
+        }
+    } else if (c->clientTask == me) {
+        /* Client side closes — server callback lives in the per-port
+         * table on the server task, no need to embed anything. */
+        TaskHandle_t serverTask = c->serverTask;
+        int8_t serverRef = c->serverRef;
+        uint16_t port = c->itsPort;
+        connFree(handle);
+        its_task_t* se = taskFind(serverTask);
+        if (se) {
+            uint8_t buf[sizeof(its_header_t) + 1];
+            auto* hdr = (its_header_t*)buf;
+            *hdr = {};
+            hdr->sender = me;
+            hdr->msg = ITS_MSG_DISCONNECT;
+            hdr->pickupIdx = -1;
+            hdr->itsPort = port;
+            hdr->handle = (int16_t)handle;
+            hdr->len = 1;
+            buf[sizeof(its_header_t)] = (uint8_t)serverRef;
+            inboxSend(se, buf, sizeof(buf), pdMS_TO_TICKS(100));
+        }
     }
 }
 
 /* ---- Aux messages ---- */
 
-static bool itsSendAuxInternal(TaskHandle_t task,
+static bool itsSendAuxInternal(TaskHandle_t task, uint16_t port,
                                const void* data, size_t dataLen,
-                               TickType_t timeout, uint16_t port,
-                               its_wait_t wait) {
+                               TickType_t timeout, its_wait_t wait) {
     its_task_t* te = taskFind(task);
     if (!te) return false;
+
+    /* Pre-flight: ensure the receiver has registered this aux port */
+    bool registered = false;
+    for (int i = 0; i < te->auxCount; i++) {
+        if (te->auxCallbacks[i].active && te->auxCallbacks[i].port == port) {
+            registered = true;
+            break;
+        }
+    }
+    if (!registered) {
+        ESP_LOGE(TAG, "%s: aux send to unregistered port %u on %s",
+                 pcTaskGetName(NULL), port, pcTaskGetName(task));
+        return false;
+    }
 
     /* Max payload = target's inbox item size minus header */
     size_t maxPayload = te->inboxItemSize > sizeof(its_header_t)
                       ? te->inboxItemSize - sizeof(its_header_t) : ITS_MAX_MSG_DATA;
     if (dataLen > maxPayload) {
-        err("aux data truncated: %u > %u", (unsigned)dataLen, (unsigned)maxPayload);
+        ESP_LOGE(TAG, "aux data truncated: %u > %u",
+                 (unsigned)dataLen, (unsigned)maxPayload);
         dataLen = maxPayload;
     }
 
@@ -745,11 +993,12 @@ static bool itsSendAuxInternal(TaskHandle_t task,
     size_t totalLen = sizeof(its_header_t) + dataLen;
     uint8_t* buf = (uint8_t*)alloca(totalLen);
     auto* hdr = (its_header_t*)buf;
+    *hdr = {};
     hdr->sender = xTaskGetCurrentTaskHandle();
     hdr->msg = ITS_MSG_AUX;
     hdr->pickupIdx = (int8_t)pickupIdx;
     hdr->itsPort = port;
-    hdr->len = dataLen;
+    hdr->len = (uint16_t)dataLen;
     hdr->handle = -1;
     if (data && dataLen > 0)
         memcpy(buf + sizeof(its_header_t), data, dataLen);
@@ -757,7 +1006,6 @@ static bool itsSendAuxInternal(TaskHandle_t task,
     bool delivered = inboxSend(te, buf, totalLen, timeout);
 
     if (!delivered) {
-        /* Message never entered inbox — free pickup slot */
         if (pickupIdx >= 0) pickupStamps[pickupIdx] = 0;
         return false;
     }
@@ -768,42 +1016,37 @@ static bool itsSendAuxInternal(TaskHandle_t task,
     return true;
 }
 
-bool itsSendAuxByHandle(TaskHandle_t task,
-                        const void* data, size_t dataLen,
-                        TickType_t timeout, uint16_t port,
-                        its_wait_t wait) {
-    return itsSendAuxInternal(task, data, dataLen, timeout, port, wait);
+bool itsSendAuxByTaskHandle(TaskHandle_t task, uint16_t port,
+                            const void* data, size_t dataLen, TickType_t timeout,
+                            its_wait_t wait) {
+    return itsSendAuxInternal(task, port, data, dataLen, timeout, wait);
 }
 
-bool itsSendAux(const char* taskName,
-                const void* data, size_t dataLen,
-                TickType_t timeout, uint16_t port,
+bool itsSendAux(const char* taskName, uint16_t port,
+                const void* data, size_t dataLen, TickType_t timeout,
                 its_wait_t wait) {
     TaskHandle_t task = xTaskGetHandle(taskName);
     if (!task) return false;
-    return itsSendAuxInternal(task, data, dataLen, timeout, port, wait);
+    return itsSendAuxInternal(task, port, data, dataLen, timeout, wait);
 }
 
 /* ---- Data API ---- */
 
 size_t itsSend(int handle, const void* data, size_t len, TickType_t timeout) {
-    StreamBufferHandle_t buf = sendBuf(handle);
-    if (!buf) return 0;
+    its_pool_entry_t* pe = nullptr;
+    StreamBufferHandle_t buf = sendBufWithPool(handle, &pe);
+    if (!buf || !pe) return 0;
     size_t sent = xStreamBufferSend(buf, data, len, timeout);
-    /* Explicit notify needed: xStreamBufferSend only notifies tasks blocked on
-     * xStreamBufferReceive, not tasks waiting in itsPoll/ulTaskNotifyTake. */
-    TaskHandle_t remote = remoteOf(handle);
-    if (remote && sent > 0) xTaskNotifyGive(remote);
+    if (sent > 0) {
+        size_t fill = xStreamBufferBytesAvailable(buf);
+        size_t trigger = pe->triggerLevel ? pe->triggerLevel : 1;
+        if (fill >= trigger) {
+            TaskHandle_t remote = remoteOf(handle);
+            if (remote) xTaskNotifyGive(remote);
+        }
+    }
     return sent;
 }
-
-size_t itsSendSilent(int handle, const void* data, size_t len, TickType_t timeout) {
-    StreamBufferHandle_t buf = sendBuf(handle);
-    if (!buf) return 0;
-    /* No notify — caller manages wake-up (e.g. threshold nudge for write streams). */
-    return xStreamBufferSend(buf, data, len, timeout);
-}
-
 
 size_t itsRecv(int handle, void* buf, size_t maxLen, TickType_t timeout) {
     StreamBufferHandle_t sb = recvBuf(handle);
@@ -826,8 +1069,12 @@ size_t itsSpacesAvailable(int handle) {
 }
 
 bool itsSetTriggerLevel(int handle, size_t triggerLevel) {
-    StreamBufferHandle_t buf = recvBuf(handle);
-    return buf ? xStreamBufferSetTriggerLevel(buf, triggerLevel) : false;
+    its_pool_entry_t* pe = nullptr;
+    StreamBufferHandle_t buf = recvBufWithPool(handle, &pe);
+    if (!buf || !pe) return false;
+    if (triggerLevel == 0) triggerLevel = 1;
+    pe->triggerLevel = triggerLevel;
+    return xStreamBufferSetTriggerLevel(buf, triggerLevel);
 }
 
 bool itsIsEmpty(int handle) {

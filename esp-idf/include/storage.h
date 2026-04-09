@@ -29,6 +29,24 @@
 #include <stddef.h>
 #include <sys/stat.h>
 
+/** Storage task's ITS server port for the /epl config WebSocket. */
+static constexpr uint16_t STORAGE_EPL_PORT = 0;
+
+/** Storage task's ITS aux ports. */
+static constexpr uint16_t STORAGE_SAVE_PORT   = 43;  /* save-now signal */
+static constexpr uint16_t STORAGE_CHANGE_PORT = 42;  /* change dispatch on subscriber tasks */
+
+/** fs worker's ITS server ports for streaming file I/O. */
+static constexpr uint16_t FS_STREAM_RD_PORT = 2;
+static constexpr uint16_t FS_STREAM_WR_PORT = 3;
+
+/** fs worker's ITS aux ports. */
+static constexpr uint16_t FS_FILE_PORT      = 1;  /* one-shot file ops */
+static constexpr uint16_t STREAM_AUX_NUDGE  = 2;  /* poke worker to refill/drain */
+static constexpr uint16_t STREAM_AUX_SEEK   = 3;
+static constexpr uint16_t STREAM_AUX_FLUSH  = 4;
+static constexpr uint16_t STREAM_AUX_TELL   = 5;
+
 /* ---- Config types ---- */
 
 enum cfg_type_t : uint8_t {

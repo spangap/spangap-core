@@ -424,7 +424,7 @@ static void logPasteBack(int handle) {
 
 /* ---- Log ITS server callbacks ---- */
 
-static int logOnConnect(int handle, int itsPort, const void* data, size_t len) {
+static int logOnConnect(int handle, const void* data, size_t len) {
   int s = logAllocSlot(handle);
   if (s < 0) return -1;
   logSlots[s].ws = false;
@@ -449,22 +449,23 @@ static void logOnDisconnect(int ref) {
 
 static void logTaskFn(void* arg) {
   for (int i = 0; i < LOG_MAX_CONSUMERS; i++) logSlots[i].itsHandle = -1;
-  itsServerInit(LOG_MAX_CONSUMERS, 0, 2048);
-  itsServerOnConnect(logOnConnect);
-  itsServerOnDisconnect(logOnDisconnect);
+  itsServerInit();
+  itsServerPortOpen(LOG_PORT, LOG_MAX_CONSUMERS, 0, 2048);
+  itsServerOnConnect(LOG_PORT, logOnConnect);
+  itsServerOnDisconnect(LOG_PORT, logOnDisconnect);
 
   /* Register TCP port with network */
   { net_port_msg_t reg = {};
-    reg.itsPort = 8080;  /* convention for log */
+    reg.itsPort = LOG_PORT;
     safeStrncpy(reg.nvsKey, "log_port", sizeof(reg.nvsKey));
-    while (!itsSendAux("net", &reg, sizeof(reg), pdMS_TO_TICKS(500)))
+    while (!itsSendAux("net", NET_PORT_REG_PORT, &reg, sizeof(reg), pdMS_TO_TICKS(500)))
       vTaskDelay(pdMS_TO_TICKS(100));
   }
   /* Register WS path with web */
   { web_path_msg_t reg = {};
-    reg.itsPort = 8080;
+    reg.itsPort = LOG_PORT;
     safeStrncpy(reg.path, "log", sizeof(reg.path));
-    while (!itsSendAux("web", &reg, sizeof(reg), pdMS_TO_TICKS(500)))
+    while (!itsSendAux("web", WEB_PATH_REG_PORT, &reg, sizeof(reg), pdMS_TO_TICKS(500)))
       vTaskDelay(pdMS_TO_TICKS(100));
   }
 

@@ -9,6 +9,10 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
+/** Log task's ITS server port (used by both raw TCP and forwarded WS).
+ *  Convention: arbitrary number distinct from other tasks' ports. */
+static constexpr uint16_t LOG_PORT = 8080;
+
 /* ---- Connect payload for log ITS server ---- */
 
 enum log_ansi_t : uint8_t {

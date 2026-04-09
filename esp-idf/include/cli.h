@@ -7,6 +7,10 @@
 #include <stddef.h>
 #include <stdint.h>
 
+/** CLI task's ITS server port (used by both raw TCP and forwarded WS).
+ *  Convention: arbitrary number distinct from other tasks' ports. */
+static constexpr uint16_t CLI_PORT = 8081;
+
 /* ---- Connect payload for CLI ITS server ---- */
 
 enum cli_mode_t : uint8_t {

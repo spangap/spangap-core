@@ -601,7 +601,7 @@ static void cliEditChar(cli_edit& e, char c, cli_write_fn write) {
       if (cliActiveSlot >= 0 && cliSlots[cliActiveSlot].usbSerial) {
         /* Serial: kick back to log view */
         if (cliSlots[cliActiveSlot].itsHandle >= 0)
-          itsServerKick(cliSlots[cliActiveSlot].itsHandle);
+          itsDisconnect(cliSlots[cliActiveSlot].itsHandle);
       } else if (ansi) {
         /* WS/TCP ANSI: just re-prompt */
         write("\r\n$ ", 4);
@@ -705,7 +705,7 @@ static void cliBuiltinInit() {
 
 /* ---- CLI ITS server callbacks ---- */
 
-static int cliOnConnect(int handle, int itsPort, const void* data, size_t len) {
+static int cliOnConnect(int handle, const void* data, size_t len) {
   int slot = cliAllocSlot(handle);
   if (slot < 0) return -1;
   auto& cl = cliSlots[slot];
@@ -771,22 +771,23 @@ static TaskHandle_t cliTaskHandle = NULL;
 
 static void cliTaskFn(void* arg) {
   for (int i = 0; i < CLI_MAX_CLIENTS; i++) cliSlots[i].itsHandle = -1;
-  itsServerInit(CLI_MAX_CLIENTS, 512, 2048);
-  itsServerOnConnect(cliOnConnect);
-  itsServerOnDisconnect(cliOnDisconnect);
+  itsServerInit();
+  itsServerPortOpen(CLI_PORT, CLI_MAX_CLIENTS, 512, 2048);
+  itsServerOnConnect(CLI_PORT, cliOnConnect);
+  itsServerOnDisconnect(CLI_PORT, cliOnDisconnect);
 
   /* Register TCP port with network */
   { net_port_msg_t reg = {};
-    reg.itsPort = 8081;  /* convention for cli */
+    reg.itsPort = CLI_PORT;
     safeStrncpy(reg.nvsKey, "cli_port", sizeof(reg.nvsKey));
-    while (!itsSendAux("net", &reg, sizeof(reg), pdMS_TO_TICKS(500)))
+    while (!itsSendAux("net", NET_PORT_REG_PORT, &reg, sizeof(reg), pdMS_TO_TICKS(500)))
       vTaskDelay(pdMS_TO_TICKS(100));
   }
   /* Register WS path with web */
   { web_path_msg_t reg = {};
-    reg.itsPort = 8081;
+    reg.itsPort = CLI_PORT;
     safeStrncpy(reg.path, "cli", sizeof(reg.path));
-    while (!itsSendAux("web", &reg, sizeof(reg), pdMS_TO_TICKS(500)))
+    while (!itsSendAux("web", WEB_PATH_REG_PORT, &reg, sizeof(reg), pdMS_TO_TICKS(500)))
       vTaskDelay(pdMS_TO_TICKS(100));
   }
 
@@ -805,7 +806,7 @@ static void cliTaskFn(void* arg) {
         size_t outLen = 0;
         int op = wsReadFrame(h, (uint8_t*)buf, sizeof(buf), &outLen);
         if (op > 0) n = outLen;
-        else if (op < 0) { itsServerKick(h); continue; }
+        else if (op < 0) { itsDisconnect(h); continue; }
       } else {
         n = itsRecv(h, buf, sizeof(buf), 0);
       }
@@ -872,7 +873,7 @@ static void serialTaskFn(void* arg) {
   /* Connect to log */
   auto connectLog = [&]() {
     log_connect_t req = { LOG_ANSI };
-    logHandle = itsConnect("log", 0, &req, sizeof(req), pdMS_TO_TICKS(500));
+    logHandle = itsConnect("log", LOG_PORT, &req, sizeof(req), pdMS_TO_TICKS(500));
   };
   connectLog();
 
@@ -886,7 +887,7 @@ static void serialTaskFn(void* arg) {
         /* Switch from log to CLI */
         if (logHandle >= 0) { itsDisconnect(logHandle); logHandle = -1; }
         cli_connect_t req = { CLI_ANSI, 1 };
-        cliHandle = itsConnect("cli", 0, &req, sizeof(req), pdMS_TO_TICKS(500));
+        cliHandle = itsConnect("cli", CLI_PORT, &req, sizeof(req), pdMS_TO_TICKS(500));
         if (cliHandle >= 0) {
           printf("\033[0m");
           if (storageGetInt("s.cli.sticky", 0) != 0)

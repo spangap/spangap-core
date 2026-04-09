@@ -72,9 +72,7 @@ static cJSON* wsPendingPatch = nullptr; /* WS outgoing coalescing */
  */
 
 #define MAX_FILE_SLOTS     6
-#define FS_FILE_PORT       1    /* ITS aux port for file ops */
-#define FS_STREAM_RD_PORT  2    /* ITS port for streaming read connections */
-#define FS_STREAM_WR_PORT  3    /* ITS port for streaming write connections */
+/* FS_FILE_PORT, FS_STREAM_RD_PORT, FS_STREAM_WR_PORT in storage.h */
 #define FS_STREAM_BUFSZ    (256 * 1024)
 #define FS_STREAM_CHUNK    (32 * 1024)   /* individual SD read/write unit */
 #define FS_READ_PREFILL    (64 * 1024)   /* blocking pre-fill on open/seek */
@@ -147,8 +145,7 @@ static void handleFileOp(storage_file_op_t* req) {
   }
 }
 
-static void onFileOp(TaskHandle_t sender, uint16_t port,
-                     const void* data, size_t len) {
+static void onFileOp(TaskHandle_t sender, const void* data, size_t len) {
   if (len < sizeof(storage_file_op_t*)) return;
   storage_file_op_t* op;
   memcpy(&op, data, sizeof(op));
@@ -159,8 +156,8 @@ static void onFileOp(TaskHandle_t sender, uint16_t port,
 
 static int fsOp(storage_file_op_t& req) {
   storage_file_op_t* ptr = &req;
-  itsSendAuxByHandle(fsWorkerTask, &ptr, sizeof(ptr),
-                     portMAX_DELAY, FS_FILE_PORT, ITS_WAIT_PICKUP);
+  itsSendAuxByTaskHandle(fsWorkerTask, FS_FILE_PORT, &ptr, sizeof(ptr),
+                         portMAX_DELAY, ITS_WAIT_PICKUP);
   return req.result;
 }
 
@@ -255,7 +252,10 @@ struct stream_seek_msg_t {
   bool result;
 };
 
-static int onStreamConnect(int handle, int itsPort, const void* data, size_t len) {
+/* Per-port onConnect: itsPort is implicit, deduced from which port the
+ * callback was registered for. fs worker registers two: one for read, one
+ * for write. */
+static int onStreamConnectImpl(int handle, const void* data, size_t len, bool writing) {
   if (len < sizeof(stream_open_msg_t*)) return -1;
   stream_open_msg_t* msg;
   memcpy(&msg, data, sizeof(msg));
@@ -266,7 +266,6 @@ static int onStreamConnect(int handle, int itsPort, const void* data, size_t len
     if (slot.itsHandle < 0) { s = &slot; break; }
   if (!s) { msg->result = -1; return -1; }
 
-  bool writing = (itsPort == FS_STREAM_WR_PORT);
   const char* mode = msg->mode ? msg->mode : (writing ? "wb" : "rb");
   FILE* f = fopen(msg->path, mode);
   if (!f) { msg->result = -1; return -1; }
@@ -280,6 +279,13 @@ static int onStreamConnect(int handle, int itsPort, const void* data, size_t len
   return 0;  /* serverRef */
 }
 
+static int onStreamConnectRead(int handle, const void* data, size_t len) {
+  return onStreamConnectImpl(handle, data, len, false);
+}
+static int onStreamConnectWrite(int handle, const void* data, size_t len) {
+  return onStreamConnectImpl(handle, data, len, true);
+}
+
 static void onStreamDisconnect(int ref) {
   /* ref is serverRef (0 from onStreamConnect). Find by scanning. */
   for (auto& s : streams) {
@@ -291,12 +297,11 @@ static void onStreamDisconnect(int ref) {
   }
 }
 
-static void onStreamNudge(TaskHandle_t, uint16_t, const void*, size_t) {
+static void onStreamNudge(TaskHandle_t, const void*, size_t) {
   /* Just a wake-up — serviceStreams fills based on available space */
 }
 
-static void onStreamSeek(TaskHandle_t sender, uint16_t port,
-                         const void* data, size_t len) {
+static void onStreamSeek(TaskHandle_t sender, const void* data, size_t len) {
   if (len < sizeof(stream_seek_msg_t*)) return;
   stream_seek_msg_t* msg;
   memcpy(&msg, data, sizeof(msg));
@@ -342,8 +347,7 @@ static void drainWriteStream(stream_state_t& s) {
   }
 }
 
-static void onStreamFlush(TaskHandle_t sender, uint16_t port,
-                          const void* data, size_t len) {
+static void onStreamFlush(TaskHandle_t sender, const void* data, size_t len) {
   if (len < sizeof(int)) return;
   int handle;
   memcpy(&handle, data, sizeof(handle));
@@ -362,8 +366,7 @@ struct stream_tell_msg_t {
   long result;
 };
 
-static void onStreamTell(TaskHandle_t sender, uint16_t port,
-                         const void* data, size_t len) {
+static void onStreamTell(TaskHandle_t sender, const void* data, size_t len) {
   if (len < sizeof(stream_tell_msg_t*)) return;
   stream_tell_msg_t* msg;
   memcpy(&msg, data, sizeof(msg));
@@ -378,23 +381,21 @@ static void onStreamTell(TaskHandle_t sender, uint16_t port,
   }
 }
 
-/* Aux sub-ports for stream commands */
-#define STREAM_AUX_NUDGE 2
-#define STREAM_AUX_SEEK  3
-#define STREAM_AUX_FLUSH 4
-#define STREAM_AUX_TELL  5
+/* STREAM_AUX_* now declared in storage.h */
 
 static void fsWorkerFn(void*) {
-  itsServerInit(4, 0, 0);
-  itsServerPortInit(FS_STREAM_RD_PORT, 1, 0, FS_STREAM_BUFSZ);
-  itsServerPortInit(FS_STREAM_WR_PORT, 1, FS_STREAM_BUFSZ, 0);
-  itsServerOnConnect(onStreamConnect);
-  itsServerOnDisconnect(onStreamDisconnect);
-  itsOnAux(onFileOp, FS_FILE_PORT);
-  itsOnAux(onStreamNudge, STREAM_AUX_NUDGE);
-  itsOnAux(onStreamSeek, STREAM_AUX_SEEK);
-  itsOnAux(onStreamFlush, STREAM_AUX_FLUSH);
-  itsOnAux(onStreamTell, STREAM_AUX_TELL);
+  itsServerInit();
+  itsServerPortOpen(FS_STREAM_RD_PORT, 1, 0, FS_STREAM_BUFSZ);
+  itsServerOnConnect(FS_STREAM_RD_PORT, onStreamConnectRead);
+  itsServerOnDisconnect(FS_STREAM_RD_PORT, onStreamDisconnect);
+  itsServerPortOpen(FS_STREAM_WR_PORT, 1, FS_STREAM_BUFSZ, 0);
+  itsServerOnConnect(FS_STREAM_WR_PORT, onStreamConnectWrite);
+  itsServerOnDisconnect(FS_STREAM_WR_PORT, onStreamDisconnect);
+  itsOnAux(FS_FILE_PORT,     onFileOp);
+  itsOnAux(STREAM_AUX_NUDGE, onStreamNudge);
+  itsOnAux(STREAM_AUX_SEEK,  onStreamSeek);
+  itsOnAux(STREAM_AUX_FLUSH, onStreamFlush);
+  itsOnAux(STREAM_AUX_TELL,  onStreamTell);
   for (auto& s : streams) s.itsHandle = -1;
   xSemaphoreGive(fsReady);
   for (;;) {
@@ -673,11 +674,11 @@ static void writeSettingsFile() {
   savePending = false;
 }
 
-#define STORAGE_SAVE_PORT 43
+/* STORAGE_SAVE_PORT in storage.h */
 
 static void saveTimerCb(void* arg) {
   if (!storageHandle) return;
-  itsSendAuxByHandle(storageHandle, nullptr, 0, 0, STORAGE_SAVE_PORT);
+  itsSendAuxByTaskHandle(storageHandle, STORAGE_SAVE_PORT, nullptr, 0, 0);
 }
 
 static void startSaveTimer() {
@@ -697,7 +698,7 @@ static void startSaveTimer() {
 /* ---- Config change subscriptions ---- */
 
 #define STORAGE_MAX_SUBS     96
-#define STORAGE_CHANGE_PORT  42
+/* STORAGE_CHANGE_PORT in storage.h */
 
 struct storage_sub_t {
   TaskHandle_t        task;
@@ -716,8 +717,7 @@ struct storage_change_msg_t {
 };
 
 /* Aux handler installed on each subscribing task — unpacks and calls */
-static void storageChangeDispatch(TaskHandle_t sender, uint16_t port,
-                                  const void* data, size_t len) {
+static void storageChangeDispatch(TaskHandle_t sender, const void* data, size_t len) {
   if (len < sizeof(storage_change_msg_t)) return;
   auto* msg = (const storage_change_msg_t*)data;
   if (msg->cb) msg->cb(msg->key, msg->val);
@@ -734,7 +734,7 @@ void storageSubscribeChanges(const char* scope, storage_change_cb_t cb) {
     if (subs[i].task == me) { needsHandler = false; break; }
   }
   if (needsHandler)
-    itsOnAux(storageChangeDispatch, STORAGE_CHANGE_PORT);
+    itsOnAux(STORAGE_CHANGE_PORT, storageChangeDispatch);
 
   auto& s = subs[subCount++];
   s.task = me;
@@ -752,8 +752,8 @@ static void fireSubscriptions(const char* key, const char* val) {
     size_t scopeLen = strlen(subs[i].scope);
     if (scopeLen == 0 || strncmp(key, subs[i].scope, scopeLen) == 0) {
       msg.cb = subs[i].cb;
-      itsSendAuxByHandle(subs[i].task, &msg, sizeof(msg),
-                         pdMS_TO_TICKS(10), STORAGE_CHANGE_PORT);
+      itsSendAuxByTaskHandle(subs[i].task, STORAGE_CHANGE_PORT, &msg, sizeof(msg),
+                             pdMS_TO_TICKS(10));
     }
   }
 }
@@ -1252,7 +1252,7 @@ size_t storageStreamRead(int handle, void* buf, size_t len) {
   /* Nudge fs worker to refill when buffer is getting low */
   if (itsBytesAvailable(handle) < FS_READ_REFILL) {
     int h = handle;
-    itsSendAuxByHandle(fsWorkerTask, &h, sizeof(h), 0, STREAM_AUX_NUDGE);
+    itsSendAuxByTaskHandle(fsWorkerTask, STREAM_AUX_NUDGE, &h, sizeof(h), 0);
   }
   return got;
 }
@@ -1260,8 +1260,8 @@ size_t storageStreamRead(int handle, void* buf, size_t len) {
 bool storageStreamSeek(int handle, long offset) {
   stream_seek_msg_t msg = { handle, offset, false };
   stream_seek_msg_t* ptr = &msg;
-  itsSendAuxByHandle(fsWorkerTask, &ptr, sizeof(ptr),
-                     portMAX_DELAY, STREAM_AUX_SEEK, ITS_WAIT_PICKUP);
+  itsSendAuxByTaskHandle(fsWorkerTask, STREAM_AUX_SEEK, &ptr, sizeof(ptr),
+                         portMAX_DELAY, ITS_WAIT_PICKUP);
   if (msg.result && handle == streamWriteHandle) streamWritePos = offset;
   return msg.result;
 }
@@ -1279,27 +1279,23 @@ int storageStreamOpenWrite(const char* path, const char* mode) {
   streamWriteHandle = handle;
   streamWritePos = 0;
   streamWriteSinceNudge = 0;
+  /* Set incoming-stream trigger level on the fs worker side: itsSend() from
+   * us only wakes the worker once enough has been buffered for a real drain.
+   * Replaces the old itsSendSilent + manual nudge dance. */
+  itsSetTriggerLevel(handle, FS_WRITE_DRAIN);
   return handle;
 }
 
 size_t storageStreamWrite(int handle, const void* data, size_t len) {
-  size_t sent = itsSendSilent(handle, data, len, portMAX_DELAY);
+  size_t sent = itsSend(handle, data, len, portMAX_DELAY);
   streamWritePos += (long)sent;
-  /* Nudge fs worker only when enough data has accumulated for a drain.
-   * Avoids waking it on every small write (which caused 97% CPU spin). */
-  streamWriteSinceNudge += sent;
-  if (streamWriteSinceNudge >= FS_WRITE_DRAIN) {
-    streamWriteSinceNudge = 0;
-    int h = handle;
-    itsSendAuxByHandle(fsWorkerTask, &h, sizeof(h), 0, STREAM_AUX_NUDGE);
-  }
   return sent;
 }
 
 bool storageStreamFlush(int handle) {
   int h = handle;
-  itsSendAuxByHandle(fsWorkerTask, &h, sizeof(h),
-                     portMAX_DELAY, STREAM_AUX_FLUSH, ITS_WAIT_PICKUP);
+  itsSendAuxByTaskHandle(fsWorkerTask, STREAM_AUX_FLUSH, &h, sizeof(h),
+                         portMAX_DELAY, ITS_WAIT_PICKUP);
   return true;
 }
 
@@ -1309,8 +1305,8 @@ long storageStreamTell(int handle) {
   /* Read streams: ask fs worker */
   stream_tell_msg_t msg = { handle, -1 };
   stream_tell_msg_t* ptr = &msg;
-  itsSendAuxByHandle(fsWorkerTask, &ptr, sizeof(ptr),
-                     portMAX_DELAY, STREAM_AUX_TELL, ITS_WAIT_PICKUP);
+  itsSendAuxByTaskHandle(fsWorkerTask, STREAM_AUX_TELL, &ptr, sizeof(ptr),
+                         portMAX_DELAY, ITS_WAIT_PICKUP);
   return msg.result;
 }
 
@@ -1556,7 +1552,7 @@ static void wsPollConfig() {
 
 /* ---- ITS server callbacks ---- */
 
-static int storageItsConnect(int handle, int itsPort, const void* data, size_t len) {
+static int storageItsConnect(int handle, const void* data, size_t len) {
     if (len < sizeof(net_connect_t)) return -1;
     auto* cd = (const net_connect_t*)data;
     if (!cd->ws) return -1;
@@ -1602,15 +1598,16 @@ static void storageItsDisconnect(int ref) {
 
 /* ---- Task function ---- */
 
-static void storageSaveAux(TaskHandle_t, uint16_t, const void*, size_t) {
+static void storageSaveAux(TaskHandle_t, const void*, size_t) {
     writeSettingsFile();
 }
 
 static void storageTaskFn(void* arg) {
-    itsServerInit(WS_MAX_CLIENTS, 2048, 4096);
-    itsServerOnConnect(storageItsConnect);
-    itsServerOnDisconnect(storageItsDisconnect);
-    itsOnAux(storageSaveAux, STORAGE_SAVE_PORT);
+    itsServerInit();
+    itsServerPortOpen(STORAGE_EPL_PORT, WS_MAX_CLIENTS, 2048, 4096);
+    itsServerOnConnect(STORAGE_EPL_PORT, storageItsConnect);
+    itsServerOnDisconnect(STORAGE_EPL_PORT, storageItsDisconnect);
+    itsOnAux(STORAGE_SAVE_PORT, storageSaveAux);
 
     /* Subscribe to all config changes for WS coalescing */
     storageSubscribeChanges("", ON_CHANGE {
@@ -1620,7 +1617,7 @@ static void storageTaskFn(void* arg) {
         if (atoi(val) == 0) {
             for (int i = 0; i < WS_MAX_CLIENTS; i++) {
                 if (wsHandles[i] >= 0) {
-                    itsServerKick(wsHandles[i]);
+                    itsDisconnect(wsHandles[i]);
                     wsHandles[i] = -1;
                 }
             }
@@ -1628,9 +1625,9 @@ static void storageTaskFn(void* arg) {
     });
 
     web_path_msg_t reg = {};
-    reg.itsPort = 0;
+    reg.itsPort = STORAGE_EPL_PORT;
     safeStrncpy(reg.path, "epl", sizeof(reg.path));
-    while (!itsSendAux("web", &reg, sizeof(reg), pdMS_TO_TICKS(500)))
+    while (!itsSendAux("web", WEB_PATH_REG_PORT, &reg, sizeof(reg), pdMS_TO_TICKS(500)))
         vTaskDelay(pdMS_TO_TICKS(100));
 
     info("ready\n");
