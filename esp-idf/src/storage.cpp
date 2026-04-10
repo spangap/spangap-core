@@ -670,6 +670,25 @@ void storageUnset(const char* key) {
   CFG_UNLOCK();
 }
 
+void storageSetTree(const char* key, cJSON* val) {
+  if (!val) return;
+  CFG_LOCK();
+  bool autoCommit = (txDepth == 0);
+  if (autoCommit) storageBegin();
+
+  char leaf[48];
+  cJSON* parent = navigateOrCreate(txPatch, key, leaf, sizeof(leaf));
+  if (parent) {
+    cJSON_DeleteItemFromObject(parent, leaf);
+    cJSON_AddItemToObject(parent, leaf, val);
+  } else {
+    cJSON_Delete(val);  /* ownership was transferred, clean up on failure */
+  }
+
+  if (autoCommit) storageEnd();
+  CFG_UNLOCK();
+}
+
 /** Build nested JSON with a null at the given dot-path. */
 static cJSON* buildNullJson(const char* dotPath) {
   cJSON* root = cJSON_CreateObject();
@@ -1109,7 +1128,8 @@ static void wsAccumulateChange(const char* key, const char* val) {
     if (!parent) { CFG_UNLOCK(); return; }
 
     cJSON_DeleteItemFromObject(parent, leaf);
-    cJSON_AddItemToObject(parent, leaf, cJSON_Duplicate(node, false));
+    bool deep = cJSON_IsObject(node) || cJSON_IsArray(node);
+    cJSON_AddItemToObject(parent, leaf, cJSON_Duplicate(node, deep));
     CFG_UNLOCK();
 }
 
@@ -1140,6 +1160,8 @@ static void mergeIncomingWs(cJSON* obj, const std::string& prefix) {
       if (strncmp(key.c_str(), "s.", 2) == 0) startSaveTimer();
     } else if (cJSON_IsObject(item)) {
       mergeIncomingWs(item, key);
+    } else if (cJSON_IsArray(item)) {
+      storageSetTree(key.c_str(), cJSON_Duplicate(item, true));
     } else if (cJSON_IsNumber(item)) {
       storageSet(key.c_str(), item->valueint);
     } else if (cJSON_IsString(item)) {

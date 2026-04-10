@@ -198,7 +198,7 @@ void authInit() {
         snprintf(key, sizeof(key), "secrets.auth.cookies.%d.expires", i);
         storageGetStr(key, val, sizeof(val));
         time_t exp = (time_t)strtoll(val, nullptr, 10);
-        if (exp < tv.tv_sec) {
+        if (exp > 1700000000 && exp < tv.tv_sec) {
             cookieRemove(i);
         }
     }
@@ -345,8 +345,8 @@ std::string authCheck(const char* cookie) {
         storageGetStr(key, expStr, sizeof(expStr));
         time_t exp = (time_t)strtoll(expStr, nullptr, 10);
 
-        if (now > 1700000000 && exp < now) {
-            /* Expired — remove it */
+        if (now > 1700000000 && exp > 1700000000 && exp < now) {
+            /* Expired — remove it (skip check for cookies created before valid time) */
             cookieRemove(i);
             return "";
         }

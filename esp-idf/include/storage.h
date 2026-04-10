@@ -28,6 +28,7 @@
 #include <stdint.h>
 #include <stddef.h>
 #include <sys/stat.h>
+#include <cJSON.h>
 
 /** Storage task's ITS server port for the /epl config WebSocket. */
 static constexpr uint16_t STORAGE_EPL_PORT = 0;
@@ -59,6 +60,10 @@ int    storageGetInt(const char* key, int def = 0);
 void   storageGetStr(const char* key, char* out, size_t outLen, const char* def = "");
 void   storageSet(const char* key, int val);
 void   storageSet(const char* key, const char* val);
+/** Set an arbitrary cJSON node (array, object, etc.) at a dot-notation key.
+ *  Takes ownership of val — caller must not free it.
+ *  Uses patch/commit: fires subscriptions and WS broadcast. */
+void   storageSetTree(const char* key, cJSON* val);
 /** Delete a single key via patch/commit. Fires storageSubscribeChanges with val="". */
 void   storageUnset(const char* key);
 /** Delete a key/subtree directly. No change callbacks. Sends null on WS. */
