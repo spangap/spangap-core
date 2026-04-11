@@ -6,6 +6,7 @@
  * Enabled/disabled via s.cron.enable config. Subscribes via storageSubscribeChanges.
  */
 #include "cron.h"
+#include "fs.h"
 #include "log.h"
 #include "storage.h"
 #include "its.h"
@@ -40,17 +41,19 @@ static bool cronEnabled() {
 
 /** Check if /state/crontab has any non-comment entries. */
 static bool crontabHasEntries() {
-    FILE* f = fopen("/state/crontab", "r");
-    if (!f) return false;
-    char line[192];
-    bool found = false;
-    while (fgets(line, sizeof(line), f)) {
-        const char* p = line;
+    int f = fs_open(FS_STATE "/crontab", "r");
+    if (f < 0) return false;
+    char buf[512];
+    size_t n = fs_read(buf, 1, sizeof(buf) - 1, f);
+    fs_close(f);
+    buf[n] = '\0';
+    for (const char* p = buf; *p; ) {
         while (*p == ' ' || *p == '\t') p++;
-        if (*p && *p != '#' && *p != '\n') { found = true; break; }
+        if (*p && *p != '#' && *p != '\n') return true;
+        while (*p && *p != '\n') p++;
+        if (*p == '\n') p++;
     }
-    fclose(f);
-    return found;
+    return false;
 }
 
 /** Update deep sleep lock: held unless cron is enabled with entries. */
@@ -207,18 +210,25 @@ bool cronPoll(bool execute) {
     bool netUp = netIsUp();
     bool hasWork = false;
 
-    FILE* f = fopen("/state/crontab", "r");
-    if (!f) return false;
+    struct stat st;
+    if (fs_stat(FS_STATE "/crontab", &st) != 0 || st.st_size <= 0) return false;
+    char* buf = (char*)malloc(st.st_size + 1);
+    if (!buf) return false;
+    int fh = fs_open(FS_STATE "/crontab", "r");
+    if (fh < 0) { free(buf); return false; }
+    size_t nr = fs_read(buf, 1, st.st_size, fh);
+    fs_close(fh);
+    buf[nr] = '\0';
 
-    char line[192];
-    while (fgets(line, sizeof(line), f)) {
-        /* Strip trailing newline */
-        size_t len = strlen(line);
-        while (len > 0 && (line[len - 1] == '\n' || line[len - 1] == '\r'))
-            line[--len] = '\0';
+    /* Parse line by line */
+    char* saveptr = nullptr;
+    for (char* tok = strtok_r(buf, "\n", &saveptr); tok; tok = strtok_r(nullptr, "\n", &saveptr)) {
+        /* Strip trailing CR */
+        size_t len = strlen(tok);
+        while (len > 0 && tok[len - 1] == '\r') tok[--len] = '\0';
 
         /* Skip empty lines and comments */
-        const char* p = line;
+        const char* p = tok;
         while (*p == ' ' || *p == '\t') p++;
         if (!*p || *p == '#') continue;
 
@@ -238,7 +248,7 @@ bool cronPoll(bool execute) {
             printf("[cron] %02d:%02d %s\n", tm.tm_hour, tm.tm_min, cmd);
         }
     }
-    fclose(f);
+    free(buf);
 
     return hasWork;
 }

@@ -24,15 +24,6 @@ static inline char* safeStrncpy(char* dst, const char* src, size_t n) {
     return dst;
 }
 
-/** Create directory and all parent components (like mkdir -p). */
-static inline void mkdirp(const char* path) {
-    char tmp[128];
-    safeStrncpy(tmp, path, sizeof(tmp));
-    for (char* p = tmp + 1; *p; p++) {
-        if (*p == '/') { *p = '\0'; mkdir(tmp, 0755); *p = '/'; }
-    }
-    mkdir(tmp, 0755);
-}
 
 static inline uint32_t millis() {
     return static_cast<uint32_t>(esp_timer_get_time() / 1000);

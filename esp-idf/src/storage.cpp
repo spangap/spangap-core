@@ -1,5 +1,5 @@
 /**
- * storage — config store + file I/O service.
+ * storage — config store.
  *
  * Config: cJSON tree in RAM, backed by JSON on /state.
  * All writes go through a patch tree (RFC 7396 merge-patch). commit() merges
@@ -8,10 +8,6 @@
  *
  * storageBegin()/storageEnd() bracket explicit transactions.
  * Without them, storageSet() is auto-commit (one patch per call).
- *
- * File I/O: POSIX-like API. SD card paths → direct calls on caller's thread.
- *   LittleFS paths → proxied to a small DRAM-stack worker (SPI flash ops
- *   disable the PSRAM cache, so the call stack must be in DRAM).
  *
  * Thread safety: a recursive mutex (cfgMux) protects cfgRoot, txPatch, and
  * txDepth.  storageBegin() acquires, storageEnd() releases.  All public
@@ -25,6 +21,7 @@
  * ITS server: handle 0 = browser config WS (path "/epl").
  */
 #include "storage.h"
+#include "fs.h"
 #include "auth.h"
 #include "log.h"
 #include "cli.h"
@@ -61,116 +58,7 @@ static TaskHandle_t storageHandle = nullptr;
 static int wsHandle = -1;
 static cJSON* wsPendingPatch = nullptr; /* WS outgoing coalescing */
 
-/* ---- File I/O ---- */
-
-/*
- * All file ops run on the fs worker task (DRAM stack). Callers block on a
- * semaphore until the worker completes. This is safe for any caller stack
- * type — the worker's DRAM stack is needed because SPI flash ops disable
- * the PSRAM cache. Data buffers in PSRAM are fine (only accessed after
- * cache re-enable).
- */
-
-#define MAX_FILE_SLOTS  6
-/* FS_FILE_PORT in storage.h */
-
-static FILE* fileFps[MAX_FILE_SLOTS];
-static bool fileActive[MAX_FILE_SLOTS];
-static TaskHandle_t fsWorkerTask = nullptr;
-static SemaphoreHandle_t fsReady = nullptr;
-
-struct storage_file_op_t {
-  enum Op { OPEN, READ, WRITE, TELL, CLOSE, STAT, RENAME, REMOVE } op;
-  const char* path;
-  const char* path2;        /* rename: newPath; open: mode */
-  int slot;
-  void* buf;
-  size_t len;
-  struct stat* st;
-  int result;
-};
-
-static void handleFileOp(storage_file_op_t* req) {
-  switch (req->op) {
-    case storage_file_op_t::OPEN: {
-      FILE* f = fopen(req->path, req->path2);
-      if (!f) { req->result = -1; break; }
-      fileFps[req->slot] = f;
-      req->result = req->slot;
-      break;
-    }
-    case storage_file_op_t::READ: {
-      int s = req->slot;
-      if (s < 0 || s >= MAX_FILE_SLOTS || !fileFps[s]) { req->result = 0; break; }
-      req->result = (int)fread(req->buf, 1, req->len, fileFps[s]);
-      break;
-    }
-    case storage_file_op_t::WRITE: {
-      int s = req->slot;
-      if (s < 0 || s >= MAX_FILE_SLOTS || !fileFps[s]) { req->result = 0; break; }
-      req->result = (int)fwrite(req->buf, 1, req->len, fileFps[s]);
-      break;
-    }
-    case storage_file_op_t::TELL: {
-      int s = req->slot;
-      if (s < 0 || s >= MAX_FILE_SLOTS || !fileFps[s]) { req->result = -1; break; }
-      req->result = (int)ftell(fileFps[s]);
-      break;
-    }
-    case storage_file_op_t::CLOSE: {
-      int s = req->slot;
-      if (s >= 0 && s < MAX_FILE_SLOTS && fileFps[s]) {
-        fclose(fileFps[s]);
-        fileFps[s] = nullptr;
-        fileActive[s] = false;
-      }
-      req->result = 0;
-      break;
-    }
-    case storage_file_op_t::STAT:
-      req->result = stat(req->path, req->st);
-      break;
-    case storage_file_op_t::RENAME:
-      req->result = rename(req->path, req->path2);
-      break;
-    case storage_file_op_t::REMOVE:
-      req->result = remove(req->path);
-      break;
-  }
-}
-
-static void onFileOp(TaskHandle_t sender, const void* data, size_t len) {
-  if (len < sizeof(storage_file_op_t*)) return;
-  storage_file_op_t* op;
-  memcpy(&op, data, sizeof(op));
-  handleFileOp(op);
-}
-
-/* fsWorkerFn defined after stream handlers (below) */
-
-static int fsOp(storage_file_op_t& req) {
-  storage_file_op_t* ptr = &req;
-  itsSendAuxByTaskHandle(fsWorkerTask, FS_FILE_PORT, &ptr, sizeof(ptr),
-                         portMAX_DELAY, ITS_WAIT_PICKUP);
-  return req.result;
-}
-
-static int allocSlot() {
-  for (int i = 0; i < MAX_FILE_SLOTS; i++) {
-    if (!fileActive[i]) { fileActive[i] = true; return i; }
-  }
-  return -1;
-}
-
-/* fs worker: aux-only server. Receives one-shot file op requests on
- * FS_FILE_PORT and processes them on its DRAM stack so SPI flash ops don't
- * need PSRAM cache. */
-static void fsWorkerFn(void*) {
-  itsServerInit();
-  itsOnAux(FS_FILE_PORT, onFileOp);
-  xSemaphoreGive(fsReady);
-  for (;;) itsPoll();
-}
+/* File I/O moved to fs.cpp/h — unified PSRAM-safe API. */
 
 /* ---- Path navigation ---- */
 
@@ -362,19 +250,17 @@ static bool isSecret(const char* key) {
   return strncmp(key, "secrets.", 8) == 0;
 }
 
-/* readFileLocal: only called from storageLoad() which runs on main's DRAM stack at boot */
-static char* readFileLocal(const char* path) {
-  FILE* f = fopen(path, "rb");
-  if (!f) return nullptr;
-  fseek(f, 0, SEEK_END);
-  long sz = ftell(f);
-  fseek(f, 0, SEEK_SET);
-  if (sz <= 0) { fclose(f); return nullptr; }
-  char* buf = (char*)malloc(sz + 1);
-  if (!buf) { fclose(f); return nullptr; }
-  fread(buf, 1, sz, f);
-  buf[sz] = '\0';
-  fclose(f);
+/** Read entire file into malloc'd buffer (NUL-terminated). Uses fs API. */
+static char* readFileStr(const char* path) {
+  struct stat st;
+  if (fs_stat(path, &st) != 0 || st.st_size <= 0) return nullptr;
+  int f = fs_open(path, "rb");
+  if (f < 0) return nullptr;
+  char* buf = (char*)malloc(st.st_size + 1);
+  if (!buf) { fs_close(f); return nullptr; }
+  fs_read(buf, 1, st.st_size, f);
+  buf[st.st_size] = '\0';
+  fs_close(f);
   return buf;
 }
 
@@ -390,11 +276,11 @@ static void writeSettingsFile() {
   cJSON_Delete(out);
   if (!text) return;
 
-  int f = storageFopen("/state/settings.new", "w");
+  int f = fs_open(FS_STATE "/settings.new", "w");
   if (f >= 0) {
-    storageFwrite(text, strlen(text), f);
-    storageFclose(f);
-    storageRename("/state/settings.new", "/state/settings.json");
+    fs_write(text, 1, strlen(text), f);
+    fs_close(f);
+    fs_rename(FS_STATE "/settings.new", FS_STATE "/settings.json");
   }
   cJSON_free(text);
   savePending = false;
@@ -570,22 +456,66 @@ void storageEnd() {
   CFG_UNLOCK();
 }
 
+/* ---- JSON deep merge (RFC 7396) ---- */
+
+/** Merge src into dst in place. Objects recurse. Arrays/primitives replace. Null deletes. */
+static void jsonDeepMerge(cJSON* dst, const cJSON* src) {
+  const cJSON* item = src->child;
+  while (item) {
+    const cJSON* next = item->next;
+    const char* name = item->string;
+    if (!name) { item = next; continue; }
+    if (cJSON_IsNull(item)) {
+      cJSON_DeleteItemFromObject(dst, name);
+    } else if (cJSON_IsObject(item)) {
+      cJSON* dstChild = cJSON_GetObjectItem(dst, name);
+      if (dstChild && cJSON_IsObject(dstChild)) {
+        jsonDeepMerge(dstChild, item);
+      } else {
+        if (dstChild) cJSON_DeleteItemFromObject(dst, name);
+        cJSON_AddItemToObject(dst, name, cJSON_Duplicate(item, true));
+      }
+    } else {
+      cJSON* existing = cJSON_DetachItemFromObject(dst, name);
+      if (existing) cJSON_Delete(existing);
+      cJSON_AddItemToObject(dst, name, cJSON_Duplicate(item, true));
+    }
+    item = next;
+  }
+}
+
 /* ---- Public Config API ---- */
 
 void storageLoad() {
   if (!cfgMux) cfgMux = xSemaphoreCreateRecursiveMutex();
   if (cfgRoot) cJSON_Delete(cfgRoot);
 
-  /* /state/settings.json is the single source of truth.
-   * First boot copies factory defaults to /state/; factory reset does the same.
-   * No merging — just load what's there. */
-  char* text = readFileLocal("/state/settings.json");
+  /* Load /state/settings.json — the single source of truth. */
+  char* text = readFileStr(FS_STATE "/settings.json");
   if (text) {
     cfgRoot = cJSON_Parse(text);
     free(text);
   }
   if (!cfgRoot) cfgRoot = cJSON_CreateObject();
-  remove("/state/settings.new");
+
+  /* First boot only: deep-merge additional_state/settings.json overlay.
+   * fs_init() copies plain files from additional_state/; settings.json is
+   * handled here because it requires cJSON knowledge. The merged result is
+   * written to /state/ by the first storageSave(), so subsequent boots
+   * just load the already-merged file. */
+  if (fs_first_boot()) {
+    char* overlay = readFileStr(FS_FIXED "/additional_state/settings.json");
+    if (overlay) {
+      cJSON* ov = cJSON_Parse(overlay);
+      if (ov) {
+        jsonDeepMerge(cfgRoot, ov);
+        cJSON_Delete(ov);
+      }
+      free(overlay);
+    }
+  }
+
+  fs_remove(FS_STATE "/settings.new");
 }
 
 bool storageExists(const char* key) {
@@ -887,81 +817,6 @@ void storageList(cli_write_fn write) {
   }
   walkTreePrint(cfgRoot, "", write);
   CFG_UNLOCK();
-}
-
-/* ---- Public File I/O API ---- */
-
-int storageFopen(const char* path, const char* mode) {
-  int slot = allocSlot();
-  if (slot < 0) return -1;
-  storage_file_op_t req = {};
-  req.op = storage_file_op_t::OPEN;
-  req.path = path;
-  req.path2 = mode;
-  req.slot = slot;
-  if (fsOp(req) < 0) { fileActive[slot] = false; return -1; }
-  return slot;
-}
-
-size_t storageFread(void* buf, size_t maxLen, int f) {
-  if (f < 0 || f >= MAX_FILE_SLOTS || !fileActive[f]) return 0;
-  storage_file_op_t req = {};
-  req.op = storage_file_op_t::READ;
-  req.slot = f;
-  req.buf = buf;
-  req.len = maxLen;
-  int r = fsOp(req);
-  return r > 0 ? (size_t)r : 0;
-}
-
-size_t storageFwrite(const void* buf, size_t len, int f) {
-  if (f < 0 || f >= MAX_FILE_SLOTS || !fileActive[f]) return 0;
-  storage_file_op_t req = {};
-  req.op = storage_file_op_t::WRITE;
-  req.slot = f;
-  req.buf = (void*)buf;
-  req.len = len;
-  int r = fsOp(req);
-  return r > 0 ? (size_t)r : 0;
-}
-
-long storageFtell(int f) {
-  if (f < 0 || f >= MAX_FILE_SLOTS || !fileActive[f]) return -1;
-  storage_file_op_t req = {};
-  req.op = storage_file_op_t::TELL;
-  req.slot = f;
-  return (long)fsOp(req);
-}
-
-void storageFclose(int f) {
-  if (f < 0 || f >= MAX_FILE_SLOTS || !fileActive[f]) return;
-  storage_file_op_t req = {};
-  req.op = storage_file_op_t::CLOSE;
-  req.slot = f;
-  fsOp(req);
-}
-
-int storageStat(const char* path, struct stat* st) {
-  storage_file_op_t req = {};
-  req.op = storage_file_op_t::STAT;
-  req.path = path;
-  req.st = st;
-  return fsOp(req);
-}
-
-int storageRename(const char* oldPath, const char* newPath) {
-  storage_file_op_t req = {};
-  req.op = storage_file_op_t::RENAME;
-  req.path = oldPath;
-  req.path2 = newPath;
-  return fsOp(req);
-}
-
-int storageRemove(const char* path) {
-  storage_file_op_t req = {};
-  req.op = storage_file_op_t::REMOVE;
-  req.path = path;
-  return fsOp(req);
 }
 
 /* ---- CLI commands ---- */
@@ -1290,13 +1145,6 @@ static void storageTaskFn(void* arg) {
 }
 
 void storageInit() {
-    /* fs worker: small DRAM-stack task for LittleFS/SD file I/O via ITS */
-    fsReady = xSemaphoreCreateBinary();
-    xTaskCreatePinnedToCore(fsWorkerFn, "fs", 3072, nullptr, 1, &fsWorkerTask, 1);
-    xSemaphoreTake(fsReady, portMAX_DELAY);  /* wait until ITS server is up */
-    vSemaphoreDelete(fsReady);
-    fsReady = nullptr;
-
     /* storage task: PSRAM stack (config WS + ITS, no direct file I/O) */
     xTaskCreatePinnedToCoreWithCaps(storageTaskFn, "storage", 4096, NULL, 1, &storageHandle, 1, MALLOC_CAP_SPIRAM);
 }

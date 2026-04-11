@@ -10,6 +10,7 @@
 #include "net.h"
 #include "storage.h"
 #include "compat.h"
+#include "fs.h"
 #include <esp_log.h>
 #include <esp_heap_caps.h>
 #include <esp_timer.h>
@@ -54,7 +55,7 @@ static size_t logRingRead(char* buf, size_t maxLen) {
 
 /* ---- Log file output ---- */
 
-static FILE* logFile = nullptr;
+static int logFile = -1;
 static char logFilePath[128] = {};
 static int64_t lastFlushUs = 0;
 static int logFileLevelMax = 4;  /* 0=E 1=W 2=I 3=D 4=V — default: pass all */
@@ -124,25 +125,27 @@ static const char* logColor(char level) {
 }
 
 static void logFileMsg(const char* msg) {
-    if (!logFile) return;
+    if (logFile < 0) return;
     char ts[24]; fmtWallClock(ts, sizeof(ts));
-    fprintf(logFile, "%s I [log] %s\n", ts, msg);
+    char line[256];
+    int n = snprintf(line, sizeof(line), "%s I [log] %s\n", ts, msg);
+    if (n > 0) fs_write(line, 1, n, logFile);
 }
 
 static void logFileClose() {
-    if (!logFile) return;
+    if (logFile < 0) return;
     logFileMsg("log file closed");
-    fflush(logFile); fsync(fileno(logFile));
-    fclose(logFile);
-    logFile = nullptr;
+    fs_sync(logFile);
+    fs_close(logFile);
+    logFile = -1;
     logFilePath[0] = '\0';
 }
 
 static void logFileOpen(const char* path) {
     logFileClose();
     if (!path || !*path) return;
-    FILE* f = fopen(path, "a");
-    if (!f) return;
+    int f = fs_open(path, "a");
+    if (f < 0) return;
     logFile = f;
     safeStrncpy(logFilePath, path, sizeof(logFilePath));
     lastFlushUs = esp_timer_get_time();
@@ -151,24 +154,24 @@ static void logFileOpen(const char* path) {
 
 /* Write plain text to log file, filtering lines by level */
 static void logFileWrite(const char* data, size_t len) {
-    if (!logFile) return;
+    if (logFile < 0) return;
     const char* p = data;
     const char* end = data + len;
     while (p < end) {
         const char* nl = (const char*)memchr(p, '\n', end - p);
         size_t lineLen = nl ? (size_t)(nl - p + 1) : (size_t)(end - p);
         if (levelCharToNum(lineLevel(p, lineLen)) <= logFileLevelMax)
-            fwrite(p, 1, lineLen, logFile);
+            fs_write(p, 1, lineLen, logFile);
         p += lineLen;
     }
 }
 
 static void logFileFlush() {
-    if (!logFile) return;
+    if (logFile < 0) return;
     int intervalS = storageGetInt("s.log.file.interval", 5);
     int64_t now = esp_timer_get_time();
     if (now - lastFlushUs >= (int64_t)intervalS * 1000000) {
-        fflush(logFile); fsync(fileno(logFile));
+        fs_sync(logFile);
         lastFlushUs = now;
     }
 }
@@ -376,21 +379,21 @@ static void logPasteBack(int handle) {
   if (pasteKB <= 0 || !logFilePath[0]) return;
 
   /* Flush current file so all recent data is on disk */
-  if (logFile) { fflush(logFile); fsync(fileno(logFile)); }
+  if (logFile >= 0) fs_sync(logFile);
 
-  FILE* f = fopen(logFilePath, "r");
-  if (!f) return;
+  int f = fs_open(logFilePath, "r");
+  if (f < 0) return;
 
-  fseek(f, 0, SEEK_END);
-  long fileSize = ftell(f);
+  fs_seek(f, 0, SEEK_END);
+  long fileSize = fs_tell(f);
   long readSize = (long)pasteKB * 1024;
   long offset = fileSize > readSize ? fileSize - readSize : 0;
-  fseek(f, offset, SEEK_SET);
+  fs_seek(f, offset, SEEK_SET);
 
   /* If starting mid-file, skip to first newline */
   if (offset > 0) {
-    int c;
-    while ((c = fgetc(f)) != EOF && c != '\n') {}
+    char c;
+    while (fs_read(&c, 1, 1, f) == 1 && c != '\n') {}
   }
 
   /* Colorize each line: timestamp in timestamp color, rest in level color.
@@ -399,30 +402,37 @@ static void logPasteBack(int handle) {
   char tsColor[24], lvlColor[24];
   snprintf(tsColor, sizeof(tsColor), "\033[%sm", logColors[5]);
   char line[512];
-  while (fgets(line, sizeof(line), f)) {
-    size_t len = strlen(line);
-    /* Find level position — same scan as lineLevel */
+  size_t lineLen = 0;
+  char c;
+  auto flushLine = [&]() -> bool {
+    if (lineLen == 0) return true;
+    size_t len = lineLen;
+    lineLen = 0;
     int lvlPos = -1;
     for (size_t i = 1; i + 1 < len && line[i] != '\n'; i++) {
       if (line[i] == ' ' && line[i + 1] == '[') {
-        char c = line[i - 1];
-        if (c == 'E' || c == 'W' || c == 'I' || c == 'D' || c == 'V') { lvlPos = i - 1; break; }
+        char ch = line[i - 1];
+        if (ch == 'E' || ch == 'W' || ch == 'I' || ch == 'D' || ch == 'V') { lvlPos = i - 1; break; }
       }
     }
     if (lvlPos > 0) {
       snprintf(lvlColor, sizeof(lvlColor), "\033[%sm", logColor(line[lvlPos]));
-      /* Timestamp portion (before level char) */
-      if (!wsSendText(handle, tsColor, strlen(tsColor))) break;
-      if (!wsSendText(handle, line, lvlPos)) break;
-      /* Level + rest of line */
-      if (!wsSendText(handle, lvlColor, strlen(lvlColor))) break;
-      if (!wsSendText(handle, line + lvlPos, len - lvlPos)) break;
+      if (!wsSendText(handle, tsColor, strlen(tsColor))) return false;
+      if (!wsSendText(handle, line, lvlPos)) return false;
+      if (!wsSendText(handle, lvlColor, strlen(lvlColor))) return false;
+      if (!wsSendText(handle, line + lvlPos, len - lvlPos)) return false;
       wsSendText(handle, "\033[0m", 4);
     } else {
-      if (!wsSendText(handle, line, len)) break;
+      if (!wsSendText(handle, line, len)) return false;
     }
+    return true;
+  };
+  while (fs_read(&c, 1, 1, f) == 1) {
+    if (lineLen < sizeof(line) - 1) line[lineLen++] = c;
+    if (c == '\n') { if (!flushLine()) break; }
   }
-  fclose(f);
+  flushLine();
+  fs_close(f);
 }
 
 /* ---- Log ITS server callbacks ---- */
@@ -468,7 +478,7 @@ static void logTaskFn(void* arg) {
     storageGetStr("s.log.file.name", name, sizeof(name));
     if (name[0]) {
       char dir[64]; storageGetStr("s.log.dir", dir, sizeof(dir), "/sdcard/log");
-      mkdirp(dir);
+      fs_mkdirp(dir);
       char path[128]; snprintf(path, sizeof(path), "%s/%s", dir, name);
       logFileOpen(path);
     }
@@ -478,7 +488,7 @@ static void logTaskFn(void* arg) {
     logFileClose();
     if (val[0]) {
       char dir[64]; storageGetStr("s.log.dir", dir, sizeof(dir), "/sdcard/log");
-      mkdirp(dir);
+      fs_mkdirp(dir);
       char path[128]; snprintf(path, sizeof(path), "%s/%s", dir, val);
       logFileOpen(path);
     }
@@ -525,7 +535,7 @@ static void logTaskFn(void* arg) {
       };
 
       /* Write plain text to log file */
-      if (logFile) { ensurePlain(); logFileWrite(plain, pn); }
+      if (logFile >= 0) { ensurePlain(); logFileWrite(plain, pn); }
 
       if (itsServerActive() == 0) continue;
       for (int i = 0; i < LOG_MAX_CONSUMERS; i++) {
@@ -750,7 +760,7 @@ static void cmdLogrotate(const char* a) {
         if (ft > 0 && ft < cutoff) {
             char fp[80];  /* dir(64) + '/' + "YYYYMMDD.log"(12) + NUL */
             snprintf(fp, sizeof(fp), "%.63s/%.12s", dir, ent->d_name);
-            if (remove(fp) == 0) deleted++;
+            if (fs_remove(fp) == 0) deleted++;
         }
     }
     closedir(d);

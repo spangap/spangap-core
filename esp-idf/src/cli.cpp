@@ -2,6 +2,7 @@
  * CLI — command registry, line editor, serial task, CLI task.
  */
 #include "cli.h"
+#include "fs.h"
 #include "log.h"
 #include "its.h"
 #include "web.h"
@@ -184,7 +185,7 @@ static void cliResolvedStartDir(char* out, size_t outLen) {
     safeStrncpy(tmp, d, sizeof(tmp));
     if (!cliCollapseAbsolute(tmp, sizeof(tmp))) safeStrncpy(tmp, "/sdcard", sizeof(tmp));
     struct stat st;
-    if (stat(tmp, &st) != 0 || !S_ISDIR(st.st_mode)) safeStrncpy(tmp, "/sdcard", sizeof(tmp));
+    if (fs_stat(tmp, &st) != 0 || !S_ISDIR(st.st_mode)) safeStrncpy(tmp, "/sdcard", sizeof(tmp));
     safeStrncpy(out, tmp, outLen);
 }
 
@@ -218,7 +219,7 @@ bool cliSetCwd(const char* absolutePath) {
         return true;
     }
     struct stat st;
-    if (stat(tmp, &st) != 0 || !S_ISDIR(st.st_mode)) return false;
+    if (fs_stat(tmp, &st) != 0 || !S_ISDIR(st.st_mode)) return false;
     safeStrncpy(cliSlots[cliActiveSlot].cwd, tmp, sizeof(cliSlots[0].cwd));
     if (cliSlots[cliActiveSlot].usbSerial) safeStrncpy(cliUsbPersistCwd, tmp, sizeof(cliUsbPersistCwd));
     return true;
@@ -297,7 +298,7 @@ static void cliEditRefresh(cli_edit& e, int from, cli_write_fn write) {
 }
 
 void cliRunFile(const char* path) {
-  int f = storageFopen(path, "r");
+  int f = fs_open(path, "r");
   if (f < 0) return;  /* silent if file doesn't exist (e.g. optional net_up) */
   /* Log only via info() — printf/cliFlush on USB races the log task and garbles lines.
    * Message is "cli: …" so the line reads once as [task] + cli: (no nested [cli]). */
@@ -305,7 +306,7 @@ void cliRunFile(const char* path) {
   char buf[128];
   size_t linePos = 0;
   for (;;) {
-    size_t n = storageFread(buf + linePos, sizeof(buf) - linePos - 1, f);
+    size_t n = fs_read(buf + linePos, 1, sizeof(buf) - linePos - 1, f);
     if (n == 0 && linePos == 0) break;
     size_t end = linePos + n;
     buf[end] = '\0';
@@ -348,7 +349,7 @@ void cliRunFile(const char* path) {
       break;
     }
   }
-  storageFclose(f);
+  fs_close(f);
   info("cli: end %s\n", path);
 }
 
@@ -737,7 +738,7 @@ static int cliOnConnect(int handle, const void* data, size_t len) {
     if (cliUsbPersistCwd[0] == '/') {
       bool rootOnly = (cliUsbPersistCwd[1] == '\0');
       struct stat st;
-      if (rootOnly || (stat(cliUsbPersistCwd, &st) == 0 && S_ISDIR(st.st_mode)))
+      if (rootOnly || (fs_stat(cliUsbPersistCwd, &st) == 0 && S_ISDIR(st.st_mode)))
         safeStrncpy(cl.cwd, cliUsbPersistCwd, sizeof(cl.cwd));
       else
         cliApplyStartDir(cl);

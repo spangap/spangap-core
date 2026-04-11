@@ -1,5 +1,6 @@
 /** CLI commands: ls, cd, mkdir, rm, cat, df — filesystem operations (per-session cwd). */
 #include "cli.h"
+#include "fs.h"
 #include "compat.h"
 #include "esp_littlefs.h"
 #include <cstring>
@@ -60,7 +61,7 @@ static void cmdLs(const char* a) {
     char fullpath[320];
     snprintf(fullpath, sizeof(fullpath), "%.200s/%.80s", path, ent->d_name);
     struct stat st;
-    if (stat(fullpath, &st) == 0) {
+    if (fs_stat(fullpath, &st) == 0) {
       safeStrncpy(entries[count].name, ent->d_name, sizeof(entries[0].name));
       entries[count].mtime = st.st_mtime;
       entries[count].size = (uint32_t)st.st_size;
@@ -125,23 +126,23 @@ static bool mkdirParents(const char* path) {
     if (tmp[i] != '/') continue;
     tmp[i] = '\0';
     struct stat st;
-    if (stat(tmp, &st) == 0) {
+    if (fs_stat(tmp, &st) == 0) {
       if (!S_ISDIR(st.st_mode)) {
         tmp[i] = '/';
         return false;
       }
     } else {
-      if (mkdir(tmp, 0755) != 0 && errno != EEXIST) {
+      if (fs_mkdir(tmp) != 0 && errno != EEXIST) {
         tmp[i] = '/';
         return false;
       }
     }
     tmp[i] = '/';
   }
-  if (mkdir(tmp, 0755) == 0) return true;
+  if (fs_mkdir(tmp) == 0) return true;
   if (errno != EEXIST) return false;
   struct stat st;
-  return stat(tmp, &st) == 0 && S_ISDIR(st.st_mode);
+  return fs_stat(tmp, &st) == 0 && S_ISDIR(st.st_mode);
 }
 
 static void cmdMkdir(const char* a) {
@@ -167,7 +168,7 @@ static void cmdMkdir(const char* a) {
     cliPrintf("mkdir: path too long\n");
     return;
   }
-  bool ok = parents ? mkdirParents(full) : (mkdir(full, 0755) == 0);
+  bool ok = parents ? mkdirParents(full) : (fs_mkdir(full) == 0);
   if (!ok) cliPrintf("mkdir: %s: %s\n", full, strerror(errno));
 }
 
@@ -198,7 +199,7 @@ static void rmRecursive(const char* filepath, bool opt_f) {
     struct dirent* ent = readdir(stack[depth].dir);
     if (!ent) {
       closedir(stack[depth].dir);
-      if (rmdir(stack[depth].path) != 0 && !opt_f)
+      if (fs_remove(stack[depth].path) != 0 && !opt_f)
         cliPrintf("rm: cannot remove %s: %s\n", stack[depth].path, strerror(errno));
       depth--;
       continue;
@@ -206,9 +207,9 @@ static void rmRecursive(const char* filepath, bool opt_f) {
     if (rmDotSkip(ent->d_name)) continue;
     char child[RM_PATH];
     snprintf(child, RM_PATH, "%.150s/%.80s", stack[depth].path, ent->d_name);
-    if (remove(child) == 0) continue;
+    if (fs_remove(child) == 0) continue;
     struct stat cst;
-    if (stat(child, &cst) == 0 && S_ISDIR(cst.st_mode) && depth < RM_DEPTH - 1) {
+    if (fs_stat(child, &cst) == 0 && S_ISDIR(cst.st_mode) && depth < RM_DEPTH - 1) {
       depth++;
       safeStrncpy(stack[depth].path, child, RM_PATH);
       stack[depth].dir = opendir(child);
@@ -264,7 +265,7 @@ static void cmdRm(const char* a) {
       continue;
     }
     struct stat st;
-    if (stat(full, &st) != 0) {
+    if (fs_stat(full, &st) != 0) {
       if (!opt_f) cliPrintf("rm: cannot stat %s\n", full);
       continue;
     }
@@ -275,7 +276,7 @@ static void cmdRm(const char* a) {
       }
       rmRecursive(full, opt_f);
     } else {
-      if (remove(full) != 0) {
+      if (fs_remove(full) != 0) {
         if (!(opt_f && errno == ENOENT)) cliPrintf("rm: cannot remove %s: %s\n", full, strerror(errno));
       }
     }
@@ -315,19 +316,19 @@ static void cmdCat(const char* a) {
       continue;
     }
     struct stat st;
-    if (stat(full, &st) != 0 || S_ISDIR(st.st_mode)) {
+    if (fs_stat(full, &st) != 0 || S_ISDIR(st.st_mode)) {
       cliPrintf("cat: %s: not a regular file\n", full);
       continue;
     }
-    FILE* f = fopen(full, "rb");
-    if (!f) {
+    int f = fs_open(full, "rb");
+    if (f < 0) {
       cliPrintf("cat: cannot open %s\n", full);
       continue;
     }
     char buf[512];
     size_t n;
-    while ((n = fread(buf, 1, sizeof(buf), f)) > 0) cliWrite(buf, n);
-    fclose(f);
+    while ((n = fs_read(buf, 1, sizeof(buf), f)) > 0) cliWrite(buf, n);
+    fs_close(f);
   }
 }
 

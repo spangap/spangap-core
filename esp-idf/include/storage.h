@@ -1,5 +1,5 @@
 /**
- * storage — config store + file I/O service.
+ * storage — config store.
  *
  * Config: cJSON tree in RAM, backed by JSON on /state.
  * All writes go through a patch tree (RFC 7396 merge-patch format).
@@ -19,8 +19,7 @@
  * - Browser→device: nested JSON merge-patches. null = delete subtree (silent).
  * - Deletes via storageDeleteTree() do not fire storageSubscribeChanges callbacks.
  *
- * File I/O: POSIX-like API proxied to a DRAM-stack worker task.
- * PSRAM-stack tasks can safely call storageFopen/Fread/Fwrite/Fclose.
+ * File I/O: use fs.h (unified PSRAM-safe API).
  */
 #ifndef SECCAM_STORAGE_H
 #define SECCAM_STORAGE_H
@@ -36,9 +35,6 @@ static constexpr uint16_t STORAGE_EPL_PORT = 0;
 /** Storage task's ITS aux ports. */
 static constexpr uint16_t STORAGE_SAVE_PORT   = 43;  /* save-now signal */
 static constexpr uint16_t STORAGE_CHANGE_PORT = 42;  /* change dispatch on subscriber tasks */
-
-/** fs worker's ITS aux port: one-shot file ops (open/read/write/stat/...). */
-static constexpr uint16_t FS_FILE_PORT = 1;
 
 /* ---- Config types ---- */
 
@@ -114,31 +110,5 @@ void storageSubscribeChanges(const char* scope, storage_change_cb_t cb);
 
 /** Convenience: lambda-friendly callback type */
 #define ON_CHANGE [](const char* key, const char* val)
-
-/* ---- File I/O API ---- */
-
-/** Open a file via storage task. Returns handle (>= 0) or -1 on error. */
-int    storageFopen(const char* path, const char* mode);
-
-/** Read from an open file handle. Returns bytes read, 0 on EOF. */
-size_t storageFread(void* buf, size_t maxLen, int f);
-
-/** Write to an open file handle. Returns bytes written. */
-size_t storageFwrite(const void* buf, size_t len, int f);
-
-/** Get current file position. */
-long   storageFtell(int f);
-
-/** Close a file handle. For writes, blocks until data is flushed. */
-void   storageFclose(int f);
-
-/** stat() via storage task. Returns 0 on success, -1 on error. */
-int    storageStat(const char* path, struct stat* st);
-
-/** rename() via storage task. */
-int    storageRename(const char* oldPath, const char* newPath);
-
-/** remove() via storage task. */
-int    storageRemove(const char* path);
 
 #endif
