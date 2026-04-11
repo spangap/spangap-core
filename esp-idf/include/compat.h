@@ -5,8 +5,10 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include <sys/time.h>
+#include <sys/stat.h>
 #include <time.h>
 #include <cstring>
+#include <cerrno>
 
 /** Central RTC RAM validity — one magic word for all application RTC state.
  *  Set before deep sleep, checked on wakeup. If invalid, all RTC vars are stale. */
@@ -20,6 +22,16 @@ static inline char* safeStrncpy(char* dst, const char* src, size_t n) {
     strncpy(dst, src, n - 1);
     dst[n - 1] = '\0';
     return dst;
+}
+
+/** Create directory and all parent components (like mkdir -p). */
+static inline void mkdirp(const char* path) {
+    char tmp[128];
+    safeStrncpy(tmp, path, sizeof(tmp));
+    for (char* p = tmp + 1; *p; p++) {
+        if (*p == '/') { *p = '\0'; mkdir(tmp, 0755); *p = '/'; }
+    }
+    mkdir(tmp, 0755);
 }
 
 static inline uint32_t millis() {

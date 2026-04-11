@@ -457,21 +457,6 @@ static void logTaskFn(void* arg) {
   itsServerOnConnect(LOG_PORT, logOnConnect);
   itsServerOnDisconnect(LOG_PORT, logOnDisconnect);
 
-  /* Register TCP port with network */
-  { net_port_msg_t reg = {};
-    reg.itsPort = LOG_PORT;
-    safeStrncpy(reg.nvsKey, "log_port", sizeof(reg.nvsKey));
-    while (!itsSendAux("net", NET_PORT_REG_PORT, &reg, sizeof(reg), pdMS_TO_TICKS(500)))
-      vTaskDelay(pdMS_TO_TICKS(100));
-  }
-  /* Register WS path with web */
-  { web_path_msg_t reg = {};
-    reg.itsPort = LOG_PORT;
-    safeStrncpy(reg.path, "log", sizeof(reg.path));
-    while (!itsSendAux("web", WEB_PATH_REG_PORT, &reg, sizeof(reg), pdMS_TO_TICKS(500)))
-      vTaskDelay(pdMS_TO_TICKS(100));
-  }
-
   logLoadColors();
   storageSubscribeChanges("s.log.colors.", ON_CHANGE { logLoadColors(); });
 
@@ -483,7 +468,7 @@ static void logTaskFn(void* arg) {
     storageGetStr("s.log.file.name", name, sizeof(name));
     if (name[0]) {
       char dir[64]; storageGetStr("s.log.dir", dir, sizeof(dir), "/sdcard/log");
-      mkdir(dir, 0755);
+      mkdirp(dir);
       char path[128]; snprintf(path, sizeof(path), "%s/%s", dir, name);
       logFileOpen(path);
     }
@@ -493,7 +478,7 @@ static void logTaskFn(void* arg) {
     logFileClose();
     if (val[0]) {
       char dir[64]; storageGetStr("s.log.dir", dir, sizeof(dir), "/sdcard/log");
-      mkdir(dir, 0755);
+      mkdirp(dir);
       char path[128]; snprintf(path, sizeof(path), "%s/%s", dir, val);
       logFileOpen(path);
     }
@@ -502,10 +487,28 @@ static void logTaskFn(void* arg) {
     logFileLevelMax = parseLevelNum(val);
   });
 
+  /* Register TCP port + WS path (non-blocking: retry from main loop so serial
+   * log connection is accepted immediately during boot). */
+  bool netRegistered = false, webRegistered = false;
+
   char buf[512];
   for (;;) {
     pmPollUsb();
     while (itsPoll(pdMS_TO_TICKS(200))) {}
+
+    if (!netRegistered) {
+      net_port_msg_t reg = {};
+      reg.itsPort = LOG_PORT;
+      safeStrncpy(reg.nvsKey, "log_port", sizeof(reg.nvsKey));
+      netRegistered = itsSendAux("net", NET_PORT_REG_PORT, &reg, sizeof(reg), 0);
+    }
+    if (!webRegistered) {
+      web_path_msg_t reg = {};
+      reg.itsPort = LOG_PORT;
+      safeStrncpy(reg.path, "log", sizeof(reg.path));
+      webRegistered = itsSendAux("web", WEB_PATH_REG_PORT, &reg, sizeof(reg), 0);
+    }
+
     /* Drain input stream → fan out to ITS consumers + log file */
     for (;;) {
       size_t n = logRingRead(buf, sizeof(buf) - 1);

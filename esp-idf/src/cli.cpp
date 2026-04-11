@@ -776,25 +776,27 @@ static void cliTaskFn(void* arg) {
   itsServerOnConnect(CLI_PORT, cliOnConnect);
   itsServerOnDisconnect(CLI_PORT, cliOnDisconnect);
 
-  /* Register TCP port with network */
-  { net_port_msg_t reg = {};
-    reg.itsPort = CLI_PORT;
-    safeStrncpy(reg.nvsKey, "cli_port", sizeof(reg.nvsKey));
-    while (!itsSendAux("net", NET_PORT_REG_PORT, &reg, sizeof(reg), pdMS_TO_TICKS(500)))
-      vTaskDelay(pdMS_TO_TICKS(100));
-  }
-  /* Register WS path with web */
-  { web_path_msg_t reg = {};
-    reg.itsPort = CLI_PORT;
-    safeStrncpy(reg.path, "cli", sizeof(reg.path));
-    while (!itsSendAux("web", WEB_PATH_REG_PORT, &reg, sizeof(reg), pdMS_TO_TICKS(500)))
-      vTaskDelay(pdMS_TO_TICKS(100));
-  }
-
   cliBuiltinInit();  /* register built-in CLI commands */
+
+  /* Register TCP port + WS path (non-blocking: retry from main loop so serial
+   * connections are accepted immediately during boot). */
+  bool netRegistered = false, webRegistered = false;
 
   for (;;) {
     while (itsPoll(pdMS_TO_TICKS(50))) {}
+
+    if (!netRegistered) {
+      net_port_msg_t reg = {};
+      reg.itsPort = CLI_PORT;
+      safeStrncpy(reg.nvsKey, "cli_port", sizeof(reg.nvsKey));
+      netRegistered = itsSendAux("net", NET_PORT_REG_PORT, &reg, sizeof(reg), 0);
+    }
+    if (!webRegistered) {
+      web_path_msg_t reg = {};
+      reg.itsPort = CLI_PORT;
+      safeStrncpy(reg.path, "cli", sizeof(reg.path));
+      webRegistered = itsSendAux("web", WEB_PATH_REG_PORT, &reg, sizeof(reg), 0);
+    }
 
     /* Process each active slot */
     char buf[128];
