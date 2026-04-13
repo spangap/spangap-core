@@ -740,12 +740,24 @@ int itsRef(int handle) {
     return -1;
 }
 
-size_t itsServerInject(int handle, const void* data, size_t len) {
+size_t itsInject(int handle, bool asServer, const void* data, size_t len,
+                 TickType_t timeout) {
     its_conn_t* c = conn(handle);
-    if (!c || c->serverTask != xTaskGetCurrentTaskHandle()) return 0;
-    StreamBufferHandle_t sb = poolHandle(c->toPoolIdx);
-    if (!sb) return 0;
-    return xStreamBufferSend(sb, data, len, 0);
+    if (!c) return 0;
+    int idx = asServer ? c->fromPoolIdx : c->toPoolIdx;
+    if (idx < 0 || idx >= itsPoolCount) return 0;
+    auto* pe = &itsPool[idx];
+    if (!pe->handle) return 0;
+    size_t sent = xStreamBufferSend(pe->handle, data, len, timeout);
+    if (sent > 0) {
+        size_t fill = xStreamBufferBytesAvailable(pe->handle);
+        size_t trigger = pe->triggerLevel ? pe->triggerLevel : 1;
+        if (fill >= trigger) {
+            TaskHandle_t remote = asServer ? c->clientTask : c->serverTask;
+            if (remote) xTaskNotifyGive(remote);
+        }
+    }
+    return sent;
 }
 
 int itsServerForwardByTaskHandle(int handle, TaskHandle_t targetTask, uint16_t port,

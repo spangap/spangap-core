@@ -7,6 +7,7 @@
 #include <cstdio>
 #include <cerrno>
 #include <dirent.h>
+#include <esp_heap_caps.h>
 #include <sys/stat.h>
 #include <algorithm>
 #include <unistd.h>
@@ -36,11 +37,6 @@ static void cmdLs(const char* a) {
   } else {
     cliGetCwd(path, sizeof(path));
   }
-  DIR* dir = opendir(path);
-  if (!dir) {
-    cliPrintf("ls: cannot open %s\n", path);
-    return;
-  }
   constexpr int LS_MAX = 128;
   struct ls_entry {
     char name[80];
@@ -49,27 +45,21 @@ static void cmdLs(const char* a) {
     bool isDir;
   };
   auto* entries = (ls_entry*)malloc(LS_MAX * sizeof(ls_entry));
-  if (!entries) {
-    closedir(dir);
-    cliPrintf("ls: out of memory\n");
-    return;
-  }
+  if (!entries) { cliPrintf("ls: out of memory\n"); return; }
+  auto* listing = (fs_listing_t*)heap_caps_malloc(LS_MAX * sizeof(fs_listing_t), MALLOC_CAP_SPIRAM);
+  if (!listing) { free(entries); cliPrintf("ls: out of memory\n"); return; }
+  int n = fs_listdir(path, listing, LS_MAX);
+  if (n < 0) { heap_caps_free(listing); free(entries); cliPrintf("ls: cannot open %s\n", path); return; }
   int count = 0;
-  struct dirent* ent;
-  while ((ent = readdir(dir)) != nullptr && count < LS_MAX) {
-    if (!showAll && ent->d_name[0] == '.') continue;
-    char fullpath[320];
-    snprintf(fullpath, sizeof(fullpath), "%.200s/%.80s", path, ent->d_name);
-    struct stat st;
-    if (fs_stat(fullpath, &st) == 0) {
-      safeStrncpy(entries[count].name, ent->d_name, sizeof(entries[0].name));
-      entries[count].mtime = st.st_mtime;
-      entries[count].size = (uint32_t)st.st_size;
-      entries[count].isDir = S_ISDIR(st.st_mode);
-      count++;
-    }
+  for (int i = 0; i < n && count < LS_MAX; i++) {
+    if (!showAll && listing[i].name[0] == '.') continue;
+    safeStrncpy(entries[count].name, listing[i].name, sizeof(entries[0].name));
+    entries[count].mtime = listing[i].mtime;
+    entries[count].size  = listing[i].size;
+    entries[count].isDir = listing[i].isDir;
+    count++;
   }
-  closedir(dir);
+  heap_caps_free(listing);
   std::sort(entries, entries + count, [](const ls_entry& a, const ls_entry& b) { return a.mtime < b.mtime; });
   if (count == 0) cliPrintf("  (empty)\n");
   for (int i = 0; i < count; i++) {
@@ -179,7 +169,7 @@ static bool rmDotSkip(const char* name) {
 static void rmRecursive(const char* filepath, bool opt_f) {
   constexpr int RM_PATH = 256, RM_DEPTH = 16;
   struct rm_frame {
-    DIR* dir;
+    int dir;
     char path[RM_PATH];
   };
   auto* stack = (rm_frame*)malloc(RM_DEPTH * sizeof(rm_frame));
@@ -189,31 +179,31 @@ static void rmRecursive(const char* filepath, bool opt_f) {
   }
   int depth = 0;
   safeStrncpy(stack[0].path, filepath, RM_PATH);
-  stack[0].dir = opendir(filepath);
-  if (!stack[0].dir) {
+  stack[0].dir = fs_opendir(filepath);
+  if (stack[0].dir < 0) {
     free(stack);
     if (!opt_f) cliPrintf("rm: cannot open %s\n", filepath);
     return;
   }
   while (depth >= 0) {
-    struct dirent* ent = readdir(stack[depth].dir);
-    if (!ent) {
-      closedir(stack[depth].dir);
+    fs_dirent_t ent;
+    if (!fs_readdir(stack[depth].dir, &ent)) {
+      fs_closedir(stack[depth].dir);
       if (fs_remove(stack[depth].path) != 0 && !opt_f)
         cliPrintf("rm: cannot remove %s: %s\n", stack[depth].path, strerror(errno));
       depth--;
       continue;
     }
-    if (rmDotSkip(ent->d_name)) continue;
+    if (rmDotSkip(ent.name)) continue;
     char child[RM_PATH];
-    snprintf(child, RM_PATH, "%.150s/%.80s", stack[depth].path, ent->d_name);
+    snprintf(child, RM_PATH, "%.150s/%.80s", stack[depth].path, ent.name);
     if (fs_remove(child) == 0) continue;
     struct stat cst;
     if (fs_stat(child, &cst) == 0 && S_ISDIR(cst.st_mode) && depth < RM_DEPTH - 1) {
       depth++;
       safeStrncpy(stack[depth].path, child, RM_PATH);
-      stack[depth].dir = opendir(child);
-      if (!stack[depth].dir) {
+      stack[depth].dir = fs_opendir(child);
+      if (stack[depth].dir < 0) {
         if (!opt_f) cliPrintf("rm: cannot open %s\n", child);
         depth--;
       }

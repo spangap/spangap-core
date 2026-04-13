@@ -460,24 +460,25 @@ static void cliTabComplete(cli_edit& e, cli_write_fn write) {
   }
 
   size_t prefixLen = strlen(prefix);
-  DIR* dir = opendir(dirPath);
-  if (!dir) return;
-
+  constexpr int MAX = 128;
+  auto* listing = (fs_listing_t*)heap_caps_malloc(MAX * sizeof(fs_listing_t), MALLOC_CAP_SPIRAM);
+  if (!listing) return;
+  int n = fs_listdir(dirPath, listing, MAX);
   char match[128] = {};
   int matchCount = 0;
-  struct dirent* ent;
-  while ((ent = readdir(dir)) != nullptr) {
-    if (strncmp(ent->d_name, prefix, prefixLen) != 0) continue;
+  for (int i = 0; i < n; i++) {
+    const char* name = listing[i].name;
+    if (strncmp(name, prefix, prefixLen) != 0) continue;
     matchCount++;
     if (matchCount == 1) {
-      safeStrncpy(match, ent->d_name, sizeof(match));
+      safeStrncpy(match, name, sizeof(match));
     } else {
-      int i = 0;
-      while (match[i] && match[i] == ent->d_name[i]) i++;
-      match[i] = '\0';
+      int j = 0;
+      while (match[j] && match[j] == name[j]) j++;
+      match[j] = '\0';
     }
   }
-  closedir(dir);
+  heap_caps_free(listing);
 
   if (matchCount == 0 || strlen(match) <= prefixLen) return;
 
@@ -863,22 +864,17 @@ static void serialEmit(const char* p, size_t n) {
   }
 }
 
+/* Set true while in CLI mode so logVprintf suppresses its direct-stdout echo
+ * (otherwise log lines would interleave with command output / prompts). */
+extern "C" volatile bool serialInCli = false;
+
 static void serialTaskFn(void* arg) {
   /* Set stdin non-blocking */
   int flags = fcntl(STDIN_FILENO, F_GETFL, 0);
   fcntl(STDIN_FILENO, F_SETFL, flags | O_NONBLOCK);
 
-  itsClientInit(2);
-
-  int logHandle = -1;
+  itsClientInit(1);
   int cliHandle = -1;
-
-  /* Connect to log */
-  auto connectLog = [&]() {
-    log_connect_t req = { LOG_ANSI };
-    logHandle = itsConnect("log", LOG_PORT, &req, sizeof(req), pdMS_TO_TICKS(500));
-  };
-  connectLog();
 
   for (;;) {
     while (itsPoll(pdMS_TO_TICKS(50))) {}
@@ -887,8 +883,8 @@ static void serialTaskFn(void* arg) {
     char c;
     while (read(STDIN_FILENO, &c, 1) == 1) {
       if (cliHandle < 0 && c != '\n' && c != '\r') {
-        /* Switch from log to CLI */
-        if (logHandle >= 0) { itsDisconnect(logHandle); logHandle = -1; }
+        /* Switch to CLI mode — suppress direct-stdout log echo */
+        serialInCli = true;
         cli_connect_t req = { CLI_ANSI, 1 };
         cliHandle = itsConnect("cli", CLI_PORT, &req, sizeof(req), pdMS_TO_TICKS(500));
         if (cliHandle >= 0) {
@@ -898,22 +894,13 @@ static void serialTaskFn(void* arg) {
           else
             printf("\r\n$ ");
           fflush(stdout); cliFlush();
+        } else {
+          /* connect failed — abort CLI mode */
+          serialInCli = false;
         }
       }
       if (cliHandle >= 0)
         itsSend(cliHandle, &c, 1, 0);
-    }
-
-    /* Drain log → serial */
-    if (logHandle >= 0) {
-      char buf[256];
-      for (;;) {
-        size_t n = itsRecv(logHandle, buf, sizeof(buf) - 1, 0);
-        if (n == 0) break;
-        serialEmit(buf, n);
-      }
-      fflush(stdout);
-      cliFlush();
     }
 
     /* Drain CLI → serial */
@@ -932,7 +919,7 @@ static void serialTaskFn(void* arg) {
         printf("\033[0m\r\033[K\r\nExiting CLI, resuming log.\r\n\r\n");
         fflush(stdout);
         cliFlush();
-        connectLog();
+        serialInCli = false;
       }
     }
 
@@ -953,13 +940,9 @@ static void serialTaskFn(void* arg) {
         cliFlush();
         itsDisconnect(cliHandle);
         cliHandle = -1;
-        connectLog();
+        serialInCli = false;
       }
     }
-
-    /* Retry log connection if not connected (boot ordering) */
-    if (logHandle < 0 && cliHandle < 0)
-      connectLog();
   }
 }
 
@@ -969,7 +952,7 @@ void cliInit() {
   /* Allocate history buffer in PSRAM */
   histBuf = (char(*)[128])heap_caps_calloc(HIST_SIZE, 128, MALLOC_CAP_SPIRAM);
 
-  xTaskCreatePinnedToCore(cliTaskFn, "cli", 6144, NULL, 1, &cliTaskHandle, 1);
+  xTaskCreatePinnedToCoreWithCaps(cliTaskFn, "cli", 6144, NULL, 1, &cliTaskHandle, 1, MALLOC_CAP_SPIRAM);
   static TaskHandle_t serialTaskHandle = NULL;
   xTaskCreatePinnedToCoreWithCaps(serialTaskFn, "serial", 3072, NULL, 1, &serialTaskHandle, 1, MALLOC_CAP_SPIRAM);
 }

@@ -85,4 +85,44 @@ int     fs_mkdir(const char* path);
 /** Create directory and all parent components (mkdir -p). */
 void    fs_mkdirp(const char* path);
 
+/* ---- Directory iteration ---- */
+
+struct fs_dirent_t {
+    char name[64];
+    int  d_type;   /* DT_REG, DT_DIR, DT_UNKNOWN */
+};
+
+/** Open a directory. Returns handle >= 0 on success, -1 on error. */
+int     fs_opendir(const char* path);
+
+/** Read one entry. Returns true if entry written, false at end. */
+bool    fs_readdir(int d, fs_dirent_t* out);
+
+/** Close a directory handle. */
+void    fs_closedir(int d);
+
+/** Bulk directory listing with per-entry stat — single proxy round-trip.
+ *  Caller allocates out[max]. Returns entry count, or -1 on error.
+ *  Includes '.' / '..' / dotfiles — caller filters as desired. */
+struct fs_listing_t {
+    char     name[64];
+    uint32_t size;
+    time_t   mtime;
+    bool     isDir;
+};
+
+int     fs_listdir(const char* path, fs_listing_t* out, int max);
+
+/* ---- HTTP-style file serving (single round-trip body delivery) ---- */
+
+struct fs_file_info_t {
+    bool   gzipped;
+    size_t size;
+    time_t mtime;
+};
+
+/** Discover a file. If tryGz, tries `path.gz` first (sets gzipped=true) then `path`.
+ *  Returns 0 on found, -1 if missing. Single round-trip. */
+int     fs_file_info(const char* path, bool tryGz, fs_file_info_t* out);
+
 #endif

@@ -109,10 +109,17 @@ int  itsActiveTotal(void);
  *  table + stream pool usage). Useful for diagnostics. */
 void itsStatus(void);
 
-/** Inject bytes directly into a connection's client→server buffer.
- *  Used before itsServerForward to put consumed protocol bytes back
- *  for the receiving task. */
-size_t itsServerInject(int handle, const void* data, size_t len);
+/** Inject bytes into one side of a connection's stream-buffer pair without
+ *  caller-identity checks. `asServer=true` writes to the server→client
+ *  direction (as if the server called itsSend); `asServer=false` writes to
+ *  the client→server direction (as if the client sent data).
+ *  Callers include:
+ *    - a server task pushing back already-consumed protocol bytes before
+ *      calling itsServerForward (asServer=false),
+ *    - a worker task spawned by the server to push response bytes on behalf
+ *      of the connection owner (asServer=true). */
+size_t itsInject(int handle, bool asServer, const void* data, size_t len,
+                 TickType_t timeout = 0);
 
 /** Hand off a connection's ownership to another server task.
  *  Stream buffers stay; the new owner sees an onConnect for `port`. */

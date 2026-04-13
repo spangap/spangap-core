@@ -21,13 +21,18 @@ static void cmdReboot(const char* a) {
     esp_restart();
 }
 
+static void resetFactoryTask(void*) {
+    /* DRAM stack: esp_littlefs_format does flash ops that disable PSRAM cache. */
+    esp_littlefs_format("state");
+    delay(100);
+    esp_restart();
+}
+
 static void cmdResetFactory(const char* a) {
     if (strcmp(a, "help") == 0) { cliPrintf("  %-*s factory reset and reboot\n", CLI_HELP_COL, "reset factory"); return; }
     cliPrintf("factory reset: formatting /state and rebooting...\n");
     fflush(stdout);
-    esp_littlefs_format("state");
-    delay(100);
-    esp_restart();
+    xTaskCreatePinnedToCore(resetFactoryTask, "rfact", 3072, nullptr, 1, nullptr, 0);
 }
 
 static void cmdSleep(const char* a) {

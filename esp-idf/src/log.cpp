@@ -14,6 +14,8 @@
 #include <esp_log.h>
 #include <esp_heap_caps.h>
 #include <esp_timer.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 #include <cstdio>
 #include <cstring>
 #include <sys/stat.h>
@@ -350,6 +352,11 @@ static int logReformat(const char* src, char* dst, size_t dstSize, bool ansi) {
 static TaskHandle_t logTaskHandle = NULL;
 
 /* vprintf callback — called by ESP-IDF log system from any task */
+/* True while the serial task is in CLI mode — suppresses the direct-stdout
+ * log echo so command output isn't tangled with background log lines.
+ * Defined in cli.cpp. */
+extern "C" volatile bool serialInCli;
+
 static int logVprintf(const char* fmt, va_list args) {
     if (!logInited) return 0;
 
@@ -368,6 +375,13 @@ static int logVprintf(const char* fmt, va_list args) {
 
     /* Wake log task */
     if (logTaskHandle) xTaskNotifyGive(logTaskHandle);
+
+    /* Always echo to stdout (USB Serial JTAG) unless serial is in CLI mode.
+     * This bypasses the ITS log→serial consumer path entirely so logs reach
+     * the wire even if the serial task is wedged or not yet connected. */
+    if (!serialInCli) {
+        fwrite(formatted, 1, fmtLen, stdout);
+    }
 
     return rawLen;
 }
@@ -388,26 +402,42 @@ static void logPasteBack(int handle) {
   long fileSize = fs_tell(f);
   long readSize = (long)pasteKB * 1024;
   long offset = fileSize > readSize ? fileSize - readSize : 0;
+  long want = fileSize - offset;
   fs_seek(f, offset, SEEK_SET);
 
+  /* Read the whole tail chunk in one go — one ITS roundtrip instead of ~50K.
+   * PSRAM buffer so we don't eat DRAM. */
+  char* in = (char*)heap_caps_malloc(want + 1, MALLOC_CAP_SPIRAM);
+  if (!in) { fs_close(f); return; }
+  size_t got = fs_read(in, 1, want, f);
+  fs_close(f);
+  if (got == 0) { heap_caps_free(in); return; }
+  in[got] = '\0';
+
+  /* Worst case output: every line gets ~40 bytes of ANSI codes. Overallocate. */
+  char* out = (char*)heap_caps_malloc(got * 2 + 64, MALLOC_CAP_SPIRAM);
+  if (!out) { heap_caps_free(in); return; }
+
+  char tsColor[24];
+  snprintf(tsColor, sizeof(tsColor), "\033[%sm", logColors[5]);
+  size_t tsLen = strlen(tsColor);
+
   /* If starting mid-file, skip to first newline */
+  size_t p = 0;
   if (offset > 0) {
-    char c;
-    while (fs_read(&c, 1, 1, f) == 1 && c != '\n') {}
+    while (p < got && in[p] != '\n') p++;
+    if (p < got) p++;
   }
 
-  /* Colorize each line: timestamp in timestamp color, rest in level color.
-   * Line format: "Apr 07 16:41:01.139 I [task] msg\n"
-   * lineLevel finds X before " [", so the timestamp is everything before that char. */
-  char tsColor[24], lvlColor[24];
-  snprintf(tsColor, sizeof(tsColor), "\033[%sm", logColors[5]);
-  char line[512];
-  size_t lineLen = 0;
-  char c;
-  auto flushLine = [&]() -> bool {
-    if (lineLen == 0) return true;
-    size_t len = lineLen;
-    lineLen = 0;
+  size_t op = 0;
+  while (p < got) {
+    size_t lineStart = p;
+    while (p < got && in[p] != '\n') p++;
+    if (p < got) p++;  /* include newline */
+    size_t len = p - lineStart;
+    const char* line = in + lineStart;
+
+    /* Locate level char X in "... X [task] ..." (colorize same as live) */
     int lvlPos = -1;
     for (size_t i = 1; i + 1 < len && line[i] != '\n'; i++) {
       if (line[i] == ' ' && line[i + 1] == '[') {
@@ -415,24 +445,23 @@ static void logPasteBack(int handle) {
         if (ch == 'E' || ch == 'W' || ch == 'I' || ch == 'D' || ch == 'V') { lvlPos = i - 1; break; }
       }
     }
+
     if (lvlPos > 0) {
-      snprintf(lvlColor, sizeof(lvlColor), "\033[%sm", logColor(line[lvlPos]));
-      if (!wsSendText(handle, tsColor, strlen(tsColor))) return false;
-      if (!wsSendText(handle, line, lvlPos)) return false;
-      if (!wsSendText(handle, lvlColor, strlen(lvlColor))) return false;
-      if (!wsSendText(handle, line + lvlPos, len - lvlPos)) return false;
-      wsSendText(handle, "\033[0m", 4);
+      memcpy(out + op, tsColor, tsLen); op += tsLen;
+      memcpy(out + op, line, lvlPos); op += lvlPos;
+      char lvlColor[24];
+      int lvlLen = snprintf(lvlColor, sizeof(lvlColor), "\033[%sm", logColor(line[lvlPos]));
+      memcpy(out + op, lvlColor, lvlLen); op += lvlLen;
+      memcpy(out + op, line + lvlPos, len - lvlPos); op += len - lvlPos;
+      memcpy(out + op, "\033[0m", 4); op += 4;
     } else {
-      if (!wsSendText(handle, line, len)) return false;
+      memcpy(out + op, line, len); op += len;
     }
-    return true;
-  };
-  while (fs_read(&c, 1, 1, f) == 1) {
-    if (lineLen < sizeof(line) - 1) line[lineLen++] = c;
-    if (c == '\n') { if (!flushLine()) break; }
   }
-  flushLine();
-  fs_close(f);
+
+  wsSendText(handle, out, op);
+  heap_caps_free(out);
+  heap_caps_free(in);
 }
 
 /* ---- Log ITS server callbacks ---- */
@@ -460,12 +489,16 @@ static void logOnDisconnect(int ref) {
 
 /* ---- Log task: drains input stream → fan out to ITS consumers ---- */
 
+static SemaphoreHandle_t logReadySem = nullptr;
+
 static void logTaskFn(void* arg) {
   for (int i = 0; i < LOG_MAX_CONSUMERS; i++) logSlots[i].itsHandle = -1;
   itsServerInit();
   itsServerPortOpen(LOG_PORT, LOG_MAX_CONSUMERS, 0, 2048);
   itsServerOnConnect(LOG_PORT, logOnConnect);
   itsServerOnDisconnect(LOG_PORT, logOnDisconnect);
+  /* Unblock logInit() — server is open for clients (e.g. serial task). */
+  if (logReadySem) xSemaphoreGive(logReadySem);
 
   logLoadColors();
   storageSubscribeChanges("s.log.colors.", ON_CHANGE { logLoadColors(); });
@@ -519,6 +552,18 @@ static void logTaskFn(void* arg) {
       webRegistered = itsSendAux("web", WEB_PATH_REG_PORT, &reg, sizeof(reg), 0);
     }
 
+    /* Skip the drain entirely while there are no consumers and no log file.
+     * The ring keeps its contents so they fan out the moment a consumer
+     * (typically the serial task) connects. Without this, the boot script's
+     * logs would silently disappear because the drain happens between hook
+     * install and the first consumer's connect being processed. */
+    bool hasConsumer = (itsServerActive() > 0);
+    bool hasFile = (logFile >= 0);
+    if (!hasConsumer && !hasFile) {
+      logFileFlush();
+      continue;
+    }
+
     /* Drain input stream → fan out to ITS consumers + log file */
     for (;;) {
       size_t n = logRingRead(buf, sizeof(buf) - 1);
@@ -535,9 +580,9 @@ static void logTaskFn(void* arg) {
       };
 
       /* Write plain text to log file */
-      if (logFile >= 0) { ensurePlain(); logFileWrite(plain, pn); }
+      if (hasFile) { ensurePlain(); logFileWrite(plain, pn); }
 
-      if (itsServerActive() == 0) continue;
+      if (!hasConsumer) continue;
       for (int i = 0; i < LOG_MAX_CONSUMERS; i++) {
         int h = logSlots[i].itsHandle;
         if (h < 0 || !itsConnected(h)) continue;
@@ -576,12 +621,22 @@ void logInit() {
   /* Set INFO as default until boot script sets the real level via logApplyLevels() */
   esp_log_level_set("*", ESP_LOG_INFO);
 
-  /* Install ESP-IDF vprintf hook — all logging now flows through our callback */
+  /* Install ESP-IDF vprintf hook now so all messages from this point land
+   * in the ring. The log task does NOT drain the ring while there are no
+   * consumers (see logTaskFn), so boot logs are buffered until the serial
+   * task connects, then fan out. */
   esp_log_set_vprintf(logVprintf);
 
-  /* DRAM stack — log task accesses DRAM stream buffer; PSRAM stack would
-   * crash if SPI flash ops disable the PSRAM cache mid-read. */
-  xTaskCreatePinnedToCoreWithCaps(logTaskFn, "log", 4608, NULL, 1, &logTaskHandle, 1, MALLOC_CAP_INTERNAL);
+  /* PSRAM stack — log task no longer hits flash directly (file I/O via fs worker,
+   * directory iteration via fs_opendir/readdir/closedir). The DRAM ring buffer is
+   * accessed via spinlock from any caller; cache-disable windows freeze this task. */
+  logReadySem = xSemaphoreCreateBinary();
+  xTaskCreatePinnedToCoreWithCaps(logTaskFn, "log", 4608, NULL, 1, &logTaskHandle, 1, MALLOC_CAP_SPIRAM);
+  /* Block until log task has its ITS server open — otherwise the serial task
+   * (created right after by cliInit) races and its initial connectLog fails. */
+  xSemaphoreTake(logReadySem, portMAX_DELAY);
+  vSemaphoreDelete(logReadySem);
+  logReadySem = nullptr;
 }
 
 /* ---- Log levels ---- */
@@ -750,20 +805,21 @@ static void cmdLogrotate(const char* a) {
     if (days <= 0) return;
 
     time_t cutoff = now - (time_t)days * 86400;
-    DIR* d = opendir(dir);
-    if (!d) return;
+    constexpr int MAX = 256;
+    auto* listing = (fs_listing_t*)heap_caps_malloc(MAX * sizeof(fs_listing_t), MALLOC_CAP_SPIRAM);
+    if (!listing) return;
+    int n = fs_listdir(dir, listing, MAX);
     int deleted = 0;
-    struct dirent* ent;
-    while ((ent = readdir(d)) != nullptr) {
-        if (!isLogDateFile(ent->d_name)) continue;
-        time_t ft = logDateToTime(ent->d_name);
+    for (int i = 0; i < n; i++) {
+        if (!isLogDateFile(listing[i].name)) continue;
+        time_t ft = logDateToTime(listing[i].name);
         if (ft > 0 && ft < cutoff) {
             char fp[80];  /* dir(64) + '/' + "YYYYMMDD.log"(12) + NUL */
-            snprintf(fp, sizeof(fp), "%.63s/%.12s", dir, ent->d_name);
+            snprintf(fp, sizeof(fp), "%.63s/%.12s", dir, listing[i].name);
             if (fs_remove(fp) == 0) deleted++;
         }
     }
-    closedir(d);
+    heap_caps_free(listing);
     if (deleted) cliPrintf("  deleted %d old log file%s\n", deleted, deleted > 1 ? "s" : "");
 }
 
