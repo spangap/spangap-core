@@ -364,8 +364,10 @@ static void fireSubscriptions(const char* key, const char* val) {
     size_t scopeLen = strlen(subs[i].scope);
     if (scopeLen == 0 || strncmp(key, subs[i].scope, scopeLen) == 0) {
       msg.cb = subs[i].cb;
-      itsSendAuxByTaskHandle(subs[i].task, STORAGE_CHANGE_PORT, &msg, sizeof(msg),
-                             pdMS_TO_TICKS(10));
+      if (!itsSendAuxByTaskHandle(subs[i].task, STORAGE_CHANGE_PORT, &msg, sizeof(msg),
+                                  pdMS_TO_TICKS(10))) {
+        warn("notify drop: %s=%s → task %p (inbox full)\n", key, val, (void*)subs[i].task);
+      }
     }
   }
 }
@@ -988,17 +990,59 @@ static void wsAccumulateChange(const char* key, const char* val) {
     CFG_UNLOCK();
 }
 
-/** Flush accumulated WS changes to all connected browsers. */
+/** Try a WS text send only if the stream buffer can accept the whole frame
+ *  right now. Returns true if sent (or no client), false if would have blocked.
+ *  Used by storage so its main task never stalls on a slow browser — under
+ *  back-pressure we leave wsPendingPatch intact and retry on the next flush. */
+static bool wsTrySendTextNonblocking(int handle, const char* text, size_t len) {
+    /* WS frame overhead: 2 bytes for <126, 4 bytes for 126..65535. */
+    size_t overhead = (len < 126) ? 2 : 4;
+    if (itsSpacesAvailable(handle) < len + overhead) return false;
+    return wsSendText(handle, text, len);
+}
+
+/** Flush accumulated WS changes to all connected browsers. On any client
+ *  back-pressure we keep the patch and retry next time — never drop changes,
+ *  unless the patch grows beyond the per-client send buffer (in which case
+ *  we fall back to a full re-dump on the next flush, since incremental delivery
+ *  is no longer possible for that client). */
+static constexpr size_t WS_PATCH_MAX = 60000;  /* leaves WS overhead headroom under 64KB buf */
+
 static void wsFlushPatch() {
     if (!wsPendingPatch || !wsAnyClient()) return;
     char* text = cJSON_PrintUnformatted(wsPendingPatch);
-    cJSON_Delete(wsPendingPatch);
-    wsPendingPatch = nullptr;
     if (!text) return;
     size_t len = strlen(text);
-    for (int i = 0; i < WS_MAX_CLIENTS; i++)
-        if (wsHandles[i] >= 0) wsSendText(wsHandles[i], text, len);
+
+    /* Patch outgrew the send buffer: drop it and warn. Browser may end up
+     * with stale UI state until the next change forces a fresh patch (or the
+     * user reloads). Avoiding a re-dump here keeps storage task lean and
+     * non-blocking — full dumps are heavy (cJSON_Duplicate of cfgRoot is
+     * deeply recursive) and can blow the stack. */
+    if (len > WS_PATCH_MAX) {
+        warn("storage: patch %u > %u, dropping (clients may need reload)\n",
+             (unsigned)len, (unsigned)WS_PATCH_MAX);
+        cJSON_free(text);
+        cJSON_Delete(wsPendingPatch);
+        wsPendingPatch = nullptr;
+        return;
+    }
+
+    bool allSent = true;
+    for (int i = 0; i < WS_MAX_CLIENTS; i++) {
+        if (wsHandles[i] < 0) continue;
+        if (!wsTrySendTextNonblocking(wsHandles[i], text, len)) {
+            allSent = false;
+            /* Don't break — try other clients, they may be fine. */
+        }
+    }
     cJSON_free(text);
+    if (allSent) {
+        cJSON_Delete(wsPendingPatch);
+        wsPendingPatch = nullptr;
+    }
+    /* Else keep wsPendingPatch — next wsAccumulateChange will merge into it
+     * and the next flush will retry the combined patch. */
 }
 
 /** Process incoming JSON from browser. Null = silent delete, values = storageSet. */
@@ -1107,8 +1151,17 @@ static void storageSaveAux(TaskHandle_t, const void*, size_t) {
 }
 
 static void storageTaskFn(void* arg) {
-    itsServerInit();
-    itsServerPortOpen(STORAGE_EPL_PORT, WS_MAX_CLIENTS, 2048, 4096);
+    /* "" subscription for WS sync means every storageSet fires an aux into
+     * our inbox — including changes we ourselves push when processing browser
+     * WS messages. UI bursts (page load, opening cli/log windows) generate
+     * many writes back-to-back; default depth 8 overflows. Drops show up as
+     * "[storage] notify drop" warns when this is too small. */
+    itsServerInit(0, 64);
+    /* 64KB send buffer per client (PSRAM): non-blocking patch flush requires
+     * the whole frame to fit at once, so the buffer must accommodate any
+     * single patch we'd realistically produce (full nested-config dumps,
+     * large array writes). 2KB recv is enough — browser sends small JSON. */
+    itsServerPortOpen(STORAGE_EPL_PORT, WS_MAX_CLIENTS, 2048, 65536);
     itsServerOnConnect(STORAGE_EPL_PORT, storageItsConnect);
     itsServerOnDisconnect(STORAGE_EPL_PORT, storageItsDisconnect);
     itsOnAux(STORAGE_SAVE_PORT, storageSaveAux);
@@ -1146,5 +1199,5 @@ static void storageTaskFn(void* arg) {
 
 void storageInit() {
     /* storage task: PSRAM stack (config WS + ITS, no direct file I/O) */
-    xTaskCreatePinnedToCoreWithCaps(storageTaskFn, "storage", 4096, NULL, 1, &storageHandle, 1, MALLOC_CAP_SPIRAM);
+    xTaskCreatePinnedToCoreWithCaps(storageTaskFn, "storage", 8192, NULL, 1, &storageHandle, 1, MALLOC_CAP_SPIRAM);
 }

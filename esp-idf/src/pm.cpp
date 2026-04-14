@@ -315,9 +315,11 @@ static void cmdPm(const char* args) {
     }
 #endif
     cliPrintf("\n");
+    /* esp_pm_dump_locks crashes on internal IDF locks with NULL names — skip
+     * until upstream is fixed or we replace it with our own iterator. */
     { auto w = [](void*, const char* d, int l) -> int { cliPrintf("%.*s", l, d); return l; };
       FILE* f = funopen(nullptr, nullptr, w, nullptr, nullptr);
-      if (f) { esp_pm_dump_locks(f); pmDumpDeepSleepLocks(f); fclose(f); }
+      if (f) { pmDumpDeepSleepLocks(f); fclose(f); }
     }
 }
 

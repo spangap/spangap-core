@@ -26,7 +26,7 @@
 
 static bool logInited = false;
 
-#define LOG_RING_SIZE 16384
+#define LOG_RING_SIZE 8192
 static uint8_t  logRing[LOG_RING_SIZE];   /* static DRAM — no heap alloc to corrupt */
 static volatile uint32_t logRingHead = 0; /* write position (writers) */
 static volatile uint32_t logRingTail = 0; /* read position (log task only) */
@@ -388,9 +388,19 @@ static int logVprintf(const char* fmt, va_list args) {
 
 /* ---- Log paste-back: send tail of log file to new WS client ---- */
 
-static void logPasteBack(int handle) {
-  int pasteKB = storageGetInt("s.log.file.paste", 48);
-  if (pasteKB <= 0 || !logFilePath[0]) return;
+/** Send tail of log file to a newly connected WS client.
+ *  overrideBytes: if > 0, tail exactly that many bytes (from ?backlog=N query).
+ *  Otherwise fall back to s.log.file.paste (kB, default 48). */
+static void logPasteBack(int handle, long overrideBytes = 0) {
+  long readSize;
+  if (overrideBytes > 0) {
+    readSize = overrideBytes;
+  } else {
+    int pasteKB = storageGetInt("s.log.file.paste", 48);
+    if (pasteKB <= 0) return;
+    readSize = (long)pasteKB * 1024;
+  }
+  if (!logFilePath[0]) return;
 
   /* Flush current file so all recent data is on disk */
   if (logFile >= 0) fs_sync(logFile);
@@ -400,7 +410,6 @@ static void logPasteBack(int handle) {
 
   fs_seek(f, 0, SEEK_END);
   long fileSize = fs_tell(f);
-  long readSize = (long)pasteKB * 1024;
   long offset = fileSize > readSize ? fileSize - readSize : 0;
   long want = fileSize - offset;
   fs_seek(f, offset, SEEK_SET);
@@ -471,10 +480,17 @@ static int logOnConnect(int handle, const void* data, size_t len) {
   if (s < 0) return -1;
   logSlots[s].ws = false;
   if (len >= sizeof(net_connect_t) && ((const net_connect_t*)data)->ws) {
-    if (!wsUpgrade(handle)) { logSlots[s].itsHandle = -1; return -1; }
+    /* Read headers first so we can extract ?backlog=N before consuming them. */
+    char hdr[1024];
+    int hdrLen = webGetHeader(handle, hdr, sizeof(hdr), 500);
+    if (hdrLen <= 0) { logSlots[s].itsHandle = -1; return -1; }
+    char backlogStr[16] = {};
+    webGetQuery(hdr, hdrLen, "backlog", backlogStr, sizeof(backlogStr));
+    long backlog = atol(backlogStr);
+    if (!wsUpgrade(handle, hdr, hdrLen)) { logSlots[s].itsHandle = -1; return -1; }
     logSlots[s].ws = true;
     logSlots[s].ansi = LOG_ANSI;
-    logPasteBack(handle);
+    logPasteBack(handle, backlog);
   } else if (len >= sizeof(log_connect_t)) {
     logSlots[s].ansi = ((const log_connect_t*)data)->ansi;
   } else {
