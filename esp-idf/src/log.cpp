@@ -510,7 +510,12 @@ static SemaphoreHandle_t logReadySem = nullptr;
 static void logTaskFn(void* arg) {
   for (int i = 0; i < LOG_MAX_CONSUMERS; i++) logSlots[i].itsHandle = -1;
   itsServerInit();
-  itsServerPortOpen(LOG_PORT, LOG_MAX_CONSUMERS, 0, 2048);
+  /* 32KB send buffer per consumer (PSRAM): live log fanout uses timeout=0
+   * (can't block the log task — others depend on it), so anything that doesn't
+   * fit is silently dropped. Net's TLS proxy can stall drains for seconds
+   * when busy, and 2KB was filling in ~10 lines, producing multi-minute
+   * silences before the buffer recovered. 32KB absorbs realistic bursts. */
+  itsServerPortOpen(LOG_PORT, LOG_MAX_CONSUMERS, 0, 32768);
   itsServerOnConnect(LOG_PORT, logOnConnect);
   itsServerOnDisconnect(LOG_PORT, logOnDisconnect);
   /* Unblock logInit() — server is open for clients (e.g. serial task). */
@@ -647,7 +652,7 @@ void logInit() {
    * directory iteration via fs_opendir/readdir/closedir). The DRAM ring buffer is
    * accessed via spinlock from any caller; cache-disable windows freeze this task. */
   logReadySem = xSemaphoreCreateBinary();
-  xTaskCreatePinnedToCoreWithCaps(logTaskFn, "log", 4608, NULL, 1, &logTaskHandle, 1, MALLOC_CAP_SPIRAM);
+  xTaskCreatePinnedToCoreWithCaps(logTaskFn, "log", 6144, NULL, 1, &logTaskHandle, 1, MALLOC_CAP_SPIRAM);
   /* Block until log task has its ITS server open — otherwise the serial task
    * (created right after by cliInit) races and its initial connectLog fails. */
   xSemaphoreTake(logReadySem, portMAX_DELAY);
