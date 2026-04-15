@@ -125,4 +125,30 @@ struct fs_file_info_t {
  *  Returns 0 on found, -1 if missing. Single round-trip. */
 int     fs_file_info(const char* path, bool tryGz, fs_file_info_t* out);
 
+/* ---- Streaming read API (ITS-stream backed) ----
+ * Open a file for reading as an ITS connection. A dedicated pump task on
+ * the fs side fread's into the server→client stream buffer; caller pulls
+ * via itsRecv(handle, buf, len, timeout). At EOF the pump exits but the
+ * buffer keeps delivering remaining bytes until itsRecv returns 0 and
+ * itsConnected(handle) is false — caller then calls itsDisconnect(handle).
+ * Requires a matching itsReserveStreams(N, bufSize) entry. */
+int     fs_open_stream_read(const char* path, size_t bufMinSize, size_t triggerLevel);
+
+/* ---- Streaming write API (ITS-stream backed) ----
+ * Open a file as an ITS connection to the fs worker. Caller writes via
+ * itsSend(handle, data, len, timeout). The fs worker drains the connection's
+ * client-side stream buffer when fill crosses `triggerLevel` and bursts the
+ * data to disk in one fs_write — eliminating per-line SD round-trips.
+ * Stream buffers come from the ITS pool (no runtime allocation), so a
+ * matching itsReserveStreams(N, bufSize) must exist.
+ *
+ * Use itsDisconnect(handle) to close. Returns ITS handle >= 0 on success. */
+int     fs_open_stream(const char* path, const char* mode,
+                       size_t bufMinSize, size_t triggerLevel);
+
+/** Force-drain an fs_open_stream handle: flush the ITS stream buffer into
+ *  fwrite + fflush + fsync. Blocks until the sync completes.
+ *  Returns 0 on success, -1 on error or timeout. */
+int     fs_stream_sync(int handle);
+
 #endif

@@ -366,7 +366,8 @@ static void fireSubscriptions(const char* key, const char* val) {
       msg.cb = subs[i].cb;
       if (!itsSendAuxByTaskHandle(subs[i].task, STORAGE_CHANGE_PORT, &msg, sizeof(msg),
                                   pdMS_TO_TICKS(10))) {
-        warn("notify drop: %s=%s → task %p (inbox full)\n", key, val, (void*)subs[i].task);
+        const char* tn = pcTaskGetName(subs[i].task);
+        warn("notify drop: %s=%s → [%s] (inbox full)\n", key, val, tn ? tn : "?");
       }
     }
   }
@@ -552,23 +553,23 @@ void storageGetStr(const char* key, char* out, size_t outLen, const char* def) {
 }
 
 void storageSet(const char* key, int val) {
-  CFG_LOCK();
-  bool autoCommit = (txDepth == 0);
-  if (autoCommit) storageBegin();  /* takes lock again (recursive) */
-
-  char leaf[48];
-  cJSON* parent = navigateOrCreate(txPatch, key, leaf, sizeof(leaf));
-  if (parent) {
-    cJSON_DeleteItemFromObject(parent, leaf);
-    cJSON_AddNumberToObject(parent, leaf, val);
-  }
-
-  if (autoCommit) storageEnd();  /* commits + releases inner lock */
-  CFG_UNLOCK();
+  char buf[16];
+  snprintf(buf, sizeof(buf), "%d", val);
+  storageSet(key, buf);
 }
 
 void storageSet(const char* key, const char* val) {
   CFG_LOCK();
+  /* Dedup: skip if current committed value equals new value. Saves notify
+   * floods when e.g. browser rapid-fires the same signal repeatedly. */
+  {
+    char existing[64];
+    storageGetStr(key, existing, sizeof(existing), "\x01");  /* sentinel = absent */
+    if (existing[0] != '\x01' && strcmp(existing, val) == 0) {
+      CFG_UNLOCK();
+      return;
+    }
+  }
   bool autoCommit = (txDepth == 0);
   if (autoCommit) storageBegin();
 

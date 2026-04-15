@@ -131,14 +131,13 @@ static void logFileMsg(const char* msg) {
     char ts[24]; fmtWallClock(ts, sizeof(ts));
     char line[256];
     int n = snprintf(line, sizeof(line), "%s I [log] %s\n", ts, msg);
-    if (n > 0) fs_write(line, 1, n, logFile);
+    if (n > 0) itsSend(logFile, line, n, 0);
 }
 
 static void logFileClose() {
     if (logFile < 0) return;
     logFileMsg("log file closed");
-    fs_sync(logFile);
-    fs_close(logFile);
+    itsDisconnect(logFile);
     logFile = -1;
     logFilePath[0] = '\0';
 }
@@ -146,9 +145,11 @@ static void logFileClose() {
 static void logFileOpen(const char* path) {
     logFileClose();
     if (!path || !*path) return;
-    int f = fs_open(path, "a");
-    if (f < 0) return;
-    logFile = f;
+    /* Stream buffer 16KB, fs worker drains once 4KB have accumulated —
+     * batches ~4KB per fs_write instead of per-line. */
+    int h = fs_open_stream(path, "a", 16384, 4096);
+    if (h < 0) return;
+    logFile = h;
     safeStrncpy(logFilePath, path, sizeof(logFilePath));
     lastFlushUs = esp_timer_get_time();
     logFileMsg("log file opened");
@@ -163,19 +164,15 @@ static void logFileWrite(const char* data, size_t len) {
         const char* nl = (const char*)memchr(p, '\n', end - p);
         size_t lineLen = nl ? (size_t)(nl - p + 1) : (size_t)(end - p);
         if (levelCharToNum(lineLevel(p, lineLen)) <= logFileLevelMax)
-            fs_write(p, 1, lineLen, logFile);
+            itsSend(logFile, p, lineLen, 0);
         p += lineLen;
     }
 }
 
 static void logFileFlush() {
-    if (logFile < 0) return;
-    int intervalS = storageGetInt("s.log.file.interval", 5);
-    int64_t now = esp_timer_get_time();
-    if (now - lastFlushUs >= (int64_t)intervalS * 1000000) {
-        fs_sync(logFile);
-        lastFlushUs = now;
-    }
+    /* No-op: the fs worker drains the stream buffer on its own trigger level.
+     * Closing the file (logFileClose → itsDisconnect) flushes + fsyncs. */
+    (void)lastFlushUs;
 }
 
 /* ---- Log ITS server — consumers connect as clients ---- */
@@ -402,8 +399,7 @@ static void logPasteBack(int handle, long overrideBytes = 0) {
   }
   if (!logFilePath[0]) return;
 
-  /* Flush current file so all recent data is on disk */
-  if (logFile >= 0) fs_sync(logFile);
+  if (logFile >= 0) fs_stream_sync(logFile);
 
   int f = fs_open(logFilePath, "r");
   if (f < 0) return;
@@ -468,7 +464,26 @@ static void logPasteBack(int handle, long overrideBytes = 0) {
     }
   }
 
-  wsSendText(handle, out, op);
+  /* Chunk into smaller WS frames (each ≤ 8KB): a single large frame can
+   * exceed the consumer stream buffer, causing itsSendAll to partial-send;
+   * the frame header then declares a size bigger than payload sent, and the
+   * browser blocks the channel waiting for the "missing" bytes (which later
+   * arrive from live log writes — so xterm appears to hang until enough live
+   * activity fills the declared size). Split on line boundaries. */
+  constexpr size_t CHUNK = 8192;
+  size_t off = 0;
+  while (off < op) {
+    size_t take = (op - off > CHUNK) ? CHUNK : (op - off);
+    /* Back off to the previous newline so frames end on a clean line,
+     * keeping ANSI sequences intact within a single frame. */
+    if (take < op - off) {
+      size_t nl = take;
+      while (nl > 0 && out[off + nl - 1] != '\n') nl--;
+      if (nl > 0) take = nl;
+    }
+    if (!wsSendText(handle, out + off, take)) break;
+    off += take;
+  }
   heap_caps_free(out);
   heap_caps_free(in);
 }
@@ -510,6 +525,7 @@ static SemaphoreHandle_t logReadySem = nullptr;
 static void logTaskFn(void* arg) {
   for (int i = 0; i < LOG_MAX_CONSUMERS; i++) logSlots[i].itsHandle = -1;
   itsServerInit();
+  itsClientInit(1);  /* so logFileOpen() can itsConnect to fs stream server */
   /* 32KB send buffer per consumer (PSRAM): live log fanout uses timeout=0
    * (can't block the log task — others depend on it), so anything that doesn't
    * fit is silently dropped. Net's TLS proxy can stall drains for seconds
@@ -730,14 +746,27 @@ const char* cfd(int fd) {
 
 static void cmdLogfile(const char* a) {
     if (strcmp(a, "help") == 0) {
-        cliPrintf("  %-*s start/stop logging to file\n", CLI_HELP_COL, "logfile [level] [name|off]");
+        cliPrintf("  %-*s show current log-file status\n", CLI_HELP_COL, "logfile");
+        cliPrintf("  %-*s enable, today's YYYYMMDD.log\n", CLI_HELP_COL, "logfile on");
+        cliPrintf("  %-*s disable\n", CLI_HELP_COL, "logfile off");
+        cliPrintf("  %-*s use given filename\n", CLI_HELP_COL, "logfile <name>");
+        cliPrintf("  %-*s as above, with level (error/warn/info/debug/verbose)\n",
+                  CLI_HELP_COL, "logfile <level> <name|on|off>");
         return;
     }
 
-    /* logfile off — stop logging */
-    if (strcmp(a, "off") == 0) { storageSet("s.log.file.name", ""); return; }
+    /* logfile (no args) — status only */
+    if (a[0] == '\0') {
+        char name[64], level[16], dir[64];
+        storageGetStr("s.log.file.name", name, sizeof(name));
+        storageGetStr("s.log.file.level", level, sizeof(level), "verbose");
+        storageGetStr("s.log.dir", dir, sizeof(dir), "/sdcard/log");
+        if (name[0]) cliPrintf("  %s/%s (%s)\n", dir, name, level);
+        else         cliPrintf("  off (level=%s when on)\n", level);
+        return;
+    }
 
-    /* Parse optional level, then optional name */
+    /* Parse optional level prefix, then the action token (on/off/<name>) */
     char first[24] = {};
     int i = 0;
     while (a[i] && a[i] != ' ' && i < 23) { first[i] = a[i]; i++; }
@@ -745,35 +774,41 @@ static void cmdLogfile(const char* a) {
     const char* rest = a + i;
     while (*rest == ' ') rest++;
 
-    const char* level = "verbose";
-    const char* nameArg = nullptr;
-
-    if (first[0] && isLevelArg(first)) {
+    const char* level = nullptr;
+    const char* action;
+    if (first[0] && isLevelArg(first) && *rest) {
         level = first;
-        if (*rest) nameArg = rest;
-    } else if (first[0]) {
-        nameArg = a;  /* no level, entire arg is the name */
+        action = rest;
+    } else {
+        action = a;
     }
 
-    storageSet("s.log.file.level", level);
+    if (level) storageSet("s.log.file.level", level);
+
+    if (strcmp(action, "off") == 0) {
+        storageSet("s.log.file.name", "");
+        cliPrintf("  off\n");
+        return;
+    }
 
     char name[64];
-    if (!nameArg) {
-        /* Default: YYYYMMDD.log */
+    if (strcmp(action, "on") == 0) {
         time_t now = time(nullptr);
         struct tm tm;
         localtime_r(&now, &tm);
         snprintf(name, sizeof(name), "%04d%02d%02d.log",
-            tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday);
+                 tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday);
     } else {
         /* Extract basename if full path given */
-        const char* base = strrchr(nameArg, '/');
-        safeStrncpy(name, base ? base + 1 : nameArg, sizeof(name));
+        const char* base = strrchr(action, '/');
+        safeStrncpy(name, base ? base + 1 : action, sizeof(name));
     }
 
     storageSet("s.log.file.name", name);
     char dir[64]; storageGetStr("s.log.dir", dir, sizeof(dir), "/sdcard/log");
-    cliPrintf("  %s/%s (%s)\n", dir, name, level);
+    char curLevel[16];
+    storageGetStr("s.log.file.level", curLevel, sizeof(curLevel), "verbose");
+    cliPrintf("  %s/%s (%s)\n", dir, name, curLevel);
 }
 
 /* ---- CLI command: logrotate ---- */

@@ -19,7 +19,10 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "esp_heap_caps.h"
+#include "esp_log.h"
+#include "log.h"
 #include "esp_littlefs.h"
+#include "esp_timer.h"
 #include "nvs_flash.h"
 
 /* ---- Handle table ---- */
@@ -238,17 +241,221 @@ static void handleOp(fs_op_t* req) {
 }
 
 static void onFsOp(TaskHandle_t, const void* data, size_t len) {
+    static uint32_t lastOpExitUs = 0;
     if (len < sizeof(fs_op_t*)) return;
     fs_op_t* op;
     memcpy(&op, data, sizeof(op));
+    uint32_t t0 = (uint32_t)esp_timer_get_time();
+    /* Time gap since previous op exited — exposes whether fs worker is being
+     * starved between picking up messages. */
+    uint32_t idleMs = lastOpExitUs ? (t0 - lastOpExitUs) / 1000 : 0;
+    if (idleMs > 200) {
+        verb("fs worker: idle %ums before op=%d\n", (unsigned)idleMs, (int)op->op);
+    }
     handleOp(op);
+    uint32_t t1 = (uint32_t)esp_timer_get_time();
+    uint32_t took = (t1 - t0) / 1000;
+    if (took > 200) {
+        verb("fs worker: op=%d slot=%d took %ums\n",
+             (int)op->op, op->slot, (unsigned)took);
+    }
+    lastOpExitUs = t1;
 }
 
 static int proxyOp(fs_op_t& req) {
     fs_op_t* ptr = &req;
+    uint32_t t0 = (uint32_t)esp_timer_get_time();
     itsSendAuxByTaskHandle(fsWorkerHandle, FS_OP_PORT, &ptr, sizeof(ptr),
                            portMAX_DELAY, ITS_WAIT_PICKUP);
+    uint32_t took = ((uint32_t)esp_timer_get_time() - t0) / 1000;
+    if (took > 200) {
+        verb("fs proxy: op=%d slot=%d wait %ums\n",
+             (int)req.op, req.slot, (unsigned)took);
+    }
     return req.result;
+}
+
+/* ---- Streaming write server (ITS-stream backed) ---- */
+
+static constexpr uint16_t FS_STREAM_PORT = 2;
+#define FS_STREAM_MAX_HANDLES 2
+#define FS_STREAM_BUF_SIZE    16384
+
+struct fs_stream_open_t {
+    char     path[80];
+    char     mode[8];
+    uint32_t triggerLevel;
+};
+
+static struct {
+    FILE* fp;
+    int   handle;
+} fsStreamSlots[FS_STREAM_MAX_HANDLES];
+
+static int fsStreamSlotFor(int handle) {
+    for (int i = 0; i < FS_STREAM_MAX_HANDLES; i++)
+        if (fsStreamSlots[i].fp && fsStreamSlots[i].handle == handle) return i;
+    return -1;
+}
+
+static int fsStreamOnConnect(int handle, const void* data, size_t len) {
+    if (len < sizeof(fs_stream_open_t)) return -1;
+    fs_stream_open_t req;
+    memcpy(&req, data, sizeof(req));
+    int slot = -1;
+    for (int i = 0; i < FS_STREAM_MAX_HANDLES; i++)
+        if (!fsStreamSlots[i].fp) { slot = i; break; }
+    if (slot < 0) return -1;
+    FILE* fp = fopen(req.path, req.mode);
+    if (!fp) return -1;
+    fsStreamSlots[slot].fp = fp;
+    fsStreamSlots[slot].handle = handle;
+    if (req.triggerLevel > 1) itsSetTriggerLevel(handle, req.triggerLevel);
+    return slot;
+}
+
+static void fsStreamDrain(int slot) {
+    FILE* fp = fsStreamSlots[slot].fp;
+    int   h  = fsStreamSlots[slot].handle;
+    static char drainBuf[2048];
+    for (;;) {
+        size_t n = itsRecv(h, drainBuf, sizeof(drainBuf), 0);
+        if (n == 0) break;
+        fwrite(drainBuf, 1, n, fp);
+    }
+}
+
+static void fsStreamOnRecv(int handle, size_t /*bytesAvail*/) {
+    int slot = fsStreamSlotFor(handle);
+    if (slot < 0) return;
+    fsStreamDrain(slot);
+}
+
+static void fsStreamOnDisconnect(int ref) {
+    if (ref < 0 || ref >= FS_STREAM_MAX_HANDLES) return;
+    auto& s = fsStreamSlots[ref];
+    if (!s.fp) return;
+    fsStreamDrain(ref);
+    fflush(s.fp);
+    fsync(fileno(s.fp));
+    fclose(s.fp);
+    s.fp = nullptr;
+    s.handle = -1;
+}
+
+static TaskHandle_t fsStreamsHandle = nullptr;
+
+static constexpr uint16_t FS_STREAM_SYNC_PORT = 4;
+
+struct fs_stream_sync_msg_t { int handle; };
+
+static void fsStreamSyncHandler(TaskHandle_t, const void* data, size_t len) {
+    if (len < sizeof(fs_stream_sync_msg_t)) return;
+    fs_stream_sync_msg_t req;
+    memcpy(&req, data, sizeof(req));
+    int slot = fsStreamSlotFor(req.handle);
+    if (slot < 0) return;
+    fsStreamDrain(slot);
+    fflush(fsStreamSlots[slot].fp);
+    fsync(fileno(fsStreamSlots[slot].fp));
+}
+
+int fs_stream_sync(int handle) {
+    if (!fsStreamsHandle) return -1;
+    fs_stream_sync_msg_t req = { handle };
+    bool ok = itsSendAuxByTaskHandle(fsStreamsHandle, FS_STREAM_SYNC_PORT,
+                                     &req, sizeof(req), pdMS_TO_TICKS(2000),
+                                     ITS_WAIT_PICKUP);
+    return ok ? 0 : -1;
+}
+
+int fs_open_stream(const char* path, const char* mode,
+                   size_t bufMinSize, size_t triggerLevel) {
+    if (bufMinSize > FS_STREAM_BUF_SIZE) return -1;
+    fs_stream_open_t req = {};
+    safeStrncpy(req.path, path, sizeof(req.path));
+    safeStrncpy(req.mode, mode, sizeof(req.mode));
+    req.triggerLevel = triggerLevel;
+    return itsConnectByTaskHandle(fsStreamsHandle, FS_STREAM_PORT,
+                                  &req, sizeof(req), pdMS_TO_TICKS(2000));
+}
+
+/* ---- Streaming read server ----
+ * Pumped inline from the fs worker's main loop (see fsWorkerFn). FAT/SDMMC
+ * serializes anyway, so a separate pump task would buy nothing. Each active
+ * slot's server→client buffer is topped up with fread chunks between
+ * itsPoll calls; client pulls via itsRecv. At EOF we stop topping up —
+ * queued bytes keep draining until the client calls itsDisconnect. */
+
+static constexpr uint16_t FS_READ_PORT = 3;
+#define FS_READ_MAX_HANDLES 2
+#define FS_READ_BUF_SIZE    (512 * 1024)
+
+struct fs_read_open_t {
+    char     path[80];
+    uint32_t triggerLevel;
+    uint32_t _reserved;
+};
+
+static struct {
+    FILE* fp;
+    int   handle;
+    bool  eof;
+} fsReadSlots[FS_READ_MAX_HANDLES];
+
+static int fsReadOnConnect(int handle, const void* data, size_t len) {
+    if (len < sizeof(fs_read_open_t)) return -1;
+    fs_read_open_t req;
+    memcpy(&req, data, sizeof(req));
+    int slot = -1;
+    for (int i = 0; i < FS_READ_MAX_HANDLES; i++)
+        if (!fsReadSlots[i].fp) { slot = i; break; }
+    if (slot < 0) return -1;
+    FILE* fp = fopen(req.path, "rb");
+    if (!fp) return -1;
+    auto& s = fsReadSlots[slot];
+    s.fp = fp;
+    s.handle = handle;
+    s.eof = false;
+    if (req.triggerLevel > 1) itsSetTriggerLevel(handle, req.triggerLevel);
+    return slot;
+}
+
+static void fsReadOnDisconnect(int ref) {
+    if (ref < 0 || ref >= FS_READ_MAX_HANDLES) return;
+    auto& s = fsReadSlots[ref];
+    if (!s.fp) return;
+    fclose(s.fp);
+    s.fp = nullptr;
+    s.handle = -1;
+}
+
+/* Top up all active read slots. Returns true if any slot still needs more
+ * data (so the caller should short-poll rather than block indefinitely). */
+static bool fsReadPumpOnce() {
+    static char buf[4096];
+    bool needsMore = false;
+    for (int i = 0; i < FS_READ_MAX_HANDLES; i++) {
+        auto& s = fsReadSlots[i];
+        if (!s.fp || s.eof) continue;
+        size_t space = itsSpacesAvailable(s.handle);
+        if (space < 1024) { needsMore = true; continue; }
+        size_t toRead = space < sizeof(buf) ? space : sizeof(buf);
+        size_t n = fread(buf, 1, toRead, s.fp);
+        if (n == 0) { s.eof = true; continue; }
+        itsSend(s.handle, buf, n, 0);
+        needsMore = true;
+    }
+    return needsMore;
+}
+
+int fs_open_stream_read(const char* path, size_t bufMinSize, size_t triggerLevel) {
+    if (bufMinSize > FS_READ_BUF_SIZE) return -1;
+    fs_read_open_t req = {};
+    safeStrncpy(req.path, path, sizeof(req.path));
+    req.triggerLevel = triggerLevel;
+    return itsConnectByTaskHandle(fsStreamsHandle, FS_READ_PORT,
+                                  &req, sizeof(req), pdMS_TO_TICKS(2000));
 }
 
 static void fsWorkerFn(void*) {
@@ -256,6 +463,27 @@ static void fsWorkerFn(void*) {
     itsOnAux(FS_OP_PORT, onFsOp);
     xSemaphoreGive(fsReady);
     for (;;) itsPoll();
+}
+
+static SemaphoreHandle_t fsStreamsReady = nullptr;
+
+static void fsStreamsFn(void*) {
+    itsServerInit();
+    itsServerPortOpen(FS_STREAM_PORT, FS_STREAM_MAX_HANDLES,
+                      FS_STREAM_BUF_SIZE, 0);
+    itsServerOnConnect(FS_STREAM_PORT, fsStreamOnConnect);
+    itsServerOnRecv(FS_STREAM_PORT, fsStreamOnRecv);
+    itsServerOnDisconnect(FS_STREAM_PORT, fsStreamOnDisconnect);
+    itsServerPortOpen(FS_READ_PORT, FS_READ_MAX_HANDLES,
+                      0, FS_READ_BUF_SIZE);
+    itsServerOnConnect(FS_READ_PORT, fsReadOnConnect);
+    itsServerOnDisconnect(FS_READ_PORT, fsReadOnDisconnect);
+    itsOnAux(FS_STREAM_SYNC_PORT, fsStreamSyncHandler);
+    xSemaphoreGive(fsStreamsReady);
+    for (;;) {
+        bool needsMore = fsReadPumpOnce();
+        itsPoll(needsMore ? pdMS_TO_TICKS(50) : portMAX_DELAY);
+    }
 }
 
 /* ---- Filesystem mounting ---- */
@@ -343,12 +571,24 @@ void fs_init() {
         applyAdditionalState();
     }
 
-    /* Start DRAM-stack worker for proxied flash I/O */
+    /* Start DRAM-stack workers:
+     *   fs      — POSIX aux ops (fopen/fread/fwrite-by-handle, stat, …)
+     *   fs_strm — streaming write drain + streaming read pump
+     * Split so a long streaming read doesn't delay a quick random-access op.
+     * FAT/SDMMC still serializes, but FreeRTOS scheduling lets the aux task
+     * run between chunks. */
     fsReady = xSemaphoreCreateBinary();
     xTaskCreatePinnedToCore(fsWorkerFn, "fs", 5120, nullptr, 1, &fsWorkerHandle, 1);
     xSemaphoreTake(fsReady, portMAX_DELAY);
     vSemaphoreDelete(fsReady);
     fsReady = nullptr;
+
+    fsStreamsReady = xSemaphoreCreateBinary();
+    xTaskCreatePinnedToCore(fsStreamsFn, "fs_strm", 5120, nullptr, 1,
+                            &fsStreamsHandle, 1);
+    xSemaphoreTake(fsStreamsReady, portMAX_DELAY);
+    vSemaphoreDelete(fsStreamsReady);
+    fsStreamsReady = nullptr;
 }
 
 /* ---- Public API: handle-based ---- */
@@ -385,7 +625,14 @@ size_t fs_read(void* buf, size_t size, size_t nmemb, int f) {
         int r = proxyOp(req);
         return r > 0 ? (size_t)r : 0;
     }
-    return fileSlots[f].fp ? fread(buf, size, nmemb, fileSlots[f].fp) : 0;
+    uint32_t t0 = (uint32_t)(esp_timer_get_time() / 1000);
+    size_t n = fileSlots[f].fp ? fread(buf, size, nmemb, fileSlots[f].fp) : 0;
+    uint32_t took = (uint32_t)(esp_timer_get_time() / 1000) - t0;
+    if (took > 500) {
+        verb("fs_read %ums (%u×%u)\n",
+             (unsigned)took, (unsigned)size, (unsigned)nmemb);
+    }
+    return n;
 }
 
 size_t fs_write(const void* buf, size_t size, size_t nmemb, int f) {
@@ -400,7 +647,17 @@ size_t fs_write(const void* buf, size_t size, size_t nmemb, int f) {
         int r = proxyOp(req);
         return r > 0 ? (size_t)r : 0;
     }
-    return fileSlots[f].fp ? fwrite(buf, size, nmemb, fileSlots[f].fp) : 0;
+    uint32_t t0 = (uint32_t)(esp_timer_get_time() / 1000);
+    uint32_t tick0 = xTaskGetTickCount();
+    size_t n = fileSlots[f].fp ? fwrite(buf, size, nmemb, fileSlots[f].fp) : 0;
+    uint32_t took = (uint32_t)(esp_timer_get_time() / 1000) - t0;
+    uint32_t tookTicks = (xTaskGetTickCount() - tick0) * portTICK_PERIOD_MS;
+    if (took > 500) {
+        verb("fs_write %ums (ticks=%ums, %u×%u)\n",
+             (unsigned)took, (unsigned)tookTicks,
+             (unsigned)size, (unsigned)nmemb);
+    }
+    return n;
 }
 
 long fs_tell(int f) {
@@ -411,7 +668,17 @@ long fs_tell(int f) {
         req.slot = f;
         return (long)proxyOp(req);
     }
-    return fileSlots[f].fp ? ftell(fileSlots[f].fp) : -1;
+    /* DIAG: raw microsecond timestamps at entry and exit, always printed when
+     * slow. Lets caller correlate gap between its own marker and this. */
+    uint32_t tEntryUs = (uint32_t)esp_timer_get_time();
+    long r = fileSlots[f].fp ? ftell(fileSlots[f].fp) : -1;
+    uint32_t tExitUs = (uint32_t)esp_timer_get_time();
+    if (tExitUs - tEntryUs > 200000) {
+        verb("fs_tell: entry=%uus exit=%uus dt=%ums\n",
+             (unsigned)tEntryUs, (unsigned)tExitUs,
+             (unsigned)((tExitUs - tEntryUs) / 1000));
+    }
+    return r;
 }
 
 int fs_seek(int f, long offset, int whence) {
@@ -424,7 +691,14 @@ int fs_seek(int f, long offset, int whence) {
         req.whence = whence;
         return proxyOp(req);
     }
-    return fileSlots[f].fp ? fseek(fileSlots[f].fp, offset, whence) : -1;
+    uint32_t t0 = (uint32_t)(esp_timer_get_time() / 1000);
+    int r = fileSlots[f].fp ? fseek(fileSlots[f].fp, offset, whence) : -1;
+    uint32_t took = (uint32_t)(esp_timer_get_time() / 1000) - t0;
+    if (took > 500) {
+        verb("fs_seek %ums (offset=%ld whence=%d)\n",
+             (unsigned)took, offset, whence);
+    }
+    return r;
 }
 
 int fs_flush(int f) {

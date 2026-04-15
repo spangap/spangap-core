@@ -101,31 +101,39 @@ bool deepSleepAllowed() {
   return true;
 }
 
+static const char* pmTypeName(pm_lock_type_t t) {
+  switch (t) {
+    case PM_CPU_FREQ_MAX:  return "CPU_FREQ_MAX";
+    case PM_APB_FREQ_MAX:  return "APB_FREQ_MAX";
+    case PM_NO_LIGHT_SLEEP: return "NO_LIGHT_SLEEP";
+    case PM_NO_DEEP_SLEEP:  return "NO_DEEP_SLEEP";
+  }
+  return "?";
+}
+
+/** Dump every lock we track (name safe — it's our own list, never NULL).
+ *  Avoids esp_pm_dump_locks() which crashes on IDF-internal NULL-name locks. */
 static void pmDumpDeepSleepLocks(FILE* stream) {
+  if (!pmLockList) return;
   int64_t now = esp_timer_get_time();
   int64_t now_d100 = now / 100;
-  bool any = false;
-  for (pm_lock* l = pmLockList; l; l = l->next)
-    if (l->type == PM_NO_DEEP_SLEEP) { any = true; break; }
-  if (!any) return;
-  fprintf(stream, "\nDeep sleep locks:\n");
+  fprintf(stream, "\nPM locks:\n");
 #ifdef CONFIG_PM_PROFILING
-  fprintf(stream, "%-15s %-14s  %-5s  %-8s  %-13s  %-14s  %-8s\n",
-          "Name", "Type", "Arg", "Active", "Total_count", "Time(us)", "Time(%)");
+  fprintf(stream, "%-15s %-14s  %-8s  %-13s  %-14s  %-8s\n",
+          "Name", "Type", "Active", "Total_count", "Time(us)", "Time(%)");
   for (pm_lock* l = pmLockList; l; l = l->next) {
-    if (l->type != PM_NO_DEEP_SLEEP) continue;
     int64_t held = l->time_held;
     if (l->count > 0) held += now - l->last_taken;
-    fprintf(stream, "%-15.15s %-14s  %-5d  %-8d  %-13d  %-14lld  %-3lld%%\n",
-            l->name, "NO_DEEP_SLEEP", 0, l->count, l->times_taken,
+    fprintf(stream, "%-15.15s %-14s  %-8d  %-13d  %-14lld  %-3lld%%\n",
+            l->name ? l->name : "?", pmTypeName(l->type),
+            l->count, l->times_taken,
             held, now_d100 ? (held + now_d100 - 1) / now_d100 : 0LL);
   }
 #else
-  fprintf(stream, "%-15s %-14s  %-5s  %-8s\n", "Name", "Type", "Arg", "Active");
+  fprintf(stream, "%-15s %-14s  %-8s\n", "Name", "Type", "Active");
   for (pm_lock* l = pmLockList; l; l = l->next) {
-    if (l->type != PM_NO_DEEP_SLEEP) continue;
-    fprintf(stream, "%-15.15s %-14s  %-5d  %-8d\n",
-            l->name, "NO_DEEP_SLEEP", 0, l->count);
+    fprintf(stream, "%-15.15s %-14s  %-8d\n",
+            l->name ? l->name : "?", pmTypeName(l->type), l->count);
   }
 #endif
 }
