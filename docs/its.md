@@ -30,7 +30,8 @@ By convention, port numbers are arbitrary but stable: each module's header file 
 | [webrtc_task.h](../main/webrtc_task.h) | `WEBRTC_PORT=4433` |
 | [log.h](../main/log.h) | `LOG_PORT=8080` |
 | [cli.h](../main/cli.h) | `CLI_PORT=8081` |
-| [storage.h](../main/storage.h) | `STORAGE_EPL_PORT=0` (config WS), `STORAGE_SAVE_PORT=43`, `STORAGE_CHANGE_PORT=42`, `FS_FILE_PORT=1`, `FS_STREAM_RD_PORT=2`, `FS_STREAM_WR_PORT=3`, `STREAM_AUX_NUDGE/SEEK/FLUSH/TELL=2..5` |
+| [storage.h](../main/storage.h) | `STORAGE_EPL_PORT=0` (config WS), `STORAGE_CHANGE_PORT=42` (change dispatch), `STORAGE_SAVE_PORT=43` (save-now signal) |
+| [fs.h](../main/fs.h) | `FS_OP_PORT=1` (POSIX ops aux, on `fs`), `FS_STREAM_PORT=2` (streaming write, on `fs_strm`), `FS_READ_PORT=3` (streaming read, on `fs_strm`), `FS_STREAM_SYNC_PORT=4` (stream-sync aux, on `fs_strm`) |
 | [camera.h](../main/camera.h) | `CAM_CMD_PORT=10` |
 | [audio.h](../main/audio.h) | `AUDIO_CMD_PORT=24`, `AUDIO_NOTIFY_PORT=25` |
 | [play.h](../main/play.h) | `PLAY_CMD_VIDEO_PORT=10`, `PLAY_CMD_AUDIO_PORT=24`, `PLAY_AUDIO_PORT=25` (aliased to camera/audio numbers) |
@@ -256,13 +257,14 @@ bool itsSetTriggerLevel(int handle, size_t triggerLevel);
 
 Set the trigger level on **this side's incoming stream** (the buffer bytes are arriving in, from the caller's perspective). The default is 1 — every `itsSend` from the remote wakes the local task. Setting a higher trigger level means the remote's `itsSend` only notifies the local task once the buffer fill reaches `triggerLevel` bytes; smaller writes accumulate silently in the buffer until the threshold is crossed.
 
-This replaces the older `itsSendSilent` + manual nudge pattern. The fs worker uses it to coalesce streaming writes:
+This replaces the older `itsSendSilent` + manual nudge pattern. The fs streaming-write server uses it to coalesce writes (see `fs_open_stream`):
 
 ```cpp
-int handle = itsConnect("fs", FS_STREAM_WR_PORT, ...);
-itsSetTriggerLevel(handle, FS_WRITE_DRAIN);   // 196 KB
-// ...
-itsSend(handle, data, len, ...);              // silent until ≥196KB queued
+int handle = fs_open_stream(path, "ab", bufSize, triggerLevel);
+// fs_strm sets trigger level on the connection; itsSend accumulates silently
+// until the buffer fill crosses triggerLevel, at which point the worker drains
+// with a single fwrite.
+itsSend(handle, data, len, ...);
 ```
 
 Setting the trigger level also calls `xStreamBufferSetTriggerLevel` on the underlying FreeRTOS stream buffer, so any blocking `xStreamBufferReceive` callers (none in seccam currently) see consistent semantics.
