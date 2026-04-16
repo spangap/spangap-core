@@ -28,6 +28,12 @@ struct its_pool_entry_t {
     size_t               size;
     size_t               triggerLevel;   /* notify-on-send threshold (bytes) */
     volatile bool        inUse;
+    /* Packet-mode flow control. senderWaiting > 0 means a packet sender is
+     * blocked on spaceFreedSem because spaces_available was less than
+     * senderWaiting. The receiver gives the sem after consuming a packet if
+     * spaces_available has reached senderWaiting. */
+    volatile size_t      senderWaiting;
+    SemaphoreHandle_t    spaceFreedSem;
 };
 
 static its_pool_entry_t itsPool[ITS_MAX_POOL];
@@ -41,6 +47,8 @@ void itsReserveStreams(int count, size_t size) {
         e.size = size;
         e.triggerLevel = 1;
         e.inUse = false;
+        e.senderWaiting = 0;
+        e.spaceFreedSem = xSemaphoreCreateBinary();
     }
 }
 
@@ -136,6 +144,7 @@ static bool pickupWait(int idx, TickType_t timeout) {
 
 struct its_conn_t {
     volatile bool       active;
+    bool                packetBased;
     TaskHandle_t        clientTask;
     TaskHandle_t        serverTask;
     int                 toPoolIdx;
@@ -223,6 +232,7 @@ struct its_aux_entry_t {
 
 struct its_server_port_t {
     bool                  active;
+    bool                  packetBased;
     uint16_t              port;
     int                   maxHandles;
     size_t                toSize;
@@ -404,6 +414,7 @@ static void processInboxMsg(its_task_t* me, uint8_t* buf) {
             c->clientTask = hdr->sender;
             c->serverTask = me->task;
             c->itsPort = hdr->itsPort;
+            c->packetBased = sp->packetBased;
             if (sp->toSize > 0)   c->toPoolIdx = poolGet(sp->toSize);
             if (sp->fromSize > 0) c->fromPoolIdx = poolGet(sp->fromSize);
 
@@ -465,8 +476,10 @@ static void processInboxMsg(its_task_t* me, uint8_t* buf) {
                 ITS_LOGE("forwarded conn arrived for unopened port %u (from [%s])",
                          hdr->itsPort, pcTaskGetName(hdr->sender));
                 itsDisconnect(handle);
-            } else if (sp->onConnect && sp->onConnect(handle, payload, hdr->len) < 0) {
-                itsDisconnect(handle);
+            } else {
+                c->packetBased = sp->packetBased;
+                if (sp->onConnect && sp->onConnect(handle, payload, hdr->len) < 0)
+                    itsDisconnect(handle);
             }
         }
 
@@ -510,7 +523,10 @@ static bool dispatchRecvCallbacks(its_task_t* me) {
         }
         if (!cb || !buf) continue;
         size_t avail = xStreamBufferBytesAvailable(buf);
-        if (avail > 0) { cb(i, avail); any = true; }
+        /* Packet mode: avail <= 4 is either empty or a lone in-flight header;
+         * avail > 4 guarantees at least one complete packet at the head. */
+        size_t threshold = c->packetBased ? 4 : 0;
+        if (avail > threshold) { cb(i, avail); any = true; }
     }
     return any;
 }
@@ -558,7 +574,7 @@ bool itsServerInit(size_t inboxMaxMsgLen, size_t inboxDepth) {
     return true;
 }
 
-bool itsServerPortOpen(uint16_t port, int maxHandles,
+bool itsServerPortOpen(uint16_t port, bool packetBased, int maxHandles,
                        size_t toSize, size_t fromSize) {
     its_task_t* e = myTask();
     if (!e || !e->isServer) {
@@ -567,6 +583,7 @@ bool itsServerPortOpen(uint16_t port, int maxHandles,
     }
     its_server_port_t* sp = portFind(e, port);
     if (sp) {
+        sp->packetBased = packetBased;
         sp->maxHandles = maxHandles;
         sp->toSize = toSize;
         sp->fromSize = fromSize;
@@ -576,6 +593,7 @@ bool itsServerPortOpen(uint16_t port, int maxHandles,
         if (!e->serverPorts[i].active) {
             e->serverPorts[i] = {};
             e->serverPorts[i].active = true;
+            e->serverPorts[i].packetBased = packetBased;
             e->serverPorts[i].port = port;
             e->serverPorts[i].maxHandles = maxHandles;
             e->serverPorts[i].toSize = toSize;
@@ -786,13 +804,17 @@ int itsServerForwardByTaskHandle(int handle, TaskHandle_t targetTask, uint16_t p
 
     c->serverTask = targetTask;
     c->itsPort = port;
+    c->packetBased = sp->packetBased;
 
-    if (dataLen > ITS_MAX_MSG_DATA) {
+    size_t maxPayload = te->inboxItemSize > sizeof(its_header_t)
+                      ? te->inboxItemSize - sizeof(its_header_t) : ITS_MAX_MSG_DATA;
+    if (dataLen > maxPayload) {
         ITS_LOGE("forward data truncated: %u > %u",
-                 (unsigned)dataLen, ITS_MAX_MSG_DATA);
-        dataLen = ITS_MAX_MSG_DATA;
+                 (unsigned)dataLen, (unsigned)maxPayload);
+        dataLen = maxPayload;
     }
-    uint8_t buf[sizeof(its_header_t) + ITS_MAX_MSG_DATA];
+    size_t totalLen = sizeof(its_header_t) + dataLen;
+    uint8_t* buf = (uint8_t*)alloca(totalLen);
     auto* fhdr = (its_header_t*)buf;
     *fhdr = {};
     fhdr->sender = xTaskGetCurrentTaskHandle();
@@ -803,7 +825,7 @@ int itsServerForwardByTaskHandle(int handle, TaskHandle_t targetTask, uint16_t p
     fhdr->handle = (int16_t)handle;
     if (data && dataLen > 0)
         memcpy(buf + sizeof(its_header_t), data, dataLen);
-    inboxSend(te, buf, sizeof(its_header_t) + dataLen, pdMS_TO_TICKS(100));
+    inboxSend(te, buf, totalLen, pdMS_TO_TICKS(100));
 
     return handle;
 }
@@ -862,12 +884,18 @@ int itsConnectByTaskHandle(TaskHandle_t serverTask, uint16_t port,
     xSemaphoreTake(me->ackSem, 0);
     me->ackHandle = -1;
 
-    if (dataLen > ITS_MAX_MSG_DATA) {
+    /* Cap payload at what the target's inbox actually accepts, not a global
+     * compile-time default. Target may have been initialized with a larger
+     * inboxMaxMsgLen to carry bigger connect payloads (e.g. JSON args). */
+    size_t maxPayload = se->inboxItemSize > sizeof(its_header_t)
+                      ? se->inboxItemSize - sizeof(its_header_t) : ITS_MAX_MSG_DATA;
+    if (dataLen > maxPayload) {
         ITS_LOGE("connect data truncated: %u > %u",
-                 (unsigned)dataLen, ITS_MAX_MSG_DATA);
-        dataLen = ITS_MAX_MSG_DATA;
+                 (unsigned)dataLen, (unsigned)maxPayload);
+        dataLen = maxPayload;
     }
-    uint8_t buf[sizeof(its_header_t) + ITS_MAX_MSG_DATA];
+    size_t totalLen = sizeof(its_header_t) + dataLen;
+    uint8_t* buf = (uint8_t*)alloca(totalLen);
     auto* hdr = (its_header_t*)buf;
     *hdr = {};
     hdr->sender = me->task;
@@ -879,7 +907,7 @@ int itsConnectByTaskHandle(TaskHandle_t serverTask, uint16_t port,
     if (data && dataLen > 0)
         memcpy(buf + sizeof(its_header_t), data, dataLen);
 
-    if (!inboxSend(se, buf, sizeof(its_header_t) + dataLen, timeout))
+    if (!inboxSend(se, buf, totalLen, timeout))
         return -1;
 
     if (xSemaphoreTake(me->ackSem, timeout) != pdTRUE)
@@ -1047,10 +1075,82 @@ bool itsSendAux(const char* taskName, uint16_t port,
 
 /* ---- Data API ---- */
 
+/* Wake a sender that's blocked waiting for space, if it asked for an amount
+ * we now have free. Caller must have just consumed bytes from `pe`. */
+static inline void wakeSenderIfReady(its_pool_entry_t* pe) {
+    if (pe->senderWaiting > 0
+        && xStreamBufferSpacesAvailable(pe->handle) >= pe->senderWaiting)
+        xSemaphoreGive(pe->spaceFreedSem);
+}
+
 size_t itsSend(int handle, const void* data, size_t len, TickType_t timeout) {
     its_pool_entry_t* pe = nullptr;
     StreamBufferHandle_t buf = sendBufWithPool(handle, &pe);
     if (!buf || !pe) return 0;
+    its_conn_t* c = conn(handle);
+    if (!c) return 0;
+
+    if (c->packetBased) {
+        if (len == 0 || len > 0xFFFFFF) {
+            ITS_LOGE("packet len %u out of range", (unsigned)len);
+            return 0;
+        }
+        size_t total = 4 + len;
+        if (total > pe->size) {
+            ITS_LOGE("packet (4+%u) exceeds buffer cap %u",
+                     (unsigned)len, (unsigned)pe->size);
+            return 0;
+        }
+
+        /* Wait for the whole packet to fit. Single writer per direction, so
+         * once spaces is sufficient nothing else can shrink it; the two
+         * xStreamBufferSend calls below will not block. */
+        TickType_t startTick = xTaskGetTickCount();
+        TickType_t remaining = timeout;
+        while (xStreamBufferSpacesAvailable(buf) < total) {
+            if (timeout == 0) return 0;
+
+            xSemaphoreTake(pe->spaceFreedSem, 0);   /* clear stale signal */
+            pe->senderWaiting = total;
+            /* Re-check: receiver may have freed space between our last check
+             * and our senderWaiting set, so could have skipped giving us. */
+            if (xStreamBufferSpacesAvailable(buf) >= total) {
+                pe->senderWaiting = 0;
+                break;
+            }
+
+            BaseType_t got = xSemaphoreTake(pe->spaceFreedSem, remaining);
+            pe->senderWaiting = 0;
+            if (got != pdTRUE) return 0;
+
+            if (timeout != portMAX_DELAY) {
+                TickType_t elapsed = xTaskGetTickCount() - startTick;
+                remaining = (elapsed >= timeout) ? 0 : (timeout - elapsed);
+            }
+        }
+
+        /* Atomic write: header then body, single notify after body. The
+         * "in-flight 4-byte header" state on the wire is transient and
+         * dispatchRecvCallbacks ignores avail <= 4 in packet mode. */
+        uint8_t hdr[4];
+        hdr[0] = 0;
+        hdr[1] = (uint8_t)((len >> 16) & 0xFF);
+        hdr[2] = (uint8_t)((len >> 8) & 0xFF);
+        hdr[3] = (uint8_t)(len & 0xFF);
+        if (xStreamBufferSend(buf, hdr, 4, 0) != 4) {
+            ITS_LOGE("packet header send failed (space disappeared?)");
+            return 0;
+        }
+        if (xStreamBufferSend(buf, data, len, 0) != len) {
+            ITS_LOGE("packet body send failed (space disappeared?)");
+            return 0;
+        }
+        TaskHandle_t remote = remoteOf(handle);
+        if (remote) xTaskNotifyGive(remote);
+        return len;
+    }
+
+    /* Stream mode */
     size_t sent = xStreamBufferSend(buf, data, len, timeout);
     if (sent > 0) {
         size_t fill = xStreamBufferBytesAvailable(buf);
@@ -1064,8 +1164,57 @@ size_t itsSend(int handle, const void* data, size_t len, TickType_t timeout) {
 }
 
 size_t itsRecv(int handle, void* buf, size_t maxLen, TickType_t timeout) {
-    StreamBufferHandle_t sb = recvBuf(handle);
-    if (!sb) return 0;
+    its_pool_entry_t* pe = nullptr;
+    StreamBufferHandle_t sb = recvBufWithPool(handle, &pe);
+    if (!sb || !pe) return 0;
+    its_conn_t* c = conn(handle);
+    if (!c) return 0;
+
+    if (c->packetBased) {
+        /* Wait for a whole packet (avail > 4 ⇒ at least one complete packet
+         * at the head of the buffer; an in-flight header is at most 4 bytes
+         * at the tail, never the head). */
+        TickType_t startTick = xTaskGetTickCount();
+        TickType_t remaining = timeout;
+        while (xStreamBufferBytesAvailable(sb) <= 4) {
+            if (remaining == 0) return 0;
+            ulTaskNotifyTake(pdFALSE, remaining);
+            if (xStreamBufferBytesAvailable(sb) > 4) break;
+            if (timeout != portMAX_DELAY) {
+                TickType_t elapsed = xTaskGetTickCount() - startTick;
+                remaining = (elapsed >= timeout) ? 0 : (timeout - elapsed);
+            }
+        }
+
+        uint8_t hdr[4];
+        if (xStreamBufferReceive(sb, hdr, 4, 0) != 4) return 0;
+        if (hdr[0] != 0)
+            ITS_LOGW("packet reserved byte non-zero: 0x%02x", hdr[0]);
+        size_t bodyLen = ((size_t)hdr[1] << 16)
+                       | ((size_t)hdr[2] << 8)
+                       |  (size_t)hdr[3];
+
+        size_t got;
+        if (bodyLen > maxLen) {
+            ITS_LOGE("packet body %u > buf %u, dropping",
+                     (unsigned)bodyLen, (unsigned)maxLen);
+            uint8_t scratch[64];
+            size_t left = bodyLen;
+            while (left > 0) {
+                size_t r = xStreamBufferReceive(sb, scratch,
+                    left > sizeof(scratch) ? sizeof(scratch) : left, 0);
+                if (r == 0) break;
+                left -= r;
+            }
+            got = 0;
+        } else {
+            got = xStreamBufferReceive(sb, buf, bodyLen, 0);
+        }
+
+        wakeSenderIfReady(pe);
+        return got;
+    }
+
     return xStreamBufferReceive(sb, buf, maxLen, timeout);
 }
 
@@ -1080,7 +1229,14 @@ size_t itsBytesAvailable(int handle) {
 
 size_t itsSpacesAvailable(int handle) {
     StreamBufferHandle_t buf = sendBuf(handle);
-    return buf ? xStreamBufferSpacesAvailable(buf) : 0;
+    if (!buf) return 0;
+    size_t spaces = xStreamBufferSpacesAvailable(buf);
+    its_conn_t* c = conn(handle);
+    if (c && c->packetBased) {
+        /* Report max body size that itsSend(timeout=0) would accept. */
+        return spaces > 4 ? spaces - 4 : 0;
+    }
+    return spaces;
 }
 
 bool itsSetTriggerLevel(int handle, size_t triggerLevel) {

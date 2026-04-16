@@ -469,12 +469,12 @@ static SemaphoreHandle_t fsStreamsReady = nullptr;
 
 static void fsStreamsFn(void*) {
     itsServerInit();
-    itsServerPortOpen(FS_STREAM_PORT, FS_STREAM_MAX_HANDLES,
+    itsServerPortOpen(FS_STREAM_PORT, false, FS_STREAM_MAX_HANDLES,
                       FS_STREAM_BUF_SIZE, 0);
     itsServerOnConnect(FS_STREAM_PORT, fsStreamOnConnect);
     itsServerOnRecv(FS_STREAM_PORT, fsStreamOnRecv);
     itsServerOnDisconnect(FS_STREAM_PORT, fsStreamOnDisconnect);
-    itsServerPortOpen(FS_READ_PORT, FS_READ_MAX_HANDLES,
+    itsServerPortOpen(FS_READ_PORT, false, FS_READ_MAX_HANDLES,
                       0, FS_READ_BUF_SIZE);
     itsServerOnConnect(FS_READ_PORT, fsReadOnConnect);
     itsServerOnDisconnect(FS_READ_PORT, fsReadOnDisconnect);

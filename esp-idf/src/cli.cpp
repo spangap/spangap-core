@@ -774,7 +774,7 @@ static TaskHandle_t cliTaskHandle = NULL;
 static void cliTaskFn(void* arg) {
   for (int i = 0; i < CLI_MAX_CLIENTS; i++) cliSlots[i].itsHandle = -1;
   itsServerInit();
-  itsServerPortOpen(CLI_PORT, CLI_MAX_CLIENTS, 512, 2048);
+  itsServerPortOpen(CLI_PORT, false, CLI_MAX_CLIENTS, 512, 2048);
   itsServerOnConnect(CLI_PORT, cliOnConnect);
   itsServerOnDisconnect(CLI_PORT, cliOnDisconnect);
 

@@ -531,7 +531,7 @@ static void logTaskFn(void* arg) {
    * fit is silently dropped. Net's TLS proxy can stall drains for seconds
    * when busy, and 2KB was filling in ~10 lines, producing multi-minute
    * silences before the buffer recovered. 32KB absorbs realistic bursts. */
-  itsServerPortOpen(LOG_PORT, LOG_MAX_CONSUMERS, 0, 32768);
+  itsServerPortOpen(LOG_PORT, false, LOG_MAX_CONSUMERS, 0, 32768);
   itsServerOnConnect(LOG_PORT, logOnConnect);
   itsServerOnDisconnect(LOG_PORT, logOnDisconnect);
   /* Unblock logInit() — server is open for clients (e.g. serial task). */

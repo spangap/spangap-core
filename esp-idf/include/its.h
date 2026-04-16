@@ -83,10 +83,17 @@ typedef void (*its_aux_cb_t)(TaskHandle_t sender, const void* data, size_t len);
 bool itsServerInit(size_t inboxMaxMsgLen = 0, size_t inboxDepth = 0);
 
 /** Open a server port. Up to ITS_MAX_PORTS per task (shared with aux ports).
+ *  packetBased: if true, itsSend/itsRecv on connections to this port carry
+ *               discrete packets framed with a 4-byte header
+ *               ([reserved=0][len_hi][len_mid][len_lo], 24-bit big-endian
+ *               body length). itsSend writes one packet per call (atomic on
+ *               the wire); itsRecv copies one body per call and returns its
+ *               length. Both client and server must already know they are
+ *               doing a packet protocol; the flag exists so ITS knows too.
  *  maxHandles: maximum concurrent connections this port accepts.
  *  toSize:     client→server buffer per connection (0 = none/aux-only).
  *  fromSize:   server→client buffer per connection (0 = none/aux-only). */
-bool itsServerPortOpen(uint16_t port, int maxHandles,
+bool itsServerPortOpen(uint16_t port, bool packetBased, int maxHandles,
                        size_t toSize, size_t fromSize);
 
 /** Close a server port (existing connections are disconnected). */
@@ -193,7 +200,30 @@ bool itsPoll(TickType_t timeout = portMAX_DELAY);
 
 /* ---- Data ---- */
 
+/** Send bytes (stream mode) or one packet (packet mode).
+ *
+ *  Stream mode: same semantics as xStreamBufferSend. Returns bytes written.
+ *
+ *  Packet mode: writes [4-byte header][body] atomically (single writer per
+ *  direction). Header is built internally; caller passes only the body.
+ *    - timeout == 0: succeed and write the whole packet, or return 0 if the
+ *      buffer doesn't currently have 4+len free.
+ *    - timeout > 0: block until the whole packet fits, or return 0 on timeout.
+ *      The wait is woken by the receiver consuming bytes (no busy poll).
+ *  Returns body length on success, 0 on failure. Body length must fit in 24
+ *  bits and 4+len must fit in the connection's stream buffer capacity. */
 size_t itsSend(int handle, const void* data, size_t len, TickType_t timeout);
+
+/** Receive bytes (stream mode) or one packet body (packet mode).
+ *
+ *  Stream mode: same semantics as xStreamBufferReceive. Returns bytes read.
+ *
+ *  Packet mode: reads exactly one packet's body into buf and returns its
+ *  length. The 4-byte framing header is consumed and discarded.
+ *    - timeout == 0: returns 0 if no whole packet is queued.
+ *    - timeout > 0: blocks until a whole packet is available or timeout.
+ *  If maxLen < body length, the packet is drained, an error is logged, and
+ *  0 is returned (caller's buffer was undersized for this port's traffic). */
 size_t itsRecv(int handle, void* buf, size_t maxLen, TickType_t timeout);
 
 /** Set the trigger level on this side's incoming stream (the buffer
@@ -207,6 +237,10 @@ bool itsSetTriggerLevel(int handle, size_t triggerLevel);
 
 bool         itsConnected(int handle);
 size_t       itsBytesAvailable(int handle);
+
+/** Bytes of free space in the send-direction buffer. In packet mode this
+ *  subtracts the 4-byte header overhead — i.e. it returns the largest body
+ *  length that itsSend(timeout=0) would accept right now. */
 size_t       itsSpacesAvailable(int handle);
 bool         itsIsEmpty(int handle);
 bool         itsIsFull(int handle);

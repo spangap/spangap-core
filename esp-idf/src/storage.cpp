@@ -1162,7 +1162,7 @@ static void storageTaskFn(void* arg) {
      * the whole frame to fit at once, so the buffer must accommodate any
      * single patch we'd realistically produce (full nested-config dumps,
      * large array writes). 2KB recv is enough — browser sends small JSON. */
-    itsServerPortOpen(STORAGE_EPL_PORT, WS_MAX_CLIENTS, 2048, 65536);
+    itsServerPortOpen(STORAGE_EPL_PORT, false, WS_MAX_CLIENTS, 2048, 65536);
     itsServerOnConnect(STORAGE_EPL_PORT, storageItsConnect);
     itsServerOnDisconnect(STORAGE_EPL_PORT, storageItsDisconnect);
     itsOnAux(STORAGE_SAVE_PORT, storageSaveAux);
