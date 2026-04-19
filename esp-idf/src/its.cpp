@@ -83,6 +83,10 @@ static void poolFree(int idx) {
     itsPool[idx].inUse = false;
     itsPool[idx].triggerLevel = 1;
     portEXIT_CRITICAL(&itsPoolMux);
+    /* Wake any sender that was blocked waiting for space on this buffer —
+       the connection is gone, so they should abort rather than keep waiting
+       forever. itsSend re-checks the connection after the sem fires. */
+    xSemaphoreGive(itsPool[idx].spaceFreedSem);
 }
 
 static StreamBufferHandle_t poolHandle(int idx) {
@@ -1122,6 +1126,12 @@ size_t itsSend(int handle, const void* data, size_t len, TickType_t timeout) {
             BaseType_t got = xSemaphoreTake(pe->spaceFreedSem, remaining);
             pe->senderWaiting = 0;
             if (got != pdTRUE) return 0;
+
+            /* A disconnect path also gives the sem after poolFree — bail
+               out if the connection has gone away under us. Otherwise we'd
+               xStreamBufferSend into a buffer now owned by a different
+               connection. */
+            if (!conn(handle)) return 0;
 
             if (timeout != portMAX_DELAY) {
                 TickType_t elapsed = xTaskGetTickCount() - startTick;
