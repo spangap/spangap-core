@@ -6,7 +6,6 @@
 #include "pm.h"
 #include "cli.h"
 #include "its.h"
-#include "web.h"
 #include "net.h"
 #include "storage.h"
 #include "compat.h"
@@ -181,7 +180,6 @@ static void logFileFlush() {
 static struct {
   int itsHandle;
   log_ansi_t ansi;
-  bool ws;
 } logSlots[LOG_MAX_CONSUMERS];
 
 static int logAllocSlot(int h) {
@@ -385,13 +383,13 @@ static int logVprintf(const char* fmt, va_list args) {
 
 /* ---- Log paste-back: send tail of log file to new WS client ---- */
 
-/** Send tail of log file to a newly connected WS client.
- *  overrideBytes: if > 0, tail exactly that many bytes (from ?backlog=N query).
- *  Otherwise fall back to s.log.file.paste (kB, default 48). */
-static void logPasteBack(int handle, long overrideBytes = 0) {
+/** Send tail of log file to a newly connected DC client.
+ *  backlogBytes: if > 0, tail exactly that many bytes (from DCEP protocol
+ *  `{"backlog":N}`). Otherwise fall back to s.log.file.paste (kB, default 48). */
+static void logPasteBack(int handle, long backlogBytes = 0) {
   long readSize;
-  if (overrideBytes > 0) {
-    readSize = overrideBytes;
+  if (backlogBytes > 0) {
+    readSize = backlogBytes;
   } else {
     int pasteKB = storageGetInt("s.log.file.paste", 48);
     if (pasteKB <= 0) return;
@@ -464,24 +462,19 @@ static void logPasteBack(int handle, long overrideBytes = 0) {
     }
   }
 
-  /* Chunk into smaller WS frames (each ≤ 8KB): a single large frame can
-   * exceed the consumer stream buffer, causing itsSendAll to partial-send;
-   * the frame header then declares a size bigger than payload sent, and the
-   * browser blocks the channel waiting for the "missing" bytes (which later
-   * arrive from live log writes — so xterm appears to hang until enough live
-   * activity fills the declared size). Split on line boundaries. */
+  /* Chunk into packets ≤ 8KB: each is one DC message on the wire. Split on
+   * newline boundaries so ANSI colour sequences stay inside a single
+   * packet (browser xterm.js concats them sequentially). */
   constexpr size_t CHUNK = 8192;
   size_t off = 0;
   while (off < op) {
     size_t take = (op - off > CHUNK) ? CHUNK : (op - off);
-    /* Back off to the previous newline so frames end on a clean line,
-     * keeping ANSI sequences intact within a single frame. */
     if (take < op - off) {
       size_t nl = take;
       while (nl > 0 && out[off + nl - 1] != '\n') nl--;
       if (nl > 0) take = nl;
     }
-    if (!wsSendText(handle, out + off, take)) break;
+    if (itsSend(handle, out + off, take, pdMS_TO_TICKS(500)) != take) break;
     off += take;
   }
   heap_caps_free(out);
@@ -490,27 +483,35 @@ static void logPasteBack(int handle, long overrideBytes = 0) {
 
 /* ---- Log ITS server callbacks ---- */
 
-static int logOnConnect(int handle, const void* data, size_t len) {
+/** TCP (stream mode): net-forwarded for `nc` access. No ANSI — plain
+ *  bytes so the pipe stays clean for line-oriented tools. */
+static int logTcpConnect(int handle, const void* data, size_t len) {
+  (void)data; (void)len;
   int s = logAllocSlot(handle);
   if (s < 0) return -1;
-  logSlots[s].ws = false;
-  if (len >= sizeof(net_connect_t) && ((const net_connect_t*)data)->ws) {
-    /* Read headers first so we can extract ?backlog=N before consuming them. */
-    char hdr[1024];
-    int hdrLen = webGetHeader(handle, hdr, sizeof(hdr), 500);
-    if (hdrLen <= 0) { logSlots[s].itsHandle = -1; return -1; }
-    char backlogStr[16] = {};
-    webGetQuery(hdr, hdrLen, "backlog", backlogStr, sizeof(backlogStr));
-    long backlog = atol(backlogStr);
-    if (!wsUpgrade(handle, hdr, hdrLen)) { logSlots[s].itsHandle = -1; return -1; }
-    logSlots[s].ws = true;
-    logSlots[s].ansi = LOG_ANSI;
-    logPasteBack(handle, backlog);
-  } else if (len >= sizeof(log_connect_t)) {
-    logSlots[s].ansi = ((const log_connect_t*)data)->ansi;
-  } else {
-    logSlots[s].ansi = LOG_NO_ANSI;
+  logSlots[s].ansi = LOG_NO_ANSI;
+  return s;
+}
+
+/** DC (packet mode): forwarded by webrtc_task from `log:1`. The DCEP
+ *  protocol bytes may carry `{"backlog":N}` to override paste-back size. */
+static int logDcConnect(int handle, const void* data, size_t len) {
+  int s = logAllocSlot(handle);
+  if (s < 0) return -1;
+  logSlots[s].ansi = LOG_ANSI;
+  long backlog = 0;
+  if (data && len > 0 && len < 128) {
+    char proto[128];
+    memcpy(proto, data, len);
+    proto[len] = '\0';
+    /* Tiny parser: look for "backlog":N in the JSON. */
+    const char* p = strstr(proto, "\"backlog\"");
+    if (p) {
+      p = strchr(p, ':');
+      if (p) backlog = atol(p + 1);
+    }
   }
+  logPasteBack(handle, backlog);
   return s;
 }
 
@@ -527,13 +528,20 @@ static void logTaskFn(void* arg) {
   itsServerInit();
   itsClientInit(1);  /* so logFileOpen() can itsConnect to fs stream server */
   /* 32KB send buffer per consumer (PSRAM): live log fanout uses timeout=0
-   * (can't block the log task — others depend on it), so anything that doesn't
-   * fit is silently dropped. Net's TLS proxy can stall drains for seconds
-   * when busy, and 2KB was filling in ~10 lines, producing multi-minute
-   * silences before the buffer recovered. 32KB absorbs realistic bursts. */
-  itsServerPortOpen(LOG_PORT, false, LOG_MAX_CONSUMERS, 0, 32768);
-  itsServerOnConnect(LOG_PORT, logOnConnect);
-  itsServerOnDisconnect(LOG_PORT, logOnDisconnect);
+   * (can't block the log task — others depend on it), so anything that
+   * doesn't fit is silently dropped. Net's TLS proxy can stall drains for
+   * seconds when busy; 32KB absorbs realistic bursts. The DC side piggy-
+   * backs on the webrtc router's rexmit pool so per-handle back-pressure
+   * is similar.
+   *
+   * Two ports: stream-mode for TCP nc/serial, packet-mode for browser DC
+   * (`log:1`). LOG_MAX_CONSUMERS=4 is shared: allow up to 3 TCP + 1 DC. */
+  itsServerPortOpen(LOG_PORT_TCP, /*packetBased=*/false, 3, 0, 32768);
+  itsServerOnConnect(LOG_PORT_TCP, logTcpConnect);
+  itsServerOnDisconnect(LOG_PORT_TCP, logOnDisconnect);
+  itsServerPortOpen(LOG_PORT_DC,  /*packetBased=*/true,  1, 0, 32768);
+  itsServerOnConnect(LOG_PORT_DC, logDcConnect);
+  itsServerOnDisconnect(LOG_PORT_DC, logOnDisconnect);
   /* Unblock logInit() — server is open for clients (e.g. serial task). */
   if (logReadySem) xSemaphoreGive(logReadySem);
 
@@ -567,9 +575,11 @@ static void logTaskFn(void* arg) {
     logFileLevelMax = parseLevelNum(val);
   });
 
-  /* Register TCP port + WS path (non-blocking: retry from main loop so serial
-   * log connection is accepted immediately during boot). */
-  bool netRegistered = false, webRegistered = false;
+  /* Register TCP port (non-blocking: retry from main loop so serial log
+   * connection is accepted immediately during boot). Browser side reaches
+   * us via the webrtc task's generic `<task>:<port>` router — no WS path
+   * registration. */
+  bool netRegistered = false;
 
   char buf[512];
   for (;;) {
@@ -578,15 +588,9 @@ static void logTaskFn(void* arg) {
 
     if (!netRegistered) {
       net_port_msg_t reg = {};
-      reg.itsPort = LOG_PORT;
+      reg.itsPort = LOG_PORT_TCP;
       safeStrncpy(reg.nvsKey, "log_port", sizeof(reg.nvsKey));
       netRegistered = itsSendAux("net", NET_PORT_REG_PORT, &reg, sizeof(reg), 0);
-    }
-    if (!webRegistered) {
-      web_path_msg_t reg = {};
-      reg.itsPort = LOG_PORT;
-      safeStrncpy(reg.path, "log", sizeof(reg.path));
-      webRegistered = itsSendAux("web", WEB_PATH_REG_PORT, &reg, sizeof(reg), 0);
     }
 
     /* Skip the drain entirely while there are no consumers and no log file.
@@ -629,18 +633,10 @@ static void logTaskFn(void* arg) {
           ensurePlain();
           out = plain; outLen = pn;
         }
-        if (logSlots[i].ws) {
-          /* WS frame header + payload, non-blocking — drop if buffer full */
-          uint8_t hdr[4];
-          int hdrLen;
-          hdr[0] = 0x81; /* FIN + text */
-          if (outLen < 126) { hdr[1] = outLen; hdrLen = 2; }
-          else { hdr[1] = 126; hdr[2] = outLen >> 8; hdr[3] = outLen & 0xff; hdrLen = 4; }
-          if (itsSend(h, hdr, hdrLen, 0) == (size_t)hdrLen)
-            itsSend(h, out, outLen, 0);
-        } else {
-          itsSend(h, out, outLen, 0);
-        }
+        /* Non-blocking: drop if buffer full. Stream (TCP) and packet (DC)
+           modes are transparent to itsSend here — one call, one logical
+           unit (stream bytes / one DC message per line). */
+        itsSend(h, out, outLen, 0);
       }
     }
     logFileFlush();

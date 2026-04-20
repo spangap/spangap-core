@@ -28,9 +28,9 @@ By convention, port numbers are arbitrary but stable: each module's header file 
 | [web.h](../main/web.h) | `WEB_HTTP_PORT=80`, `WEB_HTTPS_PORT=443`, `WEB_PATH_REG_PORT=0` (URL registration) |
 | [rtsp.h](../main/rtsp.h) | `RTSP_PORT=554` |
 | [webrtc_task.h](../main/webrtc_task.h) | `WEBRTC_PORT=4433` |
-| [log.h](../main/log.h) | `LOG_PORT=8080` |
-| [cli.h](../main/cli.h) | `CLI_PORT=8081` |
-| [storage.h](../main/storage.h) | `STORAGE_EPL_PORT=0` (config WS), `STORAGE_CHANGE_PORT=42` (change dispatch), `STORAGE_SAVE_PORT=43` (save-now signal) |
+| [log.h](../main/log.h) | `LOG_PORT_TCP=8080` (stream, `nc`), `LOG_PORT_DC=1` (packet, WebRTC `log:1`) |
+| [cli.h](../main/cli.h) | `CLI_PORT_TCP=8081` (stream, `nc` + serial), `CLI_PORT_DC=1` (packet, WebRTC `cli:1`) |
+| [storage.h](../main/storage.h) | `STORAGE_EPL_PORT=1` (packet, WebRTC `storage:1`), `STORAGE_CHANGE_PORT=42` (change dispatch), `STORAGE_SAVE_PORT=43` (save-now signal) |
 | [fs.h](../main/fs.h) | `FS_OP_PORT=1` (POSIX ops aux, on `fs`), `FS_STREAM_PORT=2` (streaming write, on `fs_strm`), `FS_READ_PORT=3` (streaming read, on `fs_strm`), `FS_STREAM_SYNC_PORT=4` (stream-sync aux, on `fs_strm`) |
 | [camera.h](../main/camera.h) | `CAM_CMD_PORT=10` |
 | [audio.h](../main/audio.h) | `AUDIO_CMD_PORT=24`, `AUDIO_NOTIFY_PORT=25` |
@@ -388,7 +388,7 @@ static void onMyDisconnect(int ref) {
 
 static void taskFn(void*) {
     itsClientInit(2);
-    int h = itsConnect("log", LOG_PORT, &req, sizeof(req), pdMS_TO_TICKS(500),
+    int h = itsConnect("log", LOG_PORT_TCP, &req, sizeof(req), pdMS_TO_TICKS(500),
                        /*ref*/ -1, onMyRecv, onMyDisconnect);
     if (h < 0) return;
 

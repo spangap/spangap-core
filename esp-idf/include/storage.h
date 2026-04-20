@@ -14,7 +14,7 @@
  * Keys starting with "secrets." are persisted but never sent to the browser.
  * All other keys are ephemeral (in-memory only, lost on reboot).
  *
- * Browser config WebSocket (root path "/"):
+ * Browser config DataChannel (`storage:1`, packet-mode):
  * - Device→browser: full nested JSON dump on connect, then coalesced merge-patches.
  * - Browser→device: nested JSON merge-patches. null = delete subtree (silent).
  * - Deletes via storageDeleteTree() do not fire storageSubscribeChanges callbacks.
@@ -29,8 +29,10 @@
 #include <sys/stat.h>
 #include <cJSON.h>
 
-/** Storage task's ITS server port for the /epl config WebSocket. */
-static constexpr uint16_t STORAGE_EPL_PORT = 0;
+/** Storage task's ITS server port for the config DataChannel (`storage:1`).
+ *  Packet-mode: each browser→device message is one JSON merge-patch,
+ *  each device→browser message is one dump or coalesced patch. */
+static constexpr uint16_t STORAGE_EPL_PORT = 1;
 
 /** Storage task's ITS aux ports. */
 static constexpr uint16_t STORAGE_SAVE_PORT   = 43;  /* save-now signal */

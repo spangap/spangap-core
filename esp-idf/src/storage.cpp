@@ -13,21 +13,19 @@
  * txDepth.  storageBegin() acquires, storageEnd() releases.  All public
  * readers (storageGetInt, storageGetStr, …) lock around tree access.
  *
- * Browser config WebSocket (path "/epl"):
+ * Browser config DataChannel (`storage:1`, packet-mode over WebRTC):
  * - Device→browser: full dump on connect, then coalesced merge-patches.
  * - Browser→device: nested JSON merge-patches. null = delete subtree.
  * - Secrets (secrets.*) are never sent to browser and browser writes are ignored.
  *
- * ITS server: handle 0 = browser config WS (path "/epl").
+ * Authentication and BUSY/takeover gating live entirely at the /webrtc
+ * signaling WS — by the time a DC arrives here the peer is authenticated.
  */
 #include "storage.h"
 #include "fs.h"
-#include "auth.h"
 #include "log.h"
 #include "cli.h"
 #include "its.h"
-#include "web.h"
-#include "net.h"
 #include "compat.h"
 
 #include <string>
@@ -55,8 +53,8 @@ static esp_timer_handle_t saveTimer = nullptr;
 /* ---- Task state ---- */
 
 static TaskHandle_t storageHandle = nullptr;
-static int wsHandle = -1;
-static cJSON* wsPendingPatch = nullptr; /* WS outgoing coalescing */
+static int dcHandle = -1;               /* single packet-mode DC client */
+static cJSON* dcPendingPatch = nullptr; /* outgoing coalescing */
 
 /* File I/O moved to fs.cpp/h — unified PSRAM-safe API. */
 
@@ -661,14 +659,14 @@ void storageDeleteTree(const char* keyOrPrefix) {
   if (strncmp(keyOrPrefix, "s.", 2) == 0)
     startSaveTimer();
 
-  /* Notify browser WS with {path: null} */
-  if (wsHandle >= 0) {
+  /* Notify browser with {path: null} — one packet, non-blocking. */
+  if (dcHandle >= 0) {
     cJSON* json = buildNullJson(keyOrPrefix);
     if (json) {
       char* text = cJSON_PrintUnformatted(json);
       cJSON_Delete(json);
       if (text) {
-        wsSendText(wsHandle, text, strlen(text));
+        itsSend(dcHandle, text, strlen(text), 0);
         cJSON_free(text);
       }
     }
@@ -938,18 +936,14 @@ void storageRegisterCmds() {
     cliRegisterCmd("save", cmdSave);
 }
 
-/* ---- Config WebSocket handling (multi-client) ---- */
+/* ---- Config DataChannel handling (single-session via WebRTC router) ---- */
 
-#define WS_MAX_CLIENTS 4
-static int wsHandles[WS_MAX_CLIENTS] = {-1, -1, -1, -1};
+/* One packet per JSON message. The webrtc router (webrtc_task.cpp) holds
+ * the single-session constraint; by the time a DC reaches us, the peer
+ * is authenticated. We carry the single client handle, coalesce changes
+ * into one patch tree, and flush it as one packet per main-loop pass. */
 
-static bool wsAnyClient() {
-    for (int i = 0; i < WS_MAX_CLIENTS; i++)
-        if (wsHandles[i] >= 0) return true;
-    return false;
-}
-
-static void wsSendFullDump(int handle) {
+static void dcSendFullDump(int handle) {
     CFG_LOCK();
     cJSON* clone = cJSON_Duplicate(cfgRoot, true);
     CFG_UNLOCK();
@@ -962,14 +956,16 @@ static void wsSendFullDump(int handle) {
     char* text = cJSON_PrintUnformatted(clone);
     cJSON_Delete(clone);
     if (!text) return;
-    wsSendText(handle, text, strlen(text));
+    /* Generous timeout — first dump must land even if the router is
+       momentarily backed up. */
+    itsSend(handle, text, strlen(text), pdMS_TO_TICKS(500));
     cJSON_free(text);
 }
 
-/** Accumulate a changed key into wsPendingPatch for coalesced WS output.
- *  Called from storage task's "" subscription callback. */
-static void wsAccumulateChange(const char* key, const char* val) {
-    if (!wsAnyClient()) return;
+/** Accumulate a changed key into dcPendingPatch for coalesced output. */
+static void dcAccumulateChange(const char* key, const char* val) {
+    (void)val;
+    if (dcHandle < 0) return;
     if (isSecret(key)) return;
 
     /* Check cfgRoot — storageUnset removes the key before firing callbacks,
@@ -979,10 +975,10 @@ static void wsAccumulateChange(const char* key, const char* val) {
     cJSON* node = navigatePath(cfgRoot, key);
     if (!node) { CFG_UNLOCK(); return; }
 
-    if (!wsPendingPatch) wsPendingPatch = cJSON_CreateObject();
+    if (!dcPendingPatch) dcPendingPatch = cJSON_CreateObject();
 
     char leaf[48];
-    cJSON* parent = navigateOrCreate(wsPendingPatch, key, leaf, sizeof(leaf));
+    cJSON* parent = navigateOrCreate(dcPendingPatch, key, leaf, sizeof(leaf));
     if (!parent) { CFG_UNLOCK(); return; }
 
     cJSON_DeleteItemFromObject(parent, leaf);
@@ -991,63 +987,45 @@ static void wsAccumulateChange(const char* key, const char* val) {
     CFG_UNLOCK();
 }
 
-/** Try a WS text send only if the stream buffer can accept the whole frame
- *  right now. Returns true if sent (or no client), false if would have blocked.
- *  Used by storage so its main task never stalls on a slow browser — under
- *  back-pressure we leave wsPendingPatch intact and retry on the next flush. */
-static bool wsTrySendTextNonblocking(int handle, const char* text, size_t len) {
-    /* WS frame overhead: 2 bytes for <126, 4 bytes for 126..65535. */
-    size_t overhead = (len < 126) ? 2 : 4;
-    if (itsSpacesAvailable(handle) < len + overhead) return false;
-    return wsSendText(handle, text, len);
-}
+/** Flush accumulated changes to the browser as one DC packet. On back-
+ *  pressure leave the patch intact and retry next pass — never drop. */
+static constexpr size_t DC_PATCH_MAX = 60000;  /* within SCTP 64KB max-message-size */
 
-/** Flush accumulated WS changes to all connected browsers. On any client
- *  back-pressure we keep the patch and retry next time — never drop changes,
- *  unless the patch grows beyond the per-client send buffer (in which case
- *  we fall back to a full re-dump on the next flush, since incremental delivery
- *  is no longer possible for that client). */
-static constexpr size_t WS_PATCH_MAX = 60000;  /* leaves WS overhead headroom under 64KB buf */
-
-static void wsFlushPatch() {
-    if (!wsPendingPatch || !wsAnyClient()) return;
-    char* text = cJSON_PrintUnformatted(wsPendingPatch);
+static void dcFlushPatch() {
+    if (!dcPendingPatch || dcHandle < 0) return;
+    char* text = cJSON_PrintUnformatted(dcPendingPatch);
     if (!text) return;
     size_t len = strlen(text);
 
-    /* Patch outgrew the send buffer: drop it and warn. Browser may end up
-     * with stale UI state until the next change forces a fresh patch (or the
-     * user reloads). Avoiding a re-dump here keeps storage task lean and
-     * non-blocking — full dumps are heavy (cJSON_Duplicate of cfgRoot is
-     * deeply recursive) and can blow the stack. */
-    if (len > WS_PATCH_MAX) {
+    /* Patch outgrew what we'll send in one packet: drop and warn.
+       Incremental UI state may become stale until the next change forces
+       a fresh patch; full re-dumps from the storage task would blow the
+       stack (cJSON_Duplicate of cfgRoot is deeply recursive). */
+    if (len > DC_PATCH_MAX) {
         warn("storage: patch %u > %u, dropping (clients may need reload)\n",
-             (unsigned)len, (unsigned)WS_PATCH_MAX);
+             (unsigned)len, (unsigned)DC_PATCH_MAX);
         cJSON_free(text);
-        cJSON_Delete(wsPendingPatch);
-        wsPendingPatch = nullptr;
+        cJSON_Delete(dcPendingPatch);
+        dcPendingPatch = nullptr;
         return;
     }
 
-    bool allSent = true;
-    for (int i = 0; i < WS_MAX_CLIENTS; i++) {
-        if (wsHandles[i] < 0) continue;
-        if (!wsTrySendTextNonblocking(wsHandles[i], text, len)) {
-            allSent = false;
-            /* Don't break — try other clients, they may be fine. */
-        }
+    /* Non-blocking packet send: require the whole body + 4-byte packet
+       header to fit. Retry next pass on back-pressure. */
+    if (itsSpacesAvailable(dcHandle) < len) {
+        cJSON_free(text);
+        return;
     }
+    size_t sent = itsSend(dcHandle, text, len, 0);
     cJSON_free(text);
-    if (allSent) {
-        cJSON_Delete(wsPendingPatch);
-        wsPendingPatch = nullptr;
+    if (sent == len) {
+        cJSON_Delete(dcPendingPatch);
+        dcPendingPatch = nullptr;
     }
-    /* Else keep wsPendingPatch — next wsAccumulateChange will merge into it
-     * and the next flush will retry the combined patch. */
 }
 
 /** Process incoming JSON from browser. Null = silent delete, values = storageSet. */
-static void mergeIncomingWs(cJSON* obj, const std::string& prefix) {
+static void mergeIncomingPatch(cJSON* obj, const std::string& prefix) {
   cJSON* item;
   cJSON_ArrayForEach(item, obj) {
     std::string key = prefix.empty() ? item->string : prefix + "." + item->string;
@@ -1059,7 +1037,7 @@ static void mergeIncomingWs(cJSON* obj, const std::string& prefix) {
       CFG_UNLOCK();
       if (strncmp(key.c_str(), "s.", 2) == 0) startSaveTimer();
     } else if (cJSON_IsObject(item)) {
-      mergeIncomingWs(item, key);
+      mergeIncomingPatch(item, key);
     } else if (cJSON_IsArray(item)) {
       storageSetTree(key.c_str(), cJSON_Duplicate(item, true));
     } else if (cJSON_IsNumber(item)) {
@@ -1070,9 +1048,9 @@ static void mergeIncomingWs(cJSON* obj, const std::string& prefix) {
   }
 }
 
-static void wsHandleMessage(int handle, const char* text, size_t len) {
+static void dcHandleMessage(int handle, const char* text, size_t len) {
     if (len == 10 && memcmp(text, "{\"ping\":1}", 10) == 0) {
-        wsSendText(handle, "{\"pong\":1}", 10);
+        itsSend(handle, "{\"pong\":1}", 10, 0);
         return;
     }
     if (len == 10 && memcmp(text, "{\"save\":1}", 10) == 0) {
@@ -1081,67 +1059,45 @@ static void wsHandleMessage(int handle, const char* text, size_t len) {
     }
     cJSON* root = cJSON_Parse(text);
     if (!root) return;
-    mergeIncomingWs(root, "");
+    mergeIncomingPatch(root, "");
     cJSON_Delete(root);
 }
 
-static void wsPollConfig() {
-    uint8_t buf[1024];
-    for (int i = 0; i < WS_MAX_CLIENTS; i++) {
-        if (wsHandles[i] < 0) continue;
-        size_t outLen = 0;
-        int op = wsReadFrame(wsHandles[i], buf, sizeof(buf), &outLen);
-        if (op == 1) {
-            wsHandleMessage(wsHandles[i], (const char*)buf, outLen);
-        } else if (op < 0) {
-            wsHandles[i] = -1;
-        }
+static void dcPollConfig() {
+    if (dcHandle < 0) return;
+    /* Packet-mode itsRecv: one JSON body per call. Size to fit the
+       largest browser-originated patch we'd expect. */
+    static char buf[8192];
+    for (;;) {
+        size_t n = itsRecv(dcHandle, buf, sizeof(buf) - 1, 0);
+        if (n == 0) break;
+        buf[n] = '\0';
+        dcHandleMessage(dcHandle, buf, n);
     }
 }
 
 /* ---- ITS server callbacks ---- */
 
 static int storageItsConnect(int handle, const void* data, size_t len) {
-    if (len < sizeof(net_connect_t)) return -1;
-    auto* cd = (const net_connect_t*)data;
-    if (!cd->ws) return -1;
-
-    /* Read headers once — used for both auth check and WS upgrade */
-    char hdr[1024];
-    int hdrLen = webGetHeader(handle, hdr, sizeof(hdr));
-    if (hdrLen <= 0) return -1;
-
-    if (!wsUpgrade(handle, hdr, hdrLen)) return -1;
-
-    if (authEnabled()) {
-        char cookie[64] = {};
-        webExtractCookie(hdr, hdrLen, "session", cookie, sizeof(cookie));
-        if (authCheck(cookie).empty()) {
-            wsSendClose(handle, 4401);
-            return -1;
-        }
-    }
-
-    /* Find a free slot */
-    int slot = -1;
-    for (int i = 0; i < WS_MAX_CLIENTS; i++)
-        if (wsHandles[i] < 0) { slot = i; break; }
-    if (slot < 0) {
-        wsSendClose(handle, 1013);  /* try again later */
+    (void)data; (void)len;
+    /* webrtc router already enforces single-session + auth. Just accept. */
+    if (dcHandle >= 0) {
+        /* Shouldn't happen — router enforces one DC per label, and label
+           mapping here is one-to-one. Defensive: reject. */
+        warn("storage: unexpected second DC, rejecting\n");
         return -1;
     }
-    wsHandles[slot] = handle;
-    wsSendFullDump(handle);
-    return slot;
+    dcHandle = handle;
+    dcSendFullDump(handle);
+    return 0;
 }
 
 static void storageItsDisconnect(int ref) {
-    if (ref >= 0 && ref < WS_MAX_CLIENTS)
-        wsHandles[ref] = -1;
-    /* Discard pending patch if no clients left */
-    if (!wsAnyClient() && wsPendingPatch) {
-        cJSON_Delete(wsPendingPatch);
-        wsPendingPatch = nullptr;
+    (void)ref;
+    dcHandle = -1;
+    if (dcPendingPatch) {
+        cJSON_Delete(dcPendingPatch);
+        dcPendingPatch = nullptr;
     }
 }
 
@@ -1152,49 +1108,38 @@ static void storageSaveAux(TaskHandle_t, const void*, size_t) {
 }
 
 static void storageTaskFn(void* arg) {
-    /* "" subscription for WS sync means every storageSet fires an aux into
-     * our inbox — including changes we ourselves push when processing browser
-     * WS messages. UI bursts (page load, opening cli/log windows) generate
-     * many writes back-to-back; default depth 8 overflows. Drops show up as
-     * "[storage] notify drop" warns when this is too small. */
+    /* "" subscription for browser sync means every storageSet fires an aux
+     * into our inbox — including changes we ourselves push when processing
+     * browser-originated patches. UI bursts (page load, opening cli/log
+     * windows) generate many writes back-to-back; default depth 8 overflows.
+     * Drops show up as "[storage] notify drop" warns when too small. */
     itsServerInit(0, 64);
-    /* 64KB send buffer per client (PSRAM): non-blocking patch flush requires
-     * the whole frame to fit at once, so the buffer must accommodate any
-     * single patch we'd realistically produce (full nested-config dumps,
-     * large array writes). 2KB recv is enough — browser sends small JSON. */
-    itsServerPortOpen(STORAGE_EPL_PORT, false, WS_MAX_CLIENTS, 2048, 65536);
+    /* Packet-mode: each DC message is one JSON body (dump, patch, ping).
+     * toSize=48K holds the largest browser-originated patch — the IANA
+     * timezone DB is ~40K when flattened. fromSize=64K accommodates full
+     * config dumps + coalesced multi-key patches. SCTP fragments both on
+     * the wire; the webrtc router reassembles inbound into one packet. */
+    itsServerPortOpen(STORAGE_EPL_PORT, /*packetBased=*/true, 1, 49152, 65536);
     itsServerOnConnect(STORAGE_EPL_PORT, storageItsConnect);
     itsServerOnDisconnect(STORAGE_EPL_PORT, storageItsDisconnect);
     itsOnAux(STORAGE_SAVE_PORT, storageSaveAux);
 
-    /* Subscribe to all config changes for WS coalescing */
+    /* Subscribe to all config changes for DC coalescing */
     storageSubscribeChanges("", ON_CHANGE {
-        wsAccumulateChange(key, val);
+        dcAccumulateChange(key, val);
     });
     storageSubscribeChanges("net.up", ON_CHANGE {
-        if (atoi(val) == 0) {
-            for (int i = 0; i < WS_MAX_CLIENTS; i++) {
-                if (wsHandles[i] >= 0) {
-                    itsDisconnect(wsHandles[i]);
-                    wsHandles[i] = -1;
-                }
-            }
-        }
+        /* webrtc teardown on net down closes the DC for us — nothing to do. */
+        (void)key; (void)val;
     });
-
-    web_path_msg_t reg = {};
-    reg.itsPort = STORAGE_EPL_PORT;
-    safeStrncpy(reg.path, "epl", sizeof(reg.path));
-    while (!itsSendAux("web", WEB_PATH_REG_PORT, &reg, sizeof(reg), pdMS_TO_TICKS(500)))
-        vTaskDelay(pdMS_TO_TICKS(100));
 
     info("ready\n");
 
     for (;;) {
-        TickType_t timeout = wsAnyClient() ? pdMS_TO_TICKS(10) : portMAX_DELAY;
+        TickType_t timeout = (dcHandle >= 0) ? pdMS_TO_TICKS(10) : portMAX_DELAY;
         while (itsPoll(timeout)) { timeout = 0; }
-        wsPollConfig();
-        wsFlushPatch();
+        dcPollConfig();
+        dcFlushPatch();
     }
 }
 

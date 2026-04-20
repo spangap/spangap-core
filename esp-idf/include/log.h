@@ -9,9 +9,12 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
-/** Log task's ITS server port (used by both raw TCP and forwarded WS).
- *  Convention: arbitrary number distinct from other tasks' ports. */
-static constexpr uint16_t LOG_PORT = 8080;
+/** Log task's ITS server ports.
+ *    LOG_PORT_TCP: stream-mode, plain bytes for raw TCP `nc` access.
+ *    LOG_PORT_DC:  packet-mode, one log line per DataChannel message,
+ *                  addressed from the browser as `log:1`. */
+static constexpr uint16_t LOG_PORT_TCP = 8080;
+static constexpr uint16_t LOG_PORT_DC  = 1;
 
 /* ---- Connect payload for log ITS server ---- */
 

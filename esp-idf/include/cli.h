@@ -7,9 +7,13 @@
 #include <stddef.h>
 #include <stdint.h>
 
-/** CLI task's ITS server port (used by both raw TCP and forwarded WS).
- *  Convention: arbitrary number distinct from other tasks' ports. */
-static constexpr uint16_t CLI_PORT = 8081;
+/** CLI task's ITS server ports.
+ *    CLI_PORT_TCP: stream-mode, for raw TCP `nc` access and the on-device
+ *                  serial task.
+ *    CLI_PORT_DC:  packet-mode, one DataChannel message per keystroke
+ *                  burst in / output chunk out; addressed as `cli:1`. */
+static constexpr uint16_t CLI_PORT_TCP = 8081;
+static constexpr uint16_t CLI_PORT_DC  = 1;
 
 /* ---- Connect payload for CLI ITS server ---- */
 

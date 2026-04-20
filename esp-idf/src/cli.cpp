@@ -5,7 +5,6 @@
 #include "fs.h"
 #include "log.h"
 #include "its.h"
-#include "web.h"
 #include "net.h"
 #include "storage.h"
 #include "cron.h"
@@ -122,7 +121,6 @@ static struct cli_slot_t {
     int itsHandle;
     cli_edit edit;
     cli_mode_t mode;
-    bool ws;
     bool usbSerial;
     char lineBuf[128];
     int lineLen;
@@ -257,15 +255,15 @@ static void itsCliWrite(const char* data, size_t len) {
     if (cliActiveSlot < 0) return;
     int h = cliSlots[cliActiveSlot].itsHandle;
     if (h < 0) return;
-    if (cliSlots[cliActiveSlot].ws) {
-        wsSendText(h, data, len);
-    } else {
-        while (len > 0) {
-            size_t sent = itsSend(h, data, len, pdMS_TO_TICKS(100));
-            if (sent == 0) break;
-            data += sent;
-            len -= sent;
-        }
+    /* Stream-mode (TCP/serial) may partial-send under back-pressure; retry
+       with a short timeout so verbose commands aren't truncated. Packet-mode
+       (DC) either delivers the whole body or returns 0 — same loop handles
+       both: one non-zero return closes the packet, zero means try again. */
+    while (len > 0) {
+        size_t sent = itsSend(h, data, len, pdMS_TO_TICKS(100));
+        if (sent == 0) break;
+        data += sent;
+        len -= sent;
     }
 }
 
@@ -707,34 +705,8 @@ static void cliBuiltinInit() {
 
 /* ---- CLI ITS server callbacks ---- */
 
-static int cliOnConnect(int handle, const void* data, size_t len) {
-  int slot = cliAllocSlot(handle);
-  if (slot < 0) return -1;
-  auto& cl = cliSlots[slot];
-  cl.edit = {};
-  cl.lineLen = 0;
-  cl.ws = false;
-  cl.usbSerial = false;
-  if (len >= sizeof(net_connect_t) && ((const net_connect_t*)data)->ws) {
-    if (!wsUpgrade(handle)) return -1;
-    cl.ws = true;
-    cl.mode = CLI_ANSI;  /* WS clients get full terminal (xterm.js) */
-  } else if (len >= sizeof(net_connect_t)) {
-    /* Raw TCP/TLS from net — payload is net_connect_t, not cli_connect_t */
-    cl.mode = CLI_LINE;
-    cl.usbSerial = false;
-  } else if (len >= sizeof(cli_connect_t)) {
-    const auto* cc = (const cli_connect_t*)data;
-    cl.mode = cc->mode;
-    cl.usbSerial = cc->from_usb_serial != 0;
-  } else if (len >= 1) {
-    cl.mode = *(const cli_mode_t*)data;
-    cl.usbSerial = false;
-  } else {
-    cl.mode = CLI_LINE;
-    cl.usbSerial = false;
-  }
-
+/** Shared slot finalisation after mode/usbSerial are set. */
+static void cliInitSlot(cli_slot_t& cl, int slot) {
   if (cl.usbSerial) {
     if (cliUsbPersistCwd[0] == '/') {
       bool rootOnly = (cliUsbPersistCwd[1] == '\0');
@@ -749,14 +721,51 @@ static int cliOnConnect(int handle, const void* data, size_t len) {
   } else
     cliApplyStartDir(cl);
 
-  /* Send initial prompt for ANSI clients */
+  /* Send initial prompt for ANSI clients (non-serial) */
   if (cl.mode == CLI_ANSI && !cl.usbSerial) {
     cliActiveSlot = slot;
     itsCliWrite("$ ", 2);
     itsCliWrite("\033[0 q", 5);
     cliActiveSlot = -1;
   }
+}
 
+/** TCP (stream mode): net-forwarded TCP/TLS client (LINE mode), or the
+ *  on-device serial task sending a cli_connect_t. */
+static int cliTcpConnect(int handle, const void* data, size_t len) {
+  int slot = cliAllocSlot(handle);
+  if (slot < 0) return -1;
+  auto& cl = cliSlots[slot];
+  cl.edit = {};
+  cl.lineLen = 0;
+  cl.usbSerial = false;
+  if (len >= sizeof(net_connect_t)) {
+    /* Raw TCP/TLS from net — line-oriented, no echo */
+    cl.mode = CLI_LINE;
+  } else if (len >= sizeof(cli_connect_t)) {
+    const auto* cc = (const cli_connect_t*)data;
+    cl.mode = cc->mode;
+    cl.usbSerial = cc->from_usb_serial != 0;
+  } else if (len >= 1) {
+    cl.mode = *(const cli_mode_t*)data;
+  } else {
+    cl.mode = CLI_LINE;
+  }
+  cliInitSlot(cl, slot);
+  return slot;
+}
+
+/** DC (packet mode): browser xterm.js, always full ANSI. */
+static int cliDcConnect(int handle, const void* data, size_t len) {
+  (void)data; (void)len;
+  int slot = cliAllocSlot(handle);
+  if (slot < 0) return -1;
+  auto& cl = cliSlots[slot];
+  cl.edit = {};
+  cl.lineLen = 0;
+  cl.usbSerial = false;
+  cl.mode = CLI_ANSI;
+  cliInitSlot(cl, slot);
   return slot;
 }
 
@@ -774,46 +783,42 @@ static TaskHandle_t cliTaskHandle = NULL;
 static void cliTaskFn(void* arg) {
   for (int i = 0; i < CLI_MAX_CLIENTS; i++) cliSlots[i].itsHandle = -1;
   itsServerInit();
-  itsServerPortOpen(CLI_PORT, false, CLI_MAX_CLIENTS, 512, 2048);
-  itsServerOnConnect(CLI_PORT, cliOnConnect);
-  itsServerOnDisconnect(CLI_PORT, cliOnDisconnect);
+  /* Two ports: stream-mode (TCP nc + serial) and packet-mode (WebRTC DC).
+   * Shared CLI_MAX_CLIENTS=4 slot pool — 3 TCP + 1 DC lets a single
+   * browser xterm coexist with debug nc clients. */
+  itsServerPortOpen(CLI_PORT_TCP, /*packetBased=*/false, 3, 512, 2048);
+  itsServerOnConnect(CLI_PORT_TCP, cliTcpConnect);
+  itsServerOnDisconnect(CLI_PORT_TCP, cliOnDisconnect);
+  itsServerPortOpen(CLI_PORT_DC,  /*packetBased=*/true,  1, 512, 2048);
+  itsServerOnConnect(CLI_PORT_DC, cliDcConnect);
+  itsServerOnDisconnect(CLI_PORT_DC, cliOnDisconnect);
 
   cliBuiltinInit();  /* register built-in CLI commands */
 
-  /* Register TCP port + WS path (non-blocking: retry from main loop so serial
-   * connections are accepted immediately during boot). */
-  bool netRegistered = false, webRegistered = false;
+  /* Register TCP port (non-blocking: retry from main loop so serial
+   * connections are accepted immediately during boot). Browser reaches us
+   * through webrtc_task's `cli:1` router — no URL/WS registration. */
+  bool netRegistered = false;
 
   for (;;) {
     while (itsPoll(pdMS_TO_TICKS(50))) {}
 
     if (!netRegistered) {
       net_port_msg_t reg = {};
-      reg.itsPort = CLI_PORT;
+      reg.itsPort = CLI_PORT_TCP;
       safeStrncpy(reg.nvsKey, "cli_port", sizeof(reg.nvsKey));
       netRegistered = itsSendAux("net", NET_PORT_REG_PORT, &reg, sizeof(reg), 0);
     }
-    if (!webRegistered) {
-      web_path_msg_t reg = {};
-      reg.itsPort = CLI_PORT;
-      safeStrncpy(reg.path, "cli", sizeof(reg.path));
-      webRegistered = itsSendAux("web", WEB_PATH_REG_PORT, &reg, sizeof(reg), 0);
-    }
 
-    /* Process each active slot */
+    /* Process each active slot. Stream and packet modes both deliver bytes
+       via itsRecv — packet mode returns exactly one message body per call,
+       stream mode whatever's accumulated. The line editor doesn't care
+       about message boundaries. */
     char buf[128];
     for (int s = 0; s < CLI_MAX_CLIENTS; s++) {
       int h = cliSlots[s].itsHandle;
       if (h < 0 || !itsConnected(h)) continue;
-      size_t n = 0;
-      if (cliSlots[s].ws) {
-        size_t outLen = 0;
-        int op = wsReadFrame(h, (uint8_t*)buf, sizeof(buf), &outLen);
-        if (op > 0) n = outLen;
-        else if (op < 0) { itsDisconnect(h); continue; }
-      } else {
-        n = itsRecv(h, buf, sizeof(buf), 0);
-      }
+      size_t n = itsRecv(h, buf, sizeof(buf), 0);
       if (n == 0) continue;
       cliActiveSlot = s;
       auto& cl = cliSlots[s];
@@ -865,8 +870,10 @@ static void serialEmit(const char* p, size_t n) {
 }
 
 /* Set true while in CLI mode so logVprintf suppresses its direct-stdout echo
- * (otherwise log lines would interleave with command output / prompts). */
-extern "C" volatile bool serialInCli = false;
+ * (otherwise log lines would interleave with command output / prompts).
+ * Declared extern in log.cpp; defined here without extern (definition-with-
+ * initializer rule). */
+extern "C" { volatile bool serialInCli = false; }
 
 static void serialTaskFn(void* arg) {
   /* Set stdin non-blocking */
@@ -886,7 +893,7 @@ static void serialTaskFn(void* arg) {
         /* Switch to CLI mode — suppress direct-stdout log echo */
         serialInCli = true;
         cli_connect_t req = { CLI_ANSI, 1 };
-        cliHandle = itsConnect("cli", CLI_PORT, &req, sizeof(req), pdMS_TO_TICKS(500));
+        cliHandle = itsConnect("cli", CLI_PORT_TCP, &req, sizeof(req), pdMS_TO_TICKS(500));
         if (cliHandle >= 0) {
           printf("\033[0m");
           if (storageGetInt("s.cli.sticky", 0) != 0)
