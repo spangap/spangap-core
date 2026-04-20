@@ -1268,6 +1268,22 @@ bool itsIsFull(int handle) {
     return buf ? xStreamBufferIsFull(buf) : true;
 }
 
+bool itsSendIsEmpty(int handle) {
+    StreamBufferHandle_t buf = sendBuf(handle);
+    return buf ? xStreamBufferIsEmpty(buf) : true;
+}
+
+bool itsSendDrain(int handle, uint32_t timeoutMs) {
+    TickType_t start = xTaskGetTickCount();
+    TickType_t deadline = start + pdMS_TO_TICKS(timeoutMs);
+    while (!itsSendIsEmpty(handle)) {
+        if (!itsConnected(handle)) return false;
+        if (xTaskGetTickCount() >= deadline) return false;
+        vTaskDelay(pdMS_TO_TICKS(5));
+    }
+    return true;
+}
+
 TaskHandle_t itsRemoteTask(int handle) {
     return remoteOf(handle);
 }

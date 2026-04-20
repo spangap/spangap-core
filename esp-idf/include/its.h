@@ -244,6 +244,17 @@ size_t       itsBytesAvailable(int handle);
 size_t       itsSpacesAvailable(int handle);
 bool         itsIsEmpty(int handle);
 bool         itsIsFull(int handle);
+
+/** Returns true if the SEND-direction buffer is fully drained by the
+ *  peer (mirror of itsIsEmpty, which looks at the recv direction). Use
+ *  this to confirm the remote side has read everything we wrote before
+ *  closing the connection. */
+bool         itsSendIsEmpty(int handle);
+
+/** Block up to `timeoutMs` waiting for the send buffer to drain. Returns
+ *  true if fully drained, false on timeout. Useful before an onConnect
+ *  reject to let a last-gasp wsSendClose reach the wire. */
+bool         itsSendDrain(int handle, uint32_t timeoutMs);
 bool         itsReset(int handle);
 TaskHandle_t itsRemoteTask(int handle);
 
