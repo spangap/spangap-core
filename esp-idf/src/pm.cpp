@@ -9,6 +9,9 @@
 #include "compat.h"
 #include <esp_system.h>
 #include <esp_heap_caps.h>
+#ifdef CONFIG_HEAP_TASK_TRACKING
+#include <esp_heap_task_info.h>
+#endif
 #include <esp_wifi.h>
 #include <esp_sleep.h>
 #include <esp_pm.h>
@@ -17,6 +20,7 @@
 #include <esp_private/pm_impl.h>
 #endif
 #include <esp_private/esp_clk.h>
+#include <esp_memory_utils.h>
 #include <driver/usb_serial_jtag.h>
 #include <hal/usb_serial_jtag_ll.h>
 #include <cstdio>
@@ -335,10 +339,20 @@ static void cmdTop(const char* args) {
     if (strcmp(args, "help") == 0) { cliPrintf("  %-*s tasks, CPU%%, heap, uptime\n", CLI_HELP_COL, "top"); return; }
 #if CONFIG_FREERTOS_USE_TRACE_FACILITY && CONFIG_FREERTOS_GENERATE_RUN_TIME_STATS
     constexpr int MAX_SNAP = 32;
-    struct snap { char name[configMAX_TASK_NAME_LEN]; uint32_t run; int core; int pri; uint16_t stack; };
+    struct snap {
+        TaskHandle_t h;
+        char name[configMAX_TASK_NAME_LEN];
+        uint32_t run;
+        int core; int pri; uint16_t stack;
+        /* Filled after matching against heap task totals */
+        size_t dram, psram; uint16_t dblk, pblk;
+        uint32_t delta;
+    };
     auto* s1 = (snap*)malloc(MAX_SNAP * sizeof(snap));
     auto* s2 = (snap*)malloc(MAX_SNAP * sizeof(snap));
     if (!s1 || !s2) { free(s1); free(s2); cliPrintf("top: out of memory\n"); return; }
+    memset(s1, 0, MAX_SNAP * sizeof(snap));
+    memset(s2, 0, MAX_SNAP * sizeof(snap));
     auto takeSnap = [](snap* out, int max, uint32_t& total) -> int {
         UBaseType_t n = uxTaskGetNumberOfTasks();
         auto* raw = (TaskStatus_t*)malloc(n * sizeof(TaskStatus_t));
@@ -346,6 +360,7 @@ static void cmdTop(const char* args) {
         n = uxTaskGetSystemState(raw, n, &total);
         int cnt = n < (UBaseType_t)max ? (int)n : max;
         for (int i = 0; i < cnt; i++) {
+            out[i].h = raw[i].xHandle;
             safeStrncpy(out[i].name, raw[i].pcTaskName, configMAX_TASK_NAME_LEN);
             out[i].run = raw[i].ulRunTimeCounter;
             out[i].pri = (int)raw[i].uxCurrentPriority;
@@ -364,48 +379,173 @@ static void cmdTop(const char* args) {
     vTaskDelay(pdMS_TO_TICKS(2000));
     int n2 = takeSnap(s2, MAX_SNAP, t2);
     uint32_t deltaTotal = t2 - t1;
-    struct top_entry { const char* name; int core; int pri; uint16_t stack; uint32_t delta; };
-    auto* entries = (top_entry*)malloc(n2 * sizeof(top_entry));
-    if (!entries) { free(s1); free(s2); return; }
-    int cnt = 0;
+
+    /* Compute per-task CPU delta; also capture IDLE0/IDLE1 for per-core busy. */
+    uint32_t idle0 = 0, idle1 = 0;
     for (int i = 0; i < n2; i++) {
-        if (strncmp(s2[i].name, "IDLE", 4) == 0) continue;
         uint32_t prev = 0;
         for (int j = 0; j < n1; j++)
-            if (strcmp(s1[j].name, s2[i].name) == 0) { prev = s1[j].run; break; }
-        entries[cnt++] = { s2[i].name, s2[i].core, s2[i].pri, s2[i].stack, s2[i].run - prev };
+            if (s1[j].h == s2[i].h) { prev = s1[j].run; break; }
+        s2[i].delta = s2[i].run - prev;
+        if (strcmp(s2[i].name, "IDLE0") == 0) idle0 = s2[i].delta;
+        else if (strcmp(s2[i].name, "IDLE1") == 0) idle1 = s2[i].delta;
     }
-    std::sort(entries, entries + cnt, [](const top_entry& a, const top_entry& b) {
+
+    /* Merge per-task heap totals into s2 by TaskHandle_t; accumulate unmatched. */
+    size_t preDram = 0, preDblk = 0, preP = 0, prePblk = 0;
+    size_t delDram = 0, delDblk = 0, delP = 0, delPblk = 0;
+#ifdef CONFIG_HEAP_TASK_TRACKING
+    { constexpr size_t MAX_HT = 32;
+      static heap_task_totals_t htotals[MAX_HT];
+      memset(htotals, 0, sizeof(htotals));
+      size_t ntot = 0;
+      heap_task_info_params_t p = {};
+      p.caps[0] = MALLOC_CAP_INTERNAL; p.mask[0] = MALLOC_CAP_INTERNAL;
+      p.caps[1] = MALLOC_CAP_SPIRAM;   p.mask[1] = MALLOC_CAP_SPIRAM;
+      p.totals = htotals; p.num_totals = &ntot; p.max_totals = MAX_HT;
+      heap_caps_get_per_task_info(&p);
+      for (size_t i = 0; i < ntot; i++) {
+          if (htotals[i].task == nullptr) {
+              preDram += htotals[i].size[0];  preDblk += htotals[i].count[0];
+              preP    += htotals[i].size[1];  prePblk += htotals[i].count[1];
+              continue;
+          }
+          bool found = false;
+          for (int j = 0; j < n2; j++) {
+              if (s2[j].h == htotals[i].task) {
+                  s2[j].dram  = htotals[i].size[0];  s2[j].dblk = htotals[i].count[0];
+                  s2[j].psram = htotals[i].size[1];  s2[j].pblk = htotals[i].count[1];
+                  found = true; break;
+              }
+          }
+          if (!found) {
+              delDram += htotals[i].size[0];  delDblk += htotals[i].count[0];
+              delP    += htotals[i].size[1];  delPblk += htotals[i].count[1];
+          }
+      }
+    }
+#endif
+
+    /* Sort live tasks: pinned by core, then CPU desc; IDLE filtered out. */
+    std::sort(s2, s2 + n2, [](const snap& a, const snap& b) {
+        bool ai = strncmp(a.name, "IDLE", 4) == 0;
+        bool bi = strncmp(b.name, "IDLE", 4) == 0;
+        if (ai != bi) return !ai;
         int ca = a.core < 0 ? 99 : a.core, cb = b.core < 0 ? 99 : b.core;
         return ca != cb ? ca < cb : a.delta > b.delta;
     });
-    cliPrintf("  %-12s %4s %3s %5s %8s\n", "Task", "Core", "Pri", "Stack", "CPU%");
-    for (int i = 0; i < cnt; i++) {
-        unsigned p = deltaTotal > 0 ? (unsigned)(entries[i].delta * 1000 / deltaTotal) : 0;
+
+    /* Unified table: Task | Core | Pri | Stack | CPU% | DRAM | PSRAM | Dblk | Pblk */
+    cliPrintf("  %-12s %4s %3s  %7s %7s %8s %8s %5s %5s\n",
+              "Task", "Core", "Pri", "Stack", "CPU%", "DRAM", "PSRAM", "Dblk", "Pblk");
+    for (int i = 0; i < n2; i++) {
+        if (strncmp(s2[i].name, "IDLE", 4) == 0) continue;
+        unsigned p10 = deltaTotal > 0 ? (unsigned)(s2[i].delta * 1000 / deltaTotal) : 0;
         char cb[16];
-        if (entries[i].core < 0) strcpy(cb, entries[i].core == -2 ? " ?" : " *");
-        else snprintf(cb, sizeof(cb), " %d", entries[i].core);
-        cliPrintf("  %-12s %4s %3d %5u %4u.%u%%\n", entries[i].name, cb, entries[i].pri,
-            (unsigned)entries[i].stack, p / 10, p % 10);
+        if (s2[i].core < 0) strcpy(cb, s2[i].core == -2 ? " ?" : " *");
+        else snprintf(cb, sizeof(cb), " %d", s2[i].core);
+        char cpuBuf[16];
+        snprintf(cpuBuf, sizeof(cpuBuf), "%u.%u%%", p10 / 10, p10 % 10);
+        char stackBuf[12];
+        const void* stkBase = pxTaskGetStackStart(s2[i].h);
+        char stkMem = esp_ptr_external_ram(stkBase) ? 'P' : 'D';
+        snprintf(stackBuf, sizeof(stackBuf), "%u %c", (unsigned)s2[i].stack, stkMem);
+        cliPrintf("  %-12s %4s %3d  %7s %7s %8u %8u %5u %5u\n",
+            s2[i].name, cb, s2[i].pri, stackBuf, cpuBuf,
+            (unsigned)s2[i].dram, (unsigned)s2[i].psram,
+            (unsigned)s2[i].dblk, (unsigned)s2[i].pblk);
     }
-    free(entries); free(s1); free(s2);
+    /* Pre-scheduler + deleted-task heap aggregates (no CPU/stack to show). */
+    if (preDram || preP) {
+        cliPrintf("  %-12s %4s %3s  %7s %7s %8u %8u %5u %5u\n",
+            "pre-sched", "-", "-", "-", "-",
+            (unsigned)preDram, (unsigned)preP, (unsigned)preDblk, (unsigned)prePblk);
+    }
+    if (delDram || delP) {
+        cliPrintf("  %-12s %4s %3s  %7s %7s %8u %8u %5u %5u\n",
+            "(deleted)", "-", "-", "-", "-",
+            (unsigned)delDram, (unsigned)delP, (unsigned)delDblk, (unsigned)delPblk);
+    }
+
+    /* Per-core CPU busy: deltaTotal on SMP FreeRTOS is wall-time ticks (not
+     * summed across cores), so each IDLE task's delta is its core's idle
+     * fraction of that same window. */
+    unsigned b0 = (deltaTotal > idle0) ? (unsigned)((deltaTotal - idle0) * 1000 / deltaTotal) : 0;
+    unsigned b1 = (deltaTotal > idle1) ? (unsigned)((deltaTotal - idle1) * 1000 / deltaTotal) : 0;
+    cliPrintf("\n  Total CPU:   core0: %u.%u%%    core1: %u.%u%%\n",
+              b0/10, b0%10, b1/10, b1%10);
+
+    free(s1); free(s2);
 #endif
-    { char f[16], t[16], m[16];
-      cliPrintf("\n  Heap:\n");
-      cliPrintf("    DRAM   free %s / %s  (min %s)\n",
-          fmtSize(heap_caps_get_free_size(MALLOC_CAP_8BIT|MALLOC_CAP_INTERNAL), f, sizeof(f)),
-          fmtSize(heap_caps_get_total_size(MALLOC_CAP_8BIT|MALLOC_CAP_INTERNAL), t, sizeof(t)),
-          fmtSize(heap_caps_get_minimum_free_size(MALLOC_CAP_8BIT|MALLOC_CAP_INTERNAL), m, sizeof(m)));
-      cliPrintf("    PSRAM  free %s / %s  (min %s)\n",
-          fmtSize(heap_caps_get_free_size(MALLOC_CAP_SPIRAM), f, sizeof(f)),
-          fmtSize(heap_caps_get_total_size(MALLOC_CAP_SPIRAM), t, sizeof(t)),
-          fmtSize(heap_caps_get_minimum_free_size(MALLOC_CAP_SPIRAM), m, sizeof(m)));
-      cliPrintf("    Total  free %s\n",
-          fmtSize(heap_caps_get_free_size(MALLOC_CAP_8BIT), f, sizeof(f)));
-    }
+    cliPrintf("\n  Heap:\n");
+    cliPrintf("    DRAM   free %u / %u  min %u  largest %u\n",
+        (unsigned)heap_caps_get_free_size(MALLOC_CAP_8BIT|MALLOC_CAP_INTERNAL),
+        (unsigned)heap_caps_get_total_size(MALLOC_CAP_8BIT|MALLOC_CAP_INTERNAL),
+        (unsigned)heap_caps_get_minimum_free_size(MALLOC_CAP_8BIT|MALLOC_CAP_INTERNAL),
+        (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT|MALLOC_CAP_INTERNAL));
+    cliPrintf("    PSRAM  free %u / %u  min %u  largest %u\n",
+        (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM),
+        (unsigned)heap_caps_get_total_size(MALLOC_CAP_SPIRAM),
+        (unsigned)heap_caps_get_minimum_free_size(MALLOC_CAP_SPIRAM),
+        (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM));
+    cliPrintf("    DMA    free %u  min %u  largest %u\n",
+        (unsigned)heap_caps_get_free_size(MALLOC_CAP_DMA),
+        (unsigned)heap_caps_get_minimum_free_size(MALLOC_CAP_DMA),
+        (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DMA));
+
     uint32_t up = (uint32_t)(esp_timer_get_time() / 1000000ULL);
     char eb[32]; fmtElapsed(up, eb, sizeof(eb));
     cliPrintf("\n  Uptime: %s\n", eb);
+}
+
+/* ---- Heap dump on malloc failure ---- */
+
+static void heapRegionInfo(const char* tag, uint32_t caps) {
+    multi_heap_info_t h;
+    heap_caps_get_info(&h, caps);
+    char f[16], t[16], m[16], lg[16];
+    size_t total = h.total_free_bytes + h.total_allocated_bytes;
+    info("  %-8s free %s / %s  min %s  largest %s  free_blk %u  tot_blk %u\n",
+        tag,
+        fmtSize(h.total_free_bytes, f, sizeof(f)),
+        fmtSize(total, t, sizeof(t)),
+        fmtSize(h.minimum_free_bytes, m, sizeof(m)),
+        fmtSize(h.largest_free_block, lg, sizeof(lg)),
+        (unsigned)h.free_blocks, (unsigned)h.total_blocks);
+}
+
+void heapDump(const char* reason) {
+    info("heap dump: %s\n", reason ? reason : "(no reason)");
+    heapRegionInfo("DMA",      MALLOC_CAP_DMA);
+    heapRegionInfo("INTERNAL", MALLOC_CAP_8BIT | MALLOC_CAP_INTERNAL);
+    heapRegionInfo("SPIRAM",   MALLOC_CAP_SPIRAM);
+#ifdef CONFIG_HEAP_TASK_TRACKING
+    constexpr size_t MAX_TASKS = 24;
+    static heap_task_totals_t totals[MAX_TASKS];
+    memset(totals, 0, sizeof(totals));
+    size_t ntotals = 0;
+    heap_task_info_params_t p = {};
+    p.caps[0] = MALLOC_CAP_INTERNAL; p.mask[0] = MALLOC_CAP_INTERNAL;
+    p.caps[1] = MALLOC_CAP_SPIRAM;   p.mask[1] = MALLOC_CAP_SPIRAM;
+    p.totals = totals;
+    p.num_totals = &ntotals;
+    p.max_totals = MAX_TASKS;
+    heap_caps_get_per_task_info(&p);
+    std::sort(totals, totals + ntotals,
+        [](const heap_task_totals_t& a, const heap_task_totals_t& b) {
+            return a.size[0] > b.size[0];   /* largest internal-DRAM user first */
+        });
+    info("  per-task (task: internal / spiram, blocks):\n");
+    for (size_t i = 0; i < ntotals; i++) {
+        const char* nm = totals[i].task ? pcTaskGetName(totals[i].task) : "pre-sched";
+        char fi[16], fp[16];
+        info("    %-12s %s / %s  (%u / %u blk)\n",
+            nm,
+            fmtSize(totals[i].size[0], fi, sizeof(fi)),
+            fmtSize(totals[i].size[1], fp, sizeof(fp)),
+            (unsigned)totals[i].count[0], (unsigned)totals[i].count[1]);
+    }
+#endif
 }
 
 void pmRegisterCmds() {

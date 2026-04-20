@@ -2,7 +2,7 @@
  * auth — cookie-based authentication.
  *
  * All state lives in secrets.auth.* config keys (persisted, never sent to
- * browser via /epl). No in-memory caches — reads/writes go through storage.
+ * browser via the storage DC). No in-memory caches — reads/writes go through storage.
  *
  * Password hashing: SHA-256 with 16-byte random salt.
  * Stored as "salt_hex:hash_hex" in secrets.auth.realms.N.hash.

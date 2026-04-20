@@ -793,7 +793,10 @@ static void cliTaskFn(void* arg) {
   itsServerOnConnect(CLI_PORT_DC, cliDcConnect);
   itsServerOnDisconnect(CLI_PORT_DC, cliOnDisconnect);
 
-  cliBuiltinInit();  /* register built-in CLI commands */
+  /* Builtin commands are registered on main task in cliInit() (before this
+   * task exists) — cliRegisterCmd is unlocked and every module's Init()
+   * registers commands on main task's context, so the main task's serial
+   * flow is the one safe context. Registering them here would race. */
 
   /* Register TCP port (non-blocking: retry from main loop so serial
    * connections are accepted immediately during boot). Browser reaches us
@@ -959,7 +962,12 @@ void cliInit() {
   /* Allocate history buffer in PSRAM */
   histBuf = (char(*)[128])heap_caps_calloc(HIST_SIZE, 128, MALLOC_CAP_SPIRAM);
 
-  xTaskCreatePinnedToCoreWithCaps(cliTaskFn, "cli", 6144, NULL, 1, &cliTaskHandle, 1, MALLOC_CAP_SPIRAM);
-  static TaskHandle_t serialTaskHandle = NULL;
-  xTaskCreatePinnedToCoreWithCaps(serialTaskFn, "serial", 3072, NULL, 1, &serialTaskHandle, 1, MALLOC_CAP_SPIRAM);
+  /* Register builtin commands on main task's context, before spawning the cli
+   * task. The cli command table is an unlocked static array — all registration
+   * must happen serially on a single task, and the main task's module-init
+   * chain is already that context. */
+  cliBuiltinInit();
+
+  cliTaskHandle = spawnTask(cliTaskFn, "cli", 6144, nullptr, 1, 1);
+  spawnTask(serialTaskFn, "serial", 3072, nullptr, 1, 1);
 }

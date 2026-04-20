@@ -4,6 +4,7 @@
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/idf_additions.h"
 #include <sys/time.h>
 #include <sys/stat.h>
 #include <time.h>
@@ -31,6 +32,33 @@ static inline uint32_t millis() {
 
 static inline void delay(uint32_t ms) {
     vTaskDelay(pdMS_TO_TICKS(ms));
+}
+
+/** Task stack location. Default PSRAM — use DRAM only when the task runs
+ *  SPI-flash code paths (direct fopen/fread on LittleFS), which disable
+ *  the PSRAM cache for the duration of the flash op. */
+enum stack_caps_t { STACK_PSRAM, STACK_DRAM };
+
+/** Spawn a task with heap-capability-backed TCB + stack. Wraps
+ *  xTaskCreatePinnedToCoreWithCaps; must be paired with killSelf()
+ *  (or vTaskDeleteWithCaps) at teardown. Returns NULL on failure. */
+static inline TaskHandle_t spawnTask(TaskFunction_t fn, const char* name,
+                                      uint32_t stackBytes, void* arg,
+                                      UBaseType_t prio, BaseType_t core,
+                                      stack_caps_t stackMem = STACK_PSRAM) {
+    TaskHandle_t h = nullptr;
+    uint32_t caps = (stackMem == STACK_DRAM) ? MALLOC_CAP_INTERNAL : MALLOC_CAP_SPIRAM;
+    BaseType_t r = xTaskCreatePinnedToCoreWithCaps(fn, name, stackBytes, arg,
+                                                   prio, &h, core, caps);
+    return (r == pdPASS) ? h : nullptr;
+}
+
+/** End the current task and free its TCB + stack. Project convention:
+ *  all tasks are created via spawnTask() → xTaskCreatePinnedToCoreWithCaps,
+ *  so self-deletes always need the -WithCaps cleanup path (idle task
+ *  won't free the heap-allocated buffers on its own). */
+static inline void killSelf() {
+    vTaskDeleteWithCaps(nullptr);
 }
 
 /** UTC offset in minutes from epoch seconds (compares localtime vs gmtime). */

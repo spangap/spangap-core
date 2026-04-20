@@ -32,7 +32,7 @@ static void cmdResetFactory(const char* a) {
     if (strcmp(a, "help") == 0) { cliPrintf("  %-*s factory reset and reboot\n", CLI_HELP_COL, "reset factory"); return; }
     cliPrintf("factory reset: formatting /state and rebooting...\n");
     fflush(stdout);
-    xTaskCreatePinnedToCore(resetFactoryTask, "rfact", 3072, nullptr, 1, nullptr, 0);
+    spawnTask(resetFactoryTask, "rfact", 3072, nullptr, 1, 0);
 }
 
 static void cmdSleep(const char* a) {

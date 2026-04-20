@@ -94,53 +94,17 @@ static StreamBufferHandle_t poolHandle(int idx) {
     return itsPool[idx].handle;
 }
 
-/* ---- Pickup semaphore pool ---- */
-
-#define ITS_MAX_PICKUP 16
-
-static SemaphoreHandle_t pickupSems[ITS_MAX_PICKUP];
-static volatile uint32_t pickupStamps[ITS_MAX_PICKUP];   /* 0 = free, else millis() */
-
-static void pickupInit() {
-    for (int i = 0; i < ITS_MAX_PICKUP; i++) {
-        pickupSems[i] = xSemaphoreCreateBinary();
-        pickupStamps[i] = 0;
-    }
-}
-
-static int pickupAcquire() {
-    for (int i = 0; i < ITS_MAX_PICKUP; i++) {
-        if (pickupStamps[i] == 0) {
-            xSemaphoreTake(pickupSems[i], 0);
-            pickupStamps[i] = millis() | 1;
-            return i;
-        }
-    }
-    int oldest = 0;
-    uint32_t oldestStamp = pickupStamps[0];
-    for (int i = 1; i < ITS_MAX_PICKUP; i++) {
-        if (pickupStamps[i] && pickupStamps[i] < oldestStamp) {
-            oldest = i;
-            oldestStamp = pickupStamps[i];
-        }
-    }
-    xSemaphoreTake(pickupSems[oldest], 0);
-    pickupStamps[oldest] = millis() | 1;
-    return oldest;
-}
-
-static void pickupRelease(int idx) {
-    if (idx < 0 || idx >= ITS_MAX_PICKUP) return;
-    xSemaphoreGive(pickupSems[idx]);
-    pickupStamps[idx] = 0;
-}
-
-static bool pickupWait(int idx, TickType_t timeout) {
-    if (idx < 0 || idx >= ITS_MAX_PICKUP) return false;
-    bool ok = xSemaphoreTake(pickupSems[idx], timeout) == pdTRUE;
-    pickupStamps[idx] = 0;
-    return ok;
-}
+/* ---- Pickup semaphore: per-task (in its_task_t.pickupSem)
+ * Each task has its own binary sem. ITS_WAIT_PICKUP callers wait on their
+ * own sem; receivers give the sender's sem after processing. A task is
+ * single-threaded so it can only be in one outstanding pickup at a time,
+ * making per-task safe and race-free.
+ *
+ * Replaces the previous global pool (pickupSems[ITS_MAX_PICKUP]) which had
+ * two SMP races: (1) non-atomic check-then-claim in pickupAcquire let two
+ * callers grab the same slot; (2) stale gives from one acquire could be
+ * consumed by the next acquire's xSemaphoreTake(sem, 0) before the real
+ * waiter reached pickupWait, leaving the waiter stuck forever. */
 
 /* ---- Global connection table ---- */
 
@@ -259,6 +223,10 @@ struct its_task_t {
     SemaphoreHandle_t     ackSem;
     int                   ackHandle;
 
+    /* ITS_WAIT_PICKUP — sender waits on its own pickupSem; receiver gives
+     * this sem after processing the aux. Created on first registration. */
+    SemaphoreHandle_t     pickupSem;
+
     /* Aux callbacks (per-task, per-port) */
     its_aux_entry_t       auxCallbacks[ITS_MAX_PORTS];
     int                   auxCount;
@@ -273,7 +241,6 @@ struct its_task_t {
 
 static its_task_t s_tasks[ITS_MAX_TASKS];
 static int        s_taskCount = 0;
-static bool       pickupInited = false;
 
 static its_task_t* taskFind(TaskHandle_t task) {
     for (int i = 0; i < s_taskCount; i++)
@@ -288,12 +255,12 @@ static its_task_t* taskFindOrCreate(TaskHandle_t task, size_t inboxMaxMsgLen, si
         ITS_LOGE("task table full (max %d)", ITS_MAX_TASKS);
         return nullptr;
     }
-    if (!pickupInited) { pickupInit(); pickupInited = true; }
 
     e = &s_tasks[s_taskCount++];
     memset(e, 0, sizeof(*e));
     e->task = task;
     e->ackHandle = -1;
+    e->pickupSem = xSemaphoreCreateBinary();
 
     size_t itemSize = inboxMaxMsgLen > 0 ? (sizeof(its_header_t) + inboxMaxMsgLen)
                                          : ITS_DEFAULT_INBOX_SIZE;
@@ -501,7 +468,12 @@ static void processInboxMsg(its_task_t* me, uint8_t* buf) {
     }
 
 done:
-    if (pickupIdx >= 0) pickupRelease(pickupIdx);
+    if (pickupIdx > 0) {
+        /* Release sender's per-task pickup sem. No-op if sender isn't
+         * registered (shouldn't happen: ITS_WAIT_PICKUP forces registration). */
+        its_task_t* s = taskFind(hdr->sender);
+        if (s && s->pickupSem) xSemaphoreGive(s->pickupSem);
+    }
 }
 
 /* ---- Receive callback dispatch ---- */
@@ -1033,9 +1005,15 @@ static bool itsSendAuxInternal(TaskHandle_t task, uint16_t port,
         dataLen = maxPayload;
     }
 
-    int pickupIdx = -1;
-    if (wait == ITS_WAIT_PICKUP)
-        pickupIdx = pickupAcquire();
+    /* For ITS_WAIT_PICKUP, ensure the caller has an ITS task entry with its
+     * own pickupSem, then drain any stale give on that sem. Receiver will
+     * give it after processing the aux. */
+    its_task_t* me = nullptr;
+    if (wait == ITS_WAIT_PICKUP) {
+        me = taskFindOrCreate(xTaskGetCurrentTaskHandle(), 0, 0);
+        if (!me || !me->pickupSem) return false;
+        xSemaphoreTake(me->pickupSem, 0);
+    }
 
     size_t totalLen = sizeof(its_header_t) + dataLen;
     uint8_t* buf = (uint8_t*)alloca(totalLen);
@@ -1043,7 +1021,7 @@ static bool itsSendAuxInternal(TaskHandle_t task, uint16_t port,
     *hdr = {};
     hdr->sender = xTaskGetCurrentTaskHandle();
     hdr->msg = ITS_MSG_AUX;
-    hdr->pickupIdx = (int8_t)pickupIdx;
+    hdr->pickupIdx = (wait == ITS_WAIT_PICKUP) ? 1 : -1;  /* flag only */
     hdr->itsPort = port;
     hdr->len = (uint16_t)dataLen;
     hdr->handle = -1;
@@ -1051,14 +1029,10 @@ static bool itsSendAuxInternal(TaskHandle_t task, uint16_t port,
         memcpy(buf + sizeof(its_header_t), data, dataLen);
 
     bool delivered = inboxSend(te, buf, totalLen, timeout);
+    if (!delivered) return false;
 
-    if (!delivered) {
-        if (pickupIdx >= 0) pickupStamps[pickupIdx] = 0;
-        return false;
-    }
-
-    if (pickupIdx >= 0)
-        return pickupWait(pickupIdx, timeout);
+    if (me)
+        return xSemaphoreTake(me->pickupSem, timeout) == pdTRUE;
 
     return true;
 }

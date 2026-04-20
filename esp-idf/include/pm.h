@@ -43,4 +43,9 @@ bool deepSleepAllowed();
  *  Call just before esp_deep_sleep_start(). Stats survive in RTC RAM. */
 void pmRecordDeepSleep(int64_t durationUs);
 
+/** Dump all heap state to the log at info level. Call on malloc failure.
+ *  Shows DMA/INTERNAL/SPIRAM totals + largest free block + per-task owners
+ *  (per-task requires CONFIG_HEAP_TASK_TRACKING). */
+void heapDump(const char* reason);
+
 #endif

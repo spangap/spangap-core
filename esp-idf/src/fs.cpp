@@ -240,6 +240,10 @@ static void handleOp(fs_op_t* req) {
     }
 }
 
+static volatile uint32_t fsOpCount = 0;
+static volatile int fsCurrentOp = -1;
+static volatile int fsCurrentSlot = -1;
+
 static void onFsOp(TaskHandle_t, const void* data, size_t len) {
     static uint32_t lastOpExitUs = 0;
     if (len < sizeof(fs_op_t*)) return;
@@ -252,12 +256,16 @@ static void onFsOp(TaskHandle_t, const void* data, size_t len) {
     if (idleMs > 200) {
         verb("fs worker: idle %ums before op=%d\n", (unsigned)idleMs, (int)op->op);
     }
+    fsCurrentOp = (int)op->op;
+    fsCurrentSlot = op->slot;
     handleOp(op);
+    fsCurrentOp = -1;
+    fsCurrentSlot = -1;
+    fsOpCount++;
     uint32_t t1 = (uint32_t)esp_timer_get_time();
     uint32_t took = (t1 - t0) / 1000;
     if (took > 200) {
-        verb("fs worker: op=%d slot=%d took %ums\n",
-             (int)op->op, op->slot, (unsigned)took);
+        ESP_LOGD("fs", "op=%d slot=%d took %ums", (int)op->op, op->slot, (unsigned)took);
     }
     lastOpExitUs = t1;
 }
@@ -462,7 +470,23 @@ static void fsWorkerFn(void*) {
     itsServerInit();
     itsOnAux(FS_OP_PORT, onFsOp);
     xSemaphoreGive(fsReady);
-    for (;;) itsPoll();
+    uint32_t lastPulseMs = 0;
+    uint32_t lastOpCount = 0;
+    for (;;) {
+        itsPoll(pdMS_TO_TICKS(1000));
+        uint32_t now = (uint32_t)(esp_timer_get_time() / 1000);
+        if (now - lastPulseMs >= 1000) {
+            uint32_t delta = fsOpCount - lastOpCount;
+            if (fsCurrentOp >= 0) {
+                ESP_LOGD("fs", "pulse: ops/s=%u in-op=%d slot=%d",
+                         (unsigned)delta, fsCurrentOp, fsCurrentSlot);
+            } else if (delta > 0) {
+                ESP_LOGD("fs", "pulse: ops/s=%u idle", (unsigned)delta);
+            }
+            lastPulseMs = now;
+            lastOpCount = fsOpCount;
+        }
+    }
 }
 
 static SemaphoreHandle_t fsStreamsReady = nullptr;
@@ -578,14 +602,13 @@ void fs_init() {
      * FAT/SDMMC still serializes, but FreeRTOS scheduling lets the aux task
      * run between chunks. */
     fsReady = xSemaphoreCreateBinary();
-    xTaskCreatePinnedToCore(fsWorkerFn, "fs", 5120, nullptr, 1, &fsWorkerHandle, 1);
+    fsWorkerHandle = spawnTask(fsWorkerFn, "fs", 5120, nullptr, 1, 1, STACK_DRAM);
     xSemaphoreTake(fsReady, portMAX_DELAY);
     vSemaphoreDelete(fsReady);
     fsReady = nullptr;
 
     fsStreamsReady = xSemaphoreCreateBinary();
-    xTaskCreatePinnedToCore(fsStreamsFn, "fs_strm", 5120, nullptr, 1,
-                            &fsStreamsHandle, 1);
+    fsStreamsHandle = spawnTask(fsStreamsFn, "fs_strm", 5120, nullptr, 1, 1, STACK_DRAM);
     xSemaphoreTake(fsStreamsReady, portMAX_DELAY);
     vSemaphoreDelete(fsStreamsReady);
     fsStreamsReady = nullptr;
@@ -598,7 +621,10 @@ int fs_open(const char* path, const char* mode) {
     if (slot < 0) return -1;
     fileSlots[slot].flash = isFlashPath(path);
 
-    if (fileSlots[slot].flash && callerOnPsram()) {
+    /* Always go through the fs worker once it's up — matches the rest of fs_*
+     * and keeps FatFS/SDMMC access strictly single-threaded. Only the pre-boot
+     * settings.json read (done before the worker exists) uses direct fopen. */
+    if (fsWorkerHandle != nullptr) {
         fs_op_t req = {};
         req.op = fs_op_t::OPEN;
         req.path = path;

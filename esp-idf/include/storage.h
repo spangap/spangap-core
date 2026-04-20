@@ -32,7 +32,7 @@
 /** Storage task's ITS server port for the config DataChannel (`storage:1`).
  *  Packet-mode: each browser→device message is one JSON merge-patch,
  *  each device→browser message is one dump or coalesced patch. */
-static constexpr uint16_t STORAGE_EPL_PORT = 1;
+static constexpr uint16_t STORAGE_CONFIG_PORT = 1;
 
 /** Storage task's ITS aux ports. */
 static constexpr uint16_t STORAGE_SAVE_PORT   = 43;  /* save-now signal */

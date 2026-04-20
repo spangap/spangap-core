@@ -307,7 +307,7 @@ void cronInit() {
     cronStream = xStreamBufferCreate(CRON_STREAM_SIZE, 1);
     pmLockCreate(PM_NO_DEEP_SLEEP, "cron", &cronDeepLock);
     pmLockAcquire(cronDeepLock);
-    xTaskCreatePinnedToCoreWithCaps(cronTaskFn, "cron", 4096, nullptr, 1, nullptr, 0, MALLOC_CAP_SPIRAM);
+    spawnTask(cronTaskFn, "cron", 4096, nullptr, 1, 0);
 }
 
 /* ---- CLI drain ---- */

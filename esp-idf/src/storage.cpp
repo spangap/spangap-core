@@ -1119,9 +1119,9 @@ static void storageTaskFn(void* arg) {
      * timezone DB is ~40K when flattened. fromSize=64K accommodates full
      * config dumps + coalesced multi-key patches. SCTP fragments both on
      * the wire; the webrtc router reassembles inbound into one packet. */
-    itsServerPortOpen(STORAGE_EPL_PORT, /*packetBased=*/true, 1, 49152, 65536);
-    itsServerOnConnect(STORAGE_EPL_PORT, storageItsConnect);
-    itsServerOnDisconnect(STORAGE_EPL_PORT, storageItsDisconnect);
+    itsServerPortOpen(STORAGE_CONFIG_PORT, /*packetBased=*/true, 1, 49152, 65536);
+    itsServerOnConnect(STORAGE_CONFIG_PORT, storageItsConnect);
+    itsServerOnDisconnect(STORAGE_CONFIG_PORT, storageItsDisconnect);
     itsOnAux(STORAGE_SAVE_PORT, storageSaveAux);
 
     /* Subscribe to all config changes for DC coalescing */
@@ -1145,5 +1145,5 @@ static void storageTaskFn(void* arg) {
 
 void storageInit() {
     /* storage task: PSRAM stack (config WS + ITS, no direct file I/O) */
-    xTaskCreatePinnedToCoreWithCaps(storageTaskFn, "storage", 8192, NULL, 1, &storageHandle, 1, MALLOC_CAP_SPIRAM);
+    storageHandle = spawnTask(storageTaskFn, "storage", 8192, nullptr, 1, 1);
 }

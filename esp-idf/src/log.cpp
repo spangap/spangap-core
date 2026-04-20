@@ -664,7 +664,7 @@ void logInit() {
    * directory iteration via fs_opendir/readdir/closedir). The DRAM ring buffer is
    * accessed via spinlock from any caller; cache-disable windows freeze this task. */
   logReadySem = xSemaphoreCreateBinary();
-  xTaskCreatePinnedToCoreWithCaps(logTaskFn, "log", 6144, NULL, 1, &logTaskHandle, 1, MALLOC_CAP_SPIRAM);
+  logTaskHandle = spawnTask(logTaskFn, "log", 6144, nullptr, 1, 1);
   /* Block until log task has its ITS server open — otherwise the serial task
    * (created right after by cliInit) races and its initial connectLog fails. */
   xSemaphoreTake(logReadySem, portMAX_DELAY);
