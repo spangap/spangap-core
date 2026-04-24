@@ -22,17 +22,20 @@ static void cmdReboot(const char* a) {
 }
 
 static void resetFactoryTask(void*) {
-    /* DRAM stack: esp_littlefs_format does flash ops that disable PSRAM cache. */
+    /* DRAM stack required: esp_littlefs_format disables the PSRAM cache
+     * during SPI-flash writes. SD format happens on the next boot inside
+     * mountSD, gated on fs_first_boot() (which is true because /state is
+     * now empty and the first-boot factory-defaults path runs). */
     esp_littlefs_format("state");
     delay(100);
     esp_restart();
 }
 
 static void cmdResetFactory(const char* a) {
-    if (strcmp(a, "help") == 0) { cliPrintf("  %-*s factory reset and reboot\n", CLI_HELP_COL, "reset factory"); return; }
-    cliPrintf("factory reset: formatting /state and rebooting...\n");
+    if (strcmp(a, "help") == 0) { cliPrintf("  %-*s factory reset: format /state, reboot, SD wiped on next boot\n", CLI_HELP_COL, "reset factory"); return; }
+    cliPrintf("factory reset: formatting /state, rebooting, SD wipe on next boot...\n");
     fflush(stdout);
-    spawnTask(resetFactoryTask, "rfact", 3072, nullptr, 1, 0);
+    spawnTask(resetFactoryTask, "rfact", 3072, nullptr, 1, 0, STACK_DRAM);
 }
 
 static void cmdSleep(const char* a) {

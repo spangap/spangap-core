@@ -16,6 +16,7 @@
 bool rtcRamValid();
 void rtcRamSetValid();
 
+
 /** strncpy with truncation warning. Always NUL-terminates. */
 static inline char* safeStrncpy(char* dst, const char* src, size_t n) {
     if (strlen(src) >= n)

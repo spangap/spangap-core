@@ -33,6 +33,7 @@ RTC_DATA_ATTR static uint32_t rtcAppMagic = 0;
 bool rtcRamValid()    { return rtcAppMagic == RTC_APP_MAGIC; }
 void rtcRamSetValid() { rtcAppMagic = RTC_APP_MAGIC; }
 
+
 /* ---- Deep sleep + PM mode stats (RTC RAM — survive deep sleep) ---- */
 RTC_DATA_ATTR static int32_t rtcDeepSleepCount = 0;
 RTC_DATA_ATTR static int64_t rtcDeepSleepUs = 0;
