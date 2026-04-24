@@ -49,7 +49,7 @@ static void cmdRun(const char* a) {
 
 static void cmdIts(const char* a) {
     if (strcmp(a, "help") == 0) { cliPrintf("  %-*s show ITS connection + stream pool status\n", CLI_HELP_COL, "its"); return; }
-    itsStatus();
+    itsStatus(cliPrintf);
 }
 
 /* help is special — declared here but needs access to the cmd registry.
