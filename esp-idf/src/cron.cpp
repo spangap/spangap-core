@@ -131,9 +131,10 @@ static bool cronMatchField(const char* field, int value, int minVal, int maxVal)
 }
 
 /* Cron flags: single-letter flags after the 5 time fields, or "-" for none.
- * A = awake only (skip on deep sleep wakeup), N = network required (implies A). */
+ * A = awake only (skip on deep sleep wakeup),
+ * N = upstream network required — STA connected to real network. AP-only does not count. Implies A. */
 #define CRON_FLAG_AWAKE   0x01   /* A: skip when waking from deep sleep */
-#define CRON_FLAG_NETWORK 0x02   /* N: only run when network is up (implies A) */
+#define CRON_FLAG_NETWORK 0x02   /* N: only run when STA connected to upstream (not AP-only) */
 
 static int parseFlags(const char* s) {
     if (s[0] == '-' && (s[1] == ' ' || s[1] == '\0')) return 0;
@@ -207,7 +208,7 @@ bool cronPoll(bool execute) {
     struct tm tm;
     localtime_r(&now, &tm);
 
-    bool netUp = netIsUp();
+    bool netUp = netIsStaConnected();  /* N flag requires real upstream, not AP-only */
     bool hasWork = false;
 
     struct stat st;

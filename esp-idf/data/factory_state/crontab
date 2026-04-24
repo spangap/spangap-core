@@ -5,7 +5,7 @@
 #
 #   -   none
 #   A   When awake, not on deepsleep wakeup
-#   N   When connected to on network
+#   N   When STA connected to upstream network (AP-only does not count)
 
 # min hour  dom   mon   dow flags   command
 */15  *     *     *     *     N     duckdns update
