@@ -37,19 +37,19 @@ static void cmdLs(const char* a) {
   } else {
     cliGetCwd(path, sizeof(path));
   }
-  constexpr int LS_MAX = 128;
+  constexpr int LS_MAX = 1024;
   struct ls_entry {
     char name[80];
     time_t mtime;
     uint32_t size;
     bool isDir;
   };
-  auto* entries = (ls_entry*)malloc(LS_MAX * sizeof(ls_entry));
+  auto* entries = (ls_entry*)heap_caps_malloc(LS_MAX * sizeof(ls_entry), MALLOC_CAP_SPIRAM);
   if (!entries) { cliPrintf("ls: out of memory\n"); return; }
   auto* listing = (fs_listing_t*)heap_caps_malloc(LS_MAX * sizeof(fs_listing_t), MALLOC_CAP_SPIRAM);
-  if (!listing) { free(entries); cliPrintf("ls: out of memory\n"); return; }
+  if (!listing) { heap_caps_free(entries); cliPrintf("ls: out of memory\n"); return; }
   int n = fs_listdir(path, listing, LS_MAX);
-  if (n < 0) { heap_caps_free(listing); free(entries); cliPrintf("ls: cannot open %s\n", path); return; }
+  if (n < 0) { heap_caps_free(listing); heap_caps_free(entries); cliPrintf("ls: cannot open %s\n", path); return; }
   int count = 0;
   for (int i = 0; i < n && count < LS_MAX; i++) {
     if (!showAll && listing[i].name[0] == '.') continue;
@@ -77,7 +77,7 @@ static void cmdLs(const char* a) {
       cliPrintf("  %s\n", entries[i].name);
     }
   }
-  free(entries);
+  heap_caps_free(entries);
 }
 
 static void cmdCd(const char* a) {
