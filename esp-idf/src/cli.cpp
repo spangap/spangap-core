@@ -63,14 +63,18 @@ static void cronCliWrite(const char* data, size_t len);  /* forward */
 
 static cli_write_fn cliOut = nullptr;
 
-void cliPrintf(const char* fmt, ...) {
-    if (!cliOut) return;
+int cliPrintf(const char* fmt, ...) {
+    if (!cliOut) return 0;
     char buf[256];
     va_list ap;
     va_start(ap, fmt);
     int n = vsnprintf(buf, sizeof(buf), fmt, ap);
     va_end(ap);
-    if (n > 0) cliOut(buf, (size_t)n);
+    if (n > 0) {
+        size_t w = (size_t)n < sizeof(buf) ? (size_t)n : sizeof(buf) - 1;
+        cliOut(buf, w);
+    }
+    return n;
 }
 
 void cliWrite(const char* data, size_t len) {

@@ -40,8 +40,11 @@ void cliRegisterCmd(const char* cmd, cli_cmd_cb_t cb);
 /** Column width for help alignment. Usage: cliPrintf("  %-*s description\n", CLI_HELP_COL, "cmd [args]"); */
 #define CLI_HELP_COL 23
 
-/** printf to the active CLI client (ITS handle or serial). */
-void cliPrintf(const char* fmt, ...) __attribute__((format(printf, 1, 2)));
+/** printf to the active CLI client (ITS handle or serial).
+ *  Signature matches plain printf so it can be used as a drop-in `int (*)(const char*, ...)`
+ *  print function pointer (e.g. itsStatus(cliPrintf)). Return value is the number of
+ *  bytes formatted (pre-truncation), 0 if no output channel is set. */
+int cliPrintf(const char* fmt, ...) __attribute__((format(printf, 1, 2)));
 
 /** Raw write to active CLI client (e.g. cat). No-op if no session output. */
 void cliWrite(const char* data, size_t len);
