@@ -26,13 +26,16 @@ static inline uint32_t millis() { return (uint32_t)(esp_timer_get_time() / 1000)
 struct its_pool_entry_t {
     StreamBufferHandle_t handle;
     size_t               size;
-    size_t               triggerLevel;   /* notify-on-send threshold (bytes) */
+    size_t               triggerLevel;   /* wake receiver when >= N bytes queued */
     volatile bool        inUse;
-    /* Packet-mode flow control. senderWaiting > 0 means a packet sender is
-     * blocked on spaceFreedSem because spaces_available was less than
-     * senderWaiting. The receiver gives the sem after consuming a packet if
-     * spaces_available has reached senderWaiting. */
-    volatile size_t      senderWaiting;
+    /* Free-space notification: when the remote consumes enough that free
+     * space >= freeNotify, the receiver's consume path fires
+     *   xSemaphoreGive(spaceFreedSem)     — wakes itsWaitForSpace callers
+     *   xTaskNotifyGive(sender_task)      — wakes itsPoll on the sender
+     * then clears freeNotify (one-shot). Armed by itsSetFreeNotify and by
+     * itsWaitForSpace; the latter drains spaceFreedSem, the former relies
+     * on the sender's itsPoll to pick up the task notification. */
+    volatile size_t      freeNotify;
     SemaphoreHandle_t    spaceFreedSem;
 };
 
@@ -47,7 +50,7 @@ void itsReserveStreams(int count, size_t size) {
         e.size = size;
         e.triggerLevel = 1;
         e.inUse = false;
-        e.senderWaiting = 0;
+        e.freeNotify = 0;
         e.spaceFreedSem = xSemaphoreCreateBinary();
     }
 }
@@ -688,22 +691,22 @@ int itsActiveTotal(void) {
     return n;
 }
 
-void itsStatus(void) {
+void itsStatus(int (*print)(const char*, ...)) {
     int active = 0;
     for (int i = 0; i < ITS_MAX_CONNS; i++)
         if (connTable[i].active) active++;
 
-    ESP_LOGI(TAG, "ITS System Status Report");
-    ESP_LOGI(TAG, "Connections (%d/%d in use)", active, ITS_MAX_CONNS);
+    print("ITS System Status Report\n");
+    print("Connections (%d/%d in use)\n", active, ITS_MAX_CONNS);
     for (int i = 0; i < ITS_MAX_CONNS; i++) {
         its_conn_t* c = &connTable[i];
         if (!c->active) continue;
         const char* cn = c->clientTask ? pcTaskGetName(c->clientTask) : "?";
         const char* sn = c->serverTask ? pcTaskGetName(c->serverTask) : "?";
-        ESP_LOGI(TAG, "    [%s] -> [%s:%u]", cn, sn, c->itsPort);
+        print("    [%s] -> [%s:%u]\n", cn, sn, c->itsPort);
     }
 
-    ESP_LOGI(TAG, "Streams");
+    print("Streams\n");
     bool seen[ITS_MAX_POOL] = {};
     for (int i = 0; i < itsPoolCount; i++) {
         if (seen[i]) continue;
@@ -717,11 +720,11 @@ void itsStatus(void) {
             }
         }
         if (sz >= 1024)
-            ESP_LOGI(TAG, "    %u kB (%d/%d in use)",
-                     (unsigned)(sz / 1024), used, total);
+            print("    %u kB (%d/%d in use)\n",
+                  (unsigned)(sz / 1024), used, total);
         else
-            ESP_LOGI(TAG, "    %u B (%d/%d in use)",
-                     (unsigned)sz, used, total);
+            print("    %u B (%d/%d in use)\n",
+                  (unsigned)sz, used, total);
     }
 }
 
@@ -1055,10 +1058,16 @@ bool itsSendAux(const char* taskName, uint16_t port,
 
 /* Wake a sender that's blocked waiting for space, if it asked for an amount
  * we now have free. Caller must have just consumed bytes from `pe`. */
-static inline void wakeSenderIfReady(its_pool_entry_t* pe) {
-    if (pe->senderWaiting > 0
-        && xStreamBufferSpacesAvailable(pe->handle) >= pe->senderWaiting)
-        xSemaphoreGive(pe->spaceFreedSem);
+/* Receiver-side: consume path fires the sender's pending free-space wake
+ * if the threshold is now satisfied. One-shot: clears freeNotify before
+ * firing so the wake does not repeat until the sender re-arms. */
+static inline void wakeSenderIfReady(int handle, its_pool_entry_t* pe) {
+    if (pe->freeNotify == 0) return;
+    if (xStreamBufferSpacesAvailable(pe->handle) < pe->freeNotify) return;
+    pe->freeNotify = 0;
+    xSemaphoreGive(pe->spaceFreedSem);
+    TaskHandle_t sender = remoteOf(handle);
+    if (sender) xTaskNotifyGive(sender);
 }
 
 size_t itsSend(int handle, const void* data, size_t len, TickType_t timeout) {
@@ -1083,35 +1092,7 @@ size_t itsSend(int handle, const void* data, size_t len, TickType_t timeout) {
         /* Wait for the whole packet to fit. Single writer per direction, so
          * once spaces is sufficient nothing else can shrink it; the two
          * xStreamBufferSend calls below will not block. */
-        TickType_t startTick = xTaskGetTickCount();
-        TickType_t remaining = timeout;
-        while (xStreamBufferSpacesAvailable(buf) < total) {
-            if (timeout == 0) return 0;
-
-            xSemaphoreTake(pe->spaceFreedSem, 0);   /* clear stale signal */
-            pe->senderWaiting = total;
-            /* Re-check: receiver may have freed space between our last check
-             * and our senderWaiting set, so could have skipped giving us. */
-            if (xStreamBufferSpacesAvailable(buf) >= total) {
-                pe->senderWaiting = 0;
-                break;
-            }
-
-            BaseType_t got = xSemaphoreTake(pe->spaceFreedSem, remaining);
-            pe->senderWaiting = 0;
-            if (got != pdTRUE) return 0;
-
-            /* A disconnect path also gives the sem after poolFree — bail
-               out if the connection has gone away under us. Otherwise we'd
-               xStreamBufferSend into a buffer now owned by a different
-               connection. */
-            if (!conn(handle)) return 0;
-
-            if (timeout != portMAX_DELAY) {
-                TickType_t elapsed = xTaskGetTickCount() - startTick;
-                remaining = (elapsed >= timeout) ? 0 : (timeout - elapsed);
-            }
-        }
+        if (!itsWaitForSpace(handle, total, timeout)) return 0;
 
         /* Atomic write: header then body, single notify after body. The
          * "in-flight 4-byte header" state on the wire is transient and
@@ -1195,11 +1176,14 @@ size_t itsRecv(int handle, void* buf, size_t maxLen, TickType_t timeout) {
             got = xStreamBufferReceive(sb, buf, bodyLen, 0);
         }
 
-        wakeSenderIfReady(pe);
+        wakeSenderIfReady(handle, pe);
         return got;
     }
 
-    return xStreamBufferReceive(sb, buf, maxLen, timeout);
+    /* Stream mode */
+    size_t got = xStreamBufferReceive(sb, buf, maxLen, timeout);
+    if (got > 0) wakeSenderIfReady(handle, pe);
+    return got;
 }
 
 bool itsConnected(int handle) {
@@ -1230,6 +1214,65 @@ bool itsSetTriggerLevel(int handle, size_t triggerLevel) {
     if (triggerLevel == 0) triggerLevel = 1;
     pe->triggerLevel = triggerLevel;
     return xStreamBufferSetTriggerLevel(buf, triggerLevel);
+}
+
+bool itsSetFreeNotify(int handle, size_t freeBytes) {
+    its_pool_entry_t* pe = nullptr;
+    StreamBufferHandle_t buf = sendBufWithPool(handle, &pe);
+    if (!buf || !pe) return false;
+    /* Drain any stale sem token from a previous arm so the caller's next
+     * itsWaitForSpace / itsPoll sees only fresh wakes. */
+    xSemaphoreTake(pe->spaceFreedSem, 0);
+    pe->freeNotify = freeBytes;
+    /* Close the race where the remote consumed between the caller's last
+     * space check and our arm: if the threshold is already met, fire now.
+     * Self-notify so a subsequent itsPoll on this task returns promptly. */
+    if (freeBytes > 0 && xStreamBufferSpacesAvailable(buf) >= freeBytes) {
+        pe->freeNotify = 0;
+        xSemaphoreGive(pe->spaceFreedSem);
+        xTaskNotifyGive(xTaskGetCurrentTaskHandle());
+    }
+    return true;
+}
+
+bool itsWaitForSpace(int handle, size_t freeBytes, TickType_t timeout) {
+    if (freeBytes == 0) return true;
+    its_pool_entry_t* pe = nullptr;
+    StreamBufferHandle_t buf = sendBufWithPool(handle, &pe);
+    if (!buf || !pe) return false;
+    if (xStreamBufferSpacesAvailable(buf) >= freeBytes) return true;
+    if (timeout == 0) return false;
+
+    TickType_t startTick = xTaskGetTickCount();
+    TickType_t remaining = timeout;
+    bool success = false;
+    for (;;) {
+        xSemaphoreTake(pe->spaceFreedSem, 0);   /* clear stale signal */
+        pe->freeNotify = freeBytes;
+        /* Re-check: remote may have freed space between our last check and
+         * our freeNotify set, so could have skipped waking us. */
+        if (xStreamBufferSpacesAvailable(buf) >= freeBytes) {
+            success = true;
+            break;
+        }
+        BaseType_t got = xSemaphoreTake(pe->spaceFreedSem, remaining);
+        /* A disconnect path also gives the sem after poolFree — bail if
+         * the connection has gone away under us. Otherwise we'd proceed
+         * against a buffer now owned by a different connection. */
+        if (!conn(handle)) break;
+        if (got != pdTRUE) break;
+        if (xStreamBufferSpacesAvailable(buf) >= freeBytes) {
+            success = true;
+            break;
+        }
+        if (timeout != portMAX_DELAY) {
+            TickType_t elapsed = xTaskGetTickCount() - startTick;
+            if (elapsed >= timeout) break;
+            remaining = timeout - elapsed;
+        }
+    }
+    pe->freeNotify = 0;
+    return success;
 }
 
 bool itsIsEmpty(int handle) {

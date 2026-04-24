@@ -401,7 +401,7 @@ static constexpr uint16_t FS_READ_PORT = 3;
 
 struct fs_read_open_t {
     char     path[80];
-    uint32_t triggerLevel;
+    uint32_t freeNotify;    /* server arms itsSetFreeNotify with this */
     uint32_t _reserved;
 };
 
@@ -425,7 +425,10 @@ static int fsReadOnConnect(int handle, const void* data, size_t len) {
     s.fp = fp;
     s.handle = handle;
     s.eof = false;
-    if (req.triggerLevel > 1) itsSetTriggerLevel(handle, req.triggerLevel);
+    /* Client-side triggerLevel is owned by the client (it's a recv-side
+     * concept). We set our sender-side freeNotify per the client's
+     * request so the pump loop wakes through itsPoll instead of polling. */
+    if (req.freeNotify > 0) itsSetFreeNotify(handle, req.freeNotify);
     return slot;
 }
 
@@ -438,32 +441,40 @@ static void fsReadOnDisconnect(int ref) {
     s.handle = -1;
 }
 
-/* Top up all active read slots. Returns true if any slot still needs more
- * data (so the caller should short-poll rather than block indefinitely). */
-static bool fsReadPumpOnce() {
+/* Top up all active read slots. For slots that can't accept a useful chunk,
+ * re-arm itsSetFreeNotify so the next receiver consume past the low-water
+ * mark wakes us via itsPoll. */
+#define FS_READ_LOW_WATER 4096
+
+static void fsReadPumpOnce() {
     static char buf[4096];
-    bool needsMore = false;
     for (int i = 0; i < FS_READ_MAX_HANDLES; i++) {
         auto& s = fsReadSlots[i];
         if (!s.fp || s.eof) continue;
         size_t space = itsSpacesAvailable(s.handle);
-        if (space < 1024) { needsMore = true; continue; }
+        if (space < FS_READ_LOW_WATER) {
+            itsSetFreeNotify(s.handle, FS_READ_LOW_WATER);
+            continue;
+        }
         size_t toRead = space < sizeof(buf) ? space : sizeof(buf);
         size_t n = fread(buf, 1, toRead, s.fp);
         if (n == 0) { s.eof = true; continue; }
         itsSend(s.handle, buf, n, 0);
-        needsMore = true;
     }
-    return needsMore;
 }
 
-int fs_open_stream_read(const char* path, size_t bufMinSize, size_t triggerLevel) {
+int fs_open_stream_read(const char* path, size_t bufMinSize,
+                        size_t triggerLevel, size_t freeNotify) {
     if (bufMinSize > FS_READ_BUF_SIZE) return -1;
     fs_read_open_t req = {};
     safeStrncpy(req.path, path, sizeof(req.path));
-    req.triggerLevel = triggerLevel;
-    return itsConnectByTaskHandle(fsStreamsHandle, FS_READ_PORT,
-                                  &req, sizeof(req), pdMS_TO_TICKS(2000));
+    req.freeNotify = (uint32_t)freeNotify;
+    int h = itsConnectByTaskHandle(fsStreamsHandle, FS_READ_PORT,
+                                   &req, sizeof(req), pdMS_TO_TICKS(2000));
+    /* triggerLevel is a recv-side concept: owned by the client, set here
+     * on the client's own recv-direction pool entry. */
+    if (h >= 0 && triggerLevel > 1) itsSetTriggerLevel(h, triggerLevel);
+    return h;
 }
 
 static void fsWorkerFn(void*) {
@@ -505,8 +516,8 @@ static void fsStreamsFn(void*) {
     itsOnAux(FS_STREAM_SYNC_PORT, fsStreamSyncHandler);
     xSemaphoreGive(fsStreamsReady);
     for (;;) {
-        bool needsMore = fsReadPumpOnce();
-        itsPoll(needsMore ? pdMS_TO_TICKS(50) : portMAX_DELAY);
+        fsReadPumpOnce();
+        itsPoll(portMAX_DELAY);
     }
 }
 

@@ -131,8 +131,14 @@ int     fs_file_info(const char* path, bool tryGz, fs_file_info_t* out);
  * via itsRecv(handle, buf, len, timeout). At EOF the pump exits but the
  * buffer keeps delivering remaining bytes until itsRecv returns 0 and
  * itsConnected(handle) is false — caller then calls itsDisconnect(handle).
- * Requires a matching itsReserveStreams(N, bufSize) entry. */
-int     fs_open_stream_read(const char* path, size_t bufMinSize, size_t triggerLevel);
+ * Requires a matching itsReserveStreams(N, bufSize) entry.
+ *
+ * triggerLevel — client-side: don't wake us until >= N bytes queued.
+ * freeNotify   — server-side: pump arms a wake when >= N bytes freed
+ *                in the send buffer (low-water mark for the pump). 0 =
+ *                default (the pump uses its internal low-water mark). */
+int     fs_open_stream_read(const char* path, size_t bufMinSize,
+                            size_t triggerLevel, size_t freeNotify);
 
 /* ---- Streaming write API (ITS-stream backed) ----
  * Open a file as an ITS connection to the fs worker. Caller writes via

@@ -24,6 +24,22 @@
  * connect to multiple services and have a different handler per
  * connection without runtime dispatching. Aux callbacks are per-task,
  * per-port.
+ *
+ * Flow-control primitives on the shared per-direction pool entry:
+ *
+ *   High-water (receiver-driven): itsSetTriggerLevel(handle, N) tells the
+ *   remote sender "don't notify me until >= N bytes are queued for me."
+ *   The sender's itsSend consults this threshold to decide whether to wake
+ *   the receiver. Useful when the receiver prefers batched work.
+ *
+ *   Low-water (sender-driven): itsSetFreeNotify(handle, N) asks for a
+ *   one-shot wake when the send buffer has >= N bytes of free space again.
+ *   Fires a task notification on the sender (itsPoll returns) AND a
+ *   dedicated per-buffer semaphore; the non-blocking arm is the natural
+ *   fit for pump loops, while the blocking convenience itsWaitForSpace
+ *   uses the semaphore and is safe to call inside a handler on a task
+ *   whose main loop blocks in itsPoll. Packet-mode itsSend uses the
+ *   blocking path internally to wait for a whole packet to fit.
  */
 
 #ifndef ITS_H
@@ -32,6 +48,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include <stddef.h>
+#include <cstdio>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
@@ -112,9 +129,10 @@ int  itsServerActive(int port = -1);
 /** Number of active ITS connections in the entire system. */
 int  itsActiveTotal(void);
 
-/** Log a complete system status snapshot at INFO level (connection
- *  table + stream pool usage). Useful for diagnostics. */
-void itsStatus(void);
+/** Emit a complete system status snapshot (connection table + stream pool
+ *  usage). Defaults to plain `printf`; pass any `int (*)(const char*, ...)`
+ *  to redirect output. */
+void itsStatus(int (*print)(const char*, ...) = printf);
 
 /** Inject bytes into one side of a connection's stream-buffer pair without
  *  caller-identity checks. `asServer=true` writes to the server→client
@@ -226,14 +244,35 @@ size_t itsSend(int handle, const void* data, size_t len, TickType_t timeout);
  *  0 is returned (caller's buffer was undersized for this port's traffic). */
 size_t itsRecv(int handle, void* buf, size_t maxLen, TickType_t timeout);
 
-/** Set the trigger level on this side's incoming stream (the buffer
- *  bytes are arriving in, from the caller's perspective). itsSend on
- *  the remote will only wake the local task once the buffer fill
+/** Set the trigger level on the caller's incoming stream (the buffer
+ *  bytes are arriving in, from the caller's perspective). The remote
+ *  task's itsSend path will only notify the caller once the buffer fill
  *  reaches `triggerLevel` bytes. Default is 1 (wake on every send).
  *  Setting to 0 is interpreted as 1. The trigger level is also applied
  *  to the underlying stream buffer so blocking xStreamBufferReceive
  *  callers (if any) see consistent semantics. */
 bool itsSetTriggerLevel(int handle, size_t triggerLevel);
+
+/** Arm a one-shot free-space notification on the caller's outgoing
+ *  stream (the buffer the caller writes into, from the caller's
+ *  perspective). When the remote consumes enough bytes that at least
+ *  `freeBytes` of free space is available, ITS wakes the caller's task
+ *  via xTaskNotifyGive (so a pending itsPoll() returns) and also gives
+ *  a dedicated per-buffer semaphore (drained by itsWaitForSpace).
+ *  One-shot: auto-cleared when fired; the caller re-arms for the next
+ *  wake. Passing 0 for freeBytes clears any pending arm. If the space
+ *  is already available at call time the wake fires immediately.
+ *  Returns false on invalid handle. */
+bool itsSetFreeNotify(int handle, size_t freeBytes);
+
+/** Block the calling task until the caller's outgoing stream has at
+ *  least `freeBytes` of free space, the connection is torn down, or the
+ *  timeout expires. Uses the per-buffer semaphore; does not consume
+ *  task notifications, so it is safe to call from a handler on a task
+ *  whose main loop blocks in itsPoll. Returns true on success (space is
+ *  available), false on timeout or disconnect. Passing 0 for freeBytes
+ *  returns true immediately. */
+bool itsWaitForSpace(int handle, size_t freeBytes, TickType_t timeout);
 
 bool         itsConnected(int handle);
 size_t       itsBytesAvailable(int handle);
