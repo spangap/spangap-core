@@ -537,43 +537,45 @@ static bool copyFile(const char* src, const char* dst) {
     return true;
 }
 
-/** Apply /fixed/additional_state/ overlay on top of /state/.
- *  Plain files are copied. settings.json is skipped here — the JSON merge
- *  happens in storageLoad() which understands the config format. */
-static void applyAdditionalState() {
-    DIR* dir = opendir(FS_FIXED "/additional_state");
+/** Recursively copy a directory tree. mkdir's intermediate dirs in dst as needed.
+ *  settings.json at the top level is skipped — storageLoad merges it. */
+static void copyTree(const char* src, const char* dst, bool topLevel) {
+    DIR* dir = opendir(src);
     if (!dir) return;
-    printf("applying additional_state overlay\n");
+    mkdir(dst, 0777);
     struct dirent* ent;
     while ((ent = readdir(dir)) != nullptr) {
-        if (ent->d_type != DT_REG) continue;
-        if (strcmp(ent->d_name, "settings.json") == 0) continue;  /* handled by storageLoad */
-        char src[128], dst[128];
-        snprintf(src, sizeof(src), FS_FIXED "/additional_state/%.100s", ent->d_name);
-        snprintf(dst, sizeof(dst), FS_STATE "/%.100s", ent->d_name);
-        if (copyFile(src, dst))
-            printf("copied %s\n", ent->d_name);
-        else
-            printf("failed to copy %s\n", ent->d_name);
+        if (ent->d_name[0] == '.') continue;
+        char srcChild[512], dstChild[512];
+        snprintf(srcChild, sizeof(srcChild), "%s/%s", src, ent->d_name);
+        snprintf(dstChild, sizeof(dstChild), "%s/%s", dst, ent->d_name);
+        if (ent->d_type == DT_DIR) {
+            copyTree(srcChild, dstChild, false);
+        } else if (ent->d_type == DT_REG) {
+            if (topLevel && strcmp(ent->d_name, "settings.json") == 0) continue;
+            if (copyFile(srcChild, dstChild))
+                printf("copied %s\n", srcChild + strlen(FS_FIXED) + 1);
+            else
+                printf("failed to copy %s\n", srcChild);
+        }
     }
     closedir(dir);
 }
 
+/** Apply /fixed/additional_state/ overlay on top of /state/.
+ *  Files (and subdirs) are copied recursively. settings.json is skipped at the
+ *  top level — the JSON merge happens in storageLoad(). */
+static void applyAdditionalState() {
+    if (opendir(FS_FIXED "/additional_state") == nullptr) return;
+    printf("applying additional_state overlay\n");
+    copyTree(FS_FIXED "/additional_state", FS_STATE, true);
+}
+
 void fs_factory_reset() {
-    DIR* dir = opendir(FS_FIXED "/factory_state");
-    if (!dir) { printf("factory_state dir not found\n"); return; }
-    struct dirent* ent;
-    while ((ent = readdir(dir)) != nullptr) {
-        if (ent->d_type != DT_REG) continue;
-        char src[128], dst[128];
-        snprintf(src, sizeof(src), FS_FIXED "/factory_state/%.100s", ent->d_name);
-        snprintf(dst, sizeof(dst), FS_STATE "/%.100s", ent->d_name);
-        if (copyFile(src, dst))
-            printf("copied %s\n", ent->d_name);
-        else
-            printf("failed to copy %s\n", ent->d_name);
-    }
-    closedir(dir);
+    DIR* probe = opendir(FS_FIXED "/factory_state");
+    if (!probe) { printf("factory_state dir not found\n"); return; }
+    closedir(probe);
+    copyTree(FS_FIXED "/factory_state", FS_STATE, false);
 }
 
 void fs_init() {
@@ -595,15 +597,28 @@ void fs_init() {
             printf("mount %s failed\n", m.path);
     }
 
-    /* First boot: copy factory defaults to /state */
-    FILE* f = fopen(FS_STATE "/settings.json", "r");
-    if (f) {
-        fclose(f);
-    } else {
-        printf("first boot: copying factory defaults to " FS_STATE "\n");
-        firstBoot = true;
-        fs_factory_reset();
-        applyAdditionalState();
+    /* First boot: /state is empty (just-formatted partition). Trigger factory
+     * copy. We can't probe a specific file (settings.json may legitimately
+     * not exist now that all defaults self-install), so check whether the
+     * directory has any non-dot entries. */
+    {
+        DIR* d = opendir(FS_STATE);
+        bool empty = true;
+        if (d) {
+            struct dirent* ent;
+            while ((ent = readdir(d)) != nullptr) {
+                if (ent->d_name[0] == '.') continue;
+                empty = false;
+                break;
+            }
+            closedir(d);
+        }
+        if (empty) {
+            printf("first boot: copying factory defaults to " FS_STATE "\n");
+            firstBoot = true;
+            fs_factory_reset();
+            applyAdditionalState();
+        }
     }
 
     /* Start DRAM-stack workers:

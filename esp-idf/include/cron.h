@@ -32,4 +32,14 @@ bool cronWakeupHandler();
  *  Called by CLI task in its main loop. */
 void cronDrainCommands();
 
+/** Add a crontab entry only if no existing line — active or commented out —
+ *  contains the same command string. Schedule is the leading time/flags
+ *  fields (e.g. "*\/15 * * * * N"); command is everything after that.
+ *
+ *  Modules call this from init() once per version bump (gated by their own
+ *  s.<mod>.version key) to install their default periodic tasks. Idempotent
+ *  across reboots; respects user edits (delete to disable, or comment out
+ *  to disable while keeping the line as a hint). Returns true if written. */
+bool cronDefault(const char* schedule, const char* command);
+
 #endif

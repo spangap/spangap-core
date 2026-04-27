@@ -29,6 +29,9 @@
 #include "compat.h"
 
 #include <string>
+#include <vector>
+#include <algorithm>
+#include <functional>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -37,11 +40,28 @@
 #include "esp_timer.h"
 #include "esp_heap_caps.h"
 
+/* ---- External storage files ----
+ *
+ * /state/storage/<mode>/<key.path>.json holds a sub-tree at the given prefix.
+ * The first-level subdir under /state/storage/ is the "mode" — only "external"
+ * is used today (own file, lives in cfgRoot at runtime, saved to its own file
+ * instead of settings.json). New modes (e.g. "flash-only") can be added later
+ * by handling more subdirs in scanExternals(). Drop a file in the build tree
+ * and it just appears — no compile-time registration. */
+struct external_t {
+  std::string prefix;   /* dot-path key prefix, e.g. "s.time.zones" */
+  std::string path;     /* on-disk file, e.g. "/state/storage/external/s.time.zones.json" */
+  bool        dirty;    /* sub-tree at prefix changed since last flush */
+};
+static std::vector<external_t> externals;
+static bool rootDirty = false;        /* settings.json needs rewrite */
+
 /* ---- Config tree state ---- */
 
 static cJSON* cfgRoot = nullptr;        /* committed config (the truth) */
 static cJSON* txPatch = nullptr;        /* transaction write accumulator */
 static int txDepth = 0;                 /* transaction nesting depth */
+static int silentDepth = 0;             /* >0 suppresses change subscriptions */
 static SemaphoreHandle_t cfgMux = nullptr;  /* recursive mutex protecting cfgRoot + txPatch */
 
 #define CFG_LOCK()   xSemaphoreTakeRecursive(cfgMux, portMAX_DELAY)
@@ -146,9 +166,62 @@ static std::string stripDots(const char* s) {
   return r;
 }
 
-/* ---- Deep merge (RFC 7396) ---- */
+/* ---- Deep merge (RFC 7396, with array-element extension) ---- */
 
-/** Merge src into dst in place. Objects recurse; arrays and primitives replace;
+static void deepMerge(cJSON* dst, const cJSON* src);
+
+/** True if every (named) child of obj has an all-digits name. Empty objects
+ *  return false — we don't want to interpret `{}` as "merge nothing into the
+ *  array"; that case never happens for a real edit. */
+static bool allNumericKeys(const cJSON* obj) {
+  if (!cJSON_IsObject(obj) || !obj->child) return false;
+  for (const cJSON* it = obj->child; it; it = it->next) {
+    if (!it->string) return false;
+    if (!isAllDigits(it->string, strlen(it->string))) return false;
+  }
+  return true;
+}
+
+/** Merge a numeric-keyed object patch into an existing array, element-wise.
+ *  patch[i]=null removes the element (subsequent indices shift down — same
+ *  semantics as object-key delete). patch[i]=object recursively merges into
+ *  the existing element if it's an object, otherwise replaces. patch[i] at
+ *  an out-of-bounds index extends the array (padding with null if sparse).
+ *
+ *  This is what makes `set s.net.wifi.nets.3.pass=foo` work: the patch tree
+ *  always builds nested objects (numeric segments become object keys), and
+ *  without this routine the existing array would be wholesale replaced. */
+static void deepMergeIntoArray(cJSON* dstArr, const cJSON* patchObj) {
+  /* Apply deletions first, in descending order, so earlier indices stay valid. */
+  std::vector<int> deletions;
+  for (const cJSON* it = patchObj->child; it; it = it->next) {
+    if (cJSON_IsNull(it)) deletions.push_back(atoi(it->string));
+  }
+  std::sort(deletions.begin(), deletions.end(), std::greater<int>());
+  for (int idx : deletions)
+    if (idx >= 0 && idx < cJSON_GetArraySize(dstArr))
+      cJSON_DeleteItemFromArray(dstArr, idx);
+
+  for (const cJSON* it = patchObj->child; it; it = it->next) {
+    if (cJSON_IsNull(it)) continue;
+    int idx = atoi(it->string);
+    int sz = cJSON_GetArraySize(dstArr);
+    cJSON* dstElem = (idx < sz) ? cJSON_GetArrayItem(dstArr, idx) : nullptr;
+
+    if (cJSON_IsObject(it) && dstElem && cJSON_IsObject(dstElem)) {
+      deepMerge(dstElem, it);
+    } else if (idx < sz) {
+      cJSON_ReplaceItemInArray(dstArr, idx, cJSON_Duplicate(it, true));
+    } else {
+      while (cJSON_GetArraySize(dstArr) < idx)
+        cJSON_AddItemToArray(dstArr, cJSON_CreateNull());
+      cJSON_AddItemToArray(dstArr, cJSON_Duplicate(it, true));
+    }
+  }
+}
+
+/** Merge src into dst in place. Objects recurse; arrays receive element-wise
+ *  patches when src is a numeric-keyed object; everything else replaces.
  *  null deletes. src is not modified. */
 static void deepMerge(cJSON* dst, const cJSON* src) {
   const cJSON* item = src->child;
@@ -163,6 +236,8 @@ static void deepMerge(cJSON* dst, const cJSON* src) {
       cJSON* dstChild = cJSON_GetObjectItem(dst, name);
       if (dstChild && cJSON_IsObject(dstChild)) {
         deepMerge(dstChild, item);
+      } else if (dstChild && cJSON_IsArray(dstChild) && allNumericKeys(item)) {
+        deepMergeIntoArray(dstChild, item);
       } else {
         if (dstChild) cJSON_DeleteItemFromObject(dst, name);
         cJSON_AddItemToObject(dst, name, cJSON_Duplicate(item, true));
@@ -262,25 +337,105 @@ static char* readFileStr(const char* path) {
   return buf;
 }
 
-static void writeSettingsFile() {
-  CFG_LOCK();
-  cJSON* out = cJSON_CreateObject();
-  cJSON* s = cJSON_GetObjectItem(cfgRoot, "s");
-  cJSON* sec = cJSON_GetObjectItem(cfgRoot, "secrets");
-  if (s) cJSON_AddItemToObject(out, "s", cJSON_Duplicate(s, true));
-  if (sec) cJSON_AddItemToObject(out, "secrets", cJSON_Duplicate(sec, true));
-  CFG_UNLOCK();
-  char* text = cJSON_Print(out);
-  cJSON_Delete(out);
-  if (!text) return;
+/** Atomic write of `text` to `path` via `<path>.new` + rename. */
+static bool atomicWriteJson(const char* path, const char* text) {
+  std::string tmp = std::string(path) + ".new";
+  int f = fs_open(tmp.c_str(), "w");
+  if (f < 0) return false;
+  size_t len = strlen(text);
+  bool ok = (fs_write(text, 1, len, f) == len);
+  fs_close(f);
+  if (ok) fs_rename(tmp.c_str(), path);
+  else    fs_remove(tmp.c_str());
+  return ok;
+}
 
-  int f = fs_open(FS_STATE "/settings.new", "w");
-  if (f >= 0) {
-    fs_write(text, 1, strlen(text), f);
-    fs_close(f);
-    fs_rename(FS_STATE "/settings.new", FS_STATE "/settings.json");
+/** Resolve a prefix-or-leaf path inside an object. Returns the parent of the
+ *  leaf and writes the leaf name to `outLeaf`. Used to (de)attach an
+ *  external sub-tree. Returns nullptr if the path is empty/invalid. */
+static cJSON* navigateLeaf(cJSON* root, const char* dotPath,
+                           char* outLeaf, size_t leafLen) {
+  if (!root || !dotPath || !*dotPath) return nullptr;
+  cJSON* node = root;
+  const char* p = dotPath;
+  for (;;) {
+    const char* dot = strchr(p, '.');
+    size_t segLen = dot ? (size_t)(dot - p) : strlen(p);
+    if (segLen == 0 || segLen >= 48) return nullptr;
+    if (!dot) {
+      memcpy(outLeaf, p, segLen);
+      outLeaf[segLen] = '\0';
+      return node;
+    }
+    char seg[48];
+    memcpy(seg, p, segLen);
+    seg[segLen] = '\0';
+    node = cJSON_GetObjectItem(node, seg);
+    if (!node) return nullptr;
+    p = dot + 1;
   }
+}
+
+/** Detach all external sub-trees from cfgRoot, run `fn`, then reattach.
+ *  Used so cJSON_Print of cfgRoot omits external blobs from settings.json
+ *  without copying the whole tree. Caller holds CFG_LOCK. */
+static void withExternalsDetached(std::function<void()> fn) {
+  struct save_t { cJSON* parent; std::string leaf; cJSON* item; };
+  std::vector<save_t> saved;
+  for (auto& ext : externals) {
+    char leaf[48];
+    cJSON* parent = navigateLeaf(cfgRoot, ext.prefix.c_str(), leaf, sizeof(leaf));
+    if (!parent) continue;
+    cJSON* item = cJSON_DetachItemFromObject(parent, leaf);
+    if (item) saved.push_back({parent, leaf, item});
+  }
+  fn();
+  /* Reattach in reverse order — preserves original child positions
+   * if multiple externals share a parent. */
+  for (auto it = saved.rbegin(); it != saved.rend(); ++it)
+    cJSON_AddItemToObject(it->parent, it->leaf.c_str(), it->item);
+}
+
+/** Serialize one external's sub-tree at its prefix to its own file. */
+static void writeExternalFile(const external_t& ext) {
+  CFG_LOCK();
+  cJSON* node = navigatePath(cfgRoot, ext.prefix.c_str());
+  char* text = node ? cJSON_Print(node) : nullptr;
+  CFG_UNLOCK();
+  if (!text) return;
+  atomicWriteJson(ext.path.c_str(), text);
   cJSON_free(text);
+}
+
+/** Write settings.json (cfgRoot minus external sub-trees). */
+static void writeSettingsFileOnly() {
+  CFG_LOCK();
+  char* text = nullptr;
+  withExternalsDetached([&]() {
+    cJSON* out = cJSON_CreateObject();
+    cJSON* s = cJSON_GetObjectItem(cfgRoot, "s");
+    cJSON* sec = cJSON_GetObjectItem(cfgRoot, "secrets");
+    if (s)   cJSON_AddItemToObject(out, "s",       cJSON_Duplicate(s, true));
+    if (sec) cJSON_AddItemToObject(out, "secrets", cJSON_Duplicate(sec, true));
+    text = cJSON_Print(out);
+    cJSON_Delete(out);
+  });
+  CFG_UNLOCK();
+  if (!text) return;
+  atomicWriteJson(FS_STATE "/settings.json", text);
+  cJSON_free(text);
+}
+
+static void writeSettingsFile() {
+  for (auto& ext : externals) {
+    if (!ext.dirty) continue;
+    writeExternalFile(ext);
+    ext.dirty = false;
+  }
+  if (rootDirty) {
+    writeSettingsFileOnly();
+    rootDirty = false;
+  }
   savePending = false;
 }
 
@@ -427,6 +582,38 @@ static void firePatchSubscriptions(cJSON* node, char* path, size_t pathSize, siz
   }
 }
 
+/** Walk a patch tree and route dirty flags. If a sub-tree's path equals an
+ *  external prefix, mark that external dirty (don't descend further). Any
+ *  primitive/array leaf reached under "s." or "secrets." marks rootDirty. */
+static void routePatchDirty(const cJSON* node, char* path, size_t cap, size_t len) {
+  /* Check whole-prefix match before descending. */
+  if (len > 0) {
+    for (auto& ext : externals) {
+      if (ext.prefix.size() == len && strcmp(ext.prefix.c_str(), path) == 0) {
+        ext.dirty = true;
+        return;
+      }
+    }
+  }
+  if (cJSON_IsObject(node)) {
+    for (cJSON* child = node->child; child; child = child->next) {
+      const char* name = child->string;
+      if (!name) continue;
+      size_t nameLen = strlen(name);
+      size_t addLen = (len > 0 ? 1 : 0) + nameLen;
+      if (len + addLen >= cap) continue;
+      if (len > 0) path[len] = '.';
+      memcpy(path + len + (len > 0 ? 1 : 0), name, nameLen + 1);
+      routePatchDirty(child, path, cap, len + addLen);
+      path[len] = '\0';
+    }
+    return;
+  }
+  if (len > 0 &&
+      (strncmp(path, "s.", 2) == 0 || strncmp(path, "secrets.", 8) == 0))
+    rootDirty = true;
+}
+
 static void commitPatch() {
   /* Caller holds CFG_LOCK — protects cfgRoot, txPatch, txDepth from
      concurrent access.  ITS aux sends (10ms timeout) are bounded. */
@@ -434,11 +621,16 @@ static void commitPatch() {
 
   deepMerge(cfgRoot, txPatch);
 
-  char pathBuf[128] = "";
-  firePatchSubscriptions(txPatch, pathBuf, sizeof(pathBuf), 0);
+  if (silentDepth == 0) {
+    char pathBuf[128] = "";
+    firePatchSubscriptions(txPatch, pathBuf, sizeof(pathBuf), 0);
+  }
 
-  if (cJSON_GetObjectItem(txPatch, "s") || cJSON_GetObjectItem(txPatch, "secrets"))
+  if (cJSON_GetObjectItem(txPatch, "s") || cJSON_GetObjectItem(txPatch, "secrets")) {
+    char routeBuf[128] = "";
+    routePatchDirty(txPatch, routeBuf, sizeof(routeBuf), 0);
     startSaveTimer();
+  }
 
   cJSON_Delete(txPatch);
   txPatch = nullptr;
@@ -487,6 +679,59 @@ static void jsonDeepMerge(cJSON* dst, const cJSON* src) {
 
 /* ---- Public Config API ---- */
 
+/** Insert `subtree` into cfgRoot at `dotPath`. Replaces any existing node at
+ *  that path. Takes ownership of `subtree`. */
+static void attachAtPath(const char* dotPath, cJSON* subtree) {
+  if (!subtree) return;
+  char leaf[48];
+  cJSON* parent = navigateOrCreate(cfgRoot, dotPath, leaf, sizeof(leaf));
+  if (!parent) { cJSON_Delete(subtree); return; }
+  cJSON_DeleteItemFromObject(parent, leaf);
+  cJSON_AddItemToObject(parent, leaf, subtree);
+}
+
+/** Scan /state/storage/MODE/ for .json files; register each as an external.
+ *  Filename's stem (sans .json) is the dot-path prefix where its content lives
+ *  in cfgRoot. Subdir under storage/ is the "mode" — only "external" today. */
+static void scanExternals() {
+  externals.clear();
+  const char* modes[] = { "external" };
+  for (const char* mode : modes) {
+    char dirPath[64];
+    snprintf(dirPath, sizeof(dirPath), FS_STATE "/storage/%s", mode);
+    int dh = fs_opendir(dirPath);
+    if (dh < 0) continue;
+    fs_dirent_t ent;
+    while (fs_readdir(dh, &ent)) {
+      const char* dot = strrchr(ent.name, '.');
+      if (!dot || strcmp(dot, ".json") != 0) continue;
+      external_t ext;
+      ext.prefix.assign(ent.name, dot - ent.name);
+      ext.path  = std::string(dirPath) + "/" + ent.name;
+      ext.dirty = false;
+      externals.push_back(std::move(ext));
+    }
+    fs_closedir(dh);
+  }
+  /* Longest prefix first — needed for correct dirty routing if two externals
+   * ever overlap (e.g. "s.foo" and "s.foo.bar"). */
+  std::sort(externals.begin(), externals.end(),
+            [](const external_t& a, const external_t& b) {
+              return a.prefix.size() > b.prefix.size();
+            });
+}
+
+/** Read each external's file and attach its content to cfgRoot. */
+static void loadExternals() {
+  for (auto& ext : externals) {
+    char* text = readFileStr(ext.path.c_str());
+    if (!text) continue;
+    cJSON* node = cJSON_Parse(text);
+    free(text);
+    if (node) attachAtPath(ext.prefix.c_str(), node);
+  }
+}
+
 void storageLoad() {
   if (!cfgMux) cfgMux = xSemaphoreCreateRecursiveMutex();
   if (cfgRoot) cJSON_Delete(cfgRoot);
@@ -498,6 +743,12 @@ void storageLoad() {
     free(text);
   }
   if (!cfgRoot) cfgRoot = cJSON_CreateObject();
+
+  /* External files: scan /state/storage/<mode>/, register, then load each
+   * file's contents into cfgRoot at its prefix. Externals overwrite anything
+   * at the same path that may have been in settings.json. */
+  scanExternals();
+  loadExternals();
 
   /* First boot only: deep-merge additional_state/settings.json overlay.
    * fs_init() copies plain files from additional_state/; settings.json is
@@ -583,6 +834,87 @@ void storageSet(const char* key, const char* val) {
 
   if (autoCommit) storageEnd();
   CFG_UNLOCK();
+}
+
+/* Default writes don't fire change subscriptions: by definition the value
+ * was absent before, and these are firmware-bundled defaults being seeded
+ * once (typically dozens at first boot), not real config changes. Without
+ * this, broad subscriptions like net's "s." flood inboxes during install. */
+bool storageDefault(const char* key, const char* val) {
+  CFG_LOCK();
+  bool exists = storageExists(key);
+  if (!exists) {
+    silentDepth++;
+    storageSet(key, val);
+    silentDepth--;
+  }
+  CFG_UNLOCK();
+  return !exists;
+}
+
+bool storageDefault(const char* key, int val) {
+  char buf[16];
+  snprintf(buf, sizeof(buf), "%d", val);
+  return storageDefault(key, buf);
+}
+
+/** Internal: does any node exist at this path (any type, including arrays)? */
+static bool pathPresent(const char* key) {
+  CFG_LOCK();
+  cJSON* node = navigatePath(cfgRoot, key);
+  CFG_UNLOCK();
+  return node != nullptr;
+}
+
+static bool defaultTreeImpl(const char* fullKey, const cJSON* node, bool atRoot) {
+  if (!node || cJSON_IsNull(node)) return false;
+
+  if (cJSON_IsObject(node)) {
+    bool wrote = false;
+    for (cJSON* item = node->child; item; item = item->next) {
+      if (!item->string) continue;
+      char childKey[128];
+      if (atRoot)
+        safeStrncpy(childKey, item->string, sizeof(childKey));
+      else
+        snprintf(childKey, sizeof(childKey), "%s.%s", fullKey, item->string);
+      wrote |= defaultTreeImpl(childKey, item, false);
+    }
+    return wrote;
+  }
+
+  if (atRoot) return false;  /* a non-object at the bare prefix has no key to set */
+
+  if (cJSON_IsArray(node)) {
+    if (pathPresent(fullKey)) return false;
+    storageSetTree(fullKey, cJSON_Duplicate(node, true));
+    return true;
+  }
+  if (cJSON_IsString(node))
+    return storageDefault(fullKey, node->valuestring);
+  if (cJSON_IsNumber(node))
+    return storageDefault(fullKey, node->valueint);
+  return false;
+}
+
+bool storageDefaultTree(const char* prefix, const cJSON* json) {
+  if (!json) return false;
+  bool prefixEmpty = (!prefix || !*prefix);
+  silentDepth++;
+  storageBegin();
+  bool wrote = defaultTreeImpl(prefixEmpty ? "" : prefix, json, prefixEmpty);
+  storageEnd();
+  silentDepth--;
+  return wrote;
+}
+
+bool storageDefaultTree(const char* prefix, const char* jsonStr) {
+  if (!jsonStr) return false;
+  cJSON* j = cJSON_Parse(jsonStr);
+  if (!j) return false;
+  bool ret = storageDefaultTree(prefix, j);
+  cJSON_Delete(j);
+  return ret;
 }
 
 void storageUnset(const char* key) {
@@ -1143,7 +1475,16 @@ static void storageTaskFn(void* arg) {
     }
 }
 
+/* Module config version. Bump when adding/changing defaults. See duckdns.cpp. */
+#define STORAGE_VERSION 1
+
 void storageInit() {
+    int v = storageGetInt("s.storage.version", 0);
+    if (v < STORAGE_VERSION) {
+        storageDefault("s.storage.flash_delay", 60);
+        storageSet("s.storage.version", STORAGE_VERSION);
+    }
+
     /* storage task: PSRAM stack (config WS + ITS, no direct file I/O) */
     storageHandle = spawnTask(storageTaskFn, "storage", 8192, nullptr, 1, 1);
 }

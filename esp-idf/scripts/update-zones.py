@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """
-Download IANA→POSIX timezone mapping from GitHub and update settings.json.
+Download IANA→POSIX timezone mapping from GitHub.
+
+Writes the result to data/factory_state/storage/external/s.time.zones.json,
+which the device's storage layer mounts at the s.time.zones key on boot.
 
 Usage: python3 scripts/update-zones.py [--force]
 
@@ -10,7 +13,8 @@ Use --force to always download.
 import json, os, sys, urllib.request, urllib.error
 
 ZONES_URL = "https://raw.githubusercontent.com/nayarsystems/posix_tz_db/master/zones.json"
-SETTINGS_PATH = os.path.join(os.path.dirname(__file__), "..", "data", "factory_state", "settings.json")
+ZONES_PATH = os.path.join(os.path.dirname(__file__), "..", "data", "factory_state",
+                          "storage", "external", "s.time.zones.json")
 CACHE_PATH = os.path.join(os.path.dirname(__file__), ".zones_etag")
 
 def fetch_zones(force=False):
@@ -52,23 +56,18 @@ def flat_to_nested(zones):
         node[parts[-1]] = posix
     return nested
 
-def update_settings(zones_nested, etag):
-    """Replace s.time.zones in settings.json."""
-    settings_path = os.path.realpath(SETTINGS_PATH)
-    with open(settings_path) as f:
-        settings = json.load(f)
+def update_zones_file(zones_nested, etag):
+    """Replace contents of s.time.zones.json (the external storage file)."""
+    path = os.path.realpath(ZONES_PATH)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
 
     zones_nested["updated"] = etag
-    s = settings.setdefault("s", {})
-    t = s.setdefault("time", {})
-    t["zones"] = zones_nested
-
-    with open(settings_path, "w") as f:
-        json.dump(settings, f, indent=2, ensure_ascii=False)
+    with open(path, "w") as f:
+        json.dump(zones_nested, f, indent=2, ensure_ascii=False)
         f.write("\n")
 
     n = sum(1 for v in zones_nested.values() if isinstance(v, dict))
-    print(f"settings.json: updated s.time.zones ({n} continents)")
+    print(f"s.time.zones.json: updated ({n} continents)")
 
 def main():
     force = "--force" in sys.argv
@@ -76,7 +75,7 @@ def main():
     if zones is None:
         return
     nested = flat_to_nested(zones)
-    update_settings(nested, etag)
+    update_zones_file(nested, etag)
 
 if __name__ == "__main__":
     main()

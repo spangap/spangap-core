@@ -5,6 +5,7 @@
 #include "log.h"
 #include "pm.h"
 #include "cli.h"
+#include "cron.h"
 #include "its.h"
 #include "net.h"
 #include "storage.h"
@@ -645,9 +646,31 @@ static void logTaskFn(void* arg) {
 
 /* ---- Init ---- */
 
+/* Module config version. Bump when adding/changing defaults. See duckdns.cpp. */
+#define LOG_VERSION 1
+
+static void logInstallDefaults() {
+  int v = storageGetInt("s.log.version", 0);
+  if (v >= LOG_VERSION) return;
+
+  storageDefaultTree("s.log", R"({
+    "level": "info",
+    "timestamp": 1,
+    "dir": "/sdcard/log",
+    "file":   {"name":"", "level":"verbose", "interval":5, "paste":48},
+    "colors": {"error":"0;31", "warn":"0;33", "info":"0;32",
+               "debug":"0;37", "verbose":"0;90", "timestamp":"0;90"}
+  })");
+
+  cronDefault("0 0 * * * A", "logrotate 7");
+  storageSet("s.log.version", LOG_VERSION);
+}
+
 void logInit() {
   if (logInited) return;
   logInited = true;
+
+  logInstallDefaults();
 
   /* Ring buffer is static DRAM — no heap allocation needed */
 

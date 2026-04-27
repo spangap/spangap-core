@@ -19,6 +19,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <string>
 #include <time.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -304,11 +305,85 @@ static void cronTaskFn(void*) {
     }
 }
 
+/* Module config version. Bump when adding/changing defaults. See duckdns.cpp. */
+#define CRON_VERSION 1
+
 void cronInit() {
+    int v = storageGetInt("s.cron.version", 0);
+    if (v < CRON_VERSION) {
+        storageDefault("s.cron.enable", 0);
+        storageSet("s.cron.version", CRON_VERSION);
+    }
+
     cronStream = xStreamBufferCreate(CRON_STREAM_SIZE, 1);
     pmLockCreate(PM_NO_DEEP_SLEEP, "cron", &cronDeepLock);
     pmLockAcquire(cronDeepLock);
     spawnTask(cronTaskFn, "cron", 4096, nullptr, 1, 0);
+}
+
+/* ---- cronDefault ---- */
+
+/** Extract the command portion of a cron line (after 5 time fields + flags),
+ *  stripping leading '#' and whitespace. Returns true if a command was found. */
+static bool extractCronCommand(const char* line, std::string& out) {
+    const char* p = line;
+    while (*p == ' ' || *p == '\t') p++;
+    if (*p == '#') {
+        p++;
+        while (*p == ' ' || *p == '\t') p++;
+    }
+    if (!*p || *p == '\n' || *p == '\r') return false;
+    /* Skip 6 whitespace-separated fields: 5 time fields + flags. */
+    for (int i = 0; i < 6; i++) {
+        while (*p && *p != ' ' && *p != '\t' && *p != '\n' && *p != '\r') p++;
+        if (!*p || *p == '\n' || *p == '\r') return false;
+        while (*p == ' ' || *p == '\t') p++;
+    }
+    const char* end = p + strlen(p);
+    while (end > p && (end[-1] == ' ' || end[-1] == '\t' ||
+                       end[-1] == '\n' || end[-1] == '\r')) end--;
+    out.assign(p, end - p);
+    return true;
+}
+
+bool cronDefault(const char* schedule, const char* command) {
+    std::string target = command;
+    while (!target.empty() && (target.back() == ' ' || target.back() == '\t'))
+        target.pop_back();
+
+    /* Scan existing crontab for any line whose command matches. */
+    bool fileExists = false;
+    bool needsNewline = false;
+    int fh = fs_open(FS_STATE "/crontab", "r");
+    if (fh >= 0) {
+        fileExists = true;
+        struct stat st;
+        if (fs_stat(FS_STATE "/crontab", &st) == 0 && st.st_size > 0) {
+            char* buf = (char*)malloc(st.st_size + 1);
+            if (!buf) { fs_close(fh); return false; }
+            size_t nr = fs_read(buf, 1, st.st_size, fh);
+            buf[nr] = '\0';
+            needsNewline = (nr > 0 && buf[nr - 1] != '\n');
+            char* saveptr = nullptr;
+            for (char* tok = strtok_r(buf, "\n", &saveptr); tok;
+                 tok = strtok_r(nullptr, "\n", &saveptr)) {
+                std::string cmd;
+                if (!extractCronCommand(tok, cmd)) continue;
+                if (cmd == target) { free(buf); fs_close(fh); return false; }
+            }
+            free(buf);
+        }
+        fs_close(fh);
+    }
+
+    int wh = fs_open(FS_STATE "/crontab", fileExists ? "a" : "w");
+    if (wh < 0) return false;
+    if (needsNewline) fs_write("\n", 1, 1, wh);
+    char line[256];
+    int n = snprintf(line, sizeof(line), "%s %s\n", schedule, command);
+    if (n > 0) fs_write(line, 1, (size_t)n, wh);
+    fs_close(wh);
+    return true;
 }
 
 /* ---- CLI drain ---- */

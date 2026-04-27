@@ -962,7 +962,19 @@ static void serialTaskFn(void* arg) {
 
 /* ---- Init ---- */
 
+/* Module config version. Bump when adding/changing defaults. See duckdns.cpp. */
+#define CLI_VERSION 1
+
 void cliInit() {
+  int v = storageGetInt("s.cli.version", 0);
+  if (v < CLI_VERSION) {
+    storageDefaultTree("s.cli", R"({
+      "sticky": 0,
+      "start_dir": "/sdcard"
+    })");
+    storageSet("s.cli.version", CLI_VERSION);
+  }
+
   /* Allocate history buffer in PSRAM */
   histBuf = (char(*)[128])heap_caps_calloc(HIST_SIZE, 128, MALLOC_CAP_SPIRAM);
 

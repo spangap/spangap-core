@@ -58,6 +58,30 @@ int    storageGetInt(const char* key, int def = 0);
 void   storageGetStr(const char* key, char* out, size_t outLen, const char* def = "");
 void   storageSet(const char* key, int val);
 void   storageSet(const char* key, const char* val);
+
+/** Set a key only if it does not currently exist. Returns true if written.
+ *  Use from module init() to seed config defaults that the module owns. */
+bool   storageDefault(const char* key, int val);
+bool   storageDefault(const char* key, const char* val);
+
+/** Walk a JSON tree under `prefix` and install only-missing primitive leaves
+ *  (each acts like storageDefault). Arrays in the JSON install wholesale only
+ *  if the path is absent — never element-wise (would clash with user data).
+ *  Existing keys are preserved. nulls in the JSON are skipped.
+ *
+ *  Wraps the whole walk in storageBegin/End so subscriptions and the WS push
+ *  see one coalesced commit. Use to install a module's whole config block:
+ *
+ *    storageDefaultTree("s.detect", R"({
+ *      "motion": {"fps":-2, "pct":5},
+ *      "audio":  {"level":500},
+ *      "stop_after": 10
+ *    })");
+ *
+ *  The cJSON* form does not take ownership of `json`. Returns true if any
+ *  leaf was written. */
+bool   storageDefaultTree(const char* prefix, const cJSON* json);
+bool   storageDefaultTree(const char* prefix, const char* jsonStr);
 /** Set an arbitrary cJSON node (array, object, etc.) at a dot-notation key.
  *  Takes ownership of val — caller must not free it.
  *  Uses patch/commit: fires subscriptions and WS broadcast. */

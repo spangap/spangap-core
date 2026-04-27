@@ -186,7 +186,20 @@ static bool isRateLimited() {
 
 /* ---- Public API ---- */
 
+/* Module config version. Bump when adding/changing defaults. See duckdns.cpp. */
+#define AUTH_VERSION 1
+
 void authInit() {
+    int v = storageGetInt("secrets.auth.version", 0);
+    if (v < AUTH_VERSION) {
+        storageDefaultTree("secrets.auth", R"({
+            "enable": 1,
+            "realms": [{"name":"admin", "hash":""}],
+            "cookies": []
+        })");
+        storageSet("secrets.auth.version", AUTH_VERSION);
+    }
+
     /* Sweep expired cookies */
     struct timeval tv;
     gettimeofday(&tv, nullptr);
