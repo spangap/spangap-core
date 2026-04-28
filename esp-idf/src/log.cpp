@@ -11,6 +11,7 @@
 #include "storage.h"
 #include "compat.h"
 #include "fs.h"
+#include "rec_task.h"
 #include <esp_log.h>
 #include <esp_heap_caps.h>
 #include <esp_timer.h>
@@ -88,13 +89,16 @@ static bool isLevelArg(const char* s) {
            strcasecmp(s, "debug") == 0 || strcasecmp(s, "verbose") == 0;
 }
 
-/* Find log level character in a plain-text line: the char before " [" */
+/* Find log level character in a plain-text line: a single E/W/I/D/V
+ * surrounded by spaces (or at start of line). Matches both the device's
+ * native "<ts> L [task] msg" and free-form "<ts> L Browser: msg". */
 static char lineLevel(const char* line, size_t len) {
-    for (size_t i = 1; i + 1 < len && line[i] != '\n'; i++) {
-        if (line[i] == ' ' && line[i + 1] == '[') {
-            char c = line[i - 1];
-            if (c == 'E' || c == 'W' || c == 'I' || c == 'D' || c == 'V') return c;
-        }
+    for (size_t i = 0; i + 1 < len && line[i] != '\n'; i++) {
+        char c = line[i];
+        if (c != 'E' && c != 'W' && c != 'I' && c != 'D' && c != 'V') continue;
+        bool leftOk  = (i == 0) || line[i - 1] == ' ';
+        bool rightOk = line[i + 1] == ' ';
+        if (leftOk && rightOk) return c;
     }
     return 'I';
 }
@@ -145,6 +149,14 @@ static void logFileClose() {
 static void logFileOpen(const char* path) {
     logFileClose();
     if (!path || !*path) return;
+    /* If the file lives on the SD card and there is no card, refuse the open
+     * with one warn. Without this, fs_open_stream would block on a doomed
+     * mount path or spam the log with retry errors. */
+    if (strncmp(path, "/sdcard/", 8) == 0 && !sdAvailable()) {
+        static bool warned = false;
+        if (!warned) { warn("logfile: no SD card, log file disabled\n"); warned = true; }
+        return;
+    }
     /* Stream buffer 16KB, fs worker drains once 4KB have accumulated —
      * batches ~4KB per fs_write instead of per-line. */
     int h = fs_open_stream(path, "a", 16384, 4096);
@@ -178,15 +190,29 @@ static void logFileFlush() {
 /* ---- Log ITS server — consumers connect as clients ---- */
 
 #define LOG_MAX_CONSUMERS 4
+#define LOG_INBOUND_BUF   512    /* per-slot accumulator for partial inbound lines */
 static struct {
   int itsHandle;
   log_ansi_t ansi;
+  char  lineBuf[LOG_INBOUND_BUF];
+  size_t lineLen;
 } logSlots[LOG_MAX_CONSUMERS];
 
 static int logAllocSlot(int h) {
   for (int i = 0; i < LOG_MAX_CONSUMERS; i++)
-    if (logSlots[i].itsHandle < 0) { logSlots[i].itsHandle = h; return i; }
+    if (logSlots[i].itsHandle < 0) {
+      logSlots[i].itsHandle = h;
+      logSlots[i].lineLen = 0;
+      return i;
+    }
   return -1;
+}
+
+/* True if the buffer contains any ANSI escape sequence */
+static bool containsAnsi(const char* buf, size_t len) {
+    for (size_t i = 0; i + 1 < len; i++)
+        if (buf[i] == '\033' && buf[i + 1] == '[') return true;
+    return false;
 }
 
 /* Strip ANSI escape codes from a buffer in-place, return new length */
@@ -517,7 +543,128 @@ static int logDcConnect(int handle, const void* data, size_t len) {
 }
 
 static void logOnDisconnect(int ref) {
-  if (ref >= 0 && ref < LOG_MAX_CONSUMERS) logSlots[ref].itsHandle = -1;
+  if (ref >= 0 && ref < LOG_MAX_CONSUMERS) {
+    logSlots[ref].itsHandle = -1;
+    logSlots[ref].lineLen = 0;
+  }
+}
+
+/* ---- Inbound stream support ----
+ * Consumers (browser log:1, plain TCP) may also send lines TO the log task.
+ * Each complete line is fanned out to the OTHER consumers + log file as-is —
+ * no timestamp / [task] / level char added, so the source can stamp its own.
+ * ANSI-capable consumers still get coloring re-applied if the level char is
+ * recognizable in the standard "<ts> L [tag] msg" position. */
+
+/* Find the level char position (E/W/I/D/V) — same heuristic as lineLevel():
+ * a single level char surrounded by spaces (or at start of line). */
+static size_t findLevelCharPos(const char* line, size_t len) {
+    for (size_t i = 0; i + 1 < len; i++) {
+        char c = line[i];
+        if (c != 'E' && c != 'W' && c != 'I' && c != 'D' && c != 'V') continue;
+        bool leftOk  = (i == 0) || line[i - 1] == ' ';
+        bool rightOk = line[i + 1] == ' ';
+        if (leftOk && rightOk) return i;
+    }
+    return (size_t)-1;
+}
+
+/* Wrap a plain preformatted line in ANSI colors when a level char is present.
+ * If no level char is found, copies the line unchanged. Adds a trailing '\n'.
+ * Returns bytes written. */
+static int colorizePreformatted(const char* in, size_t len, char* out, size_t outSize) {
+    while (len > 0 && (in[len - 1] == '\n' || in[len - 1] == '\r')) len--;
+    size_t lp = findLevelCharPos(in, len);
+    if (lp == (size_t)-1)
+        return snprintf(out, outSize, "%.*s\n", (int)len, in);
+    char level = in[lp];
+    /* Trim trailing space from the timestamp prefix (if any) */
+    size_t prefixLen = lp;
+    while (prefixLen > 0 && in[prefixLen - 1] == ' ') prefixLen--;
+    if (prefixLen == 0) {
+        return snprintf(out, outSize, "\033[%sm%.*s\033[0m\n",
+                        logColor(level), (int)(len - lp), in + lp);
+    }
+    return snprintf(out, outSize, "\033[%sm%.*s\033[0m \033[%sm%.*s\033[0m\n",
+                    logColors[5], (int)prefixLen, in,
+                    logColor(level), (int)(len - lp), in + lp);
+}
+
+/* Fan one inbound line out to file + all OTHER consumers (skip the source). */
+static void logInboundLineOut(int srcSlot, const char* line, size_t len) {
+    if (len == 0) return;
+    dbg("inbound from slot %d (%u bytes)\n", srcSlot, (unsigned)len);
+
+    /* Plain version (ANSI-stripped) for file + non-ANSI consumers */
+    char plain[LOG_INBOUND_BUF + 8];
+    size_t plainLen = len;
+    if (plainLen > sizeof(plain) - 2) plainLen = sizeof(plain) - 2;
+    memcpy(plain, line, plainLen);
+    plainLen = stripAnsi(plain, plainLen);
+    plain[plainLen++] = '\n';
+    plain[plainLen] = '\0';
+
+    if (logFile >= 0) logFileWrite(plain, plainLen);
+
+    /* ANSI version: if line already has escape sequences, pass through; else
+     * re-apply color around level char (and grey on the timestamp prefix). */
+    char ansi[LOG_INBOUND_BUF + 64];
+    size_t ansiLen = 0;
+    bool ansiDone = false;
+    auto ensureAnsi = [&]() {
+        if (ansiDone) return;
+        if (containsAnsi(line, len)) {
+            size_t n = len > sizeof(ansi) - 2 ? sizeof(ansi) - 2 : len;
+            memcpy(ansi, line, n);
+            ansi[n++] = '\n';
+            ansiLen = n;
+        } else {
+            int n = colorizePreformatted(line, len, ansi, sizeof(ansi));
+            ansiLen = (n > 0) ? (size_t)n : 0;
+        }
+        ansiDone = true;
+    };
+
+    for (int i = 0; i < LOG_MAX_CONSUMERS; i++) {
+        if (i == srcSlot) continue;  /* don't echo back to sender */
+        int h = logSlots[i].itsHandle;
+        if (h < 0 || !itsConnected(h)) continue;
+        if (logSlots[i].ansi == LOG_ANSI) {
+            ensureAnsi();
+            if (ansiLen > 0) itsSend(h, ansi, ansiLen, 0);
+        } else {
+            itsSend(h, plain, plainLen, 0);
+        }
+    }
+
+    /* Serial console isn't an ITS consumer of the log task — it sees log
+     * output via logVprintf's direct fwrite(stdout). Mirror that here so
+     * inbound lines also reach the serial console. */
+    if (!serialInCli) {
+        ensureAnsi();
+        if (ansiLen > 0) fwrite(ansi, 1, ansiLen, stdout);
+    }
+}
+
+/* Drain inbound bytes from one slot, splitting into newline-terminated lines. */
+static void logSlotDrainInbound(int slot) {
+    int h = logSlots[slot].itsHandle;
+    if (h < 0 || !itsConnected(h)) return;
+    char tmp[256];
+    size_t got = itsRecv(h, tmp, sizeof(tmp), 0);  /* non-blocking */
+    if (got == 0) return;
+    auto& s = logSlots[slot];
+    for (size_t k = 0; k < got; k++) {
+        char c = tmp[k];
+        if (c == '\r') continue;
+        if (c == '\n') {
+            logInboundLineOut(slot, s.lineBuf, s.lineLen);
+            s.lineLen = 0;
+        } else if (s.lineLen + 1 < sizeof(s.lineBuf)) {
+            s.lineBuf[s.lineLen++] = c;
+        }
+        /* Overflow → silently drop until next newline */
+    }
 }
 
 /* ---- Log task: drains input stream → fan out to ITS consumers ---- */
@@ -528,19 +675,18 @@ static void logTaskFn(void* arg) {
   for (int i = 0; i < LOG_MAX_CONSUMERS; i++) logSlots[i].itsHandle = -1;
   itsServerInit();
   itsClientInit(1);  /* so logFileOpen() can itsConnect to fs stream server */
-  /* 32KB send buffer per consumer (PSRAM): live log fanout uses timeout=0
-   * (can't block the log task — others depend on it), so anything that
-   * doesn't fit is silently dropped. Net's TLS proxy can stall drains for
-   * seconds when busy; 32KB absorbs realistic bursts. The DC side piggy-
-   * backs on the webrtc router's rexmit pool so per-handle back-pressure
-   * is similar.
+  /* 2KB each direction. Outbound (fromSize): log fanout uses timeout=0,
+   * downstream layers (webrtc rexmit pool, TCP send buffer) absorb real
+   * bursts — the per-handle buffer just covers the small gap between
+   * itsSend and the consumer's drain. Inbound (toSize): same idea, browser
+   * console bursts at session start are ~25 short lines, well within 2KB.
    *
    * Two ports: stream-mode for TCP nc/serial, packet-mode for browser DC
-   * (`log:1`). LOG_MAX_CONSUMERS=4 is shared: allow up to 3 TCP + 1 DC. */
-  itsServerPortOpen(LOG_PORT_TCP, /*packetBased=*/false, 3, 0, 32768);
+   * (`log:1`). LOG_MAX_CONSUMERS=4: allow up to 3 TCP + 1 DC. */
+  itsServerPortOpen(LOG_PORT_TCP, /*packetBased=*/false, 3, 2048, 2048);
   itsServerOnConnect(LOG_PORT_TCP, logTcpConnect);
   itsServerOnDisconnect(LOG_PORT_TCP, logOnDisconnect);
-  itsServerPortOpen(LOG_PORT_DC,  /*packetBased=*/true,  1, 0, 32768);
+  itsServerPortOpen(LOG_PORT_DC,  /*packetBased=*/true,  1, 2048, 2048);
   itsServerOnConnect(LOG_PORT_DC, logDcConnect);
   itsServerOnDisconnect(LOG_PORT_DC, logOnDisconnect);
   /* Unblock logInit() — server is open for clients (e.g. serial task). */
@@ -557,7 +703,7 @@ static void logTaskFn(void* arg) {
     storageGetStr("s.log.file.name", name, sizeof(name));
     if (name[0]) {
       char dir[64]; storageGetStr("s.log.dir", dir, sizeof(dir), "/sdcard/log");
-      fs_mkdirp(dir);
+      if (strncmp(dir, "/sdcard/", 8) != 0 || sdAvailable()) fs_mkdirp(dir);
       char path[128]; snprintf(path, sizeof(path), "%s/%s", dir, name);
       logFileOpen(path);
     }
@@ -567,7 +713,7 @@ static void logTaskFn(void* arg) {
     logFileClose();
     if (val[0]) {
       char dir[64]; storageGetStr("s.log.dir", dir, sizeof(dir), "/sdcard/log");
-      fs_mkdirp(dir);
+      if (strncmp(dir, "/sdcard/", 8) != 0 || sdAvailable()) fs_mkdirp(dir);
       char path[128]; snprintf(path, sizeof(path), "%s/%s", dir, val);
       logFileOpen(path);
     }
@@ -601,6 +747,13 @@ static void logTaskFn(void* arg) {
      * install and the first consumer's connect being processed. */
     bool hasConsumer = (itsServerActive() > 0);
     bool hasFile = (logFile >= 0);
+
+    /* Drain any inbound bytes from connected consumers — each complete line
+     * is fanned out to the OTHER consumers + log file as-is. Allows browser /
+     * external clients to inject pre-stamped log lines. */
+    if (hasConsumer)
+      for (int i = 0; i < LOG_MAX_CONSUMERS; i++) logSlotDrainInbound(i);
+
     if (!hasConsumer && !hasFile) {
       logFileFlush();
       continue;

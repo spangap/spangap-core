@@ -247,7 +247,7 @@ bool cronPoll(bool execute) {
             size_t cmdLen = strlen(cmd);
             xStreamBufferSend(cronStream, cmd, cmdLen, pdMS_TO_TICKS(100));
             xStreamBufferSend(cronStream, "\n", 1, pdMS_TO_TICKS(100));
-            printf("[cron] %02d:%02d %s\n", tm.tm_hour, tm.tm_min, cmd);
+            info("%02d:%02d %s\n", tm.tm_hour, tm.tm_min, cmd);
         }
     }
     free(buf);
@@ -311,7 +311,7 @@ static void cronTaskFn(void*) {
 void cronInit() {
     int v = storageGetInt("s.cron.version", 0);
     if (v < CRON_VERSION) {
-        storageDefault("s.cron.enable", 0);
+        storageDefault("s.cron.enable", 1);
         storageSet("s.cron.version", CRON_VERSION);
     }
 
@@ -379,8 +379,21 @@ bool cronDefault(const char* schedule, const char* command) {
     int wh = fs_open(FS_STATE "/crontab", fileExists ? "a" : "w");
     if (wh < 0) return false;
     if (needsNewline) fs_write("\n", 1, 1, wh);
+    /* Format to match the column header in factory_state/crontab — all 4-wide. */
+    char fields[6][16] = {};
+    int fi = 0;
+    const char* p = schedule;
+    while (*p && fi < 6) {
+        while (*p == ' ' || *p == '\t') p++;
+        int j = 0;
+        while (*p && *p != ' ' && *p != '\t' && j + 1 < (int)sizeof(fields[fi]))
+            fields[fi][j++] = *p++;
+        fields[fi][j] = '\0';
+        fi++;
+    }
     char line[256];
-    int n = snprintf(line, sizeof(line), "%s %s\n", schedule, command);
+    int n = snprintf(line, sizeof(line), "%-4s %-4s %-4s %-4s %-4s %-4s %s\n",
+                     fields[0], fields[1], fields[2], fields[3], fields[4], fields[5], command);
     if (n > 0) fs_write(line, 1, (size_t)n, wh);
     fs_close(wh);
     return true;

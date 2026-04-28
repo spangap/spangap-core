@@ -8,8 +8,8 @@
 # flags:
 #
 #   -   none
-#   A   When awake, not on deepsleep wakeup
+#   A   When already awake, not on brief deepsleep wakeup
 #   N   When STA connected to upstream network (AP-only does not count)
 #
-# min hour  dom   mon   dow flags   command
+# min  hour dom  mon  dow  flag command
 
