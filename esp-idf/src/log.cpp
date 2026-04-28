@@ -489,10 +489,10 @@ static void logPasteBack(int handle, long backlogBytes = 0) {
     }
   }
 
-  /* Chunk into packets ≤ 8KB: each is one DC message on the wire. Split on
-   * newline boundaries so ANSI colour sequences stay inside a single
-   * packet (browser xterm.js concats them sequentially). */
-  constexpr size_t CHUNK = 8192;
+  /* Chunk into packets that fit the per-connection ITS buffer (2KB cap).
+   * Split on newline boundaries so ANSI colour sequences stay inside a
+   * single packet (browser xterm.js concats them sequentially). */
+  constexpr size_t CHUNK = 1500;
   size_t off = 0;
   while (off < op) {
     size_t take = (op - off > CHUNK) ? CHUNK : (op - off);
