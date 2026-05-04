@@ -21,18 +21,27 @@
 /** Filesystem mount descriptor. */
 struct fs_mount_t {
     const char* path;           /**< VFS mount point */
-    const char* partition;      /**< partition label in partitions.csv */
+    const char* partition;      /**< partition label in partitions.csv (resolved at fs_init) */
     bool        readonly;       /**< mount read-only */
     bool        needsDramStack; /**< SPI flash — PSRAM cache disabled during access */
     bool        formatOnFail;   /**< format if mount fails (writable partitions) */
 };
 
-static constexpr fs_mount_t FS_MOUNTS[] = {
-    { FS_FIXED, "fixed", true,  true, false },
-    { FS_STATE, "state", false, true, true  },
-};
+/* The "fixed" partition label is resolved at fs_init() to fixed_a or fixed_b
+ * based on the running app slot (app0 → fixed_a, app1 → fixed_b). The pair
+ * is selected together by the bootloader's otadata, so rollback automatically
+ * pairs the matching fixed slot. */
+extern const fs_mount_t FS_MOUNTS[];
+extern const int        FS_MOUNT_COUNT;
 
-static constexpr int FS_MOUNT_COUNT = sizeof(FS_MOUNTS) / sizeof(FS_MOUNTS[0]);
+/** Partition label for the inactive fixed slot — OTA writes here. */
+const char* fs_inactive_fixed_label();
+
+/** Partition label for the inactive app slot — OTA writes here. */
+const char* fs_inactive_app_label();
+
+/** Partition label for the running fixed slot. */
+const char* fs_active_fixed_label();
 
 /* ---- Init ---- */
 

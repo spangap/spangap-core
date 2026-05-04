@@ -24,6 +24,8 @@
 #include "esp_littlefs.h"
 #include "esp_timer.h"
 #include "nvs_flash.h"
+#include "esp_ota_ops.h"
+#include "esp_partition.h"
 
 /* ---- Handle table ---- */
 
@@ -42,6 +44,26 @@ static struct {
 } dirSlots[MAX_DIR_SLOTS];
 
 static bool firstBoot = false;
+
+/* ---- OTA-aware mount table (label resolved at fs_init) ---- */
+
+static char fixedLabel[12] = "fixed_a";   /* default: app0 → fixed_a */
+
+const fs_mount_t FS_MOUNTS[] = {
+    { FS_FIXED, fixedLabel, true,  true, false },
+    { FS_STATE, "state",    false, true, true  },
+};
+const int FS_MOUNT_COUNT = (int)(sizeof(FS_MOUNTS) / sizeof(FS_MOUNTS[0]));
+
+const char* fs_active_fixed_label()   { return fixedLabel; }
+const char* fs_inactive_fixed_label() {
+    return strcmp(fixedLabel, "fixed_a") == 0 ? "fixed_b" : "fixed_a";
+}
+const char* fs_inactive_app_label() {
+    const esp_partition_t* run = esp_ota_get_running_partition();
+    if (run && run->subtype == ESP_PARTITION_SUBTYPE_APP_OTA_1) return "app0";
+    return "app1";
+}
 
 static int allocSlot() {
     for (int i = 0; i < MAX_FILE_SLOTS; i++)
@@ -584,6 +606,17 @@ void fs_init() {
     if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
         nvs_flash_erase();
         nvs_flash_init();
+    }
+
+    /* Resolve "fixed" partition based on running app slot.
+     * app0 → fixed_a, app1 → fixed_b. OTA writes the inactive pair together
+     * and otadata flips both atomically by association. */
+    {
+        const esp_partition_t* run = esp_ota_get_running_partition();
+        const char* lbl = (run && run->subtype == ESP_PARTITION_SUBTYPE_APP_OTA_1)
+                              ? "fixed_b"
+                              : "fixed_a";
+        safeStrncpy(fixedLabel, lbl, sizeof(fixedLabel));
     }
 
     /* Mount LittleFS partitions from table */

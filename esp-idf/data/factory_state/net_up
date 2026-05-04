@@ -1,3 +1,4 @@
 # Runs each time STA connects to upstream network (NET_EV_UPSTREAM_UP) — on a
 # temp task, ok to block. AP-only mode does not trigger this.
 date wait 60
+version
