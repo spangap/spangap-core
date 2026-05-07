@@ -13,8 +13,14 @@
 #include "storage.h"
 #include "log.h"
 #include "compat.h"
+#include "its.h"
+#include "web.h"
+#include "cJSON.h"
 #include "mbedtls/sha256.h"
 #include "esp_random.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "esp_heap_caps.h"
 #include <cstdio>
 #include <cstring>
 #include <string>
@@ -184,6 +190,139 @@ static bool isRateLimited() {
     return (millis() - lastFailMs) < (delaySec * 1000);
 }
 
+/* ---- /auth/{login,passwd,logout} REST endpoints ----
+ * auth registers the URL prefix "auth" with web. web forwards matching
+ * HTTP requests here; we read the request, dispatch by path, send the
+ * JSON response, and disconnect. Each request is short and synchronous,
+ * so handlers run inline on the auth task — no temp-task hand-off. */
+
+static constexpr uint16_t AUTH_URL_PORT = 1;
+static constexpr int      AUTH_BODY_MAX = 1024;
+
+static void authReplyJson(int h, const char* json) {
+    webSendResponse(h, 200, "application/json", json, strlen(json));
+}
+
+static void authReplyResultCode(int h, int result) {
+    char json[40];
+    snprintf(json, sizeof(json), "{\"result\":%d}", result);
+    authReplyJson(h, json);
+}
+
+static void authHandleLogin(int h, const char* hdr, int hlen) {
+    char* body = webReadBody(h, hdr, hlen, AUTH_BODY_MAX, nullptr);
+    if (!body) { webSendStatus(h, 400); return; }
+
+    cJSON* req = cJSON_Parse(body);
+    heap_caps_free(body);
+    if (!req) { webSendStatus(h, 400); return; }
+
+    const char* password = cJSON_GetStringValue(cJSON_GetObjectItem(req, "password"));
+    const char* tryRealm = "";
+    cJSON* realmItem = cJSON_GetObjectItem(req, "realm");
+    if (cJSON_IsString(realmItem)) tryRealm = realmItem->valuestring;
+
+    if (!password) {
+        authReplyResultCode(h, AUTH_WRONG_PASSWORD);
+    } else {
+        std::string outRealm, outCookie;
+        auth_err_t e = authLogin(password, tryRealm, outRealm, outCookie);
+        if (e == AUTH_OK) {
+            char json[256];
+            snprintf(json, sizeof(json),
+                "{\"result\":0,\"realm\":\"%s\",\"cookie\":\"%s\"}",
+                outRealm.c_str(), outCookie.c_str());
+            authReplyJson(h, json);
+        } else {
+            authReplyResultCode(h, (int)e);
+        }
+    }
+    cJSON_Delete(req);
+}
+
+static void authHandlePasswd(int h, const char* hdr, int hlen) {
+    char* body = webReadBody(h, hdr, hlen, AUTH_BODY_MAX, nullptr);
+    if (!body) { webSendStatus(h, 400); return; }
+
+    cJSON* req = cJSON_Parse(body);
+    heap_caps_free(body);
+    if (!req) { webSendStatus(h, 400); return; }
+
+    const char* realm = cJSON_GetStringValue(cJSON_GetObjectItem(req, "realm"));
+    const char* oldPw = cJSON_GetStringValue(cJSON_GetObjectItem(req, "old"));
+    const char* newPw = cJSON_GetStringValue(cJSON_GetObjectItem(req, "new"));
+
+    if (!realm || !oldPw || !newPw) {
+        authReplyResultCode(h, AUTH_WRONG_PASSWORD);
+    } else {
+        auth_err_t e = authPasswd(realm, oldPw, newPw);
+        authReplyResultCode(h, (int)e);
+    }
+    cJSON_Delete(req);
+}
+
+static void authHandleLogout(int h, const char* hdr, int hlen) {
+    char cookie[64] = {};
+    webExtractCookie(hdr, hlen, "session", cookie, sizeof(cookie));
+    authLogout(cookie);
+    /* Note: the previous web-task implementation also force-closed every other
+     * web connection from the same client IP. Skipped here — the cookie is
+     * already deleted, so any subsequent request authenticating with it will
+     * fail authCheck and be rejected; cross-connection eviction is purely a
+     * UX nicety and not worth the cross-task plumbing. */
+    authReplyJson(h, "{\"result\":0}");
+}
+
+static void onAuthRecv(int h, size_t /*bytesAvail*/) {
+    char hdr[2048];
+    int hlen = webGetHeader(h, hdr, sizeof(hdr));
+    if (hlen <= 0) { itsDisconnect(h); return; }
+
+    char method[8];
+    char path[64];
+    webGetMethod(hdr, hlen, method, sizeof(method));
+    webGetPath(hdr, hlen, path, sizeof(path));
+
+    if (strcmp(path, "auth/logout") == 0) {
+        authHandleLogout(h, hdr, hlen);
+    } else if (strcmp(method, "POST") != 0) {
+        webSendStatus(h, 405);
+    } else if (strcmp(path, "auth/login") == 0) {
+        authHandleLogin(h, hdr, hlen);
+    } else if (strcmp(path, "auth/passwd") == 0) {
+        authHandlePasswd(h, hdr, hlen);
+    } else {
+        webSendStatus(h, 404);
+    }
+
+    /* Wait for the response we just queued to drain through net's TLS write
+     * before tearing the connection down — itsDisconnect → connFree frees
+     * the from-buffer immediately, so without this the response bytes never
+     * reach the wire and the client sees an "empty reply" with TLS close. */
+    itsSendDrain(h, 1000);
+    itsDisconnect(h);
+}
+
+static int onAuthConnect(int /*handle*/, const void* /*data*/, size_t /*len*/) {
+    return 0;  /* accept; onRecv fires when the request bytes arrive */
+}
+
+static void authTaskFn(void*) {
+    itsServerInit(0, 16);
+    itsServerPortOpen(AUTH_URL_PORT, /*packetBased=*/false, /*maxHandles=*/4,
+                      /*toSize=*/2048, /*fromSize=*/2048);
+    itsServerOnConnect(AUTH_URL_PORT, onAuthConnect);
+    itsServerOnRecv(AUTH_URL_PORT, onAuthRecv);
+
+    web_path_msg_t reg = {};
+    reg.itsPort = AUTH_URL_PORT;
+    safeStrncpy(reg.path, "auth", sizeof(reg.path));
+    while (!itsSendAux("web", WEB_PATH_REG_PORT, &reg, sizeof(reg), pdMS_TO_TICKS(500)))
+        vTaskDelay(pdMS_TO_TICKS(100));
+
+    for (;;) itsPoll();
+}
+
 /* ---- Public API ---- */
 
 /* Module config version. Bump when adding/changing defaults. See duckdns.cpp. */
@@ -203,18 +342,22 @@ void authInit() {
     /* Sweep expired cookies */
     struct timeval tv;
     gettimeofday(&tv, nullptr);
-    if (tv.tv_sec < 1700000000) return;  /* time not set yet, skip sweep */
-
-    int count = cookieCount();
-    for (int i = count - 1; i >= 0; i--) {
-        char key[80], val[32];
-        snprintf(key, sizeof(key), "secrets.auth.cookies.%d.expires", i);
-        storageGetStr(key, val, sizeof(val));
-        time_t exp = (time_t)strtoll(val, nullptr, 10);
-        if (exp > 1700000000 && exp < tv.tv_sec) {
-            cookieRemove(i);
+    if (tv.tv_sec >= 1700000000) {
+        int count = cookieCount();
+        for (int i = count - 1; i >= 0; i--) {
+            char key[80], val[32];
+            snprintf(key, sizeof(key), "secrets.auth.cookies.%d.expires", i);
+            storageGetStr(key, val, sizeof(val));
+            time_t exp = (time_t)strtoll(val, nullptr, 10);
+            if (exp > 1700000000 && exp < tv.tv_sec) {
+                cookieRemove(i);
+            }
         }
     }
+
+    /* Spawn the auth task that owns the /auth URL prefix. PSRAM stack —
+     * cJSON parsing for login bodies allocates from PSRAM via storage code. */
+    spawnTask(authTaskFn, "auth", 8192, nullptr, 1, 1, STACK_PSRAM);
 }
 
 bool authEnabled() {

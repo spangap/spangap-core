@@ -58,8 +58,10 @@ static inline TaskHandle_t spawnTask(TaskFunction_t fn, const char* name,
  *  all tasks are created via spawnTask() → xTaskCreatePinnedToCoreWithCaps,
  *  so self-deletes always need the -WithCaps cleanup path (idle task
  *  won't free the heap-allocated buffers on its own). */
-static inline void killSelf() {
+[[noreturn]] static inline void killSelf() {
     vTaskDeleteWithCaps(nullptr);
+    /* unreachable: vTaskDeleteWithCaps(nullptr) deletes the current task */
+    while (1) { vTaskDelay(portMAX_DELAY); }
 }
 
 /** UTC offset in minutes from epoch seconds (compares localtime vs gmtime). */

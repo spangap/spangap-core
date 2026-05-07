@@ -11,7 +11,6 @@
 #include "storage.h"
 #include "compat.h"
 #include "fs.h"
-#include "rec_task.h"
 #include <esp_log.h>
 #include <esp_heap_caps.h>
 #include <esp_timer.h>

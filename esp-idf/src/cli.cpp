@@ -9,8 +9,11 @@
 #include "storage.h"
 #include "cron.h"
 #include "compat.h"
+#if CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG
 #include <driver/usb_serial_jtag.h>
+#include <driver/usb_serial_jtag_vfs.h>
 #include <hal/usb_serial_jtag_ll.h>
+#endif
 #include <esp_heap_caps.h>
 #include <fcntl.h>
 #include <unistd.h>
@@ -56,7 +59,12 @@ typedef void (*cli_write_fn)(const char* data, size_t len);
 
 static void cliFlush() {
   fflush(stdout);
+#if CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG
+  /* USB Serial JTAG echo needs a TX FIFO flush — fflush(stdout) only pushes
+   * into the USB FIFO, but bytes don't actually leave until either a newline
+   * or this explicit flush. UART has no equivalent (writes leave immediately). */
   usb_serial_jtag_ll_txfifo_flush();
+#endif
 }
 
 static void cronCliWrite(const char* data, size_t len);  /* forward */
@@ -178,16 +186,16 @@ static bool cliCollapseAbsolute(char* path, size_t cap) {
     return true;
 }
 
-/** Resolved s.cli.start_dir — absolute, normalized, existing directory (else /sdcard). */
+/** Resolved s.cli.start_dir — absolute, normalized, existing directory (else "/"). */
 static void cliResolvedStartDir(char* out, size_t outLen) {
     char d[256];
-    storageGetStr("s.cli.start_dir", d, sizeof(d), "/sdcard");
-    if (d[0] != '/') safeStrncpy(d, "/sdcard", sizeof(d));
+    storageGetStr("s.cli.start_dir", d, sizeof(d), "/");
+    if (d[0] != '/') safeStrncpy(d, "/", sizeof(d));
     char tmp[256];
     safeStrncpy(tmp, d, sizeof(tmp));
-    if (!cliCollapseAbsolute(tmp, sizeof(tmp))) safeStrncpy(tmp, "/sdcard", sizeof(tmp));
+    if (!cliCollapseAbsolute(tmp, sizeof(tmp))) safeStrncpy(tmp, "/", sizeof(tmp));
     struct stat st;
-    if (fs_stat(tmp, &st) != 0 || !S_ISDIR(st.st_mode)) safeStrncpy(tmp, "/sdcard", sizeof(tmp));
+    if (fs_stat(tmp, &st) != 0 || !S_ISDIR(st.st_mode)) safeStrncpy(tmp, "/", sizeof(tmp));
     safeStrncpy(out, tmp, outLen);
 }
 
@@ -883,6 +891,18 @@ static void serialEmit(const char* p, size_t n) {
 extern "C" { volatile bool serialInCli = false; }
 
 static void serialTaskFn(void* arg) {
+#if CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG
+  /* IDF 5.5 regression: the USB Serial JTAG VFS no-driver read path can't size
+   * non-blocking reads — usb_serial_jtag_get_read_bytes_available() returns 0
+   * unless the driver is installed (the LL only exposes a 1-bit "any byte"
+   * flag, not a count), so non-blocking read() always returns -1 EWOULDBLOCK
+   * even with bytes in the hardware FIFO. Installing the driver attaches an
+   * ISR that drains LL → ringbuffer, and the VFS then reads from the ring. */
+  usb_serial_jtag_driver_config_t cfg = USB_SERIAL_JTAG_DRIVER_CONFIG_DEFAULT();
+  usb_serial_jtag_driver_install(&cfg);
+  usb_serial_jtag_vfs_use_driver();
+#endif
+
   /* Set stdin non-blocking */
   int flags = fcntl(STDIN_FILENO, F_GETFL, 0);
   fcntl(STDIN_FILENO, F_SETFL, flags | O_NONBLOCK);
@@ -970,7 +990,7 @@ void cliInit() {
   if (v < CLI_VERSION) {
     storageDefaultTree("s.cli", R"({
       "sticky": 0,
-      "start_dir": "/sdcard"
+      "start_dir": "/"
     })");
     storageSet("s.cli.version", CLI_VERSION);
   }

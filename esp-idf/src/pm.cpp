@@ -21,8 +21,10 @@
 #endif
 #include <esp_private/esp_clk.h>
 #include <esp_memory_utils.h>
+#if CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG
 #include <driver/usb_serial_jtag.h>
 #include <hal/usb_serial_jtag_ll.h>
+#endif
 #include <cstdio>
 #include <cstring>
 #include <algorithm>
@@ -149,6 +151,7 @@ void pmInit() {
   dbg("pm: configured 240/80 MHz + light sleep (%s)\n", esp_err_to_name(err));
 
   pmLockCreate(PM_NO_LIGHT_SLEEP, "usb", &usbLock);
+#if CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG
   if (rtcRamValid() && rtcUsbDisabled) {
     /* USB was disabled before deep sleep — keep it off */
     usb_serial_jtag_pull_override_vals_t vals = { .dp_pu = false, .dm_pu = false,
@@ -158,9 +161,15 @@ void pmInit() {
     rtcUsbDisabled = false;
     pmLockAcquire(usbLock);
   }
+#else
+  /* UART console: no USB peer state, no SOF traffic to gate light sleep on.
+   * The "usb" lock stays released; light sleep is governed by other holders. */
+  rtcUsbDisabled = false;
+#endif
 }
 
 void pmPollUsb() {
+#if CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG
   if (!usbLock) return;
   static const uint32_t USB_GRACE_MS = 5000;
   bool inGrace = millis() < USB_GRACE_MS;
@@ -171,9 +180,13 @@ void pmPollUsb() {
     pmLockAcquire(usbLock);
   else if (!wantLock && held)
     pmLockRelease(usbLock);
+#else
+  /* UART console: no peer presence to track. */
+#endif
 }
 
 static void cliUsbDown() {
+#if CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG
   info("usb down\n");
   vTaskDelay(pdMS_TO_TICKS(10));
   /* Disable D+ pullup → host sees disconnect, stops SOF packets */
@@ -183,9 +196,13 @@ static void cliUsbDown() {
   rtcUsbDisabled = true;
   if (usbLock->count > 0)
     pmLockRelease(usbLock);
+#else
+  info("usb down: no-op on UART console\n");
+#endif
 }
 
 static void cliUsbUp() {
+#if CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG
   /* Acquire lock first to prevent light sleep during re-enumeration */
   rtcUsbDisabled = false;
   if (usbLock && usbLock->count == 0)
@@ -199,6 +216,9 @@ static void cliUsbUp() {
   usb_serial_jtag_ll_phy_enable_pad(true);
   usb_serial_jtag_ll_phy_disable_pull_override();
   info("usb up\n");
+#else
+  info("usb up: no-op on UART console\n");
+#endif
 }
 
 #ifdef CONFIG_PM_PROFILING

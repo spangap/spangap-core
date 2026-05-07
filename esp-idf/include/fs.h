@@ -55,6 +55,32 @@ bool fs_first_boot();
 /** Copy factory defaults from /fixed/factory_state/ to /state/. */
 void fs_factory_reset();
 
+/* ---- Optional SD card mount ---- */
+
+/** Pin + behavior config for SD_MMC mount. Pass to fs_mount_sd().
+ *  Fields default to 1-bit mode at high speed; set d1/d2/d3 for 4-bit. */
+struct fs_sd_config_t {
+    int  clk_pin;
+    int  cmd_pin;
+    int  d0_pin;
+    int  d1_pin = -1;            /* -1 = unused (1-bit mode) */
+    int  d2_pin = -1;
+    int  d3_pin = -1;
+    int  max_freq_khz = 0;       /* 0 = SDMMC_FREQ_HIGHSPEED */
+    bool format_on_fail = false; /* fall back to format-and-mount on first-mount failure */
+    int  max_files = 10;
+};
+
+/** Mount an SD card at /sdcard (FAT on SDMMC slot). Returns true on success.
+ *  Calls in this layer use no board headers — pin numbers come from cfg.
+ *  After this returns true, sdAvailable() returns true.
+ *  Call after fs_init(). One-shot: subsequent calls are no-ops. */
+bool fs_mount_sd(const fs_sd_config_t& cfg);
+
+/** True iff the SD card is mounted at /sdcard. Modules that may write to
+ *  /sdcard/... should gate on this. False until fs_mount_sd() succeeds. */
+bool sdAvailable();
+
 /* ---- Handle-based file operations ---- */
 
 /** Open a file. Returns handle >= 0 on success, -1 on error. */

@@ -26,6 +26,10 @@
 #include "nvs_flash.h"
 #include "esp_ota_ops.h"
 #include "esp_partition.h"
+#include "esp_vfs_fat.h"
+#include "ff.h"
+#include "sdmmc_cmd.h"
+#include "driver/sdmmc_host.h"
 
 /* ---- Handle table ---- */
 
@@ -99,6 +103,9 @@ __attribute__((unused)) static bool callerOnPsram() {
 static bool needsProxy(const char*) {
     return fsWorkerHandle != nullptr;
 }
+
+static volatile bool sdReady = false;
+bool sdAvailable() { return sdReady; }
 
 static bool needsProxyHandle(int f) {
     if (f < 0 || f >= MAX_FILE_SLOTS || !fileSlots[f].active) return false;
@@ -184,6 +191,14 @@ static void handleOp(fs_op_t* req) {
         break;
     }
     case fs_op_t::STAT:
+        /* "/" isn't a real VFS mount — synthesize a directory entry so cd /,
+         * stat checks, etc. work. */
+        if (req->path && (strcmp(req->path, "/") == 0 || req->path[0] == '\0')) {
+            memset(req->st, 0, sizeof(*req->st));
+            req->st->st_mode = S_IFDIR | 0755;
+            req->result = 0;
+            break;
+        }
         req->result = stat(req->path, req->st);
         break;
     case fs_op_t::RENAME:
@@ -238,10 +253,27 @@ static void handleOp(fs_op_t* req) {
         break;
     }
     case fs_op_t::LISTDIR: {
-        DIR* d = opendir(req->path);
-        if (!d) { req->result = -1; break; }
         auto* out = (fs_listing_t*)req->buf;
         int max = (int)req->nmemb;
+        /* "/" isn't a real VFS mount — synthesize the mount points. */
+        if (req->path && (strcmp(req->path, "/") == 0 || req->path[0] == '\0')) {
+            int count = 0;
+            const char* names[] = { "fixed", "state", "sdcard" };
+            const char* paths[] = { FS_FIXED, FS_STATE, FS_SDCARD };
+            for (size_t i = 0; i < sizeof(names) / sizeof(names[0]) && count < max; i++) {
+                if (strcmp(names[i], "sdcard") == 0 && !sdReady) continue;
+                struct stat st;
+                safeStrncpy(out[count].name, names[i], sizeof(out[count].name));
+                out[count].size  = 0;
+                out[count].mtime = (stat(paths[i], &st) == 0) ? st.st_mtime : 0;
+                out[count].isDir = true;
+                count++;
+            }
+            req->result = count;
+            break;
+        }
+        DIR* d = opendir(req->path);
+        if (!d) { req->result = -1; break; }
         int count = 0;
         struct dirent* ent;
         char fp[256];
@@ -600,6 +632,84 @@ void fs_factory_reset() {
     copyTree(FS_FIXED "/factory_state", FS_STATE, false);
 }
 
+/* ---- Optional SD card mount (FAT on SDMMC slot) ----
+ * Mount logic lives here so /sdcard plumbing (sdAvailable(), IDF log silencing,
+ * format-on-fail retry, FATFS type detection) is shared. Board pin numbers come
+ * from the caller via fs_sd_config_t — fs.cpp/h have no board-specific includes. */
+
+static sdmmc_card_t* sdCard = nullptr;
+/* sdReady + sdAvailable() defined earlier so the fs worker (LISTDIR root case)
+ * can gate the synthetic /sdcard entry on whether the card mounted. */
+
+bool fs_mount_sd(const fs_sd_config_t& cfg) {
+    if (sdReady) return true;  /* one-shot — subsequent calls are no-ops */
+
+    sdmmc_host_t host = SDMMC_HOST_DEFAULT();
+    bool fourBit = (cfg.d1_pin >= 0 && cfg.d2_pin >= 0 && cfg.d3_pin >= 0);
+    host.flags = fourBit ? SDMMC_HOST_FLAG_4BIT : SDMMC_HOST_FLAG_1BIT;
+    host.max_freq_khz = (cfg.max_freq_khz > 0) ? cfg.max_freq_khz : SDMMC_FREQ_HIGHSPEED;
+
+    sdmmc_slot_config_t slot = SDMMC_SLOT_CONFIG_DEFAULT();
+    slot.width = fourBit ? 4 : 1;
+    slot.clk = (gpio_num_t)cfg.clk_pin;
+    slot.cmd = (gpio_num_t)cfg.cmd_pin;
+    slot.d0  = (gpio_num_t)cfg.d0_pin;
+    if (fourBit) {
+        slot.d1 = (gpio_num_t)cfg.d1_pin;
+        slot.d2 = (gpio_num_t)cfg.d2_pin;
+        slot.d3 = (gpio_num_t)cfg.d3_pin;
+    }
+    slot.flags |= SDMMC_SLOT_FLAG_INTERNAL_PULLUP;
+
+    esp_vfs_fat_sdmmc_mount_config_t mount_config = {};
+    mount_config.format_if_mount_failed = false;
+    mount_config.max_files = (cfg.max_files > 0) ? cfg.max_files : 10;
+    mount_config.allocation_unit_size = 16 * 1024;
+
+    /* Silence IDF's sdmmc/vfs chatter — empty slot or slow first probe both
+     * splatter "send_op_cond" / "init failed" lines. We collapse to one warn
+     * after both attempts fail. */
+    esp_log_level_set("sdmmc_common",  ESP_LOG_NONE);
+    esp_log_level_set("sdmmc_sd",      ESP_LOG_NONE);
+    esp_log_level_set("vfs_fat_sdmmc", ESP_LOG_NONE);
+
+    esp_err_t ret = esp_vfs_fat_sdmmc_mount(FS_SDCARD, &host, &slot, &mount_config, &sdCard);
+    if (ret != ESP_OK && cfg.format_on_fail) {
+        /* Retry with format-on-failure. A present card sometimes only succeeds
+         * on the second probe; an empty slot fails again here and we bail. */
+        mount_config.format_if_mount_failed = true;
+        ret = esp_vfs_fat_sdmmc_mount(FS_SDCARD, &host, &slot, &mount_config, &sdCard);
+        if (ret == ESP_OK) info("SD: filesystem formatted\n");
+    }
+    /* Restore IDF log defaults — real I/O errors should be visible from now on. */
+    esp_log_level_set("sdmmc_common",  ESP_LOG_WARN);
+    esp_log_level_set("sdmmc_sd",      ESP_LOG_WARN);
+    esp_log_level_set("vfs_fat_sdmmc", ESP_LOG_WARN);
+
+    if (ret != ESP_OK) {
+        warn("no SD card mounted at " FS_SDCARD "\n");
+        return false;
+    }
+
+    /* Detect filesystem type for the info line. */
+    FATFS* ffs;
+    DWORD free_clust;
+    const char* fsName = "FAT?";
+    if (f_getfree("0:", &free_clust, &ffs) == FR_OK) {
+        switch (ffs->fs_type) {
+            case FS_FAT16: fsName = "FAT16"; break;
+            case FS_FAT32: fsName = "FAT32"; break;
+#if FF_FS_EXFAT
+            case FS_EXFAT: fsName = "exFAT"; break;
+#endif
+        }
+    }
+    info("SD: %s %llu MB %s\n", sdCard->cid.name,
+         ((uint64_t)sdCard->csd.capacity) * sdCard->csd.sector_size / (1024 * 1024), fsName);
+    sdReady = true;
+    return true;
+}
+
 void fs_init() {
     /* NVS flash — ESP-IDF internals only (WiFi cal, PHY data) */
     esp_err_t err = nvs_flash_init();
@@ -671,6 +781,9 @@ void fs_init() {
     xSemaphoreTake(fsStreamsReady, portMAX_DELAY);
     vSemaphoreDelete(fsStreamsReady);
     fsStreamsReady = nullptr;
+
+    /* SD card mount is optional and project-specific (board pins). Call
+     * fs_mount_sd() from main.cpp / project init if the board has SDMMC. */
 }
 
 /* ---- Public API: handle-based ---- */
