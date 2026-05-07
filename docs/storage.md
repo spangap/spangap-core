@@ -90,6 +90,20 @@ Defaults live with the owning module's `init()` (search the codebase for `storag
 
 **fps convention**: positive = frames per second; negative = 1/N fps (e.g. `-3` = one frame every 3 seconds). Applies to `s.record.max_fps`, `s.stream.max_fps`, `s.detect.motion.fps`. Use `fpsToIntervalMs()` (`compat.h`) to convert.
 
+## Patterns
+
+### Same-value dedup + pending-flag for high-frequency writes
+
+`storageSet()` skips the patch + change-notify entirely when the new value equals the currently committed value in `cfgRoot`. This is the general fix for notify-inbox floods from rapid browser writes (e.g. scrub bars firing at ~100/s).
+
+For any rapid-write signal from the browser, use this pattern:
+
+- Browser writes `value_key = X` (no subscriber on the value — it's pure state) **and** `trigger_key = 1`.
+- Consumer subscribes **only to** `trigger_key`. On notify it reads `value_key`, processes, then sets `trigger_key = 0`.
+- Dedup ensures repeated `trigger_key = 1` while the value is already `1` is silent. Only the `0 → 1` edge after consumption re-fires the subscriber.
+
+Concrete example: `play.seek` (the target ms) + `play.seek_pending` (the trigger). Same shape works for any scrub / throttle / command signal where the browser may fire updates faster than the consumer can drain them.
+
 ## CLI
 
 `set s.camera.img.quality=20` (auto-saves s.* keys), `show s.cam` (prefix match), `unset <key>`, `save` (force immediate flush), `run <file>`, `sleep <secs>`, `date [yyyymmddhhmmss]`, `date wait [timeout]`, `net` (WiFi status: SSID/IP/router/DNS/traffic), `net up|down|down!`, `usb up|down`, `detect start|stop`, `record start|stop`, `cam read [addr]` / `cam write <addr> <val>` (sensor register access, hex+decimal), `cert` / `cert self-signed` / `cert delete` / `cert acme [days]`, `wg` / `wg up|down` / `wg keygen`, `upnp`, `duckdns` / `duckdns update`, `web` (show file mappings + registered paths), `pm` / `pm wifi [none|min|max]`, `log [tag] [level]` / `log timestamp` / `log notimestamp`, `logfile [level] [path|off]`, `logrotate [days]`, `help`, `reboot` (flushes settings), `reset factory` (formats /state, copies factory defaults, reboots). Supports `#` comments and `;` for multiple commands on one line. **Silent on success**: `set`, `unset`, `save`, `detect` commands produce no output on success.
