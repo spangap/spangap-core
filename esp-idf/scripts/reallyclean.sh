@@ -2,13 +2,10 @@
 # reallyclean — remove every build/cache artifact in a diptych-consuming
 # project, going beyond `idf.py fullclean` (which only nukes build/).
 #
-# Wired into consumers as `idf.py reallyclean` via a custom target in
-# diptych-core/CMakeLists.txt.
-#
-# Order: everything except build/ first, then build/ last. When invoked
-# via ninja's custom-target machinery, deleting build/ kills ninja's
-# stdout/stderr capture files; doing it last means all other cleanup is
-# already complete by the time that happens.
+# Invoked from the consumer's idf_ext.py as a Python idf.py action, NOT
+# as a ninja custom-target. ninja-target invocation deadlocks with build/
+# deletion because ninja keeps writing logs into build/log/ after the
+# script returns.
 #
 # Usage: bash reallyclean.sh <project_root>
 set -e
@@ -48,7 +45,7 @@ rm -f web-interface/package-lock.json
 # macOS noise
 find . -name .DS_Store -delete 2>/dev/null || true
 
-# build/ last — destroying ninja's working tree after everything else is done.
+# build/ last
 rrm build
 
 echo "reallyclean: done — repo back to source-only state."
