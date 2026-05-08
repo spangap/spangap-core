@@ -21,7 +21,7 @@ static inline uint32_t millis() { return (uint32_t)(esp_timer_get_time() / 1000)
 
 /* ---- Stream buffer pool ---- */
 
-#define ITS_MAX_POOL 32
+#define ITS_MAX_POOL 48
 
 struct its_pool_entry_t {
     StreamBufferHandle_t handle;
@@ -44,6 +44,7 @@ static int              itsPoolCount = 0;
 static portMUX_TYPE     itsPoolMux = portMUX_INITIALIZER_UNLOCKED;
 
 void itsReserveStreams(int count, size_t size) {
+    int created = 0;
     for (int i = 0; i < count && itsPoolCount < ITS_MAX_POOL; i++) {
         auto& e = itsPool[itsPoolCount++];
         e.handle = xStreamBufferCreateWithCaps(size, 1, MALLOC_CAP_SPIRAM);
@@ -52,7 +53,11 @@ void itsReserveStreams(int count, size_t size) {
         e.inUse = false;
         e.freeNotify = 0;
         e.spaceFreedSem = xSemaphoreCreateBinary();
+        created++;
     }
+    if (created < count)
+        ITS_LOGE("pool full: only %d/%d streams of size %u reserved (raise ITS_MAX_POOL)",
+                 created, count, (unsigned)size);
 }
 
 static int poolGet(size_t minSize) {
@@ -389,17 +394,38 @@ static void processInboxMsg(its_task_t* me, uint8_t* buf) {
             c->serverTask = me->task;
             c->itsPort = hdr->itsPort;
             c->packetBased = sp->packetBased;
-            if (sp->toSize > 0)   c->toPoolIdx = poolGet(sp->toSize);
-            if (sp->fromSize > 0) c->fromPoolIdx = poolGet(sp->fromSize);
-
-            if (!sp->onConnect) {
-                accepted = true;
-            } else {
-                int sRef = sp->onConnect(handle, payload, hdr->len);
-                accepted = sRef >= 0;
-                if (accepted) c->serverRef = (int8_t)sRef;
+            bool buffersOk = true;
+            if (sp->toSize > 0) {
+                c->toPoolIdx = poolGet(sp->toSize);
+                if (c->toPoolIdx < 0) {
+                    ITS_LOGE("port %u rejected: no pool stream >= %u for to-buffer "
+                             "(client %s -> server %s)",
+                             hdr->itsPort, (unsigned)sp->toSize,
+                             pcTaskGetName(hdr->sender), pcTaskGetName(me->task));
+                    buffersOk = false;
+                }
             }
-            if (!accepted) connFree(handle);
+            if (sp->fromSize > 0) {
+                c->fromPoolIdx = poolGet(sp->fromSize);
+                if (c->fromPoolIdx < 0) {
+                    ITS_LOGE("port %u rejected: no pool stream >= %u for from-buffer "
+                             "(client %s -> server %s)",
+                             hdr->itsPort, (unsigned)sp->fromSize,
+                             pcTaskGetName(hdr->sender), pcTaskGetName(me->task));
+                    buffersOk = false;
+                }
+            }
+
+            if (buffersOk) {
+                if (!sp->onConnect) {
+                    accepted = true;
+                } else {
+                    int sRef = sp->onConnect(handle, payload, hdr->len);
+                    accepted = sRef >= 0;
+                    if (accepted) c->serverRef = (int8_t)sRef;
+                }
+            }
+            if (!accepted) connFree(handle);  /* releases pool entries via poolFree */
         }
 
         if (cli) {
