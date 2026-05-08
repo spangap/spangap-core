@@ -29,9 +29,6 @@ rrm() {
 rrm managed_components
 rm -f  sdkconfig sdkconfig.old dependencies.lock
 
-# Generated source files (regenerated each build by tools/*.py)
-rm -f  main/app_build_epoch.c main/build_id.h
-
 # LittleFS image inputs that are generated, not source-of-truth
 rm -f  data/build_times
 rrm data/webroot
