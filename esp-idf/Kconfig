@@ -1,11 +1,121 @@
-# Kconfig for diptych-core.
-#
-# WireGuard menu is vendored from trombik/esp_wireguard while the netif->state
-# PPP workaround is needed for ESP-IDF 5.x. Once upstream esp_wireguard ships
-# the fix and propagates, this menu and src/esp_wireguard/ go away and we
-# depend on the upstream component instead.
+menu "diptych modules"
 
-menu "WireGuard"
+config DIPTYCH_BANNER
+    string "System banner / progname"
+    default "diptych device"
+    help
+        Default value for the s.sys.banner config key, displayed by the
+        browser SPA in the menu bar and used by the device as its
+        identifying name. Editable at runtime via `set s.sys.banner ...`.
+
+config DIPTYCH_SDCARD
+    bool "Mount SD card on boot (SDMMC)"
+    default n
+    help
+        When enabled, diptychInit() calls fs_mount_sd(). Required for any
+        module that writes to /sdcard (recordings, log files on SD, etc.).
+        Pin numbers and bus width are board-specific — set them in your
+        project's sdkconfig.defaults.
+
+config DIPTYCH_SDCARD_PIN_CLK
+    int "SDMMC CLK pin"
+    depends on DIPTYCH_SDCARD
+
+config DIPTYCH_SDCARD_PIN_CMD
+    int "SDMMC CMD pin"
+    depends on DIPTYCH_SDCARD
+
+config DIPTYCH_SDCARD_PIN_D0
+    int "SDMMC D0 pin"
+    depends on DIPTYCH_SDCARD
+
+config DIPTYCH_SDCARD_4BIT
+    bool "4-bit SDMMC bus (D0..D3 wired)"
+    depends on DIPTYCH_SDCARD
+    default n
+    help
+        Enable when the board has all four data lines (D0..D3) routed.
+        Roughly 4× throughput over 1-bit. Most ESP32-S3 dev boards (XIAO
+        Sense included) only expose D0; leave off unless you know the
+        SD slot has the wider bus.
+
+config DIPTYCH_SDCARD_PIN_D1
+    int "SDMMC D1 pin"
+    depends on DIPTYCH_SDCARD_4BIT
+
+config DIPTYCH_SDCARD_PIN_D2
+    int "SDMMC D2 pin"
+    depends on DIPTYCH_SDCARD_4BIT
+
+config DIPTYCH_SDCARD_PIN_D3
+    int "SDMMC D3 pin"
+    depends on DIPTYCH_SDCARD_4BIT
+
+config DIPTYCH_OTA
+    bool "OTA (signed-manifest over-the-air updates)"
+    default n
+    help
+        Pulls a signed manifest from s.sys.ota.url, verifies an ECDSA
+        P-256 signature against a consumer-supplied public key, and
+        downloads paired firmware + files binaries into the inactive
+        slot. Requires the consumer to ship `idf.py ota-keygen` output
+        (keys/ota_priv.pem gitignored, main/ota_pubkey.h committed) and
+        to call `otaSetPubkey(OTA_PUBKEY_PEM, OTA_PUBKEY_PEM_LEN)` from
+        app_main after diptychInit(). When n, the firmware can only be
+        updated by re-flashing over USB / JTAG.
+
+config DIPTYCH_OTA_URL
+    string "OTA manifest URL"
+    depends on DIPTYCH_OTA
+    default ""
+    help
+        URL the firmware fetches at version-check time. Becomes the
+        default for the s.sys.ota.url config key (otaInit installs it
+        on first boot via storageDefault). At runtime the user can
+        override via CLI (`set s.sys.ota.url <url>`) or factory_state
+        overlay. Empty value means OTA is configured but won't actually
+        check anything until s.sys.ota.url is set at runtime.
+
+config DIPTYCH_WG
+    bool "WireGuard tunnel"
+    default y
+    select LWIP_PPP_SUPPORT
+    help
+        ESP-IDF integration of the vendored trombik/esp_wireguard fork
+        (with netif->state workaround). Enables the wg.* CLI commands,
+        wg.* config keys, and auto-tunnel-up on STA upstream.
+
+config DIPTYCH_DUCKDNS
+    bool "DuckDNS dynamic DNS"
+    default y
+    help
+        Periodic POST to www.duckdns.org with the device's current
+        public IP. Enables the duckdns CLI command and s.duckdns.*
+        config keys.
+
+config DIPTYCH_UPNP
+    bool "UPnP IGD port mapping"
+    default y
+    help
+        Auto-creates UPnP port mappings on the upstream router for
+        configured ports (HTTPS, RTSP). Enables the upnp CLI command
+        and s.upnp.* config keys.
+
+config DIPTYCH_ACME
+    bool "ACME (Let's Encrypt) TLS certificates"
+    default y
+    help
+        Auto-renews a publicly-trusted TLS certificate via the ACME
+        protocol (HTTP-01 or DNS-01-via-DuckDNS). Enables the acme
+        CLI command and s.acme.* config keys. DNS-01 also requires
+        DIPTYCH_DUCKDNS.
+
+endmenu
+
+# ─── vendored esp_wireguard tuning (only meaningful when DIPTYCH_WG=y) ───
+
+menu "WireGuard (vendored fork — internal)"
+    visible if DIPTYCH_WG
 
 choice WIREGUARD_ESP_ADAPTER_SELECTION
     prompt "TCP/IP adapter to use"
@@ -27,8 +137,6 @@ config WIREGUARD_MAX_SRC_IPS
 config MAX_INITIATIONS_PER_SECOND
     int "Per device limit on accepting (valid) initiation requests"
     default 2
-    help
-        Per device limit on accepting (valid) initiation requests - per peer.
 
 choice WIREGUARD_x25519_IMPLEMENTATION
     prompt "x25519 implementation to use"
