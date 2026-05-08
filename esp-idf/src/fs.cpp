@@ -315,7 +315,7 @@ static void onFsOp(TaskHandle_t, const void* data, size_t len) {
     handleOp(op);
     fsCurrentOp = -1;
     fsCurrentSlot = -1;
-    fsOpCount++;
+    fsOpCount = fsOpCount + 1;  /* C++20 deprecates ++ on volatile */
     uint32_t t1 = (uint32_t)esp_timer_get_time();
     uint32_t took = (t1 - t0) / 1000;
     if (took > 200) {
