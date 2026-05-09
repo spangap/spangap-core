@@ -1460,10 +1460,6 @@ static void storageTaskFn(void* arg) {
     storageSubscribeChanges("", ON_CHANGE {
         dcAccumulateChange(key, val);
     });
-    storageSubscribeChanges("net.up", ON_CHANGE {
-        /* webrtc teardown on net down closes the DC for us — nothing to do. */
-        (void)key; (void)val;
-    });
 
     info("ready\n");
 
