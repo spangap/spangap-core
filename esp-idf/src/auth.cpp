@@ -13,13 +13,10 @@
 #include "storage.h"
 #include "log.h"
 #include "compat.h"
-#include "its.h"
 #include "web.h"
 #include "cJSON.h"
 #include "mbedtls/sha256.h"
 #include "esp_random.h"
-#include "freertos/FreeRTOS.h"
-#include "freertos/task.h"
 #include "esp_heap_caps.h"
 #include <cstdio>
 #include <cstring>
@@ -193,11 +190,10 @@ static bool isRateLimited() {
 /* ---- /auth/{login,passwd,logout} REST endpoints ----
  * auth registers the URL prefix "auth" with web. web forwards matching
  * HTTP requests here; we read the request, dispatch by path, send the
- * JSON response, and disconnect. Each request is short and synchronous,
- * so handlers run inline on the auth task — no temp-task hand-off. */
+ * JSON response. Each request is short and synchronous, so the handler
+ * runs inline on web's task via webRegisterHandler — no own task. */
 
-static constexpr uint16_t AUTH_URL_PORT = 1;
-static constexpr int      AUTH_BODY_MAX = 1024;
+static constexpr int AUTH_BODY_MAX = 1024;
 
 static void authReplyJson(int h, const char* json) {
     webSendResponse(h, 200, "application/json", json, strlen(json));
@@ -273,11 +269,7 @@ static void authHandleLogout(int h, const char* hdr, int hlen) {
     authReplyJson(h, "{\"result\":0}");
 }
 
-static void onAuthRecv(int h, size_t /*bytesAvail*/) {
-    char hdr[2048];
-    int hlen = webGetHeader(h, hdr, sizeof(hdr));
-    if (hlen <= 0) { itsDisconnect(h); return; }
-
+static void authUrlHandler(int h, const char* hdr, int hlen) {
     char method[8];
     char path[64];
     webGetMethod(hdr, hlen, method, sizeof(method));
@@ -294,33 +286,6 @@ static void onAuthRecv(int h, size_t /*bytesAvail*/) {
     } else {
         webSendStatus(h, 404);
     }
-
-    /* Wait for the response we just queued to drain through net's TLS write
-     * before tearing the connection down — itsDisconnect → connFree frees
-     * the from-buffer immediately, so without this the response bytes never
-     * reach the wire and the client sees an "empty reply" with TLS close. */
-    itsSendDrain(h, 1000);
-    itsDisconnect(h);
-}
-
-static int onAuthConnect(int /*handle*/, const void* /*data*/, size_t /*len*/) {
-    return 0;  /* accept; onRecv fires when the request bytes arrive */
-}
-
-static void authTaskFn(void*) {
-    itsServerInit(0, 16);
-    itsServerPortOpen(AUTH_URL_PORT, /*packetBased=*/false, /*maxHandles=*/4,
-                      /*toSize=*/2048, /*fromSize=*/2048);
-    itsServerOnConnect(AUTH_URL_PORT, onAuthConnect);
-    itsServerOnRecv(AUTH_URL_PORT, onAuthRecv);
-
-    web_path_msg_t reg = {};
-    reg.itsPort = AUTH_URL_PORT;
-    safeStrncpy(reg.path, "auth", sizeof(reg.path));
-    while (!itsSendAux("web", WEB_PATH_REG_PORT, &reg, sizeof(reg), pdMS_TO_TICKS(500)))
-        vTaskDelay(pdMS_TO_TICKS(100));
-
-    for (;;) itsPoll();
 }
 
 /* ---- Public API ---- */
@@ -355,9 +320,8 @@ void authInit() {
         }
     }
 
-    /* Spawn the auth task that owns the /auth URL prefix. PSRAM stack —
-     * cJSON parsing for login bodies allocates from PSRAM via storage code. */
-    spawnTask(authTaskFn, "auth", 8192, nullptr, 1, 1, STACK_PSRAM);
+    /* Register the /auth URL handler — runs inline on web's task. */
+    webRegisterHandler("auth", authUrlHandler);
 }
 
 bool authEnabled() {
