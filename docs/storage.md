@@ -11,7 +11,7 @@ In-memory cJSON tree with hierarchical dot-notation keys. Backed by `/state/sett
 
 **External storage files** (`/state/storage/<mode>/<key.path>.json`): runtime registry. The first-level subdir under `storage/` is the **mode**, the filename's stem is the dot-path **prefix**. Today only mode `external` is implemented: file is mounted into `cfgRoot` at boot and saved to its own file when its sub-tree dirties (instead of going through `settings.json`). Drop a file in `data/factory_state/storage/external/` and `scanExternals` picks it up — no compile-time registration. The big `s.time.zones` IANA→POSIX map lives this way (saves rewriting ~15 KB on unrelated config changes). Future modes (e.g. `flash-only/`) can be added by handling more subdirs in `scanExternals()`.
 
-**Boot sequence**: `fs_init()` → mount `/fixed` + `/state` → if `/state` is empty, `fs_factory_reset()` recursively copies `/fixed/factory_state/` to `/state/`, then `applyAdditionalState()` overlays `/fixed/additional_state/` (also recursive; `settings.json` deferred to storageLoad's deepMerge) → `storageLoad()` reads `settings.json` (may be absent → `{}`) and mounts each `storage/external/*.json` at its prefix → `cronWakeupHandler()` → `pmInit()` → all module inits (each runs its `if (version < N)` install block) → `cliRunFile("/state/boot")` → `recNotifyBootScriptDone()` → `cronPoll(true)` → `vTaskDelete`. Boot script runs after all CLI commands are registered. `/state/net_up` runs on a temp task each time **NET_EV_UPSTREAM_UP** fires (STA upstream connect, not AP-only).
+**Boot sequence**: `fs_init()` → mount `/fixed` + `/state` → if `/state` is empty, `fs_factory_reset()` recursively copies `/fixed/factory_state/` to `/state/`, then `applyAdditionalState()` overlays `/fixed/additional_state/` (also recursive; `settings.json` deferred to storageLoad's deepMerge) → `storageLoad()` reads `settings.json` (may be absent → `{}`) and mounts each `storage/external/*.json` at its prefix → `cronWakeupHandler()` → `pmInit()` → all module inits (each runs its `if (version < N)` install block) → `cliRunFile("/state/boot")` → `recordNotifyBootScriptDone()` → `cronPoll(true)` → `vTaskDelete`. Boot script runs after all CLI commands are registered. `/state/net_up` runs on a temp task each time **NET_EV_UPSTREAM_UP** fires (STA upstream connect, not AP-only).
 
 **Config API**: `storageGetInt()`, `storageGetStr()`, `storageSet()`, `storageUnset()`, `storageExists()`, `storageDefault()`, `storageDefaultTree()`, `storageSetTree()` (cJSON node), `storageSave()` (force immediate flush), `storageCopy()` (prefix copy with optional `onlyIfTargetKeyExists`), `storageForEach()`, `storageList()`, `storageArrayCount()` (count consecutive `.0.`, `.1.`, ... entries for numbered arrays like `s.web.map.`).
 
@@ -25,7 +25,7 @@ In-memory cJSON tree with hierarchical dot-notation keys. Backed by `/state/sett
 
 **Factory layout (consumer-supplied)**: each consumer app ships a `data/factory_state/` directory holding (a) loose files copied verbatim (`boot`, `crontab`, `net_up`), (b) `storage/<mode>/<prefix>.json` external blobs, and (c) optionally `settings.json` for keys that don't have a natural module owner. A sibling `data/additional_state/` is the per-build user overlay applied on first boot only: same layout (`settings.json` deep-merged into `cfgRoot`, plain files copied, `storage/<mode>/*.json` overlays the corresponding factory file). Both directories are flashed read-only via the consumer's LittleFS image build; user-edited config lives in `/state/settings.json` after first boot.
 
-If the consumer ships an `s.time.zones.json` external blob, it can update it at build time from a GitHub-hosted IANA→POSIX map (ETag-conditional fetch). seccam does this via its own `scripts/update-zones.py`; the file format is an external storage blob, not a settings.json fragment.
+Diptych ships one such blob itself: `s.time.zones.json`, an IANA→POSIX timezone map. The consumer's CMake calls `diptych-core/scripts/update-zones.py` during the build, which fetches the latest map from a GitHub-hosted source (ETag-cached so it only re-downloads when upstream changes) and drops the JSON into the merged factory-state dir. From there it gets baked into the LittleFS image like any other factory file.
 
 ## Config Key Naming
 
@@ -56,39 +56,28 @@ Dot-notation hierarchy. Keys starting with `s.` are saved to JSON; others are ep
 
 ### Consumer-side prefixes (examples)
 
-Apps add their own prefixes for domain config. seccam adds `s.camera.{img,exp,cor,hw}.*`, `s.audio.*`, `s.stream.*`, `s.record.*`, `s.detect.*`, plus `s.time.zones.*` as an external blob.
+Apps add their own prefixes for domain config. A camera-and-audio app, for example, might own `s.camera.*`, `s.audio.*`, `s.stream.*`, `s.record.*`, `s.detect.*`.
 
-**Ephemeral keys** — live working config, populated by `storageCopy()` on stream/record start:
+**Ephemeral keys** — runtime state, no `s.` prefix, never persisted:
 
 | Prefix | Source | Description |
 |--------|--------|-------------|
-| `audio.*` | `s.audio.` + `s.stream.audio.`/`s.record.audio.` | Active audio config — consumers read from here |
-| `camera.sensor` | Published by camera | Detected sensor name |
-| `camera.width/height` | Published by camera | Current resolution dimensions |
-| `camera.resolutions.*` | Published by camera | Available resolutions for this sensor |
-| `detect.*` | Detection state | `detect.motion`, `detect.audio` |
 | `dns.txtrecord` | Set by ACME for DNS-01 | DuckDNS subscribes, publishes TXT |
 | `dns.txtrecord.capable` | Set by DuckDNS at init | `1` if DNS TXT API available |
 | `wg.up` | WireGuard status | |
 | `wg.keygen` | Set to 1 by browser to trigger key generation | WG generates key after 2s, resets to 0 |
 | `webrtc.up` | WebRTC status | |
-| `record.active` | Recording state | 1 while writing to SD, 0 when idle |
-| `record.status` | Recording status | `REC`, `ERROR`, `FULL`, `WRITE_ERR`, `RETRY`, or empty |
 | `sys.build_time` | Build version | |
 | `sys.time.valid` | 1 when system time ≥ 2025 | Published by NTP |
 | `sys.time.set` | Browser pushes epoch seconds | NTP accepts if time invalid, resets to 0 |
 
-**Config copy on stream/record start** — `storageCopy(src, dst)`: audio only.
-```
-s.audio.          → audio.           (base audio settings)
-s.stream.audio.   → audio.           (stream-specific overrides)       # webrtc / rtsp
-s.record.audio.   → audio.           (record-specific overrides)       # rec_task
-```
-Video config is read directly from `s.camera.*` / `s.stream.max_fps` / `s.record.max_fps` by the camera module and its consumers — no ephemeral `camera.*` copy.
+Consumer apps publish their own ephemerals (e.g. status flags, detection state); they show up alongside diptych's in `show` output and over the `storage:1` DC.
+
+**Config copy** — `storageCopy(src, dst)` is the way to layer base + override config trees into a single read-only ephemeral tree at activation time. Useful when one config family (e.g. audio settings) has multiple modes that overlay on a common base. Apps that need this set up the copies themselves; diptych provides only the primitive.
 
 Defaults live with the owning module's `init()` (search the codebase for `storageDefaultTree(` to find them). Browser-side window/UI state lives in browser `localStorage` (`diptych.win.<id>`), not in device storage.
 
-**fps convention**: positive = frames per second; negative = 1/N fps (e.g. `-3` = one frame every 3 seconds). Applies to `s.record.max_fps`, `s.stream.max_fps`, `s.detect.motion.fps`. Use `fpsToIntervalMs()` (`compat.h`) to convert.
+**fps convention** (`compat.h`'s `fpsToIntervalMs()`): positive = frames per second; negative = 1/N fps (e.g. `-3` = one frame every 3 seconds). Used by any consumer that has an fps-style config knob.
 
 ## Patterns
 
@@ -102,8 +91,8 @@ For any rapid-write signal from the browser, use this pattern:
 - Consumer subscribes **only to** `trigger_key`. On notify it reads `value_key`, processes, then sets `trigger_key = 0`.
 - Dedup ensures repeated `trigger_key = 1` while the value is already `1` is silent. Only the `0 → 1` edge after consumption re-fires the subscriber.
 
-Concrete example: `play.seek` (the target ms) + `play.seek_pending` (the trigger). Same shape works for any scrub / throttle / command signal where the browser may fire updates faster than the consumer can drain them.
+Same shape works for any scrub / throttle / command signal where the browser may fire updates faster than the consumer can drain them. One might, for example, expose `play.seek` (target ms) + `play.seek_pending` (trigger) for a video scrubber.
 
 ## CLI
 
-`set s.camera.img.quality=20` (auto-saves s.* keys), `show s.cam` (prefix match), `unset <key>`, `save` (force immediate flush), `run <file>`, `sleep <secs>`, `date [yyyymmddhhmmss]`, `date wait [timeout]`, `net` (WiFi status: SSID/IP/router/DNS/traffic), `net up|down|down!`, `usb up|down`, `detect start|stop`, `record start|stop`, `cam read [addr]` / `cam write <addr> <val>` (sensor register access, hex+decimal), `cert` / `cert self-signed` / `cert delete` / `cert acme [days]`, `wg` / `wg up|down` / `wg keygen`, `upnp`, `duckdns` / `duckdns update`, `web` (show file mappings + registered paths), `pm` / `pm wifi [none|min|max]`, `log [tag] [level]` / `log timestamp` / `log notimestamp`, `logfile [level] [path|off]`, `logrotate [days]`, `help`, `reboot` (flushes settings), `reset factory` (formats /state, copies factory defaults, reboots). Supports `#` comments and `;` for multiple commands on one line. **Silent on success**: `set`, `unset`, `save`, `detect` commands produce no output on success.
+`set s.foo.bar=20` (auto-saves `s.*` keys), `show s.foo` (prefix match), `unset <key>`, `save` (force immediate flush), `run <file>`, `sleep <secs>`, `date [yyyymmddhhmmss]`, `date wait [timeout]`, `net` (WiFi status: SSID/IP/router/DNS/traffic), `net up|down|down!`, `usb up|down`, `cert` / `cert self-signed` / `cert delete` / `cert acme [days]`, `wg` / `wg up|down` / `wg keygen`, `upnp`, `duckdns` / `duckdns update`, `web` (show file mappings + registered paths), `pm` / `pm wifi [none|min|max]`, `log [tag] [level]` / `log timestamp` / `log notimestamp`, `logfile [level] [path|off]`, `logrotate [days]`, `help`, `reboot` (flushes settings), `reset factory` (formats /state, copies factory defaults, reboots). Supports `#` comments and `;` for multiple commands on one line. Consumer apps register their own commands via `cliRegisterCmd`. **Silent on success**: `set`, `unset`, `save` produce no output on success.

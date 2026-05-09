@@ -35,16 +35,17 @@ ESP types delegate to `esp_pm_lock_*()`. `PM_NO_DEEP_SLEEP` is tracked in our ow
 
 ## Lock Holders
 
+Diptych itself takes these:
+
 | Name | Type | Holder |
 |------|------|--------|
-| `"camera"` | NO_LIGHT_SLEEP | camera task while running |
-| `"audio"` | NO_LIGHT_SLEEP | audio task while running |
-| `"rtsp"` | NO_LIGHT_SLEEP + CPU_FREQ_MAX | RTSP during active streaming |
 | `"usb"` | NO_LIGHT_SLEEP | USB host connected (SOF detection, 5s boot grace) |
 | `"network"` | NO_DEEP_SLEEP | WiFi up (STA connected or AP) |
 | `"storage"` | NO_DEEP_SLEEP | after `set`/`unset` until `save` |
 | `"boot"` | NO_DEEP_SLEEP | during `waitForTime()` until NTP syncs |
 | `"cron"` | NO_DEEP_SLEEP | held by default; released when `s.cron.enable=1` AND cron entries exist |
+
+Consumer apps add their own — anything that needs to keep the CPU awake while running (a streaming server, a peripheral driver) acquires its own named lock and shows up in `pm` output alongside diptych's.
 
 ## Deep Sleep Triggering
 

@@ -2,7 +2,7 @@
 
 Socket-style point-to-point connections between FreeRTOS tasks. Header: `its.h`.
 
-ITS is the seccam project's only inter-task communication primitive. Every cross-task signal — HTTP requests, RTSP streams, log lines, CLI commands, camera/audio subscriptions, config-change notifications, file I/O — flows through ITS. Tasks open numbered "ports" the way a UNIX server opens TCP ports; clients connect to a server's task by name and port. Per-task aux messages handle the things that don't fit a connection model.
+ITS is diptych's only inter-task communication primitive. Every cross-task signal — HTTP requests, log lines, CLI commands, config-change notifications, file I/O — flows through ITS, and consumer apps use it the same way for their own tasks. Tasks open numbered "ports" the way a UNIX server opens TCP ports; clients connect to a server's task by name and port. Per-task aux messages handle the things that don't fit a connection model.
 
 ## Concepts
 
@@ -34,7 +34,7 @@ By convention, port numbers are arbitrary but stable: each module's header file 
 | [storage.h](../diptych-core/include/storage.h) | `STORAGE_CONFIG_PORT=1` (packet, WebRTC `storage:1`), `STORAGE_CHANGE_PORT=42` (change dispatch), `STORAGE_SAVE_PORT=43` (save-now signal) |
 | [fs.h](../diptych-core/include/fs.h) | `FS_OP_PORT=1` (POSIX ops aux, on `fs`), `FS_STREAM_PORT=2` (streaming write, on `fs_strm`), `FS_READ_PORT=3` (streaming read, on `fs_strm`), `FS_STREAM_SYNC_PORT=4` (stream-sync aux, on `fs_strm`) |
 
-Consumer apps add their own port constants in their own headers (e.g. seccam reserves `RTSP_PORT=554`, `CAM_CMD_PORT=10`, `REC_CMD_PORT=3`, `DETECT_CMD_PORT=2`, `AUDIO_CMD_PORT=24`, `AUDIO_NOTIFY_PORT=25`, `PLAY_*` variants).
+Consumer apps add their own port constants in their own headers. One might, for example, reserve a `CAMERA_CMD_PORT`, `RECORD_CMD_PORT`, `RTSP_PORT=554`, etc., one per server task.
 
 ### Connection
 
@@ -63,21 +63,9 @@ All functions are in [`its.h`](../diptych-core/include/its.h). Errors are logged
 
 ### Stream buffer pool
 
-```cpp
-void itsReserveStreams(int count, size_t size);
-```
+Connections draw their stream buffers from a system-wide PSRAM pool that grows on demand: when a port opens a connection that needs a buffer of size `S`, the pool returns a free entry of exactly that size, or allocates a new one if none is free. Entries are never freed — once allocated they stay in the pool forever and become reusable for the next connection asking for the same size. This avoids PSRAM fragmentation and lets each port pick whatever size it needs without having to declare the working set up front.
 
-Pre-allocate `count` FreeRTOS stream buffers of `size` bytes each into a system-wide pool, sized in PSRAM. Call once per size class during boot from `app_main`. Connections automatically draw the smallest buffer that fits the requested size, return it on close.
-
-```cpp
-itsReserveStreams(2,  256 * 1024); // big: file streaming
-itsReserveStreams(10, 16384);      // medium: video frames
-itsReserveStreams(10, 4096);       // small: HTTP requests
-itsReserveStreams(10, 2048);       // tiny:  log/CLI text
-itsReserveStreams(4,  512);        // pico:  CLI input
-```
-
-The pool has a hard limit of 32 entries total (`ITS_MAX_POOL`).
+The pool table itself has a hard limit of 48 entries total (`ITS_MAX_POOL`); each unique size in use consumes at least one entry plus one per concurrent connection of that size.
 
 ### Server API
 
@@ -265,7 +253,7 @@ int handle = fs_open_stream(path, "ab", bufSize, triggerLevel);
 itsSend(handle, data, len, ...);
 ```
 
-Setting the trigger level also calls `xStreamBufferSetTriggerLevel` on the underlying FreeRTOS stream buffer, so any blocking `xStreamBufferReceive` callers (none in seccam currently) see consistent semantics.
+Setting the trigger level also calls `xStreamBufferSetTriggerLevel` on the underlying FreeRTOS stream buffer, so any blocking `xStreamBufferReceive` callers see consistent semantics.
 
 ### Status snapshot
 
@@ -283,7 +271,7 @@ Global, fixed-size: 64 entries (`ITS_MAX_CONNS`). Round-robin allocation. Both s
 
 ### Stream buffer pool
 
-System-wide PSRAM pool, max 32 entries (`ITS_MAX_POOL`). Entries are allocated by `itsReserveStreams` at boot. `poolGet` finds the smallest free buffer ≥ requested size; `poolFree` returns it (and resets the trigger level back to 1).
+System-wide PSRAM pool, max 48 entries (`ITS_MAX_POOL`). Entries are allocated lazily: `poolGet(size)` reuses a free entry of exactly `size`, or allocates a new one if none is free. `poolFree` marks an entry unused (the buffer stays in the pool, ready for the next caller asking for the same size) and resets the trigger level back to 1. No entry is ever destroyed.
 
 ### Inbox
 
@@ -302,11 +290,11 @@ Client-initiated disconnects don't need this trick because the server's disconne
 | `ITS_MAX_PORTS` | 8 | Max server ports + max aux ports per task (each in its own table) |
 | `ITS_MAX_MSG_DATA` | 96 | Default max aux/connect/forward payload |
 | `ITS_MAX_CONNS` | 64 | Global active connection table size |
-| `ITS_MAX_POOL` | 32 | Global stream buffer pool size |
+| `ITS_MAX_POOL` | 48 | Global stream buffer pool size (lazy growth) |
 | `ITS_MAX_TASKS` | 24 | Max ITS-registered tasks in the system |
 | `ITS_MAX_PICKUP` | 16 | Pickup-wait semaphore pool size |
 
-These are compile-time. The defaults are sized for seccam; bump them if you hit ceilings.
+These are compile-time. Defaults are sized for moderately busy apps; bump them if you hit ceilings.
 
 ## Common patterns
 
