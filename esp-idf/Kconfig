@@ -53,7 +53,7 @@ config DIPTYCH_SDCARD_PIN_D3
 
 config DIPTYCH_OTA
     bool "OTA (signed-manifest over-the-air updates)"
-    default n
+    default y
     help
         Pulls a signed manifest from s.sys.ota.url, verifies an ECDSA
         P-256 signature against a consumer-supplied public key, and
@@ -62,7 +62,24 @@ config DIPTYCH_OTA
         (keys/ota_priv.pem gitignored, main/ota_pubkey.h committed) and
         to call `otaSetPubkey(OTA_PUBKEY_PEM, OTA_PUBKEY_PEM_LEN)` from
         app_main after diptychInit(). When n, the firmware can only be
-        updated by re-flashing over USB / JTAG.
+        updated by re-flashing over USB / JTAG — but app+fixed partitions
+        get twice the space (no A/B pairing).
+
+config DIPTYCH_APP_PERCENT
+    int "App share of available flash (%)"
+    range 10 90
+    default 75
+    help
+        After NVS, otadata, and the /state partition are reserved, the
+        remaining flash is split between app (firmware code) and fixed
+        (read-only LittleFS for the SPA + factory defaults). This knob
+        is the percentage that goes to app; the rest goes to fixed.
+
+        With OTA on, both app and fixed are paired A/B (so each individual
+        slot is half the share). With OTA off, each gets the full share.
+
+        Diptych regenerates partitions.csv from this value + flash size +
+        OTA on/off at every reconfigure — never edit partitions.csv by hand.
 
 config DIPTYCH_OTA_URL
     string "OTA manifest URL"
