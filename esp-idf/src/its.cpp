@@ -43,44 +43,55 @@ static its_pool_entry_t itsPool[ITS_MAX_POOL];
 static int              itsPoolCount = 0;
 static portMUX_TYPE     itsPoolMux = portMUX_INITIALIZER_UNLOCKED;
 
-void itsReserveStreams(int count, size_t size) {
-    int created = 0;
-    for (int i = 0; i < count && itsPoolCount < ITS_MAX_POOL; i++) {
-        auto& e = itsPool[itsPoolCount++];
-        e.handle = xStreamBufferCreateWithCaps(size, 1, MALLOC_CAP_SPIRAM);
-        e.size = size;
-        e.triggerLevel = 1;
-        e.inUse = false;
-        e.freeNotify = 0;
-        e.spaceFreedSem = xSemaphoreCreateBinary();
-        created++;
-    }
-    if (created < count)
-        ITS_LOGE("pool full: only %d/%d streams of size %u reserved (raise ITS_MAX_POOL)",
-                 created, count, (unsigned)size);
-}
+/* Find a free pool entry of exactly `size` bytes; if none exists, allocate
+ * a new entry (PSRAM stream buffer + semaphore) and add it to the pool.
+ * Pool entries are never deleted — once allocated they stay forever and
+ * become reusable for the next request of the same size. This avoids PSRAM
+ * fragmentation and lets callers ask for any buffer size without having to
+ * pre-declare the working set at boot. */
+static int poolGet(size_t size) {
+    if (size == 0) return -1;
 
-static int poolGet(size_t minSize) {
-    if (minSize == 0) return -1;
     portENTER_CRITICAL(&itsPoolMux);
-    int best = -1;
-    size_t bestSize = SIZE_MAX;
     for (int i = 0; i < itsPoolCount; i++) {
-        if (!itsPool[i].inUse && itsPool[i].size >= minSize && itsPool[i].size < bestSize) {
-            best = i;
-            bestSize = itsPool[i].size;
+        if (!itsPool[i].inUse && itsPool[i].size == size) {
+            itsPool[i].inUse = true;
+            itsPool[i].triggerLevel = 1;
+            portEXIT_CRITICAL(&itsPoolMux);
+            xStreamBufferReset(itsPool[i].handle);
+            xStreamBufferSetTriggerLevel(itsPool[i].handle, 1);
+            return i;
         }
     }
-    if (best >= 0) {
-        itsPool[best].inUse = true;
-        itsPool[best].triggerLevel = 1;
+    /* No free entry of this size — reserve a fresh slot. Mark it inUse
+     * before dropping the spinlock so concurrent searches skip it; populate
+     * the actual stream buffer + semaphore outside the critical section
+     * (xStreamBufferCreateWithCaps yields the scheduler). */
+    if (itsPoolCount >= ITS_MAX_POOL) {
+        portEXIT_CRITICAL(&itsPoolMux);
+        ITS_LOGE("pool table full (%d entries), cannot add %u-byte stream "
+                 "(raise ITS_MAX_POOL)", ITS_MAX_POOL, (unsigned)size);
+        return -1;
     }
+    int idx = itsPoolCount++;
+    auto& e = itsPool[idx];
+    e.size = size;
+    e.inUse = true;
+    e.triggerLevel = 1;
+    e.freeNotify = 0;
+    e.handle = nullptr;
+    e.spaceFreedSem = nullptr;
     portEXIT_CRITICAL(&itsPoolMux);
-    if (best >= 0) {
-        xStreamBufferReset(itsPool[best].handle);
-        xStreamBufferSetTriggerLevel(itsPool[best].handle, 1);
+
+    e.handle = xStreamBufferCreateWithCaps(size, 1, MALLOC_CAP_SPIRAM);
+    e.spaceFreedSem = xSemaphoreCreateBinary();
+    if (!e.handle || !e.spaceFreedSem) {
+        ITS_LOGE("alloc failed for %u-byte stream entry", (unsigned)size);
+        /* Slot stays in the pool with inUse=true so it is never reused.
+         * Rare path (PSRAM OOM at connect time); the connect attempt fails. */
+        return -1;
     }
-    return best;
+    return idx;
 }
 
 static void poolFree(int idx) {

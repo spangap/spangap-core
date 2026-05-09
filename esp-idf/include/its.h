@@ -10,7 +10,7 @@
  *
  * Per-task inbox (FreeRTOS Queue) carries connect / disconnect / aux /
  * forward signaling. Per-connection FreeRTOS stream buffers (drawn from a
- * pre-allocated PSRAM pool) carry payload bytes.
+ * PSRAM pool that grows on demand and never shrinks) carry payload bytes.
  *
  * itsPoll() is the universal blocking primitive: it drains one inbox
  * message AND dispatches per-connection recv callbacks for connections
@@ -60,12 +60,6 @@ enum its_wait_t {
     ITS_WAIT_DELIVERY = 0,   /* return when message is in receiver's inbox */
     ITS_WAIT_PICKUP,         /* return when receiver has processed it */
 };
-
-/* ---- Stream buffer pool ---- */
-
-/** Pre-allocate stream buffers into a system-wide pool.
- *  Call multiple times for different sizes during boot. */
-void itsReserveStreams(int count, size_t size);
 
 /* ---- Callback signatures ---- */
 
