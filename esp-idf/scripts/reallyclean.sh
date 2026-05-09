@@ -27,7 +27,7 @@ rrm() {
 
 # IDF artifacts (build/ comes last, separately)
 rrm managed_components
-rm -f  sdkconfig sdkconfig.old dependencies.lock
+rm -f  sdkconfig sdkconfig.old dependencies.lock partitions.csv
 
 # LittleFS image inputs that are generated, not source-of-truth
 rm -f  data/build_times
