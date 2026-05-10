@@ -1,5 +1,18 @@
 menu "diptych modules"
 
+config DIPTYCH_PROJECT_NAME
+    string "Project name (immutable identity)"
+    default "diptych"
+    help
+        Compile-time project identity. Stored verbatim in s.sys.project at
+        first boot. On every subsequent boot, diptychInit() compares the
+        loaded value to this string and factory-resets /state if they
+        differ — so flashing a different diptych project (e.g. seccam →
+        reticulous) over the same flash chip starts with a clean state.
+
+        Not user-editable at runtime. For the user-facing display name,
+        use DIPTYCH_BANNER (s.sys.banner) instead.
+
 config DIPTYCH_BANNER
     string "System banner / progname"
     default "diptych device"
