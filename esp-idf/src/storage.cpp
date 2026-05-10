@@ -810,11 +810,11 @@ void storageSet(const char* key, int val) {
 void storageSet(const char* key, const char* val) {
   CFG_LOCK();
   /* Dedup: skip if current committed value equals new value. Saves notify
-   * floods when e.g. browser rapid-fires the same signal repeatedly. */
+   * floods when e.g. browser rapid-fires the same signal repeatedly. Compare
+   * against the cJSON string directly so we don't truncate long values. */
   {
-    char existing[64];
-    storageGetStr(key, existing, sizeof(existing), "\x01");  /* sentinel = absent */
-    if (existing[0] != '\x01' && strcmp(existing, val) == 0) {
+    cJSON* node = resolveKey(key);
+    if (node && cJSON_IsString(node) && strcmp(node->valuestring, val) == 0) {
       CFG_UNLOCK();
       return;
     }
