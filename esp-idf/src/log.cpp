@@ -13,6 +13,7 @@
 #include "fs.h"
 #include <esp_log.h>
 #include <esp_heap_caps.h>
+#include <string>
 #include <esp_timer.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
@@ -381,18 +382,20 @@ extern "C" volatile bool serialInCli;
 static int logVprintf(const char* fmt, va_list args) {
     if (!logInited) return 0;
 
-    char buf[256];
-    int rawLen = vsnprintf(buf, sizeof(buf), fmt, args);
+    /* PSRAM-backed via the default allocator (CONFIG_SPIRAM_MALLOC_ALWAYS-
+     * INTERNAL=0 prefers SPIRAM for std::string). RAII frees on every
+     * return path — no leaks possible. */
+    std::string buf(1024, '\0');
+    int rawLen = vsnprintf(buf.data(), buf.size(), fmt, args);
     if (rawLen <= 0) return 0;
 
-    /* Reformat with task name (ANSI version for the input stream — consumers strip if needed) */
-    char formatted[288];
-    int fmtLen = logReformat(buf, formatted, sizeof(formatted), true);
+    std::string formatted(1056, '\0');
+    int fmtLen = logReformat(buf.c_str(), formatted.data(), formatted.size(), true);
     if (fmtLen <= 0) return rawLen;
 
     /* Write to ring buffer — spinlock serializes concurrent writers.
      * Safe from any task context (spinlock disables interrupts briefly). */
-    logRingWrite(formatted, fmtLen);
+    logRingWrite(formatted.data(), fmtLen);
 
     /* Wake log task */
     if (logTaskHandle) xTaskNotifyGive(logTaskHandle);
@@ -401,7 +404,7 @@ static int logVprintf(const char* fmt, va_list args) {
      * This bypasses the ITS log→serial consumer path entirely so logs reach
      * the wire even if the serial task is wedged or not yet connected. */
     if (!serialInCli) {
-        fwrite(formatted, 1, fmtLen, stdout);
+        fwrite(formatted.data(), 1, fmtLen, stdout);
     }
 
     return rawLen;
@@ -649,7 +652,9 @@ static void logInboundLineOut(int srcSlot, const char* line, size_t len) {
 static void logSlotDrainInbound(int slot) {
     int h = logSlots[slot].itsHandle;
     if (h < 0 || !itsConnected(h)) return;
-    char tmp[256];
+    /* Packet-mode reads need the recv buffer to hold the entire packet at
+     * once; size to match the slot's toSize (2048 at port-open). */
+    char tmp[2048];
     size_t got = itsRecv(h, tmp, sizeof(tmp), 0);  /* non-blocking */
     if (got == 0) return;
     auto& s = logSlots[slot];
@@ -672,7 +677,8 @@ static SemaphoreHandle_t logReadySem = nullptr;
 
 static void logTaskFn(void* arg) {
   for (int i = 0; i < LOG_MAX_CONSUMERS; i++) logSlots[i].itsHandle = -1;
-  itsServerInit();
+  /* Bigger inbox so long log lines don't truncate. */
+  itsServerInit(1600);
   itsClientInit(1);  /* so logFileOpen() can itsConnect to fs stream server */
   /* 2KB each direction. Outbound (fromSize): log fanout uses timeout=0,
    * downstream layers (webrtc rexmit pool, TCP send buffer) absorb real
