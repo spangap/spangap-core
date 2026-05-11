@@ -879,16 +879,28 @@ int itsConnectByTaskHandle(TaskHandle_t serverTask, uint16_t port,
                            its_recv_cb_t onRecv,
                            its_disconnect_cb_t onDisconnect) {
     its_task_t* me = myTask();
-    if (!me || !me->isClient) return -1;
+    if (!me || !me->isClient) {
+        ITS_LOGE("itsConnect: caller [%s] is not initialised as a client (missing itsClientInit?)",
+                 pcTaskGetName(nullptr));
+        return -1;
+    }
 
     int clientActive = 0;
     for (int i = 0; i < ITS_MAX_CONNS; i++)
         if (connTable[i].active && connTable[i].clientTask == me->task)
             clientActive++;
-    if (clientActive >= me->maxConns) return -1;
+    if (clientActive >= me->maxConns) {
+        ITS_LOGE("itsConnect: [%s] has %d/%d client conns already; raise itsClientInit cap",
+                 pcTaskGetName(nullptr), clientActive, me->maxConns);
+        return -1;
+    }
 
     its_task_t* se = taskFind(serverTask);
-    if (!se || !se->isServer) return -1;
+    if (!se || !se->isServer) {
+        ITS_LOGE("itsConnect: target task [%s] not initialised as a server",
+                 pcTaskGetName(serverTask));
+        return -1;
+    }
 
     /* Pre-flight: ensure the server has actually opened this port. */
     if (!portFind(se, port)) {
@@ -923,19 +935,29 @@ int itsConnectByTaskHandle(TaskHandle_t serverTask, uint16_t port,
     if (data && dataLen > 0)
         memcpy(buf + sizeof(its_header_t), data, dataLen);
 
-    if (!inboxSend(se, buf, totalLen, timeout))
+    if (!inboxSend(se, buf, totalLen, timeout)) {
+        ITS_LOGE("itsConnect: target [%s] inbox full or send timed out",
+                 pcTaskGetName(serverTask));
         return -1;
+    }
 
-    if (xSemaphoreTake(me->ackSem, timeout) != pdTRUE)
+    if (xSemaphoreTake(me->ackSem, timeout) != pdTRUE) {
+        ITS_LOGE("itsConnect: target [%s] did not ack within %u ms",
+                 pcTaskGetName(serverTask),
+                 (unsigned)(timeout * portTICK_PERIOD_MS));
         return -1;
+    }
 
     int handle = me->ackHandle;
-    if (handle >= 0) {
-        its_conn_t* c = &connTable[handle];
-        if (ref >= 0)        c->clientRef       = (int8_t)ref;
-        if (onRecv)          c->cliRecvCb       = onRecv;
-        if (onDisconnect)    c->cliDisconnectCb = onDisconnect;
+    if (handle < 0) {
+        ITS_LOGE("itsConnect: target [%s] rejected connection on port %u",
+                 pcTaskGetName(serverTask), port);
+        return -1;
     }
+    its_conn_t* c = &connTable[handle];
+    if (ref >= 0)        c->clientRef       = (int8_t)ref;
+    if (onRecv)          c->cliRecvCb       = onRecv;
+    if (onDisconnect)    c->cliDisconnectCb = onDisconnect;
     return handle;
 }
 
@@ -943,7 +965,10 @@ int itsConnect(const char* serverName, uint16_t port,
                const void* data, size_t dataLen, TickType_t timeout, int ref,
                its_recv_cb_t onRecv, its_disconnect_cb_t onDisconnect) {
     TaskHandle_t task = xTaskGetHandle(serverName);
-    if (!task) return -1;
+    if (!task) {
+        ITS_LOGE("itsConnect: server task [%s] not found (not running?)", serverName);
+        return -1;
+    }
     return itsConnectByTaskHandle(task, port, data, dataLen, timeout, ref,
                                   onRecv, onDisconnect);
 }
