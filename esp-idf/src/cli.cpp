@@ -795,6 +795,10 @@ static TaskHandle_t cliTaskHandle = NULL;
 static void cliTaskFn(void* arg) {
   for (int i = 0; i < CLI_MAX_CLIENTS; i++) cliSlots[i].itsHandle = -1;
   itsServerInit();
+  /* CLI commands sometimes need to itsConnect outwards (e.g. rnprobe → rnsd
+   * RNSD_PORT_PACKET). Mark this task as a client too. 2 slots = current
+   * command + headroom. */
+  itsClientInit(2);
   /* Two ports: stream-mode (TCP nc + serial) and packet-mode (WebRTC DC).
    * Shared CLI_MAX_CLIENTS=4 slot pool — 3 TCP + 1 DC lets a single
    * browser xterm coexist with debug nc clients. */
