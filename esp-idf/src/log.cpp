@@ -912,6 +912,16 @@ void logSetTag(const char* tag, const char* level) {
 
 bool logIsDebug() { return currentLogLevel >= LOG_DEBUG; }
 
+bool logIsDebug(const char* tag) {
+  /* esp_log_level_get returns the per-tag level if explicitly set
+   * (via esp_log_level_set, which logApplyLevels does for every
+   * `s.log.tag.<tag>` entry in storage); otherwise it falls back to
+   * the "*" wildcard which logApplyLevels keeps in sync with the
+   * global `s.log.level`. So this resolves "rnsd-specific first,
+   * then global" in one call. */
+  return tag && esp_log_level_get(tag) >= ESP_LOG_DEBUG;
+}
+
 const char* cfd(int fd) {
   static char buf[12];
   if (!logIsDebug()) return "";

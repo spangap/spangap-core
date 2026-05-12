@@ -41,7 +41,16 @@ typedef enum {
 
 void logInit();
 void logRegisterCmds();
+
+/** True iff the global log level is at debug or finer. */
 bool logIsDebug();
+
+/** True iff this tag's effective log level is at debug or finer.
+ *  Resolves the per-tag override from `s.log.tag.<tag>` if set;
+ *  otherwise falls back to the global level from `s.log.level`.
+ *  Useful for short-circuiting expensive work that only feeds dbg()
+ *  output for a specific component. */
+bool logIsDebug(const char* tag);
 
 /** Apply all log levels from cfg store (global + per-tag). Call on boot and level changes. */
 void logApplyLevels();
