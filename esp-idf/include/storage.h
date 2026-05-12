@@ -27,6 +27,7 @@
 #include <stdint.h>
 #include <stddef.h>
 #include <sys/stat.h>
+#include <string>
 #include <cJSON.h>
 
 /** Storage task's ITS server port for the config DataChannel (`storage:1`).
@@ -56,8 +57,11 @@ void storageLoad();
 bool   storageExists(const char* key);
 int    storageGetInt(const char* key, int def = 0);
 void   storageGetStr(const char* key, char* out, size_t outLen, const char* def = "");
+/** std::string overload — no fixed buffer, no truncation. */
+std::string storageGetStr(const char* key, const char* def = "");
 void   storageSet(const char* key, int val);
 void   storageSet(const char* key, const char* val);
+inline void storageSet(const char* key, const std::string& val) { storageSet(key, val.c_str()); }
 
 /** Set a key only if it does not currently exist. Returns true if written.
  *  Use from module init() to seed config defaults that the module owns. */
@@ -133,6 +137,10 @@ typedef void (*storage_change_cb_t)(const char* key, const char* val);
  *  Empty scope "" matches all changes.
  *  Call from the task that should receive the callback (during init). */
 void storageSubscribeChanges(const char* scope, storage_change_cb_t cb);
+
+/** Remove all subscriptions on `scope` registered by the calling task.
+ *  Exact-string scope match; pair with storageSubscribeChanges. */
+void storageUnsubscribe(const char* scope);
 
 /** Convenience: lambda-friendly callback type */
 #define ON_CHANGE [](const char* key, const char* val)

@@ -474,12 +474,16 @@ struct storage_sub_t {
 static storage_sub_t subs[STORAGE_MAX_SUBS];
 static int           subCount = 0;
 
-/* Payload for aux message on STORAGE_CHANGE_PORT */
+/* Payload for aux message on STORAGE_CHANGE_PORT. Sized to fit in
+ * ITS_MAX_MSG_DATA with room for hierarchical keys (deep dotted paths)
+ * and reasonably long values. */
 struct storage_change_msg_t {
   storage_change_cb_t cb;
-  char                key[48];
-  char                val[44];
+  char                key[128];
+  char                val[128];
 };
+static_assert(sizeof(storage_change_msg_t) <= ITS_MAX_MSG_DATA,
+              "storage_change_msg_t exceeds ITS_MAX_MSG_DATA");
 
 /* Aux handler installed on each subscribing task — unpacks and calls */
 static void storageChangeDispatch(TaskHandle_t sender, const void* data, size_t len) {
@@ -505,6 +509,20 @@ void storageSubscribeChanges(const char* scope, storage_change_cb_t cb) {
   s.task = me;
   s.cb = cb;
   safeStrncpy(s.scope, scope, sizeof(s.scope));
+}
+
+void storageUnsubscribe(const char* scope) {
+  if (!scope) return;
+  TaskHandle_t me = xTaskGetCurrentTaskHandle();
+  for (int i = 0; i < subCount; ) {
+    if (subs[i].task == me && strcmp(subs[i].scope, scope) == 0) {
+      subs[i] = subs[--subCount];  /* swap-with-last */
+    } else {
+      i++;
+    }
+  }
+  /* Aux handler stays installed for the task — itsOnAux has no off
+   * counterpart, and an idle dispatcher costs ~one strcmp per delivery. */
 }
 
 static void fireSubscriptions(const char* key, const char* val) {
@@ -799,6 +817,17 @@ void storageGetStr(const char* key, char* out, size_t outLen, const char* def) {
   if (cJSON_IsNumber(node)) { snprintf(out, outLen, "%d", node->valueint); CFG_UNLOCK(); return; }
   CFG_UNLOCK();
   safeStrncpy(out, def, outLen);
+}
+
+std::string storageGetStr(const char* key, const char* def) {
+  CFG_LOCK();
+  cJSON* node = resolveKey(key);
+  std::string out;
+  if (node && cJSON_IsString(node))      out = node->valuestring;
+  else if (node && cJSON_IsNumber(node)) out = std::to_string(node->valueint);
+  else                                   out = def ? def : "";
+  CFG_UNLOCK();
+  return out;
 }
 
 void storageSet(const char* key, int val) {
