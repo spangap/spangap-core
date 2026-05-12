@@ -285,7 +285,13 @@ static its_task_t* taskFindOrCreate(TaskHandle_t task, size_t inboxMaxMsgLen, si
                                          : ITS_DEFAULT_INBOX_SIZE;
     int depth = inboxDepth > 0 ? (int)inboxDepth : 8;
     e->inboxItemSize = itemSize;
-    e->inbox = xQueueCreate(depth, itemSize);
+    /* PSRAM-backed: ITS is task-context only — no ISR may call
+     * itsSend/itsSendAux. ISRs should set a heap flag + use
+     * vTaskNotifyGiveFromISR instead (PSRAM is unreachable from ISRs
+     * during cache-disabled windows; xQueueSendFromISR on a PSRAM
+     * queue would crash). See docs/its.md "ISR safety". The big win
+     * is storage's depth-64 inbox: ~22 KB reclaimed from DRAM. */
+    e->inbox = xQueueCreateWithCaps(depth, itemSize, MALLOC_CAP_SPIRAM);
     return e;
 }
 

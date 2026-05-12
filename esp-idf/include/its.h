@@ -52,7 +52,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
-#define ITS_MAX_MSG_DATA  96
+#define ITS_MAX_MSG_DATA  320
 #define ITS_MAX_PORTS      8     /* per task: server ports + aux ports */
 
 /** itsSendAux: wait for inbox delivery (default) or for receiver pickup. */

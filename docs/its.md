@@ -277,6 +277,24 @@ System-wide PSRAM pool, max 48 entries (`ITS_MAX_POOL`). Entries are allocated l
 
 Per-task FreeRTOS Queue. Item size is `sizeof(its_header_t) + ITS_MAX_MSG_DATA` by default (96-byte max payload), depth 8. Customizable via `itsServerInit` / `itsClientInit` arguments. The header carries: sender, message type (CONNECT / DISCONNECT / AUX / FORWARD), port, length, handle, optional pickup-pool index.
 
+Inbox queues are allocated via `xQueueCreateWithCaps(..., MALLOC_CAP_SPIRAM)` so they live in PSRAM rather than DRAM. See "ISR safety" below for the rule that makes this OK.
+
+### ISR safety
+
+**ITS is task-context only.** None of `itsSend` / `itsRecv` / `itsSendAux` / `itsConnect` / `itsPoll` may be called from an ISR.
+
+Two reasons:
+- The inbox queue is in PSRAM. `xQueueSendFromISR` on a PSRAM-backed queue crashes or hangs when the cache is disabled (which it is during any SPI flash operation — OTA, LittleFS commit, etc.). FreeRTOS doesn't enforce this; the symptom is a sporadic crash that only manifests during a flash write.
+- ITS internals take spinlocks/mutexes and do non-trivial work per send (pool lookup, length checks, sender notify). Not bounded enough for an ISR anyway.
+
+The right pattern for ISR → task communication on diptych is:
+
+1. ISR writes a heap-resident flag (any plain global / volatile bool / counter).
+2. ISR calls `vTaskNotifyGiveFromISR(taskHandle, &hp)` + `portYIELD_FROM_ISR(hp)`.
+3. Target task's main loop blocks on `itsPoll(timeout)` (which uses `ulTaskNotifyTake` under the hood, so the task wakes from the ISR notification too) and reads the flag.
+
+Example: `lora.cpp`'s DIO1 ISR calls `vTaskNotifyGiveFromISR(s_task, ...)`; the task loop drains the radio inside its `itsPoll` wake. No ITS calls from the ISR. lwIP's UDP recv callback does the same for `udp.cpp`.
+
 ### Disconnect message payload
 
 When a server kicks a client, the client-side `cliDisconnectCb` (per-connection callback) is captured before `connFree` and embedded as raw bytes in the disconnect message payload. By the time the client wakes up to process the inbox message, the connection record is already freed — but the cb pointer travels with the message, so the client's dispatcher still calls the right callback. Function pointers in the same address space are safe to ship as raw bytes.
