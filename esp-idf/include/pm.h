@@ -39,6 +39,29 @@ void pmLockRelease(pm_lock_handle_t handle);
 /** Returns true when no locks of any type are held. */
 bool deepSleepAllowed();
 
+/** Register a GPIO as a light-sleep wake source.
+ *
+ *  ESP-IDF couples GPIO wakeup config with the per-pin interrupt type:
+ *  enabling wakeup forces the pin to `GPIO_INTR_HIGH_LEVEL` or
+ *  `GPIO_INTR_LOW_LEVEL` (edges aren't detectable in light sleep — the
+ *  GPIO peripheral clock is gated). Callers must therefore be ready for
+ *  a level-triggered ISR: disable the GPIO interrupt inside the ISR (or
+ *  rely on the registering HAL doing so), and re-enable it after
+ *  servicing the peripheral so the line drops back to the inactive
+ *  level.
+ *
+ *  The first call also enables `esp_sleep_enable_gpio_wakeup()`. Each
+ *  call sets `gpio_wakeup_enable(pin, level)` and `gpio_set_intr_type`
+ *  on the pin. Multiple pins may be registered.
+ *
+ *  @param pin        GPIO number (0..GPIO_NUM_MAX-1, must support RTC
+ *                    GPIO wakeup on the target chip).
+ *  @param wakeLevel  `GPIO_INTR_HIGH_LEVEL` or `GPIO_INTR_LOW_LEVEL`. */
+int pmGpioWakeEnable(int pin, int wakeLevel);
+
+/** Disable light-sleep wakeup on this pin. */
+void pmGpioWakeDisable(int pin);
+
 /** Record that we're about to enter deep sleep for durationUs microseconds.
  *  Call just before esp_deep_sleep_start(). Stats survive in RTC RAM. */
 void pmRecordDeepSleep(int64_t durationUs);

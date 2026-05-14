@@ -93,6 +93,35 @@ On actual shutdown: sets `net.up` ephemeral var to 0 (subscribers react accordin
 
 `WIFI_PS_MAX_MODEM` is set after network up for aggressive modem sleep.
 
+## GPIO Wake Sources
+
+Peripherals that need to wake the CPU from light sleep on an interrupt line (LoRa modem DIO, accelerometer INT, button, etc.) register the GPIO via:
+
+```cpp
+pmGpioWakeEnable(int pin, int wakeLevel);   // GPIO_INTR_HIGH_LEVEL or LOW_LEVEL
+pmGpioWakeDisable(int pin);
+```
+
+The first call lazily flips `esp_sleep_enable_gpio_wakeup()`. Each call wires both `gpio_wakeup_enable(pin, level)` and `gpio_set_intr_type(pin, level)`. Multiple pins can be registered; `pmGpioWakeDisable` only undoes the per-pin part — the global wakeup-source enable stays on for any other registered pins.
+
+**Why level, not edge.** During light sleep the GPIO peripheral clock is gated, so edge detection doesn't run. Only the RTC IO matrix is awake, and it can match levels but not edges. ESP-IDF couples the wake trigger with the GPIO peripheral interrupt type — `gpio_wakeup_enable` requires `GPIO_INTR_HIGH_LEVEL` or `GPIO_INTR_LOW_LEVEL`. Edges that occur during sleep are lost; only the asserted level survives.
+
+**End-to-end wake path:**
+
+1. Sleep with the line in the inactive level (e.g. DIO1 low).
+2. Peripheral asserts the line. RTC IO matrix matches the configured level → CPU wakes.
+3. GPIO peripheral re-clocks, sees the level still asserted, fires the level-triggered ISR immediately. No separate "post-wake" callback is needed; the persistent level *is* the bridge.
+4. ISR services the peripheral (which drops the line back to inactive), then re-enables the GPIO interrupt for the next event.
+
+**Level-mode ISR discipline.** A naive level-triggered ISR re-fires continuously while the line stays asserted. Callers must either:
+
+- disable the interrupt inside the ISR (`gpio_intr_disable`) and re-enable after the peripheral is serviced and the line has dropped; or
+- service the peripheral fast enough inside the ISR to drop the line before returning (rarely possible).
+
+The reticulous LoRa transport uses pattern 1: an IDF HAL trampoline calls `gpio_intr_disable(pin)` before invoking the registered callback, and the consumer task calls `gpio_intr_enable(pin)` after draining the peripheral's IRQ register (which drops DIO1 low). See `reticulous/main/esp_idf_hal.cpp` for the trampoline and `reticulous/main/lora.cpp` for the consumer.
+
+**Trade-off vs. a PM lock.** Holding a `PM_NO_LIGHT_SLEEP` lock while a peripheral is armed is simpler (no ISR-discipline contract) but burns ~3 mA continuous even when nothing is happening. Use the lock when the peripheral itself draws far more than that (LoRa RX is ~5 mA, so it's a wash); use GPIO wake when the peripheral has a near-zero quiescent draw and we want the CPU to actually sleep.
+
 ## CLI Commands
 
 - `pm` — Show CPU/APB frequency, per-mode time deltas since last `pm`, per-mode totals since boot, ESP lock table, deep sleep lock table
@@ -113,7 +142,7 @@ The lwIP timer thread (~1.3mA), started by `esp_netif_init()`, cannot be stopped
 
 ## Key Files
 
-- [`pm.cpp`](../diptych-core/src/pm.cpp) — `pmInit()`, `pmLockCreate/Acquire/Release`, `pmPollUsb()`, `cliUsbDown()`/`cliUsbUp()`, `pm` command, deep sleep lock table
-- [`pm.h`](../diptych-core/include/pm.h) — `pm_lock_type_t` enum, `pmLockCreate/Acquire/Release` API, `deepSleepAllowed()`
+- [`pm.cpp`](../diptych-core/src/pm.cpp) — `pmInit()`, `pmLockCreate/Acquire/Release`, `pmGpioWakeEnable/Disable`, `pmPollUsb()`, `cliUsbDown()`/`cliUsbUp()`, `pm` command, deep sleep lock table
+- [`pm.h`](../diptych-core/include/pm.h) — `pm_lock_type_t` enum, `pmLockCreate/Acquire/Release` API, `pmGpioWakeEnable/Disable`, `deepSleepAllowed()`
 - [`net.cpp`](../diptych-core/src/net.cpp) — `esp_wifi_deinit()`/`esp_wifi_init()`, `esp_sleep_enable_wifi_wakeup()`, `"net"` deep sleep lock
 - consumer's `sdkconfig.defaults` — PM, tickless idle, profiling config

@@ -16,6 +16,7 @@
 #include <esp_sleep.h>
 #include <esp_pm.h>
 #include <esp_timer.h>
+#include <driver/gpio.h>
 #ifdef CONFIG_PM_PROFILING
 #include <esp_private/pm_impl.h>
 #endif
@@ -268,6 +269,45 @@ static void pmPrintModeLines(int64_t mode[PM_MODE_COUNT], int64_t deepUs,
   cliPrintf("  240 MHz       %d%%\n", maxPct);
 }
 #endif
+
+/* ---- GPIO wake source ---- */
+
+static bool s_gpioWakeArmed = false;
+
+int pmGpioWakeEnable(int pin, int wakeLevel) {
+  if (wakeLevel != GPIO_INTR_HIGH_LEVEL && wakeLevel != GPIO_INTR_LOW_LEVEL) {
+    err("pmGpioWakeEnable: pin %d wake level must be HIGH_LEVEL or LOW_LEVEL, got %d",
+        pin, wakeLevel);
+    return ESP_ERR_INVALID_ARG;
+  }
+  esp_err_t r = gpio_set_intr_type((gpio_num_t)pin, (gpio_int_type_t)wakeLevel);
+  if (r != ESP_OK) {
+    err("pmGpioWakeEnable: gpio_set_intr_type(%d): %s", pin, esp_err_to_name(r));
+    return r;
+  }
+  r = gpio_wakeup_enable((gpio_num_t)pin, (gpio_int_type_t)wakeLevel);
+  if (r != ESP_OK) {
+    err("pmGpioWakeEnable: gpio_wakeup_enable(%d): %s", pin, esp_err_to_name(r));
+    return r;
+  }
+  if (!s_gpioWakeArmed) {
+    r = esp_sleep_enable_gpio_wakeup();
+    if (r != ESP_OK) {
+      err("pmGpioWakeEnable: esp_sleep_enable_gpio_wakeup: %s", esp_err_to_name(r));
+      return r;
+    }
+    s_gpioWakeArmed = true;
+  }
+  dbg("pm: GPIO %d armed as wake source (level=%s)", pin,
+      wakeLevel == GPIO_INTR_HIGH_LEVEL ? "HIGH" : "LOW");
+  return ESP_OK;
+}
+
+void pmGpioWakeDisable(int pin) {
+  gpio_wakeup_disable((gpio_num_t)pin);
+  /* We do not turn off the global esp_sleep_enable_gpio_wakeup() — other
+   * pins may still rely on it, and it's a no-op for unconfigured pins. */
+}
 
 void pmRecordDeepSleep(int64_t durationUs) {
   rtcDeepSleepCount++;
