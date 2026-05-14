@@ -27,8 +27,10 @@ endif()
 #
 # Builds a LittleFS factory image for <partition_name> by merging:
 #   1. diptych-core's static factory_state/ defaults
-#   2. diptych-core's generated defaults (timezone JSON via update-zones.py)
-#   3. the consumer's own data/ (or DATA_DIR if specified) — wins on collisions
+#   2. the consumer's own data/ (or DATA_DIR if specified) — wins on collisions.
+#      Consumers ship their own checked-in `factory_state/storage/external/s.time.zones.json`;
+#      regenerate it with the platform-provided script (see scripts/update-zones.py
+#      and the consumer's `make timezones` target).
 #
 # Calls `littlefs_create_partition_image(... FLASH_IN_PROJECT)` so the image
 # is bundled into `idf.py flash`.
@@ -46,12 +48,10 @@ function(diptych_create_factory_image partition_name)
     add_custom_target(diptych_data_merge ALL
         COMMAND ${CMAKE_COMMAND} -E rm -rf "${_data_merged}"
         COMMAND ${CMAKE_COMMAND} -E make_directory "${_data_merged}"
-        # 1. Diptych static defaults (factory_state/{boot,crontab,net_up}, ...)
+        # 1. Diptych static defaults (factory_state/{boot,crontab,net_up,
+        #    storage/external/s.time.zones.json, ...})
         COMMAND ${CMAKE_COMMAND} -E copy_directory "${_diptych_data}" "${_data_merged}"
-        # 2. Diptych generated defaults (timezone JSON; ETag-cached in build/)
-        COMMAND python3 "${_diptych_core_dir}/scripts/update-zones.py"
-                        "${_data_merged}" --cache-dir "${CMAKE_BINARY_DIR}"
-        # 3. Consumer overrides (whole-file replacement on collision)
+        # 2. Consumer overrides (whole-file replacement on collision)
         COMMAND ${CMAKE_COMMAND} -E copy_directory "${_consumer_data}" "${_data_merged}"
         # macOS sprinkles .DS_Store everywhere; never want them in flash.
         COMMAND find "${_data_merged}" -name .DS_Store -delete

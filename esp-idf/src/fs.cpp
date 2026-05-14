@@ -30,6 +30,11 @@
 #include "ff.h"
 #include "sdmmc_cmd.h"
 #include "driver/sdmmc_host.h"
+#if CONFIG_DIPTYCH_SDCARD_BUS_SPI
+#include "driver/sdspi_host.h"
+#include "driver/spi_master.h"
+#include "spi_helper.h"
+#endif
 
 /* ---- Handle table ---- */
 
@@ -647,6 +652,21 @@ bool fs_mount_sd(void) {
 #else
     if (sdReady) return true;  /* one-shot — subsequent calls are no-ops */
 
+    esp_vfs_fat_sdmmc_mount_config_t mount_config = {};
+    mount_config.format_if_mount_failed = false;
+    mount_config.max_files = 10;
+    mount_config.allocation_unit_size = 16 * 1024;
+
+    /* Silence IDF's sdmmc/vfs chatter — empty slot or slow first probe both
+     * splatter "send_op_cond" / "init failed" lines. We collapse to one warn
+     * after both attempts fail. */
+    esp_log_level_set("sdmmc_common",  ESP_LOG_NONE);
+    esp_log_level_set("sdmmc_sd",      ESP_LOG_NONE);
+    esp_log_level_set("vfs_fat_sdmmc", ESP_LOG_NONE);
+
+    esp_err_t ret;
+
+#if CONFIG_DIPTYCH_SDCARD_BUS_SDMMC
     sdmmc_host_t host = SDMMC_HOST_DEFAULT();
 #if CONFIG_DIPTYCH_SDCARD_4BIT
     host.flags = SDMMC_HOST_FLAG_4BIT;
@@ -671,19 +691,41 @@ bool fs_mount_sd(void) {
 #endif
     slot.flags |= SDMMC_SLOT_FLAG_INTERNAL_PULLUP;
 
-    esp_vfs_fat_sdmmc_mount_config_t mount_config = {};
-    mount_config.format_if_mount_failed = false;
-    mount_config.max_files = 10;
-    mount_config.allocation_unit_size = 16 * 1024;
+    ret = esp_vfs_fat_sdmmc_mount(FS_SDCARD, &host, &slot, &mount_config, &sdCard);
 
-    /* Silence IDF's sdmmc/vfs chatter — empty slot or slow first probe both
-     * splatter "send_op_cond" / "init failed" lines. We collapse to one warn
-     * after both attempts fail. */
-    esp_log_level_set("sdmmc_common",  ESP_LOG_NONE);
-    esp_log_level_set("sdmmc_sd",      ESP_LOG_NONE);
-    esp_log_level_set("vfs_fat_sdmmc", ESP_LOG_NONE);
+#elif CONFIG_DIPTYCH_SDCARD_BUS_SPI
+    /* Bring up the shared SPI bus (idempotent — LoRa, display etc.
+     * may have got here first). */
+    spi_bus_config_t bus = {};
+    bus.sclk_io_num     = CONFIG_DIPTYCH_SDCARD_SPI_PIN_SCK;
+    bus.mosi_io_num     = CONFIG_DIPTYCH_SDCARD_SPI_PIN_MOSI;
+    bus.miso_io_num     = CONFIG_DIPTYCH_SDCARD_SPI_PIN_MISO;
+    bus.quadwp_io_num   = -1;
+    bus.quadhd_io_num   = -1;
+    bus.max_transfer_sz = 4096;
+    spi_host_device_t host_id = (spi_host_device_t)CONFIG_DIPTYCH_SDCARD_SPI_HOST;
+    esp_err_t br = spiHelperInitBus(host_id, &bus);
+    if (br != ESP_OK) {
+        warn("SD: SPI bus init failed: %s\n", esp_err_to_name(br));
+        esp_log_level_set("sdmmc_common",  ESP_LOG_WARN);
+        esp_log_level_set("sdmmc_sd",      ESP_LOG_WARN);
+        esp_log_level_set("vfs_fat_sdmmc", ESP_LOG_WARN);
+        return false;
+    }
 
-    esp_err_t ret = esp_vfs_fat_sdmmc_mount(FS_SDCARD, &host, &slot, &mount_config, &sdCard);
+    sdmmc_host_t host = SDSPI_HOST_DEFAULT();
+    host.slot = host_id;
+    host.max_freq_khz = CONFIG_DIPTYCH_SDCARD_SPI_FREQ_KHZ;
+
+    sdspi_device_config_t dev = SDSPI_DEVICE_CONFIG_DEFAULT();
+    dev.host_id = host_id;
+    dev.gpio_cs = (gpio_num_t)CONFIG_DIPTYCH_SDCARD_SPI_PIN_CS;
+
+    ret = esp_vfs_fat_sdspi_mount(FS_SDCARD, &host, &dev, &mount_config, &sdCard);
+#else
+#error "DIPTYCH_SDCARD enabled but no bus type selected (SDMMC or SPI)"
+#endif
+
     /* Restore IDF log defaults — real I/O errors should be visible from now on. */
     esp_log_level_set("sdmmc_common",  ESP_LOG_WARN);
     esp_log_level_set("sdmmc_sd",      ESP_LOG_WARN);

@@ -22,29 +22,47 @@ config DIPTYCH_BANNER
         identifying name. Editable at runtime via `set s.sys.banner ...`.
 
 config DIPTYCH_SDCARD
-    bool "Mount SD card on boot (SDMMC)"
+    bool "Mount SD card on boot"
     default n
     help
         When enabled, diptychInit() calls fs_mount_sd(). Required for any
         module that writes to /sdcard (recordings, log files on SD, etc.).
-        Pin numbers and bus width are board-specific — set them in your
-        project's sdkconfig.defaults.
+        Pick the bus type below; pins are board-specific — set them in
+        your project's sdkconfig.defaults.
+
+choice DIPTYCH_SDCARD_BUS
+    prompt "SD card bus"
+    depends on DIPTYCH_SDCARD
+    default DIPTYCH_SDCARD_BUS_SDMMC
+    help
+        SDMMC uses the ESP32-S3's dedicated SDIO peripheral (faster,
+        dedicated pins). SPI uses the shared SPI bus via spi_helper —
+        right choice for boards like T-Deck Plus where the SD slot
+        shares SCK/MOSI/MISO with display + LoRa.
+
+    config DIPTYCH_SDCARD_BUS_SDMMC
+        bool "SDMMC (dedicated SDIO peripheral)"
+    config DIPTYCH_SDCARD_BUS_SPI
+        bool "SPI (shared SPI bus via spi_helper)"
+endchoice
+
+# ── SDMMC variant pins ──
 
 config DIPTYCH_SDCARD_PIN_CLK
     int "SDMMC CLK pin"
-    depends on DIPTYCH_SDCARD
+    depends on DIPTYCH_SDCARD_BUS_SDMMC
 
 config DIPTYCH_SDCARD_PIN_CMD
     int "SDMMC CMD pin"
-    depends on DIPTYCH_SDCARD
+    depends on DIPTYCH_SDCARD_BUS_SDMMC
 
 config DIPTYCH_SDCARD_PIN_D0
     int "SDMMC D0 pin"
-    depends on DIPTYCH_SDCARD
+    depends on DIPTYCH_SDCARD_BUS_SDMMC
 
 config DIPTYCH_SDCARD_4BIT
     bool "4-bit SDMMC bus (D0..D3 wired)"
-    depends on DIPTYCH_SDCARD
+    depends on DIPTYCH_SDCARD_BUS_SDMMC
     default n
     help
         Enable when the board has all four data lines (D0..D3) routed.
@@ -63,6 +81,44 @@ config DIPTYCH_SDCARD_PIN_D2
 config DIPTYCH_SDCARD_PIN_D3
     int "SDMMC D3 pin"
     depends on DIPTYCH_SDCARD_4BIT
+
+# ── SPI variant pins ──
+
+config DIPTYCH_SDCARD_SPI_HOST
+    int "SPI host (2 = SPI2/FSPI, 3 = SPI3/HSPI)"
+    depends on DIPTYCH_SDCARD_BUS_SPI
+    range 2 3
+    default 2
+    help
+        Which SPI peripheral the SD card sits on. Must match the host
+        any other driver on the same bus (e.g. the LoRa transport in
+        reticulous) initialises via spi_helper.
+
+config DIPTYCH_SDCARD_SPI_PIN_CS
+    int "SPI SD CS pin"
+    depends on DIPTYCH_SDCARD_BUS_SPI
+
+config DIPTYCH_SDCARD_SPI_PIN_SCK
+    int "SPI SCK pin (shared bus)"
+    depends on DIPTYCH_SDCARD_BUS_SPI
+
+config DIPTYCH_SDCARD_SPI_PIN_MOSI
+    int "SPI MOSI pin (shared bus)"
+    depends on DIPTYCH_SDCARD_BUS_SPI
+
+config DIPTYCH_SDCARD_SPI_PIN_MISO
+    int "SPI MISO pin (shared bus)"
+    depends on DIPTYCH_SDCARD_BUS_SPI
+
+config DIPTYCH_SDCARD_SPI_FREQ_KHZ
+    int "SPI SD clock (kHz)"
+    depends on DIPTYCH_SDCARD_BUS_SPI
+    range 400 40000
+    default 20000
+    help
+        Bus clock used after card init. SD spec allows up to 25 MHz in
+        SPI mode; many cards happily run at 40 MHz with short wiring,
+        but 20 MHz is a safe default on shared-bus boards.
 
 config DIPTYCH_OTA
     bool "OTA (signed-manifest over-the-air updates)"
