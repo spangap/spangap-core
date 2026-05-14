@@ -733,11 +733,17 @@ static void cliInitSlot(cli_slot_t& cl, int slot) {
   } else
     cliApplyStartDir(cl);
 
-  /* Send initial prompt for ANSI clients (non-serial) */
+  /* Send initial prompt for ANSI clients (non-serial) and for TCP LINE
+   * clients (so a scripted nc client can read-until-prompt rather than
+   * relying on timeouts). */
   if (cl.mode == CLI_ANSI && !cl.usbSerial) {
     cliActiveSlot = slot;
     itsCliWrite("$ ", 2);
     itsCliWrite("\033[0 q", 5);
+    cliActiveSlot = -1;
+  } else if (cl.mode == CLI_LINE && !cl.usbSerial) {
+    cliActiveSlot = slot;
+    itsCliWrite("$ ", 2);
     cliActiveSlot = -1;
   }
 }
@@ -855,6 +861,7 @@ static void cliTaskFn(void* arg) {
               cliProcess(cl.lineBuf);
             }
             cl.lineLen = 0;
+            itsCliWrite("$ ", 2);
           } else if (cl.lineLen < (int)sizeof(cl.lineBuf) - 1) {
             cl.lineBuf[cl.lineLen++] = c;
           }
