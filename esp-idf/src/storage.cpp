@@ -87,7 +87,16 @@ static bool isAllDigits(const char* s, size_t len) {
   return true;
 }
 
-/** Navigate a cJSON tree by dot-path. Returns the node or NULL. */
+/** Navigate a cJSON tree by dot-path. Returns the node or NULL.
+ *
+ *  Segment buffer is sized to 96 chars to accommodate SHA-256 hex segments
+ *  (64 chars) that lxmf uses for inbound-message keys, e.g.
+ *  `s.lxmf.id.0.msgs.<64-hex>.<field>`. The previous 48-byte cap silently
+ *  rejected writes with longer segments — storageSet returned without
+ *  setting anything, and inbound LXMs never persisted. Outbound keys (mids
+ *  like `o_<ts>_<id>`) escaped notice because they're short. Subscriber
+ *  notification keys are already 128 bytes (see diptych-core CLAUDE.md);
+ *  this aligns the path parser with that. */
 static cJSON* navigatePath(cJSON* root, const char* dotPath) {
   if (!root || !dotPath || !*dotPath) return nullptr;
   cJSON* node = root;
@@ -96,8 +105,15 @@ static cJSON* navigatePath(cJSON* root, const char* dotPath) {
     const char* dot = strchr(p, '.');
     size_t segLen = dot ? (size_t)(dot - p) : strlen(p);
     if (segLen == 0) { p = dot + 1; continue; }
-    char seg[48];
-    if (segLen >= sizeof(seg)) return nullptr;
+    char seg[96];
+    if (segLen >= sizeof(seg)) {
+      /* Used to silently fail and burn cycles in callers (lxmf's inbound
+       * msg persistence depended on 64-char SHA-256 hex segments). If you
+       * see this warn, bump seg[] and the matching leaf[] buffers above. */
+      warn("storage: segment too long in key '%s' (%zu B, max %zu)",
+           dotPath, segLen, sizeof(seg) - 1);
+      return nullptr;
+    }
     memcpy(seg, p, segLen);
     seg[segLen] = '\0';
 
@@ -122,8 +138,12 @@ static cJSON* navigateOrCreate(cJSON* root, const char* dotPath,
     const char* dot = strchr(p, '.');
     size_t segLen = dot ? (size_t)(dot - p) : strlen(p);
     if (segLen == 0) { p = dot + 1; continue; }
-    char seg[48];
-    if (segLen >= sizeof(seg)) return nullptr;
+    char seg[96];  /* see navigatePath: SHA-256 hex segments are 64 chars */
+    if (segLen >= sizeof(seg)) {
+      warn("storage: segment too long in key '%s' (%zu B, max %zu)",
+           dotPath, segLen, sizeof(seg) - 1);
+      return nullptr;
+    }
     memcpy(seg, p, segLen);
     seg[segLen] = '\0';
 
@@ -361,13 +381,18 @@ static cJSON* navigateLeaf(cJSON* root, const char* dotPath,
   for (;;) {
     const char* dot = strchr(p, '.');
     size_t segLen = dot ? (size_t)(dot - p) : strlen(p);
-    if (segLen == 0 || segLen >= 48) return nullptr;
+    if (segLen == 0) return nullptr;
+    if (segLen >= 96) {
+      warn("storage: segment too long in key '%s' (%zu B, max 95)",
+           dotPath, segLen);
+      return nullptr;
+    }
     if (!dot) {
       memcpy(outLeaf, p, segLen);
       outLeaf[segLen] = '\0';
       return node;
     }
-    char seg[48];
+    char seg[96];  /* see navigatePath */
     memcpy(seg, p, segLen);
     seg[segLen] = '\0';
     node = cJSON_GetObjectItem(node, seg);
@@ -383,7 +408,7 @@ static void withExternalsDetached(std::function<void()> fn) {
   struct save_t { cJSON* parent; std::string leaf; cJSON* item; };
   std::vector<save_t> saved;
   for (auto& ext : externals) {
-    char leaf[48];
+    char leaf[96];  /* see navigatePath */
     cJSON* parent = navigateLeaf(cfgRoot, ext.prefix.c_str(), leaf, sizeof(leaf));
     if (!parent) continue;
     cJSON* item = cJSON_DetachItemFromObject(parent, leaf);
@@ -701,7 +726,7 @@ static void jsonDeepMerge(cJSON* dst, const cJSON* src) {
  *  that path. Takes ownership of `subtree`. */
 static void attachAtPath(const char* dotPath, cJSON* subtree) {
   if (!subtree) return;
-  char leaf[48];
+  char leaf[96];  /* see navigatePath */
   cJSON* parent = navigateOrCreate(cfgRoot, dotPath, leaf, sizeof(leaf));
   if (!parent) { cJSON_Delete(subtree); return; }
   cJSON_DeleteItemFromObject(parent, leaf);
@@ -851,7 +876,7 @@ void storageSet(const char* key, const char* val) {
   bool autoCommit = (txDepth == 0);
   if (autoCommit) storageBegin();
 
-  char leaf[48];
+  char leaf[96];  /* see navigatePath */
   cJSON* parent = navigateOrCreate(txPatch, key, leaf, sizeof(leaf));
   if (parent) {
     cJSON_DeleteItemFromObject(parent, leaf);
@@ -951,7 +976,7 @@ void storageUnset(const char* key) {
   bool autoCommit = (txDepth == 0);
   if (autoCommit) storageBegin();
 
-  char leaf[48];
+  char leaf[96];  /* see navigatePath */
   cJSON* parent = navigateOrCreate(txPatch, key, leaf, sizeof(leaf));
   if (parent) {
     cJSON_DeleteItemFromObject(parent, leaf);
@@ -968,7 +993,7 @@ void storageSetTree(const char* key, cJSON* val) {
   bool autoCommit = (txDepth == 0);
   if (autoCommit) storageBegin();
 
-  char leaf[48];
+  char leaf[96];  /* see navigatePath */
   cJSON* parent = navigateOrCreate(txPatch, key, leaf, sizeof(leaf));
   if (parent) {
     cJSON_DeleteItemFromObject(parent, leaf);
@@ -984,7 +1009,7 @@ void storageSetTree(const char* key, cJSON* val) {
 /** Build nested JSON with a null at the given dot-path. */
 static cJSON* buildNullJson(const char* dotPath) {
   cJSON* root = cJSON_CreateObject();
-  char leaf[48];
+  char leaf[96];  /* see navigatePath */
   cJSON* parent = navigateOrCreate(root, dotPath, leaf, sizeof(leaf));
   if (parent)
     cJSON_AddNullToObject(parent, leaf);
@@ -1114,7 +1139,7 @@ void storageCopyNoNotify(const char* srcPrefix, const char* dstPrefix, bool only
 
   /* Build a wrapper so deepMerge places the clone at the right path */
   cJSON* wrapper = cJSON_CreateObject();
-  char leaf[48];
+  char leaf[96];  /* see navigatePath */
   cJSON* parent = navigateOrCreate(wrapper, dst.c_str(), leaf, sizeof(leaf));
   if (parent) {
     cJSON_AddItemToObject(parent, leaf, clone);
@@ -1187,7 +1212,10 @@ static void cmdSet(const char* a) {
     if (strcmp(a, "help") == 0) { cliPrintf("  %-*s set config variable\n", CLI_HELP_COL, "set <key>=<value>"); return; }
     const char* eq = strchr(a, '=');
     if (!eq || eq == a) { cliPrintf("usage: set <key>=<value>\n"); return; }
-    char key[48];
+    /* Match storage's full-key capacity (storage_change_msg_t::key is 128B).
+     * Used to be 48 — small enough that `set s.lxmf.id.0.msgs.<64-hex>.<field>=…`
+     * was rejected at the CLI before storageSet ever ran. */
+    char key[128];
     size_t klen = eq - a;
     while (klen > 0 && a[klen - 1] == ' ') klen--;
     if (klen == 0 || klen >= sizeof(key)) { cliPrintf("err: key empty or too long\n"); return; }
@@ -1235,7 +1263,9 @@ static void cmdShow(const char* a) {
     bool found = false;
     const char* lastDot = strrchr(a, '.');
     if (lastDot) {
-        char parentPath[64];
+        /* Match storage's full-key capacity. Was 64 — too small for paths
+         * with 64-char SHA-256 hex segments. */
+        char parentPath[128];
         size_t parentLen = lastDot - a;
         if (parentLen >= sizeof(parentPath)) { CFG_UNLOCK(); cliPrintf("  (prefix too long)\n"); return; }
         memcpy(parentPath, a, parentLen);
@@ -1247,7 +1277,10 @@ static void cmdShow(const char* a) {
             cJSON* item;
             cJSON_ArrayForEach(item, parent) {
                 if (item->string && strncmp(item->string, partial, partialLen) == 0) {
-                    char key[128];
+                    /* parentPath up to 127 chars + '.' + item->string. cJSON
+                     * string keys are bounded by what we've stored (≤ 95
+                     * per the navigatePath limit), so 256 is comfortable. */
+                    char key[256];
                     snprintf(key, sizeof(key), "%s.%s", parentPath, item->string);
                     if (cJSON_IsObject(item) || cJSON_IsArray(item))
                         walkTreePrint(item, key, write);
@@ -1338,7 +1371,7 @@ static void dcAccumulateChange(const char* key, const char* val) {
 
     if (!dcPendingPatch) dcPendingPatch = cJSON_CreateObject();
 
-    char leaf[48];
+    char leaf[96];  /* see navigatePath */
     cJSON* parent = navigateOrCreate(dcPendingPatch, key, leaf, sizeof(leaf));
     if (!parent) { CFG_UNLOCK(); return; }
 
