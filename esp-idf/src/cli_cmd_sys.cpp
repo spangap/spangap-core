@@ -1,16 +1,17 @@
-/** CLI commands: reboot, reset, sleep, run, its. */
+/** CLI commands: reboot, reset, format, sleep, run, its. */
 #include "cli.h"
 #include "storage.h"
 #include "pm.h"
 #include "log.h"
 #include "its.h"
-#include "esp_littlefs.h"
+#include "fs.h"
 
 #include "compat.h"
 #include <cstring>
 #include <cstdio>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/semphr.h"
 
 static void cmdReboot(const char* a) {
     if (strcmp(a, "help") == 0) { cliPrintf("  %-*s restart device\n", CLI_HELP_COL, "reboot"); return; }
@@ -21,19 +22,77 @@ static void cmdReboot(const char* a) {
     esp_restart();
 }
 
+/* All three tasks run on a DRAM stack — esp_littlefs_format disables the
+ * PSRAM cache during SPI-flash writes; SD format serializes DMA likewise. */
+
 static void resetFactoryTask(void*) {
-    /* DRAM stack required: esp_littlefs_format disables the PSRAM cache
-     * during SPI-flash writes. SD card is left intact (recordings preserved). */
-    esp_littlefs_format("state");
+    fsFormatFlash();           /* format flash; on reboot it repopulates */
     delay(100);
     esp_restart();
 }
 
 static void cmdResetFactory(const char* a) {
-    if (strcmp(a, "help") == 0) { cliPrintf("  %-*s factory reset: format /state, reboot (SD preserved)\n", CLI_HELP_COL, "reset factory"); return; }
-    cliPrintf("factory reset: formatting /state, rebooting (SD preserved)...\n");
+    if (strcmp(a, "help") == 0) { cliPrintf("  %-*s factory reset: format flash state, reboot\n", CLI_HELP_COL, "reset factory"); return; }
+    if (fsStateOnSd()) {
+        cliPrintf("You've booted with an SDcard present: 'reset factory' is "
+                  "only for wiping all user state in device flash. Boot "
+                  "without SDcard and try again if that is what you want. To "
+                  "delete all user information on an sdcard, type:\n\n");
+        cliPrintf("format sd; mkdir /sdcard/state; reboot\n");
+        return;
+    }
+    cliPrintf("factory reset: formatting flash state, rebooting...\n");
     fflush(stdout);
     spawnTask(resetFactoryTask, "rfact", 3072, nullptr, 1, 0, STACK_DRAM);
+}
+
+/* format flash/sd run on a DRAM-stack worker (esp_littlefs_format disables
+ * the PSRAM cache; the CLI task is PSRAM-stacked) but the CLI command must
+ * BLOCK until the worker finishes — otherwise a scripted one-liner like
+ * `format sd; mkdir /sdcard/state; reboot` races the format. The worker
+ * signals `done`, stores `ok`, then self-terminates (a task must not
+ * return); the CLI takes the semaphore before continuing. */
+struct FmtCtx { SemaphoreHandle_t done; bool ok; };
+
+static void formatFlashWorker(void* arg) {
+    auto* c = (FmtCtx*)arg;
+    fsFormatFlash();
+    c->ok = true;
+    xSemaphoreGive(c->done);
+    killSelf();
+}
+
+static void formatSdWorker(void* arg) {
+    auto* c = (FmtCtx*)arg;
+    c->ok = fsFormatSd();
+    xSemaphoreGive(c->done);
+    killSelf();
+}
+
+static bool runFmtWorker(TaskFunction_t fn, const char* name) {
+    FmtCtx c{ xSemaphoreCreateBinary(), false };
+    if (!c.done) { cliPrintf("(out of memory)\n"); return false; }
+    spawnTask(fn, name, 3072, &c, 1, 0, STACK_DRAM);
+    xSemaphoreTake(c.done, portMAX_DELAY);
+    vSemaphoreDelete(c.done);
+    return c.ok;
+}
+
+static void cmdFormatFlash(const char* a) {
+    if (strcmp(a, "help") == 0) { cliPrintf("  %-*s unmount, format, remount the flash state partition\n", CLI_HELP_COL, "format flash"); return; }
+    cliPrintf("formatting flash state partition...\n");
+    fflush(stdout);
+    runFmtWorker(formatFlashWorker, "ffmt");
+    cliPrintf("format flash: done\n");
+}
+
+static void cmdFormatSd(const char* a) {
+    if (strcmp(a, "help") == 0) { cliPrintf("  %-*s reformat the SD card (FAT), kept mounted at /sdcard\n", CLI_HELP_COL, "format sd"); return; }
+    if (!sdAvailable()) { cliPrintf("format sd: no SD card mounted\n"); return; }
+    cliPrintf("formatting SD card...\n");
+    fflush(stdout);
+    bool ok = runFmtWorker(formatSdWorker, "sdfmt");
+    cliPrintf("format sd: %s\n", ok ? "done" : "failed");
 }
 
 static void cmdSleep(const char* a) {
@@ -59,6 +118,8 @@ static void cmdIts(const char* a) {
 void cliCmdSysInit() {
     cliRegisterCmd("reboot", cmdReboot);
     cliRegisterCmd("reset factory", cmdResetFactory);
+    cliRegisterCmd("format flash", cmdFormatFlash);
+    cliRegisterCmd("format sd", cmdFormatSd);
     cliRegisterCmd("sleep", cmdSleep);
     cliRegisterCmd("run", cmdRun);
     cliRegisterCmd("its", cmdIts);

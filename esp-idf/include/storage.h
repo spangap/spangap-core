@@ -10,7 +10,8 @@
  * storageSet() is auto-commit (one patch per call). Reads within a
  * transaction see their own writes.
  *
- * Keys starting with "s." are persisted to /state/settings.json.
+ * Keys starting with "s." are persisted to <stateDir>/storage/root.json
+ * (or a per-prefix blob under <stateDir>/storage/external/ if registered).
  * Keys starting with "secrets." are persisted but never sent to the browser.
  * All other keys are ephemeral (in-memory only, lost on reboot).
  *

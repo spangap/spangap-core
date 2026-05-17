@@ -13,6 +13,7 @@
 #include <cstdio>
 #include <cstring>
 #include <cstdlib>
+#include <string>
 #include <dirent.h>
 #include <errno.h>
 #include <unistd.h>
@@ -112,6 +113,38 @@ static bool needsProxy(const char*) {
 static volatile bool sdReady = false;
 bool sdAvailable() { return sdReady; }
 
+/* Where the active state store lives this boot. There is NO path rewriting:
+ * "/state" is *always* the on-flash partition (always mounted), and
+ * "/sdcard/state" is always the SD directory. This single string just says
+ * which one is active — set once at fs_init() and never changed. Every
+ * consumer of the state store builds its paths from fsStateDir(); nothing
+ * hard-codes FS_STATE for that purpose. Static and unambiguous: the path
+ * you see is the path that's used. */
+static char s_stateDir[24] = FS_STATE;          /* "/state" | "/sdcard/state" */
+const char* fsStateDir() { return s_stateDir; }
+
+/* Convenience: fsStateDir() + sub (sub must start with '/'). */
+std::string fsStatePath(const char* sub) {
+    return std::string(s_stateDir) + sub;
+}
+
+/* Derived, non-authoritative: the active state store is the SD one. Kept
+ * for callers that need the predicate (e.g. the `reset factory` guard);
+ * the string above is the single source of truth. */
+bool fsStateOnSd() { return strcmp(s_stateDir, FS_STATE) != 0; }
+
+/* Register the on-flash `state` LittleFS partition at /state (format on
+ * mount failure, matching the FS_MOUNTS table entry). It is ALWAYS mounted,
+ * regardless of where the active state store is. Shared by fs_init() and
+ * fsFormatFlash(). */
+static esp_err_t mountStateLittlefs() {
+    esp_vfs_littlefs_conf_t conf = {};
+    conf.base_path = FS_STATE;
+    conf.partition_label = "state";
+    conf.format_if_mount_failed = true;
+    return esp_vfs_littlefs_register(&conf);
+}
+
 static bool needsProxyHandle(int f) {
     if (f < 0 || f >= MAX_FILE_SLOTS || !fileSlots[f].active) return false;
     return fsWorkerHandle != nullptr;
@@ -143,6 +176,8 @@ struct fs_op_t {
 static SemaphoreHandle_t fsReady = nullptr;
 
 static void handleOp(fs_op_t* req) {
+    /* No path rewriting: "/state" and "/sdcard/state" are both real, always-
+     * mounted locations. Callers already pass whichever one is active. */
     switch (req->op) {
     case fs_op_t::OPEN: {
         FILE* fp = fopen(req->path, req->path2);
@@ -641,14 +676,14 @@ static void copyTree(const char* src, const char* dst, bool topLevel) {
 static void applyAdditionalState() {
     if (opendir(FS_FIXED "/additional_state") == nullptr) return;
     printf("applying additional_state overlay\n");
-    copyTree(FS_FIXED "/additional_state", FS_STATE, true);
+    copyTree(FS_FIXED "/additional_state", fsStateDir(), true);
 }
 
 void fs_factory_reset() {
     DIR* probe = opendir(FS_FIXED "/factory_state");
     if (!probe) { printf("factory_state dir not found\n"); return; }
     closedir(probe);
-    copyTree(FS_FIXED "/factory_state", FS_STATE, false);
+    copyTree(FS_FIXED "/factory_state", fsStateDir(), false);
 }
 
 /* ---- Optional SD card mount (FAT on SDMMC slot) ----
@@ -780,6 +815,68 @@ bool fs_mount_sd(void) {
 #endif  /* CONFIG_DIPTYCH_SDCARD */
 }
 
+/* Unmount, reformat, and remount the on-flash `state` partition. /state is
+ * always mounted (even when the active state store is the SD one), so this
+ * always unmounts and remounts it. Must run on a DRAM stack —
+ * esp_littlefs_format disables the PSRAM cache during SPI-flash writes.
+ * Disruptive: callers either reboot right after (factory reset) or accept
+ * that /state is briefly empty. */
+void fsFormatFlash(void) {
+    esp_vfs_littlefs_unregister("state");
+    esp_littlefs_format("state");
+    if (mountStateLittlefs() != ESP_OK)
+        printf("remount " FS_STATE " after format failed\n");
+}
+
+/* Reformat the SD card in place (FAT). The card stays mounted at /sdcard.
+ * Returns false if no card is mounted or SD support is compiled out. */
+bool fsFormatSd(void) {
+#if !CONFIG_DIPTYCH_SDCARD
+    return false;
+#else
+    if (!sdReady || !sdCard) return false;
+    esp_err_t e = esp_vfs_fat_sdcard_format(FS_SDCARD, sdCard);
+    if (e != ESP_OK) { printf("SD format failed: %s\n", esp_err_to_name(e)); return false; }
+    return true;
+#endif
+}
+
+/* Choose the active state store for this boot and seed it on first boot.
+ * Call ONCE from diptychInit(), AFTER fs_mount_sd() and BEFORE storageLoad():
+ *   - if the SD mounted and /sdcard/state is a directory, that becomes the
+ *     active store; otherwise it stays the on-flash /state;
+ *   - if the chosen store is empty (fresh flash, or a freshly `mkdir`'d
+ *     /sdcard/state), copy factory defaults + additional_state into it.
+ * /state (flash) is always mounted regardless; this never rewrites paths. */
+void fsSelectStateStore(void) {
+    struct stat st;
+    if (sdAvailable() && stat(FS_SDCARD "/state", &st) == 0 && S_ISDIR(st.st_mode))
+        safeStrncpy(s_stateDir, FS_SDCARD "/state", sizeof(s_stateDir));
+    printf("state: active store is %s (flash %s always mounted)\n",
+           fsStateDir(), FS_STATE);
+
+    /* First boot: the active store has no non-dot entries. We can't probe a
+     * specific file (settings.json may legitimately not exist now that all
+     * defaults self-install), so check for any real entry. */
+    DIR* d = opendir(fsStateDir());
+    bool empty = true;
+    if (d) {
+        struct dirent* ent;
+        while ((ent = readdir(d)) != nullptr) {
+            if (ent->d_name[0] == '.') continue;
+            empty = false;
+            break;
+        }
+        closedir(d);
+    }
+    if (empty) {
+        printf("first boot: copying factory defaults to %s\n", fsStateDir());
+        firstBoot = true;
+        fs_factory_reset();
+        applyAdditionalState();
+    }
+}
+
 void fs_init() {
     /* NVS flash — ESP-IDF internals only (WiFi cal, PHY data) */
     esp_err_t err = nvs_flash_init();
@@ -799,7 +896,9 @@ void fs_init() {
         safeStrncpy(fixedLabel, lbl, sizeof(fixedLabel));
     }
 
-    /* Mount LittleFS partitions from table */
+    /* Mount all LittleFS partitions from the table, INCLUDING `state`.
+     * /state is the on-flash partition and is always mounted, regardless of
+     * where the active state store ends up. */
     for (int i = 0; i < FS_MOUNT_COUNT; i++) {
         auto& m = FS_MOUNTS[i];
         esp_vfs_littlefs_conf_t conf = {};
@@ -810,29 +909,11 @@ void fs_init() {
             printf("mount %s failed\n", m.path);
     }
 
-    /* First boot: /state is empty (just-formatted partition). Trigger factory
-     * copy. We can't probe a specific file (settings.json may legitimately
-     * not exist now that all defaults self-install), so check whether the
-     * directory has any non-dot entries. */
-    {
-        DIR* d = opendir(FS_STATE);
-        bool empty = true;
-        if (d) {
-            struct dirent* ent;
-            while ((ent = readdir(d)) != nullptr) {
-                if (ent->d_name[0] == '.') continue;
-                empty = false;
-                break;
-            }
-            closedir(d);
-        }
-        if (empty) {
-            printf("first boot: copying factory defaults to " FS_STATE "\n");
-            firstBoot = true;
-            fs_factory_reset();
-            applyAdditionalState();
-        }
-    }
+    /* SD probe + active-state-store selection + first-boot factory copy do
+     * NOT happen here. They run in fsSelectStateStore(), called from
+     * diptychInit() AFTER fs_mount_sd() — mounting the SD that early (before
+     * the bus/card is reliably ready) failed and poisoned the later retry.
+     * fs_init() only brings up LittleFS + the workers. */
 
     /* Start DRAM-stack workers:
      *   fs      — POSIX aux ops (fopen/fread/fwrite-by-handle, stat, …)

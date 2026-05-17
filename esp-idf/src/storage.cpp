@@ -45,7 +45,7 @@
  * /state/storage/<mode>/<key.path>.json holds a sub-tree at the given prefix.
  * The first-level subdir under /state/storage/ is the "mode" — only "external"
  * is used today (own file, lives in cfgRoot at runtime, saved to its own file
- * instead of settings.json). New modes (e.g. "flash-only") can be added later
+ * instead of in root.json). New modes (e.g. "flash-only") can be added later
  * by handling more subdirs in scanExternals(). Drop a file in the build tree
  * and it just appears — no compile-time registration. */
 struct external_t {
@@ -54,7 +54,7 @@ struct external_t {
   bool        dirty;    /* sub-tree at prefix changed since last flush */
 };
 static std::vector<external_t> externals;
-static bool rootDirty = false;        /* settings.json needs rewrite */
+static bool rootDirty = false;        /* root.json needs rewrite */
 
 /* ---- Config tree state ---- */
 
@@ -402,7 +402,7 @@ static cJSON* navigateLeaf(cJSON* root, const char* dotPath,
 }
 
 /** Detach all external sub-trees from cfgRoot, run `fn`, then reattach.
- *  Used so cJSON_Print of cfgRoot omits external blobs from settings.json
+ *  Used so cJSON_Print of cfgRoot omits external blobs from root.json
  *  without copying the whole tree. Caller holds CFG_LOCK. */
 static void withExternalsDetached(std::function<void()> fn) {
   struct save_t { cJSON* parent; std::string leaf; cJSON* item; };
@@ -432,7 +432,12 @@ static void writeExternalFile(const external_t& ext) {
   cJSON_free(text);
 }
 
-/** Write settings.json (cfgRoot minus external sub-trees). */
+/* The non-external config tree lives at <stateDir>/storage/root.json,
+ * alongside the per-prefix blobs in <stateDir>/storage/external/ — so
+ * everything persisted is under storage/. */
+#define ROOT_JSON_PATH "/storage/root.json"
+
+/** Write root.json (cfgRoot minus external sub-trees). */
 static void writeSettingsFileOnly() {
   CFG_LOCK();
   char* text = nullptr;
@@ -447,7 +452,7 @@ static void writeSettingsFileOnly() {
   });
   CFG_UNLOCK();
   if (!text) return;
-  atomicWriteJson(FS_STATE "/settings.json", text);
+  atomicWriteJson(fsStatePath(ROOT_JSON_PATH).c_str(), text);
   cJSON_free(text);
 }
 
@@ -741,7 +746,7 @@ static void scanExternals() {
   const char* modes[] = { "external" };
   for (const char* mode : modes) {
     char dirPath[64];
-    snprintf(dirPath, sizeof(dirPath), FS_STATE "/storage/%s", mode);
+    snprintf(dirPath, sizeof(dirPath), "%s/storage/%s", fsStateDir(), mode);
     int dh = fs_opendir(dirPath);
     if (dh < 0) continue;
     fs_dirent_t ent;
@@ -779,8 +784,13 @@ void storageLoad() {
   if (!cfgMux) cfgMux = xSemaphoreCreateRecursiveMutex();
   if (cfgRoot) cJSON_Delete(cfgRoot);
 
-  /* Load /state/settings.json — the single source of truth. */
-  char* text = readFileStr(FS_STATE "/settings.json");
+  /* Ensure <stateDir>/storage/ (and storage/external/) exist before any
+   * read/write — a freshly-seeded SD store may only have what factory_state
+   * shipped, and atomicWriteJson() does not create parent dirs. */
+  fs_mkdirp(fsStatePath("/storage/external").c_str());
+
+  /* Load <stateDir>/storage/root.json — the single source of truth. */
+  char* text = readFileStr(fsStatePath(ROOT_JSON_PATH).c_str());
   if (text) {
     cfgRoot = cJSON_Parse(text);
     free(text);
@@ -789,7 +799,7 @@ void storageLoad() {
 
   /* External files: scan /state/storage/<mode>/, register, then load each
    * file's contents into cfgRoot at its prefix. Externals overwrite anything
-   * at the same path that may have been in settings.json. */
+   * at the same path that may have been in root.json. */
   scanExternals();
   loadExternals();
 
@@ -810,7 +820,10 @@ void storageLoad() {
     }
   }
 
-  fs_remove(FS_STATE "/settings.new");
+  /* Drop a stale temp from a crash between write and rename (atomicWriteJson
+   * writes "<path>.new"). With the FAT-safe rename this is rare, but cheap
+   * to clear. */
+  fs_remove(fsStatePath(ROOT_JSON_PATH ".new").c_str());
 }
 
 bool storageExists(const char* key) {

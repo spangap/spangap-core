@@ -42,7 +42,7 @@ static bool cronEnabled() {
 
 /** Check if /state/crontab has any non-comment entries. */
 static bool crontabHasEntries() {
-    int f = fs_open(FS_STATE "/crontab", "r");
+    int f = fs_open(fsStatePath("/crontab").c_str(), "r");
     if (f < 0) return false;
     char buf[512];
     size_t n = fs_read(buf, 1, sizeof(buf) - 1, f);
@@ -213,10 +213,11 @@ bool cronPoll(bool execute) {
     bool hasWork = false;
 
     struct stat st;
-    if (fs_stat(FS_STATE "/crontab", &st) != 0 || st.st_size <= 0) return false;
+    std::string cronFile = fsStatePath("/crontab");
+    if (fs_stat(cronFile.c_str(), &st) != 0 || st.st_size <= 0) return false;
     char* buf = (char*)malloc(st.st_size + 1);
     if (!buf) return false;
-    int fh = fs_open(FS_STATE "/crontab", "r");
+    int fh = fs_open(cronFile.c_str(), "r");
     if (fh < 0) { free(buf); return false; }
     size_t nr = fs_read(buf, 1, st.st_size, fh);
     fs_close(fh);
@@ -354,11 +355,12 @@ bool cronDefault(const char* schedule, const char* command) {
     /* Scan existing crontab for any line whose command matches. */
     bool fileExists = false;
     bool needsNewline = false;
-    int fh = fs_open(FS_STATE "/crontab", "r");
+    std::string cronFile = fsStatePath("/crontab");
+    int fh = fs_open(cronFile.c_str(), "r");
     if (fh >= 0) {
         fileExists = true;
         struct stat st;
-        if (fs_stat(FS_STATE "/crontab", &st) == 0 && st.st_size > 0) {
+        if (fs_stat(cronFile.c_str(), &st) == 0 && st.st_size > 0) {
             char* buf = (char*)malloc(st.st_size + 1);
             if (!buf) { fs_close(fh); return false; }
             size_t nr = fs_read(buf, 1, st.st_size, fh);
@@ -376,7 +378,7 @@ bool cronDefault(const char* schedule, const char* command) {
         fs_close(fh);
     }
 
-    int wh = fs_open(FS_STATE "/crontab", fileExists ? "a" : "w");
+    int wh = fs_open(cronFile.c_str(), fileExists ? "a" : "w");
     if (wh < 0) return false;
     if (needsNewline) fs_write("\n", 1, 1, wh);
     /* Format to match the column header in factory_state/crontab — all 4-wide. */

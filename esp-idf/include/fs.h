@@ -11,6 +11,7 @@
 
 #include <sys/stat.h>
 #include <cstddef>
+#include <string>
 
 /* ---- Filesystem layout ---- */
 
@@ -52,8 +53,44 @@ void fs_init();
 /** True after fs_init() if this was a first boot (factory defaults were copied). */
 bool fs_first_boot();
 
-/** Copy factory defaults from /fixed/factory_state/ to /state/. */
+/** Copy factory defaults from /fixed/factory_state/ to the active state
+ *  store (fsStateDir()). */
 void fs_factory_reset();
+
+/** Choose the active state store and seed it on first boot. Call ONCE,
+ *  AFTER fs_mount_sd() and BEFORE storageLoad(): if the SD mounted and
+ *  /sdcard/state is a directory it becomes the active store, else it stays
+ *  the on-flash /state; an empty store gets factory defaults copied in.
+ *  (Kept out of fs_init() so SD is probed at the proven-reliable time.) */
+void fsSelectStateStore(void);
+
+/** The active state store for this boot: "/state" (on-flash, always
+ *  mounted) or "/sdcard/state" (when /sdcard/state existed at boot).
+ *  There is NO path rewriting — both locations are real and always
+ *  available; this is just which one holds settings/certs/etc. Every
+ *  consumer of the state store MUST build its paths from this, e.g.
+ *  fs_open(fsStatePath("/storage/root.json").c_str(), ...), instead of
+ *  hard-coding FS_STATE. The returned pointer is stable for the process
+ *  lifetime. */
+const char* fsStateDir();
+
+/** Convenience: fsStateDir() + sub. `sub` must start with '/'. */
+std::string fsStatePath(const char* sub);
+
+/** True iff the active state store is the SD one (derived from
+ *  fsStateDir(); the string is the source of truth). For callers that need
+ *  the predicate, e.g. the `reset factory` guard. */
+bool fsStateOnSd();
+
+/** Unmount, reformat, and remount the on-flash `state` partition (always
+ *  mounted at /state, even when the active store is on SD). Run on a DRAM
+ *  stack. Used by `format flash` and `reset factory` (which reboots after). */
+void fsFormatFlash(void);
+
+/** Reformat the SD card in place (FAT); it stays mounted at /sdcard.
+ *  Returns false if no card is mounted or SD support is compiled out.
+ *  Run on a DRAM stack. Used by `format sd`. */
+bool fsFormatSd(void);
 
 /* ---- Optional SD card mount ---- */
 
