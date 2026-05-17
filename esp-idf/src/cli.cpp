@@ -878,21 +878,14 @@ static void cliTaskFn(void* arg) {
 
 /* ---- Serial task: byte shuttle between serial port and log/CLI ---- */
 
-/** USB serial: normalize newlines so raw LF/CR don't confuse host terminals */
+/** Write CLI bytes to the console verbatim. Newline translation (\n -> \r\n)
+ * happens exactly once, in the USB-Serial-JTAG VFS TX layer (TX mode CRLF) —
+ * the same single translation the log path (logVprintf fwrite) relies on.
+ * Do NOT pre-expand here: serialEmit and the VFS both expanding produced
+ * \r\r\n per line, which terminals render as a duplicated/overwritten
+ * output region (looked like CLI output "reappearing"). */
 static void serialEmit(const char* p, size_t n) {
-  for (size_t i = 0; i < n; i++) {
-    if (p[i] == '\r') {
-      printf("\r");
-      if (i + 1 < n && p[i + 1] == '\n') {
-        i++;
-        printf("\n");
-      } else
-        printf("\n");
-    } else if (p[i] == '\n')
-      printf("\r\n");
-    else
-      printf("%c", p[i]);
-  }
+  fwrite(p, 1, n, stdout);
 }
 
 /* Set true while in CLI mode so logVprintf suppresses its direct-stdout echo
