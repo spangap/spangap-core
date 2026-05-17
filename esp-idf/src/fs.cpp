@@ -208,6 +208,20 @@ static void handleOp(fs_op_t* req) {
         break;
     case fs_op_t::RENAME:
         req->result = rename(req->path, req->path2);
+        if (req->result != 0) {
+            /* FATFS f_rename does NOT overwrite an existing destination
+             * (returns FR_EXIST); LittleFS/POSIX rename does. Make rename
+             * overwrite-correct everywhere (atomicWriteJson, mv, ...): if
+             * the destination already exists, drop it and retry. Brief
+             * window where dest is absent — unavoidable on FAT, but the
+             * source still exists so no data is lost. No-op on LittleFS
+             * (the first rename already succeeded). */
+            struct stat st;
+            if (stat(req->path2, &st) == 0) {
+                remove(req->path2);
+                req->result = rename(req->path, req->path2);
+            }
+        }
         break;
     case fs_op_t::REMOVE:
         req->result = remove(req->path);
