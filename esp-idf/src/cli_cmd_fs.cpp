@@ -46,20 +46,32 @@ static void cmdLs(const char* a) {
   };
   auto* entries = (ls_entry*)heap_caps_malloc(LS_MAX * sizeof(ls_entry), MALLOC_CAP_SPIRAM);
   if (!entries) { cliPrintf("ls: out of memory\n"); return; }
-  auto* listing = (fs_listing_t*)heap_caps_malloc(LS_MAX * sizeof(fs_listing_t), MALLOC_CAP_SPIRAM);
-  if (!listing) { heap_caps_free(entries); cliPrintf("ls: out of memory\n"); return; }
-  int n = fs_listdir(path, listing, LS_MAX);
-  if (n < 0) { heap_caps_free(listing); heap_caps_free(entries); cliPrintf("ls: cannot open %s\n", path); return; }
   int count = 0;
-  for (int i = 0; i < n && count < LS_MAX; i++) {
-    if (!showAll && listing[i].name[0] == '.') continue;
-    safeStrncpy(entries[count].name, listing[i].name, sizeof(entries[0].name));
-    entries[count].mtime = listing[i].mtime;
-    entries[count].size  = listing[i].size;
-    entries[count].isDir = listing[i].isDir;
-    count++;
+  /* A plain file argument: stat it and emit the single entry, so
+   * `ls [-l] /path/to/file` works like coreutils ls. */
+  struct stat pst;
+  if (fs_stat(path, &pst) == 0 && !S_ISDIR(pst.st_mode)) {
+    const char* slash = strrchr(path, '/');
+    safeStrncpy(entries[0].name, slash ? slash + 1 : path, sizeof(entries[0].name));
+    entries[0].mtime = pst.st_mtime;
+    entries[0].size  = (uint32_t)pst.st_size;
+    entries[0].isDir = false;
+    count = 1;
+  } else {
+    auto* listing = (fs_listing_t*)heap_caps_malloc(LS_MAX * sizeof(fs_listing_t), MALLOC_CAP_SPIRAM);
+    if (!listing) { heap_caps_free(entries); cliPrintf("ls: out of memory\n"); return; }
+    int n = fs_listdir(path, listing, LS_MAX);
+    if (n < 0) { heap_caps_free(listing); heap_caps_free(entries); cliPrintf("ls: cannot open %s\n", path); return; }
+    for (int i = 0; i < n && count < LS_MAX; i++) {
+      if (!showAll && listing[i].name[0] == '.') continue;
+      safeStrncpy(entries[count].name, listing[i].name, sizeof(entries[0].name));
+      entries[count].mtime = listing[i].mtime;
+      entries[count].size  = listing[i].size;
+      entries[count].isDir = listing[i].isDir;
+      count++;
+    }
+    heap_caps_free(listing);
   }
-  heap_caps_free(listing);
   std::sort(entries, entries + count, [](const ls_entry& a, const ls_entry& b) { return a.mtime < b.mtime; });
   if (count == 0) cliPrintf("  (empty)\n");
   for (int i = 0; i < count; i++) {
@@ -377,6 +389,200 @@ static void cmdDf(const char* a) {
   cliPrintf("  total  %s\n  used   %s\n  free   %d%%\n", tBuf, uBuf, pctFree);
 }
 
+/* ---- cp / mv ----
+ * Stream copy via the fs worker, so these work on any path (LittleFS
+ * /state, /fixed, FAT /sdcard) and across filesystems. mv tries an
+ * in-place rename first (cheap, same-fs) and falls back to copy+delete
+ * when the rename crosses a mount (fs_rename → POSIX rename → EXDEV). */
+
+/** Last path component of an absolute, normalised path. */
+static const char* baseName(const char* path) {
+  const char* slash = strrchr(path, '/');
+  return slash ? slash + 1 : path;
+}
+
+/** If dst is an existing directory, append basename(src): cp/mv-into-dir
+ *  semantics. Otherwise dst is used verbatim. */
+static bool resolveDest(const char* src, const char* dst, char* out, size_t outLen) {
+  struct stat st;
+  if (fs_stat(dst, &st) == 0 && S_ISDIR(st.st_mode)) {
+    if ((size_t)snprintf(out, outLen, "%s/%s", dst, baseName(src)) >= outLen) return false;
+  } else {
+    if (strlen(dst) >= outLen) return false;
+    safeStrncpy(out, dst, outLen);
+  }
+  return true;
+}
+
+/** Byte-copy one regular file. Returns 0 on success, -1 on error. */
+static int copyFile(const char* src, const char* dst) {
+  int in = fs_open(src, "rb");
+  if (in < 0) return -1;
+  int out = fs_open(dst, "wb");
+  if (out < 0) { fs_close(in); return -1; }
+  constexpr size_t BUFSZ = 8192;
+  char* buf = (char*)heap_caps_malloc(BUFSZ, MALLOC_CAP_SPIRAM);
+  if (!buf) { fs_close(in); fs_close(out); return -1; }
+  int rc = 0;
+  size_t n;
+  while ((n = fs_read(buf, 1, BUFSZ, in)) > 0) {
+    if (fs_write(buf, 1, n, out) != n) { rc = -1; break; }
+  }
+  heap_caps_free(buf);
+  fs_sync(out);
+  fs_close(out);
+  fs_close(in);
+  if (rc != 0) fs_remove(dst);
+  return rc;
+}
+
+/** Recursively copy src (file or directory tree) to dst. dst is the final
+ *  target path (already resolved). Returns 0 on success, -1 on error. */
+static int copyTree(const char* src, const char* dst) {
+  struct stat st;
+  if (fs_stat(src, &st) != 0) return -1;
+  if (!S_ISDIR(st.st_mode)) return copyFile(src, dst);
+
+  /* DFS via open dir handles — like rmRecursive, the stack grows with
+   * tree *depth*, not directory width. One open dir handle per level. */
+  constexpr int MAX_DEPTH = 16, PATHSZ = 256;
+  struct frame {
+    int  dir;
+    char s[PATHSZ];
+    char d[PATHSZ];
+  };
+  auto* stack = (frame*)heap_caps_malloc(MAX_DEPTH * sizeof(frame), MALLOC_CAP_SPIRAM);
+  if (!stack) return -1;
+
+  if (fs_mkdir(dst) != 0 && errno != EEXIST) { heap_caps_free(stack); return -1; }
+  safeStrncpy(stack[0].s, src, PATHSZ);
+  safeStrncpy(stack[0].d, dst, PATHSZ);
+  stack[0].dir = fs_opendir(src);
+  if (stack[0].dir < 0) { heap_caps_free(stack); return -1; }
+
+  int rc = 0, depth = 0;
+  while (depth >= 0) {
+    fs_dirent_t ent;
+    if (!fs_readdir(stack[depth].dir, &ent)) {
+      fs_closedir(stack[depth].dir);
+      depth--;
+      continue;
+    }
+    if (rmDotSkip(ent.name)) continue;
+    char cs[PATHSZ], cd[PATHSZ];
+    if ((size_t)snprintf(cs, PATHSZ, "%.150s/%.80s", stack[depth].s, ent.name) >= PATHSZ ||
+        (size_t)snprintf(cd, PATHSZ, "%.150s/%.80s", stack[depth].d, ent.name) >= PATHSZ) {
+      rc = -1;
+      break;
+    }
+    struct stat cst;
+    if (fs_stat(cs, &cst) != 0) { rc = -1; break; }
+    if (S_ISDIR(cst.st_mode)) {
+      if (fs_mkdir(cd) != 0 && errno != EEXIST) { rc = -1; break; }
+      if (depth + 1 >= MAX_DEPTH) { rc = -1; break; }  /* tree too deep */
+      int nd = fs_opendir(cs);
+      if (nd < 0) { rc = -1; break; }
+      depth++;
+      stack[depth].dir = nd;
+      safeStrncpy(stack[depth].s, cs, PATHSZ);
+      safeStrncpy(stack[depth].d, cd, PATHSZ);
+    } else if (copyFile(cs, cd) != 0) {
+      rc = -1;
+      break;
+    }
+  }
+  while (depth >= 0) fs_closedir(stack[depth--].dir);  /* unwind on error */
+  heap_caps_free(stack);
+  return rc;
+}
+
+/** Remove src entirely — file or directory tree (reuses rm's recursion). */
+static void removeTree(const char* path) {
+  struct stat st;
+  if (fs_stat(path, &st) != 0) return;
+  if (S_ISDIR(st.st_mode)) rmRecursive(path, true);
+  else fs_remove(path);
+}
+
+static void cmdCp(const char* a) {
+  if (strcmp(a, "help") == 0) {
+    cliPrintf("  %-*s copy file or tree (cross-fs ok)\n", CLI_HELP_COL, "cp [-r] <src> <dst>");
+    return;
+  }
+  bool opt_r = false;
+  const char* p = a;
+  char words[2][256];
+  int nw = 0;
+  while (*p && nw < 2) {
+    while (*p == ' ') p++;
+    if (!*p) break;
+    if (*p == '-') {
+      for (p++; *p && *p != ' '; p++)
+        if (*p == 'r' || *p == 'R') opt_r = true;
+      continue;
+    }
+    const char* start = p;
+    while (*p && *p != ' ') p++;
+    size_t wl = (size_t)(p - start);
+    if (wl >= sizeof(words[0])) { cliPrintf("cp: path too long\n"); return; }
+    memcpy(words[nw], start, wl);
+    words[nw][wl] = '\0';
+    nw++;
+  }
+  if (nw != 2) { cliPrintf("usage: cp [-r] <src> <dst>\n"); return; }
+  char src[256], dstArg[256], dst[256];
+  if (!cliResolveFsPath(words[0], src, sizeof(src)) ||
+      !cliResolveFsPath(words[1], dstArg, sizeof(dstArg))) {
+    cliPrintf("cp: path too long\n");
+    return;
+  }
+  struct stat st;
+  if (fs_stat(src, &st) != 0) { cliPrintf("cp: %s: %s\n", src, strerror(errno)); return; }
+  if (S_ISDIR(st.st_mode) && !opt_r) { cliPrintf("cp: %s: is a directory (use -r)\n", src); return; }
+  if (!resolveDest(src, dstArg, dst, sizeof(dst))) { cliPrintf("cp: path too long\n"); return; }
+  if (copyTree(src, dst) != 0) cliPrintf("cp: failed copying %s -> %s\n", src, dst);
+}
+
+static void cmdMv(const char* a) {
+  if (strcmp(a, "help") == 0) {
+    cliPrintf("  %-*s move/rename (cross-fs ok)\n", CLI_HELP_COL, "mv <src> <dst>");
+    return;
+  }
+  char words[2][256];
+  int nw = 0;
+  const char* p = a;
+  while (*p && nw < 2) {
+    while (*p == ' ') p++;
+    if (!*p) break;
+    const char* start = p;
+    while (*p && *p != ' ') p++;
+    size_t wl = (size_t)(p - start);
+    if (wl >= sizeof(words[0])) { cliPrintf("mv: path too long\n"); return; }
+    memcpy(words[nw], start, wl);
+    words[nw][wl] = '\0';
+    nw++;
+  }
+  if (nw != 2) { cliPrintf("usage: mv <src> <dst>\n"); return; }
+  char src[256], dstArg[256], dst[256];
+  if (!cliResolveFsPath(words[0], src, sizeof(src)) ||
+      !cliResolveFsPath(words[1], dstArg, sizeof(dstArg))) {
+    cliPrintf("mv: path too long\n");
+    return;
+  }
+  struct stat st;
+  if (fs_stat(src, &st) != 0) { cliPrintf("mv: %s: %s\n", src, strerror(errno)); return; }
+  if (!resolveDest(src, dstArg, dst, sizeof(dst))) { cliPrintf("mv: path too long\n"); return; }
+  /* Same-fs fast path: a single rename. fs_rename → POSIX rename, which
+   * fails with EXDEV across mounts (LittleFS ↔ FAT, /state ↔ /sdcard). */
+  if (fs_rename(src, dst) == 0) return;
+  /* Cross-fs (or rename-unsupported): copy the tree, then delete src. */
+  if (copyTree(src, dst) != 0) {
+    cliPrintf("mv: failed copying %s -> %s\n", src, dst);
+    return;
+  }
+  removeTree(src);
+}
+
 void cliCmdFsInit() {
   cliRegisterCmd("ls", cmdLs);
   cliRegisterCmd("cd", cmdCd);
@@ -384,5 +590,7 @@ void cliCmdFsInit() {
   cliRegisterCmd("pwd", cmdPwd);
   cliRegisterCmd("rm", cmdRm);
   cliRegisterCmd("cat", cmdCat);
+  cliRegisterCmd("cp", cmdCp);
+  cliRegisterCmd("mv", cmdMv);
   cliRegisterCmd("df", cmdDf);
 }
