@@ -19,14 +19,28 @@
 #include <unistd.h>
 #include <cstdio>
 #include <cstring>
+#include <vector>
 #include <dirent.h>
 #include <sys/stat.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 
-/* ---- CLI command registry ---- */
-
-#define CLI_MAX_CMDS 48
+/* ---- CLI command registry ----
+ *
+ * Was a fixed cli_cmd_entry_t[48] that silently dropped registrations
+ * on overflow — once the table filled (rnsd-side consumers push it past
+ * 48) the later `lxmf`/`tcp`/`lora` verbs vanished with no warning. Now
+ * an unbounded vector, kept sorted on insert so `help` stays
+ * alphabetical (the old behaviour). `cmd` is still an un-owned
+ * `const char*`: every caller passes a string literal, stable forever.
+ *
+ * Construct-on-first-use: registration runs from module *Init() on the
+ * main task before the CLI task exists (see the concurrency note in
+ * cliTaskMain), so a function-local static is provably safe against
+ * static-init ordering rather than incidentally so. Indices returned by
+ * cliLongestCmdMatch are consumed immediately during dispatch; all
+ * registration must remain init-time — a later insert reallocates and
+ * would invalidate a held index. */
 
 struct cli_cmd_entry_t {
     const char* cmd;
@@ -34,20 +48,18 @@ struct cli_cmd_entry_t {
     int cmdLen;
 };
 
-static cli_cmd_entry_t cliCmds[CLI_MAX_CMDS];
-static int cliCmdCount = 0;
+static std::vector<cli_cmd_entry_t>& cliCmds() {
+    static std::vector<cli_cmd_entry_t> v;
+    return v;
+}
 
 void cliRegisterCmd(const char* cmd, cli_cmd_cb_t cb) {
-    if (cliCmdCount >= CLI_MAX_CMDS) return;
-    /* Insert sorted alphabetically */
-    int pos = 0;
-    while (pos < cliCmdCount && strcmp(cliCmds[pos].cmd, cmd) < 0) pos++;
-    if (pos < cliCmdCount)
-        memmove(&cliCmds[pos + 1], &cliCmds[pos], (cliCmdCount - pos) * sizeof(cli_cmd_entry_t));
-    cliCmds[pos].cmd = cmd;
-    cliCmds[pos].cb = cb;
-    cliCmds[pos].cmdLen = strlen(cmd);
-    cliCmdCount++;
+    auto& cmds = cliCmds();
+    /* Insert sorted alphabetically (keeps `help` output ordered). */
+    size_t pos = 0;
+    while (pos < cmds.size() && strcmp(cmds[pos].cmd, cmd) < 0) pos++;
+    cmds.insert(cmds.begin() + pos,
+                cli_cmd_entry_t{ cmd, cb, (int)strlen(cmd) });
 }
 
 /* ---- CLI output routing ---- */
@@ -397,7 +409,7 @@ static void cliEditReplace(cli_edit& e, const char* text, cli_write_fn write) {
 /** Commands whose arguments include filesystem paths (tab-complete files/dirs). */
 static bool cliCmdWantsFileArgs(int cmdIdx) {
   if (cmdIdx < 0) return false;
-  const char* c = cliCmds[cmdIdx].cmd;
+  const char* c = cliCmds()[cmdIdx].cmd;
   static const char* const fs[] = {"ls", "cd", "mkdir", "rm", "cat", "df", "run", "logfile", nullptr};
   for (int i = 0; fs[i]; i++)
     if (strcmp(c, fs[i]) == 0) return true;
@@ -408,11 +420,12 @@ static bool cliCmdWantsFileArgs(int cmdIdx) {
 static int cliLongestCmdMatch(const char* line, int* matchedLen) {
   while (*line == ' ') line++;
   int bestIdx = -1, bestLen = 0;
-  for (int i = 0; i < cliCmdCount; i++) {
-    auto& en = cliCmds[i];
+  auto& cmds = cliCmds();
+  for (size_t i = 0; i < cmds.size(); i++) {
+    auto& en = cmds[i];
     if (strncmp(line, en.cmd, en.cmdLen) == 0 && (line[en.cmdLen] == '\0' || line[en.cmdLen] == ' ')) {
       if (en.cmdLen > bestLen) {
-        bestIdx = i;
+        bestIdx = (int)i;
         bestLen = en.cmdLen;
       }
     }
@@ -673,18 +686,19 @@ void cliProcess(const char* line) {
   }
   /* Try registered commands (longest match first) */
   { int bestIdx = -1, bestLen = 0;
-    for (int i = 0; i < cliCmdCount; i++) {
-      auto& e = cliCmds[i];
+    auto& cmds = cliCmds();
+    for (size_t i = 0; i < cmds.size(); i++) {
+      auto& e = cmds[i];
       if (strncmp(line, e.cmd, e.cmdLen) == 0 &&
           (line[e.cmdLen] == '\0' || line[e.cmdLen] == ' ') &&
           e.cmdLen > bestLen) {
-        bestIdx = i; bestLen = e.cmdLen;
+        bestIdx = (int)i; bestLen = e.cmdLen;
       }
     }
     if (bestIdx >= 0) {
       const char* args = line + bestLen;
       while (*args == ' ') args++;
-      cliCmds[bestIdx].cb(args);
+      cmds[bestIdx].cb(args);
       return;
     }
   }
@@ -705,12 +719,13 @@ static void cliBuiltinInit() {
     logRegisterCmds();
     cliRegisterCmd("help", [](const char* a) {
         if (strcmp(a, "help") == 0) { cliPrintf("  %-*s show commands\n", CLI_HELP_COL, "help [<cmd>]"); return; }
+        auto& cmds = cliCmds();
         if (*a) {
-            for (int i = 0; i < cliCmdCount; i++)
-                if (strcmp(cliCmds[i].cmd, a) == 0) { cliCmds[i].cb("help"); return; }
+            for (auto& e : cmds)
+                if (strcmp(e.cmd, a) == 0) { e.cb("help"); return; }
             cliPrintf("unknown command: %s\n", a);
         } else {
-            for (int i = 0; i < cliCmdCount; i++) cliCmds[i].cb("help");
+            for (auto& e : cmds) e.cb("help");
         }
     });
 }
