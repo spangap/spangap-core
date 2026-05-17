@@ -717,7 +717,16 @@ bool fs_mount_sd(void) {
     bus.quadwp_io_num   = -1;
     bus.quadhd_io_num   = -1;
     bus.max_transfer_sz = 4096;
-    spi_host_device_t host_id = (spi_host_device_t)CONFIG_DIPTYCH_SDCARD_SPI_HOST;
+    /* Kconfig DIPTYCH_SDCARD_SPI_HOST is the peripheral *name* (2 = SPI2/FSPI,
+     * 3 = SPI3/HSPI), matching how board headers spell BOARD_*_SPI_HOST. The
+     * IDF spi_host_device_t enum is offset by one (SPI1_HOST=0, SPI2_HOST=1,
+     * SPI3_HOST=2), so map by name rather than casting the raw int — a straight
+     * cast put the SD on SPI3 while a board's shared bus lived on SPI2. */
+    static_assert(CONFIG_DIPTYCH_SDCARD_SPI_HOST == 2 ||
+                  CONFIG_DIPTYCH_SDCARD_SPI_HOST == 3,
+                  "DIPTYCH_SDCARD_SPI_HOST must be 2 (SPI2) or 3 (SPI3)");
+    spi_host_device_t host_id =
+        (CONFIG_DIPTYCH_SDCARD_SPI_HOST == 2) ? SPI2_HOST : SPI3_HOST;
     esp_err_t br = spiHelperInitBus(host_id, &bus);
     if (br != ESP_OK) {
         warn("SD: SPI bus init failed: %s\n", esp_err_to_name(br));
@@ -746,7 +755,8 @@ bool fs_mount_sd(void) {
     esp_log_level_set("vfs_fat_sdmmc", ESP_LOG_WARN);
 
     if (ret != ESP_OK) {
-        warn("no SD card mounted at " FS_SDCARD "\n");
+        warn("no SD card mounted at " FS_SDCARD " (mount rc=%s)\n",
+             esp_err_to_name(ret));
         return false;
     }
 
