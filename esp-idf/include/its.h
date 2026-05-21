@@ -90,8 +90,15 @@ typedef void (*its_aux_cb_t)(TaskHandle_t sender, const void* data, size_t len);
 /** Initialize this task as a server. One server per task; sets up the
  *  inbox queue. Server ports are opened with itsServerPortOpen().
  *  inboxMaxMsgLen: max size of any single inbox message (0 = default).
- *  inboxDepth:     queue depth in messages (0 = default 8). */
-bool itsServerInit(size_t inboxMaxMsgLen = 0, size_t inboxDepth = 0);
+ *  inboxDepth:     queue depth in messages (0 = default 8).
+ *  no_pool:        when true, this server's connections bypass the shared
+ *                  stream-buffer pool — each buffer is created fresh on connect
+ *                  and deleted on disconnect (by the disconnect's receiving
+ *                  end), so transient/large buffers return to the heap and the
+ *                  server's buffers stay exactly attributed under per-task heap
+ *                  tracking (no cross-task buffer inheritance). Default false —
+ *                  no behaviour change for existing callers. */
+bool itsServerInit(size_t inboxMaxMsgLen = 0, size_t inboxDepth = 0, bool no_pool = false);
 
 /** Open a server port. Up to ITS_MAX_PORTS per task (shared with aux ports).
  *  packetBased: if true, itsSend/itsRecv on connections to this port carry
@@ -127,6 +134,12 @@ int  itsActiveTotal(void);
  *  usage). Defaults to plain `printf`; pass any `int (*)(const char*, ...)`
  *  to redirect output. */
 void itsStatus(int (*print)(const char*, ...) = printf);
+
+/** PSRAM held by a task's ITS objects: stream buffers for connections it
+ *  serves (attributed to the server, which allocates them at connect) plus
+ *  its single inbox queue's storage. For per-task memory breakdowns. */
+typedef struct { size_t streamBytes; size_t inboxBytes; int streamBufs; } its_mem_t;
+its_mem_t itsTaskMem(TaskHandle_t task);
 
 /** Inject bytes into one side of a connection's stream-buffer pair without
  *  caller-identity checks. `asServer=true` writes to the server→client

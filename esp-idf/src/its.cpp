@@ -26,6 +26,12 @@ static inline uint32_t millis() { return (uint32_t)(esp_timer_get_time() / 1000)
 struct its_pool_entry_t {
     StreamBufferHandle_t handle;
     size_t               size;
+    /* false = a no_pool server's buffer: created fresh on connect, never
+     * reused/shared, and deleted (vStreamBufferDeleteWithCaps) when the
+     * connection tears down — so a brief/large buffer returns to the heap and
+     * stays correctly attributed under per-task heap tracking. true = normal
+     * retained pool entry, reused across same-size connections. */
+    bool                 pooled;
     size_t               triggerLevel;   /* wake receiver when >= N bytes queued */
     volatile bool        inUse;
     /* Free-space notification: when the remote consumes enough that free
@@ -43,52 +49,62 @@ static its_pool_entry_t itsPool[ITS_MAX_POOL];
 static int              itsPoolCount = 0;
 static portMUX_TYPE     itsPoolMux = portMUX_INITIALIZER_UNLOCKED;
 
-/* Find a free pool entry of exactly `size` bytes; if none exists, allocate
- * a new entry (PSRAM stream buffer + semaphore) and add it to the pool.
- * Pool entries are never deleted — once allocated they stay forever and
- * become reusable for the next request of the same size. This avoids PSRAM
- * fragmentation and lets callers ask for any buffer size without having to
- * pre-declare the working set at boot. */
-static int poolGet(size_t size) {
+/* Acquire a stream buffer of `size` bytes.
+ *  - Pooled (noPool=false): reuse a free same-size entry, else create a
+ *    retained one. Buffers live forever and are reused — no fragmentation,
+ *    no per-connect alloc. This is the default for every existing caller.
+ *  - no_pool (noPool=true): always create a fresh buffer; poolFree deletes it
+ *    on disconnect (see poolFree), so transient/large buffers return to the
+ *    heap and can't be inherited by another task. The lightweight slot + its
+ *    semaphore are kept for reclamation either way (the sem is tiny and
+ *    deleting it would race a not-yet-woken sender). */
+static int poolGet(size_t size, bool noPool = false) {
     if (size == 0) return -1;
 
     portENTER_CRITICAL(&itsPoolMux);
-    for (int i = 0; i < itsPoolCount; i++) {
-        if (!itsPool[i].inUse && itsPool[i].size == size) {
-            itsPool[i].inUse = true;
-            itsPool[i].triggerLevel = 1;
-            portEXIT_CRITICAL(&itsPoolMux);
-            xStreamBufferReset(itsPool[i].handle);
-            xStreamBufferSetTriggerLevel(itsPool[i].handle, 1);
-            return i;
+    if (!noPool) {
+        for (int i = 0; i < itsPoolCount; i++) {
+            if (!itsPool[i].inUse && itsPool[i].pooled &&
+                itsPool[i].handle && itsPool[i].size == size) {
+                itsPool[i].inUse = true;
+                itsPool[i].triggerLevel = 1;
+                portEXIT_CRITICAL(&itsPoolMux);
+                xStreamBufferReset(itsPool[i].handle);
+                xStreamBufferSetTriggerLevel(itsPool[i].handle, 1);
+                return i;
+            }
         }
     }
-    /* No free entry of this size — reserve a fresh slot. Mark it inUse
-     * before dropping the spinlock so concurrent searches skip it; populate
-     * the actual stream buffer + semaphore outside the critical section
-     * (xStreamBufferCreateWithCaps yields the scheduler). */
-    if (itsPoolCount >= ITS_MAX_POOL) {
-        portEXIT_CRITICAL(&itsPoolMux);
-        ITS_LOGE("pool table full (%d entries), cannot add %u-byte stream "
-                 "(raise ITS_MAX_POOL)", ITS_MAX_POOL, (unsigned)size);
-        return -1;
+    /* Need a fresh buffer. Reuse a reclaimed empty slot (handle==null, e.g. a
+     * freed no_pool entry whose semaphore we kept) or append a new one. Mark
+     * inUse before dropping the spinlock so concurrent searches skip it. */
+    int idx = -1;
+    for (int i = 0; i < itsPoolCount; i++) {
+        if (!itsPool[i].inUse && itsPool[i].handle == nullptr) { idx = i; break; }
     }
-    int idx = itsPoolCount++;
+    if (idx < 0) {
+        if (itsPoolCount >= ITS_MAX_POOL) {
+            portEXIT_CRITICAL(&itsPoolMux);
+            ITS_LOGE("pool table full (%d entries), cannot add %u-byte stream "
+                     "(raise ITS_MAX_POOL)", ITS_MAX_POOL, (unsigned)size);
+            return -1;
+        }
+        idx = itsPoolCount++;
+        itsPool[idx].spaceFreedSem = nullptr;
+    }
     auto& e = itsPool[idx];
     e.size = size;
     e.inUse = true;
+    e.pooled = !noPool;
     e.triggerLevel = 1;
     e.freeNotify = 0;
     e.handle = nullptr;
-    e.spaceFreedSem = nullptr;
     portEXIT_CRITICAL(&itsPoolMux);
 
     e.handle = xStreamBufferCreateWithCaps(size, 1, MALLOC_CAP_SPIRAM);
-    e.spaceFreedSem = xSemaphoreCreateBinary();
+    if (e.spaceFreedSem == nullptr) e.spaceFreedSem = xSemaphoreCreateBinary();
     if (!e.handle || !e.spaceFreedSem) {
         ITS_LOGE("alloc failed for %u-byte stream entry", (unsigned)size);
-        /* Slot stays in the pool with inUse=true so it is never reused.
-         * Rare path (PSRAM OOM at connect time); the connect attempt fails. */
         return -1;
     }
     return idx;
@@ -96,16 +112,43 @@ static int poolGet(size_t size) {
 
 static void poolFree(int idx) {
     if (idx < 0 || idx >= itsPoolCount) return;
-    xStreamBufferReset(itsPool[idx].handle);
-    xStreamBufferSetTriggerLevel(itsPool[idx].handle, 1);
-    portENTER_CRITICAL(&itsPoolMux);
-    itsPool[idx].inUse = false;
-    itsPool[idx].triggerLevel = 1;
-    portEXIT_CRITICAL(&itsPoolMux);
-    /* Wake any sender that was blocked waiting for space on this buffer —
-       the connection is gone, so they should abort rather than keep waiting
-       forever. itsSend re-checks the connection after the sem fires. */
-    xSemaphoreGive(itsPool[idx].spaceFreedSem);
+    its_pool_entry_t& e = itsPool[idx];
+    if (e.pooled) {
+        /* Retain for same-size reuse. */
+        if (e.handle) {
+            xStreamBufferReset(e.handle);
+            xStreamBufferSetTriggerLevel(e.handle, 1);
+        }
+        portENTER_CRITICAL(&itsPoolMux);
+        e.inUse = false;
+        e.triggerLevel = 1;
+        portEXIT_CRITICAL(&itsPoolMux);
+        /* Wake any sender blocked waiting for space — connection is gone, so
+         * it should abort. itsSend re-checks the connection after the sem. */
+        if (e.spaceFreedSem) xSemaphoreGive(e.spaceFreedSem);
+    } else {
+        /* no_pool: wake waiters, delete the buffer (return memory to the heap),
+         * keep the slot + semaphore for reclamation. Safe because this runs on
+         * the disconnect's receiving end, in its dispatch loop — neither end is
+         * inside a (non-blocking) buffer op at this point. */
+        if (e.spaceFreedSem) xSemaphoreGive(e.spaceFreedSem);
+        StreamBufferHandle_t h = e.handle;
+        portENTER_CRITICAL(&itsPoolMux);
+        e.handle = nullptr;
+        e.size = 0;
+        e.inUse = false;
+        e.triggerLevel = 1;
+        e.freeNotify = 0;
+        portEXIT_CRITICAL(&itsPoolMux);
+        if (h) vStreamBufferDeleteWithCaps(h);
+    }
+}
+
+/* Fallback when a no_pool peer can't be notified of disconnect: keep the
+ * buffers (flip to pooled) so connFree retains rather than deletes — never
+ * worse than the pooled path, and avoids both a UAF and a leak. */
+static void poolRetainOnFree(int idx) {
+    if (idx >= 0 && idx < itsPoolCount) itsPool[idx].pooled = true;
 }
 
 static StreamBufferHandle_t poolHandle(int idx) {
@@ -132,6 +175,7 @@ static StreamBufferHandle_t poolHandle(int idx) {
 struct its_conn_t {
     volatile bool       active;
     bool                packetBased;
+    bool                noPool;       /* server opted out of the buffer pool */
     TaskHandle_t        clientTask;
     TaskHandle_t        serverTask;
     int                 toPoolIdx;
@@ -173,13 +217,18 @@ static int connAlloc() {
 static void connFree(int handle) {
     if (handle < 0 || handle >= ITS_MAX_CONNS) return;
     its_conn_t* c = &connTable[handle];
-    poolFree(c->toPoolIdx);
-    poolFree(c->fromPoolIdx);
+    /* Clear the entry (mark inactive) BEFORE releasing the buffers, so a
+     * sender woken by poolFree's sem re-checks conn(), sees it gone, and
+     * aborts before touching the buffer — required now that no_pool poolFree
+     * actually deletes the StreamBuffer. */
+    int toIdx = c->toPoolIdx, fromIdx = c->fromPoolIdx;
     portENTER_CRITICAL(&connMux);
     *c = {};
     c->toPoolIdx = -1;
     c->fromPoolIdx = -1;
     portEXIT_CRITICAL(&connMux);
+    poolFree(toIdx);
+    poolFree(fromIdx);
 }
 
 static its_conn_t* conn(int handle) {
@@ -253,9 +302,16 @@ struct its_task_t {
     /* Inbox */
     QueueHandle_t         inbox;
     size_t                inboxItemSize;
+    int                   inboxDepth;
 
     bool                  isServer;
     bool                  isClient;
+    /* no_pool: when set, this server's connections bypass the shared buffer
+     * pool — each stream buffer is created fresh on connect and deleted on
+     * disconnect (by the disconnect's receiving end). Returns transient/large
+     * buffers to the heap and keeps per-task heap attribution exact. Off by
+     * default; opt in via itsServerInit. */
+    bool                  no_pool;
 };
 
 static its_task_t s_tasks[ITS_MAX_TASKS];
@@ -285,6 +341,7 @@ static its_task_t* taskFindOrCreate(TaskHandle_t task, size_t inboxMaxMsgLen, si
                                          : ITS_DEFAULT_INBOX_SIZE;
     int depth = inboxDepth > 0 ? (int)inboxDepth : 8;
     e->inboxItemSize = itemSize;
+    e->inboxDepth = depth;
     /* PSRAM-backed: ITS is task-context only — no ISR may call
      * itsSend/itsSendAux. ISRs should set a heap flag + use
      * vTaskNotifyGiveFromISR instead (PSRAM is unreachable from ISRs
@@ -411,9 +468,10 @@ static void processInboxMsg(its_task_t* me, uint8_t* buf) {
             c->serverTask = me->task;
             c->itsPort = hdr->itsPort;
             c->packetBased = sp->packetBased;
+            c->noPool = me->no_pool;
             bool buffersOk = true;
             if (sp->toSize > 0) {
-                c->toPoolIdx = poolGet(sp->toSize);
+                c->toPoolIdx = poolGet(sp->toSize, me->no_pool);
                 if (c->toPoolIdx < 0) {
                     ITS_LOGE("port %u rejected: no pool stream >= %u for to-buffer "
                              "(client %s -> server %s)",
@@ -423,7 +481,7 @@ static void processInboxMsg(its_task_t* me, uint8_t* buf) {
                 }
             }
             if (sp->fromSize > 0) {
-                c->fromPoolIdx = poolGet(sp->fromSize);
+                c->fromPoolIdx = poolGet(sp->fromSize, me->no_pool);
                 if (c->fromPoolIdx < 0) {
                     ITS_LOGE("port %u rejected: no pool stream >= %u for from-buffer "
                              "(client %s -> server %s)",
@@ -588,11 +646,12 @@ bool itsPoll(TickType_t timeout) {
 
 /* ---- Server API ---- */
 
-bool itsServerInit(size_t inboxMaxMsgLen, size_t inboxDepth) {
+bool itsServerInit(size_t inboxMaxMsgLen, size_t inboxDepth, bool no_pool) {
     TaskHandle_t me = xTaskGetCurrentTaskHandle();
     its_task_t* entry = taskFindOrCreate(me, inboxMaxMsgLen, inboxDepth);
     if (!entry || entry->isServer) return false;
     entry->isServer = true;
+    entry->no_pool = no_pool;
     return true;
 }
 
@@ -732,6 +791,26 @@ int itsActiveTotal(void) {
     for (int i = 0; i < ITS_MAX_CONNS; i++)
         if (connTable[i].active) n++;
     return n;
+}
+
+its_mem_t itsTaskMem(TaskHandle_t task) {
+    its_mem_t m = {};
+    /* Stream buffers are pool-allocated by the server task at connect, so
+     * attribute a connection's to+from buffers to its server — matches the
+     * heap-task-tracking owner. Reflects current in-use, not pool high-water. */
+    for (int i = 0; i < ITS_MAX_CONNS; i++) {
+        if (!connTable[i].active || connTable[i].serverTask != task) continue;
+        if (connTable[i].toPoolIdx >= 0) {
+            m.streamBytes += itsPool[connTable[i].toPoolIdx].size; m.streamBufs++;
+        }
+        if (connTable[i].fromPoolIdx >= 0) {
+            m.streamBytes += itsPool[connTable[i].fromPoolIdx].size; m.streamBufs++;
+        }
+    }
+    /* The task's single inbox queue (PSRAM): depth * itemSize storage. */
+    its_task_t* t = taskFind(task);
+    if (t && t->inbox) m.inboxBytes = (size_t)t->inboxDepth * t->inboxItemSize;
+    return m;
 }
 
 void itsStatus(int (*print)(const char*, ...)) {
@@ -998,6 +1077,16 @@ void itsDisconnect(int handle) {
     its_conn_t* c = conn(handle);
     if (!c) return;
 
+    /* no_pool: defer the buffer free to the disconnect's *receiving* end. The
+     * initiator leaves the conn entry live (so its slot can't be reused and the
+     * peer's connFree finds the buffers) and just notifies; the peer deletes in
+     * its dispatch loop, when neither end is inside a buffer op. Pooled conns
+     * keep the original free-now behavior. If the peer can't be notified, the
+     * initiator retains the buffers (poolRetainOnFree) — never worse than pooled,
+     * no UAF, no leak. */
+    bool noPool = c->noPool;
+    int  toIdx = c->toPoolIdx, fromIdx = c->fromPoolIdx;
+
     if (c->serverTask == me) {
         /* Server side closes — embed client cb pointer in the kick message
          * since the conn entry will be freed before the client wakes. */
@@ -1005,8 +1094,9 @@ void itsDisconnect(int handle) {
         int8_t clientRef = c->clientRef;
         uint16_t port = c->itsPort;
         its_disconnect_cb_t cb = c->cliDisconnectCb;
-        connFree(handle);
+        if (!noPool) connFree(handle);
         its_task_t* ce = taskFind(client);
+        bool notified = false;
         if (ce) {
             uint8_t buf[sizeof(its_header_t) + 1 + sizeof(cb)];
             auto* hdr = (its_header_t*)buf;
@@ -1019,7 +1109,11 @@ void itsDisconnect(int handle) {
             hdr->len = 1 + sizeof(cb);
             buf[sizeof(its_header_t)] = (uint8_t)clientRef;
             memcpy(buf + sizeof(its_header_t) + 1, &cb, sizeof(cb));
-            inboxSend(ce, buf, sizeof(buf), 0);
+            notified = inboxSend(ce, buf, sizeof(buf), 0);
+        }
+        if (noPool && !notified) {
+            poolRetainOnFree(toIdx); poolRetainOnFree(fromIdx);
+            connFree(handle);
         }
     } else if (c->clientTask == me) {
         /* Client side closes — server callback lives in the per-port
@@ -1027,8 +1121,9 @@ void itsDisconnect(int handle) {
         TaskHandle_t serverTask = c->serverTask;
         int8_t serverRef = c->serverRef;
         uint16_t port = c->itsPort;
-        connFree(handle);
+        if (!noPool) connFree(handle);
         its_task_t* se = taskFind(serverTask);
+        bool notified = false;
         if (se) {
             uint8_t buf[sizeof(its_header_t) + 1];
             auto* hdr = (its_header_t*)buf;
@@ -1040,7 +1135,11 @@ void itsDisconnect(int handle) {
             hdr->handle = (int16_t)handle;
             hdr->len = 1;
             buf[sizeof(its_header_t)] = (uint8_t)serverRef;
-            inboxSend(se, buf, sizeof(buf), pdMS_TO_TICKS(100));
+            notified = inboxSend(se, buf, sizeof(buf), pdMS_TO_TICKS(100));
+        }
+        if (noPool && !notified) {
+            poolRetainOnFree(toIdx); poolRetainOnFree(fromIdx);
+            connFree(handle);
         }
     }
 }
