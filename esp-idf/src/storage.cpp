@@ -1019,16 +1019,6 @@ void storageSetTree(const char* key, cJSON* val) {
   CFG_UNLOCK();
 }
 
-/** Build nested JSON with a null at the given dot-path. */
-static cJSON* buildNullJson(const char* dotPath) {
-  cJSON* root = cJSON_CreateObject();
-  char leaf[96];  /* see navigatePath */
-  cJSON* parent = navigateOrCreate(root, dotPath, leaf, sizeof(leaf));
-  if (parent)
-    cJSON_AddNullToObject(parent, leaf);
-  return root;
-}
-
 /** Delete a node from a tree at the given dot-path. */
 static bool deleteFromTree(cJSON* root, const char* dotPath) {
   const char* lastDot = strrchr(dotPath, '.');
@@ -1050,26 +1040,27 @@ static bool deleteFromTree(cJSON* root, const char* dotPath) {
 void storageDeleteTree(const char* keyOrPrefix) {
   if (!keyOrPrefix || !*keyOrPrefix) return;
 
+  /* Delete via the same null-in-txPatch → commit path as storageUnset
+     (RFC 7396: a null member removes the member, whole subtree included —
+     deepMerge() cJSON_DeleteItemFromObject). This routes the deletion
+     through firePatchSubscriptions + the coalesced, back-pressure-RETRIED
+     browser patch (dcFlushPatch), instead of a fire-and-forget
+     itsSend(...,0) whose drop under DC back-pressure left clients showing
+     deleted conversations until a reload. commitPatch handles
+     persistence (routePatchDirty + startSaveTimer) for s./secrets. */
   CFG_LOCK();
-  bool removed = deleteFromTree(cfgRoot, keyOrPrefix);
-  CFG_UNLOCK();
-  if (!removed) return;
+  bool autoCommit = (txDepth == 0);
+  if (autoCommit) storageBegin();
 
-  if (strncmp(keyOrPrefix, "s.", 2) == 0)
-    startSaveTimer();
-
-  /* Notify browser with {path: null} — one packet, non-blocking. */
-  if (dcHandle >= 0) {
-    cJSON* json = buildNullJson(keyOrPrefix);
-    if (json) {
-      char* text = cJSON_PrintUnformatted(json);
-      cJSON_Delete(json);
-      if (text) {
-        itsSend(dcHandle, text, strlen(text), 0);
-        cJSON_free(text);
-      }
-    }
+  char leaf[96];  /* see navigatePath */
+  cJSON* parent = navigateOrCreate(txPatch, keyOrPrefix, leaf, sizeof(leaf));
+  if (parent) {
+    cJSON_DeleteItemFromObject(parent, leaf);
+    cJSON_AddNullToObject(parent, leaf);
   }
+
+  if (autoCommit) storageEnd();
+  CFG_UNLOCK();
 }
 
 void storageSave() {
@@ -1375,12 +1366,14 @@ static void dcAccumulateChange(const char* key, const char* val) {
     if (dcHandle < 0) return;
     if (isSecret(key)) return;
 
-    /* Check cfgRoot — storageUnset removes the key before firing callbacks,
-       so if the key is gone we skip (matches current behavior: unset is not
-       echoed to browser). */
+    /* The key may be gone (storageUnset / storageDeleteTree removed it
+       before firing callbacks). Previously we skipped — so deletions were
+       never echoed and a deleted conversation lingered in open clients
+       until a full reload. Instead echo an explicit null at the key: the
+       coalesced patch is retried under back-pressure (never dropped), so
+       the browser reliably drops the (sub)tree. */
     CFG_LOCK();
     cJSON* node = navigatePath(cfgRoot, key);
-    if (!node) { CFG_UNLOCK(); return; }
 
     if (!dcPendingPatch) dcPendingPatch = cJSON_CreateObject();
 
@@ -1389,8 +1382,12 @@ static void dcAccumulateChange(const char* key, const char* val) {
     if (!parent) { CFG_UNLOCK(); return; }
 
     cJSON_DeleteItemFromObject(parent, leaf);
-    bool deep = cJSON_IsObject(node) || cJSON_IsArray(node);
-    cJSON_AddItemToObject(parent, leaf, cJSON_Duplicate(node, deep));
+    if (!node) {
+        cJSON_AddNullToObject(parent, leaf);          /* deletion */
+    } else {
+        bool deep = cJSON_IsObject(node) || cJSON_IsArray(node);
+        cJSON_AddItemToObject(parent, leaf, cJSON_Duplicate(node, deep));
+    }
     CFG_UNLOCK();
 }
 

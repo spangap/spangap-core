@@ -169,18 +169,63 @@ void pmInit() {
 #endif
 }
 
+#if CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG
+static void cliUsbUp();   /* defined below; pmPollUsb auto-recovers with it */
+#endif
+
 void pmPollUsb() {
 #if CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG
   if (!usbLock) return;
+
+  /* Evaluate at ~1 Hz regardless of how often the log loop calls us.
+   * usb_serial_jtag_is_connected() is SOF-based and noisy at sub-second
+   * rates — a single false sample used to release the lock and latch
+   * light sleep on. */
+  static uint32_t lastEvalMs = 0;
+  uint32_t now = millis();
+  if (now - lastEvalMs < 1000) return;
+  lastEvalMs = now;
+
   static const uint32_t USB_GRACE_MS = 5000;
-  bool inGrace = millis() < USB_GRACE_MS;
+  bool inGrace = now < USB_GRACE_MS;
   bool connected = usb_serial_jtag_is_connected();
-  bool wantLock = (connected || inGrace) && !rtcUsbDisabled;
   bool held = usbLock->count > 0;
-  if (wantLock && !held)
-    pmLockAcquire(usbLock);
-  else if (!wantLock && held)
-    pmLockRelease(usbLock);
+
+  /* Explicit cliUsbDown(): release immediately, no debounce. */
+  if (rtcUsbDisabled) {
+    if (held) pmLockRelease(usbLock);
+    return;
+  }
+
+  /* Up acts immediately (keep the console alive ASAP); down needs 3
+   * consecutive 1 Hz samples so a brief SOF gap — e.g. a monitor
+   * respawn around a reflash — can't latch light sleep on. */
+  static uint8_t downStreak = 0;
+  static bool    recoveryTried = false;
+  if (connected || inGrace) {
+    downStreak = 0;
+    recoveryTried = false;
+    if (!held) pmLockAcquire(usbLock);
+  } else {
+    if (downStreak < 3) downStreak++;
+    if (downStreak >= 3) {
+      if (!recoveryTried) {
+        /* Sustained loss. Before conceding to light sleep, force one
+         * clean re-enumeration: if a host is actually still attached
+         * (slow monitor respawn, or the controller wedged after an
+         * earlier light-sleep nap), cliUsbUp() resets the peripheral +
+         * re-asserts the D+ pull-up so the host re-detects us. It also
+         * re-acquires the lock; give it ~3 s to come back. */
+        recoveryTried = true;
+        downStreak = 0;
+        cliUsbUp();
+      } else if (held) {
+        /* Recovery didn't bring a host back — genuine disconnect.
+         * Release so light sleep can proceed. */
+        pmLockRelease(usbLock);
+      }
+    }
+  }
 #else
   /* UART console: no peer presence to track. */
 #endif
