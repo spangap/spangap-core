@@ -293,6 +293,9 @@ bool cronWakeupHandler() {
 /* ---- Cron task ---- */
 
 static void cronTaskFn(void*) {
+    /* Stream buffer allocated in task context so heap tracking attributes it
+       to cron, not the main task that spawned us. */
+    cronStream = xStreamBufferCreate(CRON_STREAM_SIZE, 1);
     cronUpdateLock();
 
     storageSubscribeChanges("s.cron", ON_CHANGE { cronUpdateLock(); });
@@ -316,7 +319,6 @@ void cronInit() {
         storageSet("s.cron.version", CRON_VERSION);
     }
 
-    cronStream = xStreamBufferCreate(CRON_STREAM_SIZE, 1);
     pmLockCreate(PM_NO_DEEP_SLEEP, "cron", &cronDeepLock);
     pmLockAcquire(cronDeepLock);
     spawnTask(cronTaskFn, "cron", 4096, nullptr, 1, 0);

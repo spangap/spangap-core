@@ -814,6 +814,9 @@ static void cliOnDisconnect(int ref) {
 static TaskHandle_t cliTaskHandle = NULL;
 
 static void cliTaskFn(void* arg) {
+  /* History buffer in PSRAM, allocated in task context so heap tracking
+     attributes it to cli, not the main task that spawned us. */
+  histBuf = (char(*)[128])heap_caps_calloc(HIST_SIZE, 128, MALLOC_CAP_SPIRAM);
   for (int i = 0; i < CLI_MAX_CLIENTS; i++) cliSlots[i].itsHandle = -1;
   itsServerInit();
   /* CLI commands sometimes need to itsConnect outwards (e.g. rnprobe → rnsd
@@ -1013,9 +1016,6 @@ void cliInit() {
     })");
     storageSet("s.cli.version", CLI_VERSION);
   }
-
-  /* Allocate history buffer in PSRAM */
-  histBuf = (char(*)[128])heap_caps_calloc(HIST_SIZE, 128, MALLOC_CAP_SPIRAM);
 
   /* Register builtin commands on main task's context, before spawning the cli
    * task. The cli command table is an unlocked static array — all registration

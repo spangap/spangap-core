@@ -1512,6 +1512,21 @@ static void storageSaveAux(TaskHandle_t, const void*, size_t) {
 }
 
 static void storageTaskFn(void* arg) {
+    /* Re-home the config tree onto this task. storageLoad() parsed cfgRoot on
+     * main_task (which self-deletes → the tree shows under (deleted) in `top`).
+     * A deep-copy here re-attributes the long-lived tree to `storage`. Pure
+     * memory (no fs I/O), so it can't wedge itsPoll the way running storageLoad
+     * on this task would. Measured cost: ~300 B stack, depth 9, ~1.4k nodes —
+     * far under this task's headroom, despite the dcFlushPatch caveat. */
+    {
+        CFG_LOCK();
+        cJSON* dup = cJSON_Duplicate(cfgRoot, true);
+        cJSON* old = nullptr;
+        if (dup) { old = cfgRoot; cfgRoot = dup; }
+        CFG_UNLOCK();
+        if (old) cJSON_Delete(old);
+    }
+
     /* "" subscription for browser sync means every storageSet fires an aux
      * into our inbox — including changes we ourselves push when processing
      * browser-originated patches. UI bursts (page load, opening cli/log
