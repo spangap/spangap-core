@@ -146,4 +146,18 @@ void storageUnsubscribe(const char* scope);
 /** Convenience: lambda-friendly callback type */
 #define ON_CHANGE [](const char* key, const char* val)
 
+/** Subscribe AND apply the current value once, in a single statement:
+ *  subscribes like storageSubscribeChanges, then immediately invokes the
+ *  body on the calling task with the scope's current value (or "" if unset
+ *  / scope is a prefix — handlers normally re-read by `key`). Folds the
+ *  boot-apply and the live subscription into one call, which matters because
+ *  silent defaults (storageDefault*) don't fire change subscriptions. `key`
+ *  and `val` are in scope in the body, same as ON_CHANGE. `scope` is
+ *  evaluated more than once — pass a literal. */
+#define NOW_AND_ON_CHANGE(scope, ...) do { \
+    storage_change_cb_t _naoc = [](const char* key, const char* val) __VA_ARGS__; \
+    storageSubscribeChanges((scope), _naoc); \
+    _naoc((scope), storageGetStr(scope).c_str()); \
+  } while (0)
+
 #endif
