@@ -1374,6 +1374,18 @@ size_t itsSpacesAvailable(int handle) {
     return spaces;
 }
 
+size_t itsRecvBufSize(int handle) {
+    its_pool_entry_t* pe = nullptr;
+    StreamBufferHandle_t buf = recvBufWithPool(handle, &pe);
+    return (buf && pe) ? pe->size : 0;
+}
+
+size_t itsSendBufSize(int handle) {
+    its_pool_entry_t* pe = nullptr;
+    StreamBufferHandle_t buf = sendBufWithPool(handle, &pe);
+    return (buf && pe) ? pe->size : 0;
+}
+
 bool itsSetTriggerLevel(int handle, size_t triggerLevel) {
     its_pool_entry_t* pe = nullptr;
     StreamBufferHandle_t buf = recvBufWithPool(handle, &pe);

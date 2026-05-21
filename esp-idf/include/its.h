@@ -288,6 +288,15 @@ size_t       itsBytesAvailable(int handle);
  *  subtracts the 4-byte header overhead — i.e. it returns the largest body
  *  length that itsSend(timeout=0) would accept right now. */
 size_t       itsSpacesAvailable(int handle);
+
+/** Total capacity (bytes) of the recv/send-direction buffer for this
+ *  handle — i.e. the fromSize/toSize the server declared at
+ *  itsServerPortOpen(). This is the raw ring capacity, header included;
+ *  the largest packet body is 4 bytes less in packet mode. Returns 0 if
+ *  the handle has no buffer in that direction (aux-only). */
+size_t       itsRecvBufSize(int handle);
+size_t       itsSendBufSize(int handle);
+
 bool         itsIsEmpty(int handle);
 bool         itsIsFull(int handle);
 
