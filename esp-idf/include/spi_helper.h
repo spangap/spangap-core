@@ -43,6 +43,18 @@ extern "C" {
 esp_err_t spiHelperInitBus(spi_host_device_t host,
                            const spi_bus_config_t* bus_config);
 
+/** Serialize access to the shared SPI bus across drivers that the spi_master
+ *  bus lock can't coordinate by itself. esp_lcd's color transfer queues an
+ *  async DMA and then RELEASES the driver bus lock before the DMA finishes
+ *  draining the hardware; a co-resident polling driver (e.g. a LoRa modem)
+ *  that grabs the bus in that window panics in spi_hal_setup_trans
+ *  ("running_cmd == 0"). Every task that drives the shared bus must bracket
+ *  its access with these: the LCD holds it across draw_bitmap AND the DMA
+ *  completion; other drivers hold it around their transaction. One global lock
+ *  — the platform assumes a single shared SPI bus (true on T-Deck). */
+void spiHelperBusLock(void);
+void spiHelperBusUnlock(void);
+
 #ifdef __cplusplus
 }
 #endif

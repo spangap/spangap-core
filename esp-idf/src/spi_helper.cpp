@@ -10,6 +10,16 @@
 #include "log.h"
 
 #include "esp_log.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
+
+/* Shared-bus serialization lock (see header). Created at static-init so it is
+ * always valid before any task transacts — no first-caller race. */
+static StaticSemaphore_t s_busMtxBuf;
+static SemaphoreHandle_t s_busMtx = xSemaphoreCreateMutexStatic(&s_busMtxBuf);
+
+void spiHelperBusLock(void)   { xSemaphoreTake(s_busMtx, portMAX_DELAY); }
+void spiHelperBusUnlock(void) { xSemaphoreGive(s_busMtx); }
 
 esp_err_t spiHelperInitBus(spi_host_device_t host,
                            const spi_bus_config_t* bus_config) {

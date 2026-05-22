@@ -196,6 +196,30 @@ config DIPTYCH_ACME
         CLI command and s.acme.* config keys. DNS-01 also requires
         DIPTYCH_DUCKDNS.
 
+config DIPTYCH_LCD
+    bool "LCD display + LVGL launcher"
+    default n
+    help
+        Phone-style on-device UI: owns the display + input devices and the
+        single LVGL context, paints a launcher of program icons with an
+        opaque status bar, and lets other components register programs via
+        lcdRegister(). lcdInit() is called by diptychInit(); the consumer
+        must implement the lcd_board.h HAL contract (boardLcdInit /
+        boardLcdBacklight / boardLcdShutdown / boardTouchInit) for its board
+        and add the `lvgl` + `esp_lcd_touch_gt911` managed dependencies. Pulls
+        in LVGL v9, esp_lcd and esp_lcd_touch only when enabled.
+
+config DIPTYCH_RESET_ON_OFF
+    bool "Reset button acts as on/off switch"
+    default n
+    help
+        When enabled, diptychInit() defaults s.sys.reset_on_off to 1 so the
+        hardware reset button toggles the device between on and a powered-down
+        deep sleep. The on/off state persists in s.sys.power_on; on power-down
+        the board's resetOnOffSetPowerOff() hook cuts peripheral power and the
+        device deep-sleeps until the next reset. Only a reset-button press (or
+        cold power-on) toggles — software/panic/watchdog reboots keep it on.
+
 endmenu
 
 # ─── vendored esp_wireguard tuning (only meaningful when DIPTYCH_WG=y) ───

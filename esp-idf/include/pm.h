@@ -71,4 +71,18 @@ void pmRecordDeepSleep(int64_t durationUs);
  *  (per-task requires CONFIG_HEAP_TASK_TRACKING). */
 void heapDump(const char* reason);
 
+/** Register a board callback that cuts power to the peripherals (e.g. drives a
+ *  power-enable GPIO to its inactive level). resetOnOffHandler() invokes it
+ *  just before deep sleep. Register before diptychInit(). NULL = no-op. */
+void resetOnOffSetPowerOff(void (*fn)(void));
+
+/** Reset button as on/off switch. Called inside diptychInit() (right after the
+ *  deep-sleep wake handler) and a no-op unless s.sys.reset_on_off is set. On a
+ *  reset-button press it toggles the persisted s.sys.power_on state: "on" lets
+ *  boot continue; "off" cuts peripheral power (via resetOnOffSetPowerOff) and
+ *  deep-sleeps until the next reset. State lives in flash, not RTC, because the
+ *  EN-pin reset power-cycles the RTC domain. Software/panic/watchdog reboots
+ *  and deep-sleep wakes are not button presses and keep the device on. */
+void resetOnOffHandler();
+
 #endif
