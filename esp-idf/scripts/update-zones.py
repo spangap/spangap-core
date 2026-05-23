@@ -10,9 +10,11 @@ ETag cache (skips the download when GitHub says "not modified") goes to
 Usage:
     python3 update-zones.py <out_dir> [--cache-dir <dir>] [--force]
 
-Wired into a consumer's build via diptych-core's CMakeLists; out_dir is
-typically a build-side data-staging directory the merge step then folds
-into the LittleFS image (consumer's data/ overrides on collision).
+A release-time step, NOT part of any build (so per-build images stay
+reproducible). Run via diptych-core's `make timezones`, which points out_dir
+at diptych-core/data — the platform-owned copy that ships to every consumer
+through diptych_create_factory_image's data merge. The generated file is
+checked in; re-run only to refresh the IANA data.
 """
 import argparse
 import json
