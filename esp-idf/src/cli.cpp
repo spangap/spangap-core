@@ -140,7 +140,7 @@ struct cli_edit {
 };
 
 /* CLI ITS server: per-slot state */
-#define CLI_MAX_CLIENTS 4
+#define CLI_MAX_CLIENTS 5    /* up to 3 TCP + 2 DC (browser + on-device CLI) */
 static struct cli_slot_t {
     int itsHandle;
     cli_edit edit;
@@ -788,7 +788,9 @@ static int cliTcpConnect(int handle, const void* data, size_t len) {
   return slot;
 }
 
-/** DC (packet mode): browser xterm.js, always full ANSI. */
+/** DC (packet mode): browser xterm.js. LINE mode — the browser does its own
+ *  line editing and echo (see TerminalWindow.vue) and sends one finished
+ *  command per newline; the device echoes nothing and just executes lines. */
 static int cliDcConnect(int handle, const void* data, size_t len) {
   (void)data; (void)len;
   int slot = cliAllocSlot(handle);
@@ -797,7 +799,7 @@ static int cliDcConnect(int handle, const void* data, size_t len) {
   cl.edit = {};
   cl.lineLen = 0;
   cl.usbSerial = false;
-  cl.mode = CLI_ANSI;
+  cl.mode = CLI_LINE;
   cliInitSlot(cl, slot);
   return slot;
 }
@@ -824,12 +826,12 @@ static void cliTaskFn(void* arg) {
    * command + headroom. */
   itsClientInit(2);
   /* Two ports: stream-mode (TCP nc + serial) and packet-mode (WebRTC DC).
-   * Shared CLI_MAX_CLIENTS=4 slot pool — 3 TCP + 1 DC lets a single
-   * browser xterm coexist with debug nc clients. */
+   * Shared CLI_MAX_CLIENTS=5 slot pool — 3 TCP + 2 DC lets the browser xterm
+   * and the on-device CLI program coexist with debug nc clients. */
   itsServerPortOpen(CLI_PORT_TCP, /*packetBased=*/false, 3, 512, 2048);
   itsServerOnConnect(CLI_PORT_TCP, cliTcpConnect);
   itsServerOnDisconnect(CLI_PORT_TCP, cliOnDisconnect);
-  itsServerPortOpen(CLI_PORT_DC,  /*packetBased=*/true,  1, 512, 2048);
+  itsServerPortOpen(CLI_PORT_DC,  /*packetBased=*/true,  2, 512, 2048);
   itsServerOnConnect(CLI_PORT_DC, cliDcConnect);
   itsServerOnDisconnect(CLI_PORT_DC, cliOnDisconnect);
 

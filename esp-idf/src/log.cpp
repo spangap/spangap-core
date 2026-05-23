@@ -189,7 +189,7 @@ static void logFileFlush() {
 
 /* ---- Log ITS server — consumers connect as clients ---- */
 
-#define LOG_MAX_CONSUMERS 4
+#define LOG_MAX_CONSUMERS 5      /* up to 3 TCP + 2 DC (browser + on-device viewer) */
 #define LOG_INBOUND_BUF   512    /* per-slot accumulator for partial inbound lines */
 static struct {
   int itsHandle;
@@ -414,8 +414,10 @@ static int logVprintf(const char* fmt, va_list args) {
 
 /** Send tail of log file to a newly connected DC client.
  *  backlogBytes: if > 0, tail exactly that many bytes (from DCEP protocol
- *  `{"backlog":N}`). Otherwise fall back to s.log.file.paste (kB, default 48). */
-static void logPasteBack(int handle, long backlogBytes = 0) {
+ *  `{"backlog":N}`). Otherwise fall back to s.log.file.paste (kB, default 48).
+ *  ansi: when false (clients that asked for {"ansi":0}, e.g. the on-device
+ *  viewer), the tail is sent verbatim with no colour escapes. */
+static void logPasteBack(int handle, long backlogBytes, bool ansi) {
   long readSize;
   if (backlogBytes > 0) {
     readSize = backlogBytes;
@@ -478,7 +480,7 @@ static void logPasteBack(int handle, long backlogBytes = 0) {
       }
     }
 
-    if (lvlPos > 0) {
+    if (ansi && lvlPos > 0) {
       memcpy(out + op, tsColor, tsLen); op += tsLen;
       memcpy(out + op, line, lvlPos); op += lvlPos;
       char lvlColor[24];
@@ -533,14 +535,16 @@ static int logDcConnect(int handle, const void* data, size_t len) {
     char proto[128];
     memcpy(proto, data, len);
     proto[len] = '\0';
-    /* Tiny parser: look for "backlog":N in the JSON. */
+    /* Tiny parser over the DCEP protocol JSON. */
     const char* p = strstr(proto, "\"backlog\"");
-    if (p) {
-      p = strchr(p, ':');
-      if (p) backlog = atol(p + 1);
-    }
+    if (p && (p = strchr(p, ':'))) backlog = atol(p + 1);
+    /* On-device LVGL viewers (and plain pipes) ask for {"ansi":0}: no colour
+     * escapes in live lines OR paste-back. Browser xterm omits the key. */
+    const char* a = strstr(proto, "\"ansi\"");
+    if (a && (a = strchr(a, ':')) && atol(a + 1) == 0)
+      logSlots[s].ansi = LOG_NO_ANSI;
   }
-  logPasteBack(handle, backlog);
+  logPasteBack(handle, backlog, logSlots[s].ansi == LOG_ANSI);
   return s;
 }
 
@@ -686,12 +690,13 @@ static void logTaskFn(void* arg) {
    * itsSend and the consumer's drain. Inbound (toSize): same idea, browser
    * console bursts at session start are ~25 short lines, well within 2KB.
    *
-   * Two ports: stream-mode for TCP nc/serial, packet-mode for browser DC
-   * (`log:1`). LOG_MAX_CONSUMERS=4: allow up to 3 TCP + 1 DC. */
+   * Two ports: stream-mode for TCP nc/serial, packet-mode for DC clients
+   * (`log:1` — browser xterm and the on-device Log program, which asks for
+   * {"ansi":0}). LOG_MAX_CONSUMERS=5: up to 3 TCP + 2 DC. */
   itsServerPortOpen(LOG_PORT_TCP, /*packetBased=*/false, 3, 2048, 2048);
   itsServerOnConnect(LOG_PORT_TCP, logTcpConnect);
   itsServerOnDisconnect(LOG_PORT_TCP, logOnDisconnect);
-  itsServerPortOpen(LOG_PORT_DC,  /*packetBased=*/true,  1, 2048, 2048);
+  itsServerPortOpen(LOG_PORT_DC,  /*packetBased=*/true,  2, 2048, 2048);
   itsServerOnConnect(LOG_PORT_DC, logDcConnect);
   itsServerOnDisconnect(LOG_PORT_DC, logOnDisconnect);
   /* Unblock logInit() — server is open for clients (e.g. serial task). */
