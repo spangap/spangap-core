@@ -26,11 +26,10 @@ endif()
 # diptych_create_factory_image(<partition_name> [DATA_DIR <dir>])
 #
 # Builds a LittleFS factory image for <partition_name> by merging:
-#   1. diptych-core's static factory_state/ defaults
+#   1. diptych-core's static factory_state/ defaults — including the
+#      platform-owned `factory_state/storage/external/s.time.zones.json`
+#      (refresh with diptych-core's `make timezones`; see scripts/update-zones.py).
 #   2. the consumer's own data/ (or DATA_DIR if specified) — wins on collisions.
-#      Consumers ship their own checked-in `factory_state/storage/external/s.time.zones.json`;
-#      regenerate it with the platform-provided script (see scripts/update-zones.py
-#      and the consumer's `make timezones` target).
 #
 # Calls `littlefs_create_partition_image(... FLASH_IN_PROJECT)` so the image
 # is bundled into `idf.py flash`.
@@ -101,14 +100,20 @@ function(diptych_browser_build web_dir)
 endfunction()
 
 
-# diptych_lcd_icons(SRC_DIR <dir> [SIZES "64x64;128x128"] [PARTITION fixed_a])
+# diptych_lcd_icons([SRC_DIR <dir>] [SIZES "40x40;64x64"] [PARTITION fixed_a])
 #
-# Rasterizes launcher icon SOURCES (*.svg / *.png) from <dir> into LVGL
-# RGB565A8 .bin files — one per size bucket — written into the factory-image
-# staging tree at data_merged/lcd/icons/<WxH>/<name>.bin, so they ship to
+# Rasterizes launcher icon SOURCES (*.svg / *.png) into LVGL RGB565A8 .bin
+# files — one per size bucket — written into the factory-image staging tree at
+# data_merged/lcd/icons/<WxH>/<name>.bin, so they ship to
 # /fixed/lcd/icons/<WxH>/<name>.bin. The lcd module loads them by basename and
-# picks the bucket from s.lcd.icon_res (default 64x64). Sources live outside
-# data/ so only the generated .bin ships.
+# picks the bucket from s.lcd.icon_res (default 40x40, sized for the 4×3 grid).
+# Sources live outside data/ so only the generated .bin ships.
+#
+# Two source dirs are merged at build time: diptych-core's own
+# assets/lcd-icons/ (platform defaults — gear/log/cli) always, plus the
+# consumer's SRC_DIR if given. On a basename collision the consumer wins — the
+# build-time analogue of the data/ merge. SRC_DIR is therefore optional; a
+# consumer with no icons of its own still inherits the platform defaults.
 #
 # Best-effort: the helper script warns and skips if the host lacks Pillow /
 # cairosvg or LVGLImage.py — the build still succeeds (tiles show their label
@@ -117,11 +122,8 @@ endfunction()
 # in the build).
 function(diptych_lcd_icons)
     cmake_parse_arguments(_DLI "" "SRC_DIR;PARTITION" "SIZES" ${ARGN})
-    if(NOT _DLI_SRC_DIR)
-        message(FATAL_ERROR "diptych_lcd_icons: SRC_DIR is required")
-    endif()
     if(NOT _DLI_SIZES)
-        set(_DLI_SIZES "64x64")
+        set(_DLI_SIZES "40x40")
     endif()
     if(NOT _DLI_PARTITION)
         set(_DLI_PARTITION "fixed_a")
@@ -148,10 +150,17 @@ function(diptych_lcd_icons)
     set(_data_merged "${CMAKE_BINARY_DIR}/data_merged")
     string(REPLACE ";" "," _sizes_csv "${_DLI_SIZES}")
 
+    # Platform defaults first (low precedence), consumer SRC_DIR second so it
+    # overrides on basename. SRC_DIR is optional.
+    set(_src_args --src "${_core_dir}/assets/lcd-icons")
+    if(_DLI_SRC_DIR)
+        list(APPEND _src_args --src "${_DLI_SRC_DIR}")
+    endif()
+
     add_custom_target(diptych_lcd_icons ALL
         COMMAND ${CMAKE_COMMAND} -E make_directory "${_data_merged}/lcd/icons"
         COMMAND python3 "${_core_dir}/scripts/lcd-icons.py"
-            --src "${_DLI_SRC_DIR}"
+            ${_src_args}
             --out "${_data_merged}/lcd/icons"
             --sizes "${_sizes_csv}"
             --lvgl-image-py "${_lvgl_image_py}"
