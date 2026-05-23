@@ -181,31 +181,61 @@ static const char* pmTypeName(pm_lock_type_t t) {
   return "?";
 }
 
-/** Dump every lock we track (name safe — it's our own list, never NULL).
- *  Avoids esp_pm_dump_locks() which crashes on IDF-internal NULL-name locks. */
-static void pmDumpDeepSleepLocks(FILE* stream) {
-  if (!pmLockList) return;
-  int64_t now = esp_timer_get_time();
-  int64_t now_d100 = now / 100;
-  fprintf(stream, "\nPM locks:\n");
+/* Capture an esp_pm dump into a heap buffer so we can reformat / splice it. */
+struct pm_buf_t { char* buf; size_t pos; size_t cap; };
+static int pmBufWrite(void* cookie, const char* data, int len) {
+  auto* s = (pm_buf_t*)cookie;
+  size_t n = (s->pos + len < s->cap) ? (size_t)len : s->cap - s->pos - 1;
+  memcpy(s->buf + s->pos, data, n);
+  s->pos += n;
+  s->buf[s->pos] = '\0';
+  return len;
+}
+
+/** Dump every PM lock. esp_pm_dump_locks() lists the IDF-internal ones we
+ *  otherwise can't see (wifi, rtos0/1, driver locks) and is NULL-name-safe
+ *  since IDF 5.5 (prints lock@<ptr>). It can't see our PM_NO_DEEP_SLEEP locks
+ *  (no esp_handle), so we splice those into its table. Under profiling its
+ *  output also carries Mode + Sleep stats — we keep both; Sleep stats' light-
+ *  sleep reject count is the "why no light sleep" signal. */
+static void pmDumpLocks() {
+  char* buf = (char*)malloc(4096);
+  if (buf) {
+    pm_buf_t st = { buf, 0, 4096 };
+    FILE* f = funopen(&st, nullptr, pmBufWrite, nullptr, nullptr);
+    if (f) { esp_pm_dump_locks(f); fclose(f); } else buf[0] = '\0';
+  }
+  if (!buf || !buf[0]) {                 /* fallback: at least our own locks */
+    free(buf);
+    cliPrintf("\nPM locks (own only):\n");
+    for (pm_lock* l = pmLockList; l; l = l->next)
+      cliPrintf("  %-15.15s %-14s  %d\n", l->name ? l->name : "?",
+                pmTypeName(l->type), l->count);
+    return;
+  }
+
+  /* esp_pm_dump_locks' table, then our NO_DEEP_SLEEP rows, then (profiling)
+   * the Mode + Sleep stats that trail it — splice our rows in before them. */
+  char* mode = strstr(buf, "\nMode stats:");
+  size_t head = mode ? (size_t)(mode - buf) : strlen(buf);
+  cliPrintf("\n");
+  cliWrite(buf, head);
+  for (pm_lock* l = pmLockList; l; l = l->next) {
+    if (l->type != PM_NO_DEEP_SLEEP) continue;   /* esp-backed locks already listed */
 #ifdef CONFIG_PM_PROFILING
-  fprintf(stream, "%-15s %-14s  %-8s  %-13s  %-14s  %-8s\n",
-          "Name", "Type", "Active", "Total_count", "Time(us)", "Time(%)");
-  for (pm_lock* l = pmLockList; l; l = l->next) {
-    int64_t held = l->time_held;
-    if (l->count > 0) held += now - l->last_taken;
-    fprintf(stream, "%-15.15s %-14s  %-8d  %-13d  %-14lld  %-3lld%%\n",
-            l->name ? l->name : "?", pmTypeName(l->type),
-            l->count, l->times_taken,
-            held, now_d100 ? (held + now_d100 - 1) / now_d100 : 0LL);
-  }
+    int64_t now = esp_timer_get_time(), now_d100 = now / 100;
+    int64_t held = l->time_held + (l->count > 0 ? now - l->last_taken : 0);
+    cliPrintf("%-15.15s %-14s  %-5d  %-8d  %-13d  %-14lld  %-3lld%%\n",
+              l->name ? l->name : "?", pmTypeName(l->type), 0,
+              l->count, l->times_taken, held,
+              now_d100 ? (held + now_d100 - 1) / now_d100 : 0LL);
 #else
-  fprintf(stream, "%-15s %-14s  %-8s\n", "Name", "Type", "Active");
-  for (pm_lock* l = pmLockList; l; l = l->next) {
-    fprintf(stream, "%-15.15s %-14s  %-8d\n",
-            l->name ? l->name : "?", pmTypeName(l->type), l->count);
-  }
+    cliPrintf("%-15.15s %-14s  %-5d  %-8d\n",
+              l->name ? l->name : "?", pmTypeName(l->type), 0, l->count);
 #endif
+  }
+  if (mode) cliWrite(mode, strlen(mode));        /* Mode stats + Sleep stats */
+  free(buf);
 }
 
 void pmInit() {
@@ -330,17 +360,7 @@ static void cliUsbUp() {
 }
 
 #ifdef CONFIG_PM_PROFILING
-/* Capture esp_pm_impl_dump_stats into buffer, parse mode times, print delta */
-struct pm_buf_t { char* buf; size_t pos; size_t cap; };
-static int pmBufWrite(void* cookie, const char* data, int len) {
-  auto* s = (pm_buf_t*)cookie;
-  size_t n = (s->pos + len < s->cap) ? (size_t)len : s->cap - s->pos - 1;
-  memcpy(s->buf + s->pos, data, n);
-  s->pos += n;
-  s->buf[s->pos] = '\0';
-  return len;
-}
-
+/* Parse esp_pm_impl_dump_stats' "Mode stats" table into per-mode microseconds. */
 static void pmParseModeStats(int64_t modeUs[PM_MODE_COUNT]) {
   char buf[512] = {};
   pm_buf_t state = {buf, 0, sizeof(buf)};
@@ -494,13 +514,7 @@ static void cmdPm(const char* args) {
       pmPrintModeLines(grand, rtcDeepSleepUs, grandAwake + rtcDeepSleepUs, rtcDeepSleepCount);
     }
 #endif
-    cliPrintf("\n");
-    /* esp_pm_dump_locks crashes on internal IDF locks with NULL names — skip
-     * until upstream is fixed or we replace it with our own iterator. */
-    { auto w = [](void*, const char* d, int l) -> int { cliPrintf("%.*s", l, d); return l; };
-      FILE* f = funopen(nullptr, nullptr, w, nullptr, nullptr);
-      if (f) { pmDumpDeepSleepLocks(f); fclose(f); }
-    }
+    pmDumpLocks();
 }
 
 static void cmdTop(const char* args) {
