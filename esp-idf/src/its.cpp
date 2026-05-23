@@ -132,8 +132,11 @@ static void poolFree(int idx) {
          * the disconnect's receiving end, in its dispatch loop — neither end is
          * inside a (non-blocking) buffer op at this point. */
         if (e.spaceFreedSem) xSemaphoreGive(e.spaceFreedSem);
-        StreamBufferHandle_t h = e.handle;
+        /* Read the handle and null it under the lock so two concurrent frees
+         * of the same slot can't both reach vStreamBufferDeleteWithCaps with
+         * the same pointer — the second reads nullptr and skips the delete. */
         portENTER_CRITICAL(&itsPoolMux);
+        StreamBufferHandle_t h = e.handle;
         e.handle = nullptr;
         e.size = 0;
         e.inUse = false;
@@ -220,9 +223,19 @@ static void connFree(int handle) {
     /* Clear the entry (mark inactive) BEFORE releasing the buffers, so a
      * sender woken by poolFree's sem re-checks conn(), sees it gone, and
      * aborts before touching the buffer — required now that no_pool poolFree
-     * actually deletes the StreamBuffer. */
-    int toIdx = c->toPoolIdx, fromIdx = c->fromPoolIdx;
+     * actually deletes the StreamBuffer.
+     *
+     * Read the pool indices and clear the entry atomically. Two tasks can
+     * race to free the SAME handle on a no_pool conn: a bidirectional close
+     * (rnsd's linkFreeSlot disconnects the server side while the consumer
+     * detaches the client side) leaves the entry live on both ends, so each
+     * end then receives the other's DISCONNECT and calls connFree. Reading
+     * the indices outside the lock let both read the same valid indices and
+     * double-free the stream buffers (tlsf double-free abort). Inside the
+     * lock, the first caller reads the real indices and clears them; the
+     * second reads -1 and the poolFree calls below no-op. */
     portENTER_CRITICAL(&connMux);
+    int toIdx = c->toPoolIdx, fromIdx = c->fromPoolIdx;
     *c = {};
     c->toPoolIdx = -1;
     c->fromPoolIdx = -1;
