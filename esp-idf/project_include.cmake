@@ -100,14 +100,15 @@ function(diptych_browser_build web_dir)
 endfunction()
 
 
-# diptych_lcd_icons([SRC_DIR <dir>] [SIZES "40x40;64x64"] [PARTITION fixed_a])
+# diptych_lcd_icons([SRC_DIR <dir>] [SIZES "36x36"] [PARTITION fixed_a])
 #
 # Rasterizes launcher icon SOURCES (*.svg / *.png) into LVGL RGB565A8 .bin
 # files — one per size bucket — written into the factory-image staging tree at
 # data_merged/lcd/icons/<WxH>/<name>.bin, so they ship to
-# /fixed/lcd/icons/<WxH>/<name>.bin. The lcd module loads them by basename and
-# picks the bucket from s.lcd.icon_res (default 40x40, sized for the 4×3 grid).
-# Sources live outside data/ so only the generated .bin ships.
+# /fixed/lcd/icons/<WxH>/<name>.bin. The lcd module loads them by basename at a
+# fixed resolution (LAUNCHER_ICON_RES, 36x36, the launcher tile size), rendered
+# native — so build at least that bucket. Sources live outside data/ so only the
+# generated .bin ships.
 #
 # Two source dirs are merged at build time: diptych-core's own
 # assets/lcd-icons/ (platform defaults — gear/log/cli) always, plus the
@@ -123,7 +124,7 @@ endfunction()
 function(diptych_lcd_icons)
     cmake_parse_arguments(_DLI "" "SRC_DIR;PARTITION" "SIZES" ${ARGN})
     if(NOT _DLI_SIZES)
-        set(_DLI_SIZES "40x40")
+        set(_DLI_SIZES "36x36")
     endif()
     if(NOT _DLI_PARTITION)
         set(_DLI_PARTITION "fixed_a")
