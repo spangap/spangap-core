@@ -49,9 +49,10 @@
  * by handling more subdirs in scanExternals(). Drop a file in the build tree
  * and it just appears — no compile-time registration. */
 struct external_t {
-  std::string prefix;   /* dot-path key prefix, e.g. "s.time.zones" */
-  std::string path;     /* on-disk file, e.g. "/state/storage/external/s.time.zones.json" */
-  bool        dirty;    /* sub-tree at prefix changed since last flush */
+  std::string prefix;          /* dot-path key prefix, e.g. "s.time.zones" */
+  std::string path;            /* on-disk file, e.g. "/state/storage/external/s.time.zones.json" */
+  bool        dirty = false;   /* sub-tree at prefix changed since last flush */
+  bool        pendingDelete = false; /* file should be removed + unregistered on next flush */
 };
 static std::vector<external_t> externals;
 static bool rootDirty = false;        /* root.json needs rewrite */
@@ -457,11 +458,34 @@ static void writeSettingsFileOnly() {
 }
 
 static void writeSettingsFile() {
-  for (auto& ext : externals) {
-    if (!ext.dirty) continue;
-    writeExternalFile(ext);
-    ext.dirty = false;
+  /* Externals: process deletes (fs_remove + unregister) and dirty writes.
+     Index-walk re-checking size() each step so a concurrent storageNewTreeFile
+     push_back can't invalidate us; fs I/O stays OUTSIDE CFG_LOCK (writeExternalFile
+     snapshots under the lock then writes lock-free), matching prior behaviour. */
+  for (size_t i = 0; ; ) {
+    bool doDelete = false, doWrite = false;
+    external_t work;
+    CFG_LOCK();
+    if (i >= externals.size()) { CFG_UNLOCK(); break; }
+    external_t& ext = externals[i];
+    if (ext.pendingDelete) {
+      work.path = ext.path;
+      externals.erase(externals.begin() + i);   /* don't advance i */
+      doDelete = true;
+    } else if (ext.dirty) {
+      ext.dirty = false;
+      work.prefix = ext.prefix;
+      work.path   = ext.path;
+      doWrite = true;
+      i++;
+    } else {
+      i++;
+    }
+    CFG_UNLOCK();
+    if (doDelete)      fs_remove(work.path.c_str());
+    else if (doWrite)  writeExternalFile(work);
   }
+
   if (rootDirty) {
     writeSettingsFileOnly();
     rootDirty = false;
@@ -1037,6 +1061,27 @@ static bool deleteFromTree(cJSON* root, const char* dotPath) {
   return true;
 }
 
+/** Flag every external file at or below `keyOrPrefix` for deletion (the
+ *  external IS the key, or lives under it). The actual fs_remove + unregister
+ *  happens on the next writeSettingsFile flush, keeping all external file I/O
+ *  on the saving task. NOT the reverse direction: when the key is a sub-key
+ *  *under* an external (e.g. deleting one message), no external matches here
+ *  and routePatchDirty just marks that file dirty for rewrite. Caller holds
+ *  CFG_LOCK. Returns true if any external was flagged. */
+static bool markExternalsDeletedUnder(const char* keyOrPrefix) {
+  std::string arg = stripDots(keyOrPrefix);
+  if (arg.empty()) return false;
+  std::string argDot = arg + ".";   /* trailing dot: id.0 must not match id.01 */
+  bool any = false;
+  for (auto& ext : externals) {
+    bool match = (ext.prefix == arg) ||
+                 (ext.prefix.size() >= argDot.size() &&
+                  ext.prefix.compare(0, argDot.size(), argDot) == 0);
+    if (match) { ext.pendingDelete = true; any = true; }
+  }
+  return any;
+}
+
 void storageDeleteTree(const char* keyOrPrefix) {
   if (!keyOrPrefix || !*keyOrPrefix) return;
 
@@ -1049,6 +1094,9 @@ void storageDeleteTree(const char* keyOrPrefix) {
      deleted conversations until a reload. commitPatch handles
      persistence (routePatchDirty + startSaveTimer) for s./secrets. */
   CFG_LOCK();
+  /* If this key (or an ancestor) owns an external file, drop it on next flush
+     — otherwise the on-disk .json survives and resurrects on reboot. */
+  markExternalsDeletedUnder(keyOrPrefix);
   bool autoCommit = (txDepth == 0);
   if (autoCommit) storageBegin();
 
@@ -1066,6 +1114,35 @@ void storageDeleteTree(const char* keyOrPrefix) {
 void storageSave() {
   if (saveTimer) esp_timer_stop(saveTimer);
   writeSettingsFile();
+}
+
+void storageNewTreeFile(const char* prefix) {
+  std::string p = stripDots(prefix);
+  if (p.empty()) return;
+
+  CFG_LOCK();
+  /* Idempotent. If a just-deleted prefix is being re-created before the flush
+     processed its pendingDelete, cancel that delete and reuse the entry. */
+  for (auto& ext : externals) {
+    if (ext.prefix == p) {
+      ext.pendingDelete = false;
+      CFG_UNLOCK();
+      return;
+    }
+  }
+  external_t ext;
+  ext.prefix = p;
+  ext.path   = std::string(fsStateDir()) + "/storage/external/" + p + ".json";
+  externals.push_back(std::move(ext));
+  CFG_UNLOCK();
+
+  /* No fs I/O here: the physical file is created on the next flush by
+     writeExternalFile (on the saving task) as soon as a key under `p` marks it
+     dirty — which the caller does immediately after this returns. Registration
+     alone routes those writes to the file, so we keep blocking fs I/O off the
+     caller's itsPoll loop. A reboot before the first flush simply loses the
+     (also-unsaved) registration, re-created on the conversation's next write —
+     no orphaned file, no new data-loss window beyond the existing save delay. */
 }
 
 cfg_type_t storageGetType(const char* key) {
@@ -1437,6 +1514,7 @@ static void mergeIncomingPatch(cJSON* obj, const std::string& prefix) {
     if (cJSON_IsNull(item)) {
       /* Silent delete (no subscription callbacks) */
       CFG_LOCK();
+      markExternalsDeletedUnder(key.c_str());   /* drop external file if this is one */
       deleteFromTree(cfgRoot, key.c_str());
       CFG_UNLOCK();
       if (strncmp(key.c_str(), "s.", 2) == 0) startSaveTimer();

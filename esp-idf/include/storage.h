@@ -93,9 +93,22 @@ bool   storageDefaultTree(const char* prefix, const char* jsonStr);
 void   storageSetTree(const char* key, cJSON* val);
 /** Delete a single key via patch/commit. Fires storageSubscribeChanges with val="". */
 void   storageUnset(const char* key);
-/** Delete a key/subtree directly. No change callbacks. Sends null on WS. */
+/** Delete a key/subtree directly. No change callbacks. Sends null on WS.
+ *  If the key (or an ancestor of it) names a registered external file
+ *  (see storageNewTreeFile), that file is removed and unregistered on the
+ *  next flush — so deleting a contact/identity also drops its own .json. */
 void   storageDeleteTree(const char* keyOrPrefix);
 void   storageSave();                   /** Force immediate JSON write. */
+
+/** Register a dedicated on-disk file for the subtree at `prefix`, so writes
+ *  under it persist to <stateDir>/storage/external/<prefix>.json instead of
+ *  bloating root.json (the same mechanism timezones use). Call before writing
+ *  the first key under `prefix` — e.g. at contact creation, so a chatty
+ *  conversation only rewrites its own small file. Idempotent. The file is
+ *  removed + unregistered automatically when `prefix` (or an ancestor) is
+ *  passed to storageDeleteTree. Does not evict — the subtree still lives in
+ *  cfgRoot and still syncs to the browser. */
+void   storageNewTreeFile(const char* prefix);
 
 /** Begin a transaction. All storageSet/Unset calls accumulate in a patch tree.
  *  storageEnd() commits atomically: one merge, one WS message, subscriptions
