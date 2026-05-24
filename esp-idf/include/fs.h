@@ -12,6 +12,7 @@
 #include <sys/stat.h>
 #include <cstddef>
 #include <string>
+#include "esp_err.h"
 
 /* ---- Filesystem layout ---- */
 
@@ -91,6 +92,12 @@ void fsFormatFlash(void);
  *  Returns false if no card is mounted or SD support is compiled out.
  *  Run on a DRAM stack. Used by `format sd`. */
 bool fsFormatSd(void);
+
+/** LittleFS usage for a partition `label` ("state", "webroot", "fixed_*").
+ *  Proxied through the DRAM-stack fs worker — esp_littlefs_info walks
+ *  metadata via SPI-flash reads that disable the PSRAM cache, so a direct
+ *  call from a PSRAM-stack task asserts. Returns ESP_OK on success. */
+esp_err_t fsLittlefsInfo(const char* label, size_t* total, size_t* used);
 
 /* ---- Optional SD card mount ---- */
 

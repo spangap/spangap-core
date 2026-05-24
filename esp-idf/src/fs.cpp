@@ -159,7 +159,7 @@ struct fs_op_t {
     enum Op { OPEN, READ, WRITE, TELL, SEEK, FLUSH, SYNC, TRUNCATE, CLOSE,
               STAT, RENAME, REMOVE, MKDIR,
               OPENDIR, READDIR, CLOSEDIR, LISTDIR,
-              FILE_INFO } op;
+              FILE_INFO, LFS_INFO } op;
     const char* path;
     const char* path2;      /* rename: dest; open: mode */
     int     slot;
@@ -304,6 +304,14 @@ static void handleOp(fs_op_t* req) {
         out->size  = (size_t)st.st_size;
         out->mtime = st.st_mtime;
         req->result = 0;
+        break;
+    }
+    case fs_op_t::LFS_INFO: {
+        /* path carries the partition label; size/nmemb return total/used. */
+        size_t t = 0, u = 0;
+        req->result = esp_littlefs_info(req->path, &t, &u);
+        req->size  = t;
+        req->nmemb = u;
         break;
     }
     case fs_op_t::LISTDIR: {
@@ -1112,6 +1120,19 @@ int fs_stat(const char* path, struct stat* st) {
         return proxyOp(req);
     }
     return stat(path, st);
+}
+
+esp_err_t fsLittlefsInfo(const char* label, size_t* total, size_t* used) {
+    if (needsProxy(nullptr)) {
+        fs_op_t req = {};
+        req.op = fs_op_t::LFS_INFO;
+        req.path = label;
+        esp_err_t e = (esp_err_t)proxyOp(req);
+        if (total) *total = req.size;
+        if (used)  *used  = req.nmemb;
+        return e;
+    }
+    return esp_littlefs_info(label, total, used);
 }
 
 int fs_rename(const char* from, const char* to) {

@@ -2,7 +2,6 @@
 #include "cli.h"
 #include "fs.h"
 #include "compat.h"
-#include "esp_littlefs.h"
 #include <cstring>
 #include <cstdio>
 #include <cerrno>
@@ -356,7 +355,7 @@ static void cmdDf(const char* a) {
     lfsLabel = "state";
   if (lfsLabel) {
     size_t t = 0, u = 0;
-    if (esp_littlefs_info(lfsLabel, &t, &u) == ESP_OK) {
+    if (fsLittlefsInfo(lfsLabel, &t, &u) == ESP_OK) {
       total = t;
       used = u;
       ok = true;
