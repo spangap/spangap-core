@@ -37,7 +37,7 @@
 static constexpr uint16_t STORAGE_CONFIG_PORT = 1;
 
 /** Storage task's ITS aux ports. */
-static constexpr uint16_t STORAGE_SAVE_PORT   = 43;  /* save-now signal */
+static constexpr uint16_t STORAGE_SAVE_PORT   = 43;  /* reserved (was save-now; saves now run on the storage_save worker) */
 static constexpr uint16_t STORAGE_CHANGE_PORT = 42;  /* change dispatch on subscriber tasks */
 
 /* ---- Config types ---- */

@@ -74,6 +74,13 @@ static esp_timer_handle_t saveTimer = nullptr;
 /* ---- Task state ---- */
 
 static TaskHandle_t storageHandle = nullptr;
+/* Persist worker: owns the blocking fs writes (writeSettingsFile). The storage
+ * task runs itsPoll and must NEVER do fs I/O around its poll loop — each
+ * proxyOp parks the caller in xSemaphoreTake(pickupSem, portMAX_DELAY) for the
+ * whole op, and writeSettingsFile chains one per dirty external + root.json. On
+ * the storage task that blocks its inbox drain → "notify drop … → [storage]"
+ * floods (worst with many lxmf externals). So saves run here, off the loop. */
+static TaskHandle_t saveWorkerHandle = nullptr;
 static int dcHandle = -1;               /* single packet-mode DC client */
 static cJSON* dcPendingPatch = nullptr; /* outgoing coalescing */
 
@@ -493,11 +500,22 @@ static void writeSettingsFile() {
   savePending = false;
 }
 
-/* STORAGE_SAVE_PORT in storage.h */
+/* Persist worker loop: block until poked, then flush. ulTaskNotifyTake(pdTRUE)
+ * coalesces any pokes that arrived during a flush into one extra pass. Not an
+ * ITS task — blocking on fs I/O here harms nothing. */
+static void saveWorkerFn(void*) {
+  for (;;) {
+    ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+    writeSettingsFile();
+  }
+}
 
-static void saveTimerCb(void* arg) {
-  if (!storageHandle) return;
-  itsSendAuxByTaskHandle(storageHandle, STORAGE_SAVE_PORT, nullptr, 0, 0);
+static void requestSave() {
+  if (saveWorkerHandle) xTaskNotifyGive(saveWorkerHandle);
+}
+
+static void saveTimerCb(void* /*arg*/) {
+  requestSave();
 }
 
 static void startSaveTimer() {
@@ -1536,7 +1554,7 @@ static void dcHandleMessage(int handle, const char* text, size_t len) {
         return;
     }
     if (len == 10 && memcmp(text, "{\"save\":1}", 10) == 0) {
-        storageSave();
+        requestSave();   /* off the storage task — never fs I/O on the poll loop */
         return;
     }
     cJSON* root = cJSON_Parse(text);
@@ -1585,10 +1603,6 @@ static void storageItsDisconnect(int ref) {
 
 /* ---- Task function ---- */
 
-static void storageSaveAux(TaskHandle_t, const void*, size_t) {
-    writeSettingsFile();
-}
-
 static void storageTaskFn(void* arg) {
     /* Re-home the config tree onto this task. storageLoad() parsed cfgRoot on
      * main_task (which self-deletes → the tree shows under (deleted) in `top`).
@@ -1619,7 +1633,6 @@ static void storageTaskFn(void* arg) {
     itsServerPortOpen(STORAGE_CONFIG_PORT, /*packetBased=*/true, 1, 49152, 65536);
     itsServerOnConnect(STORAGE_CONFIG_PORT, storageItsConnect);
     itsServerOnDisconnect(STORAGE_CONFIG_PORT, storageItsDisconnect);
-    itsOnAux(STORAGE_SAVE_PORT, storageSaveAux);
 
     /* Subscribe to all config changes for DC coalescing */
     storageSubscribeChanges("", ON_CHANGE {
@@ -1645,6 +1658,11 @@ void storageInit() {
         storageDefault("s.storage.flash_delay", 60);
         storageSet("s.storage.version", STORAGE_VERSION);
     }
+
+    /* persist worker: owns the blocking fs writes so the storage task's poll
+     * loop never stalls on them. Spawn before the storage task so it's ready
+     * for the first save poke (the save timer can only fire 60s+ after boot). */
+    saveWorkerHandle = spawnTask(saveWorkerFn, "storage_save", 8192, nullptr, 1, 1);
 
     /* storage task: PSRAM stack (config WS + ITS, no direct file I/O) */
     storageHandle = spawnTask(storageTaskFn, "storage", 8192, nullptr, 1, 1);
