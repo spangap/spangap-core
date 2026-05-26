@@ -703,6 +703,21 @@ static sdmmc_card_t* sdCard = nullptr;
 /* sdReady + sdAvailable() defined earlier so the fs worker (LISTDIR root case)
  * can gate the synthetic /sdcard entry on whether the card mounted. */
 
+#if CONFIG_DIPTYCH_SDCARD && CONFIG_DIPTYCH_SDCARD_BUS_SPI
+/* SD shares the SPI bus with the LCD and (on the T-Deck) the LoRa radio. The
+ * IDF's own per-device bus lock isn't enough: esp_lcd releases it the moment it
+ * queues its async colour DMA, so an SD transaction can start mid-DMA and trip
+ * `spi_ll_get_running_cmd(hw) == 0` in spi_hal_setup_trans. Take the same outer
+ * spiHelperBusLock the LCD and LoRa HAL hold, per SD command, so every bus user
+ * is serialized. Lock order is always spiHelperBusLock -> IDF bus lock. */
+static esp_err_t sdspiLockedDoTransaction(int slot, sdmmc_command_t* cmdinfo) {
+    spiHelperBusLock();
+    esp_err_t r = sdspi_host_do_transaction(slot, cmdinfo);
+    spiHelperBusUnlock();
+    return r;
+}
+#endif
+
 bool fs_mount_sd(void) {
 #if !CONFIG_DIPTYCH_SDCARD
     return false;
@@ -782,6 +797,8 @@ bool fs_mount_sd(void) {
     sdmmc_host_t host = SDSPI_HOST_DEFAULT();
     host.slot = host_id;
     host.max_freq_khz = CONFIG_DIPTYCH_SDCARD_SPI_FREQ_KHZ;
+    /* Serialize SD transactions against the LCD/LoRa on the shared bus. */
+    host.do_transaction = &sdspiLockedDoTransaction;
 
     sdspi_device_config_t dev = SDSPI_DEVICE_CONFIG_DEFAULT();
     dev.host_id = host_id;
