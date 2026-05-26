@@ -21,7 +21,7 @@ static inline uint32_t millis() { return (uint32_t)(esp_timer_get_time() / 1000)
 
 /* ---- Stream buffer pool ---- */
 
-#define ITS_MAX_POOL 48
+#define ITS_MAX_POOL 128
 
 struct its_pool_entry_t {
     StreamBufferHandle_t handle;
@@ -173,7 +173,7 @@ static StreamBufferHandle_t poolHandle(int idx) {
 
 /* ---- Global connection table ---- */
 
-#define ITS_MAX_CONNS 64
+#define ITS_MAX_CONNS 128
 
 struct its_conn_t {
     volatile bool       active;
@@ -271,7 +271,7 @@ typedef struct {
 
 /* ---- Per-task registry ---- */
 
-#define ITS_MAX_TASKS  24
+#define ITS_MAX_TASKS  48
 
 struct its_aux_entry_t {
     bool         active;
