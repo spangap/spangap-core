@@ -62,6 +62,8 @@ static int logFile = -1;
 static char logFilePath[128] = {};
 static int64_t lastFlushUs = 0;
 static int logFileLevelMax = 4;  /* 0=E 1=W 2=I 3=D 4=V — default: pass all */
+static int logFileIntervalMs = 5000;  /* tail-flush cadence; 0 = size-batch only */
+static bool logFileDirty = false;     /* lines written since the last fsync */
 
 static int levelCharToNum(char c) {
     switch (c) {
@@ -135,7 +137,7 @@ static void logFileMsg(const char* msg) {
     char ts[24]; fmtWallClock(ts, sizeof(ts));
     char line[256];
     int n = snprintf(line, sizeof(line), "%s I [log] %s\n", ts, msg);
-    if (n > 0) itsSend(logFile, line, n, 0);
+    if (n > 0) { itsSend(logFile, line, n, 0); logFileDirty = true; }
 }
 
 static void logFileClose() {
@@ -175,16 +177,26 @@ static void logFileWrite(const char* data, size_t len) {
     while (p < end) {
         const char* nl = (const char*)memchr(p, '\n', end - p);
         size_t lineLen = nl ? (size_t)(nl - p + 1) : (size_t)(end - p);
-        if (levelCharToNum(lineLevel(p, lineLen)) <= logFileLevelMax)
+        if (levelCharToNum(lineLevel(p, lineLen)) <= logFileLevelMax) {
             itsSend(logFile, p, lineLen, 0);
+            logFileDirty = true;
+        }
         p += lineLen;
     }
 }
 
 static void logFileFlush() {
-    /* No-op: the fs worker drains the stream buffer on its own trigger level.
-     * Closing the file (logFileClose → itsDisconnect) flushes + fsyncs. */
-    (void)lastFlushUs;
+    /* The fs worker auto-drains the stream buffer once 4KB accumulate. This adds
+     * a time-based tail flush so the last partial (<4KB) batch reaches the card
+     * within s.log.file.interval seconds — otherwise a crash/power-loss loses
+     * it. interval=0 disables, leaving pure size-batching. Called every task
+     * loop; the time gate sets the real cadence. */
+    if (logFile < 0 || logFileIntervalMs <= 0 || !logFileDirty) return;
+    int64_t now = esp_timer_get_time();
+    if (now - lastFlushUs < (int64_t)logFileIntervalMs * 1000) return;
+    lastFlushUs = now;
+    logFileDirty = false;
+    fs_stream_sync(logFile);
 }
 
 /* ---- Log ITS server — consumers connect as clients ---- */
@@ -196,6 +208,8 @@ static struct {
   log_ansi_t ansi;
   char  lineBuf[LOG_INBOUND_BUF];
   size_t lineLen;
+  bool  pastePending;   /* DC: paste-back deferred out of onConnect (below) */
+  long  pasteBacklog;   /* kB requested (0 = default) */
 } logSlots[LOG_MAX_CONSUMERS];
 
 static int logAllocSlot(int h) {
@@ -544,7 +558,15 @@ static int logDcConnect(int handle, const void* data, size_t len) {
     if (a && (a = strchr(a, ':')) && atol(a + 1) == 0)
       logSlots[s].ansi = LOG_NO_ANSI;
   }
-  logPasteBack(handle, backlog, logSlots[s].ansi == LOG_ANSI);
+  /* Defer paste-back out of the connect handshake. It reads up to tens of KB
+   * from the (now SD-backed, slow) log file and pushes it through the 2KB
+   * connection buffer — but onConnect runs synchronously before the client's
+   * ack is signalled, and the client is still blocked inside itsConnect, not
+   * draining. Doing it here stalls the handshake past the client's connect
+   * timeout (→ "[log: connect failed]") and leaks the server slot. The task
+   * loop runs it once the client is connected and draining. */
+  logSlots[s].pasteBacklog = backlog;
+  logSlots[s].pastePending = true;
   return s;
 }
 
@@ -552,6 +574,7 @@ static void logOnDisconnect(int ref) {
   if (ref >= 0 && ref < LOG_MAX_CONSUMERS) {
     logSlots[ref].itsHandle = -1;
     logSlots[ref].lineLen = 0;
+    logSlots[ref].pastePending = false;
   }
 }
 
@@ -709,6 +732,7 @@ static void logTaskFn(void* arg) {
   { char lvl[16];
     storageGetStr("s.log.file.level", lvl, sizeof(lvl), "verbose");
     logFileLevelMax = parseLevelNum(lvl);
+    logFileIntervalMs = storageGetInt("s.log.file.interval", 5) * 1000;
     char name[64];
     storageGetStr("s.log.file.name", name, sizeof(name));
     if (name[0]) {
@@ -731,6 +755,9 @@ static void logTaskFn(void* arg) {
   storageSubscribeChanges("s.log.file.level", ON_CHANGE {
     logFileLevelMax = parseLevelNum(val);
   });
+  storageSubscribeChanges("s.log.file.interval", ON_CHANGE {
+    logFileIntervalMs = atoi(val) * 1000;
+  });
 
   /* Register TCP port (non-blocking: retry from main loop so serial log
    * connection is accepted immediately during boot). Browser side reaches
@@ -742,6 +769,18 @@ static void logTaskFn(void* arg) {
   for (;;) {
     pmPollUsb();
     while (itsPoll(pdMS_TO_TICKS(200))) {}
+
+    /* Deferred paste-back: a DC connect was just accepted (logDcConnect) and
+     * the client is now past itsConnect and draining. Send the scrollback here,
+     * outside the handshake, so a slow SD read can't time out the connect.
+     * Runs before the live fan-out so history precedes live lines. */
+    for (int i = 0; i < LOG_MAX_CONSUMERS; i++) {
+      if (logSlots[i].pastePending && logSlots[i].itsHandle >= 0) {
+        logSlots[i].pastePending = false;
+        logPasteBack(logSlots[i].itsHandle, logSlots[i].pasteBacklog,
+                     logSlots[i].ansi == LOG_ANSI);
+      }
+    }
 
     if (!netRegistered) {
       net_port_msg_t reg = {};
