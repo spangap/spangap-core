@@ -47,7 +47,7 @@ The root config file is **`<stateDir>/storage/root.json`** (was `/state/settings
 
 **Factory layout (consumer-supplied)**: each consumer app ships a `data/factory_state/` directory holding (a) loose files copied verbatim (`boot`, `crontab`, `net_up`), (b) `storage/<mode>/<prefix>.json` external blobs, and (c) optionally `settings.json` for keys that don't have a natural module owner (it is deep-merged on first boot, **not** copied verbatim — the live file is `storage/root.json`). A sibling `data/additional_state/` is the per-build user overlay applied on first boot only: same layout (`settings.json` deep-merged into `cfgRoot`, plain files copied, `storage/<mode>/*.json` overlays the corresponding factory file). Both directories are flashed read-only via the consumer's LittleFS image build; user-edited config lives in `<stateDir>/storage/root.json` after first boot.
 
-Diptych ships one such blob itself: `s.time.zones.json`, an IANA→POSIX timezone map. It is **platform-owned** — checked in at `diptych-core/data/factory_state/storage/external/s.time.zones.json` and folded into every consumer's image by `diptych_create_factory_image`'s data merge. It is **not** fetched at build time (that would make builds non-deterministic); refresh it as a release step with diptych-core's `make timezones`, which runs `scripts/update-zones.py` to pull the latest map from a GitHub-hosted source (ETag-cached) and rewrite the checked-in file. From there it bakes into the LittleFS image like any other factory file.
+Spangap ships one such blob itself: `s.time.zones.json`, an IANA→POSIX timezone map. It is **platform-owned** — checked in at `spangap-core/data/factory_state/storage/external/s.time.zones.json` and folded into every consumer's image by `spangap_create_factory_image`'s data merge. It is **not** fetched at build time (that would make builds non-deterministic); refresh it as a release step with spangap-core's `make timezones`, which runs `scripts/update-zones.py` to pull the latest map from a GitHub-hosted source (ETag-cached) and rewrite the checked-in file. From there it bakes into the LittleFS image like any other factory file.
 
 ## Config Key Naming
 
@@ -55,7 +55,7 @@ Dot-notation hierarchy. Keys starting with `s.` are saved to JSON; others are ep
 
 **Stored settings (`s.*`, `secrets.*`)** — persisted to `<stateDir>/storage/root.json` unless marked external. Each prefix is owned by one module which installs its defaults via `storageDefaultTree` gated on `s.<mod>.version`.
 
-### Diptych-side prefixes
+### Spangap-side prefixes
 
 | Prefix | Owner / install site | Examples |
 |--------|----------------------|----------|
@@ -93,11 +93,11 @@ Apps add their own prefixes for domain config. A camera-and-audio app, for examp
 | `sys.time.valid` | 1 when system time ≥ 2025 | Published by NTP |
 | `sys.time.set` | Browser pushes epoch seconds | NTP accepts if time invalid, resets to 0 |
 
-Consumer apps publish their own ephemerals (e.g. status flags, detection state); they show up alongside diptych's in `show` output and over the `storage:1` DC.
+Consumer apps publish their own ephemerals (e.g. status flags, detection state); they show up alongside spangap's in `show` output and over the `storage:1` DC.
 
-**Config copy** — `storageCopy(src, dst)` is the way to layer base + override config trees into a single read-only ephemeral tree at activation time. Useful when one config family (e.g. audio settings) has multiple modes that overlay on a common base. Apps that need this set up the copies themselves; diptych provides only the primitive.
+**Config copy** — `storageCopy(src, dst)` is the way to layer base + override config trees into a single read-only ephemeral tree at activation time. Useful when one config family (e.g. audio settings) has multiple modes that overlay on a common base. Apps that need this set up the copies themselves; spangap provides only the primitive.
 
-Defaults live with the owning module's `init()` (search the codebase for `storageDefaultTree(` to find them). Browser-side window/UI state lives in browser `localStorage` (`diptych.win.<id>`), not in device storage.
+Defaults live with the owning module's `init()` (search the codebase for `storageDefaultTree(` to find them). Browser-side window/UI state lives in browser `localStorage` (`spangap.win.<id>`), not in device storage.
 
 **fps convention** (`compat.h`'s `fpsToIntervalMs()`): positive = frames per second; negative = 1/N fps (e.g. `-3` = one frame every 3 seconds). Used by any consumer that has an fps-style config knob.
 

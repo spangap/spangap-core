@@ -1,68 +1,68 @@
-menu "diptych modules"
+menu "spangap modules"
 
-config DIPTYCH_PROJECT_NAME
+config SPANGAP_PROJECT_NAME
     string "Project name (immutable identity)"
-    default "diptych"
+    default "spangap"
     help
         Compile-time project identity. Stored verbatim in s.sys.project at
-        first boot. On every subsequent boot, diptychInit() compares the
+        first boot. On every subsequent boot, spangapInit() compares the
         loaded value to this string and factory-resets /state if they
-        differ — so flashing a different diptych project (e.g. seccam →
+        differ — so flashing a different spangap project (e.g. seccam →
         reticulous) over the same flash chip starts with a clean state.
 
         Not user-editable at runtime. For the user-facing display name,
-        use DIPTYCH_BANNER (s.sys.banner) instead.
+        use SPANGAP_BANNER (s.sys.banner) instead.
 
-config DIPTYCH_BANNER
+config SPANGAP_BANNER
     string "System banner / progname"
-    default "diptych device"
+    default "spangap device"
     help
         Default value for the s.sys.banner config key, displayed by the
         browser SPA in the menu bar and used by the device as its
         identifying name. Editable at runtime via `set s.sys.banner ...`.
 
-config DIPTYCH_SDCARD
+config SPANGAP_SDCARD
     bool "Mount SD card on boot"
     default n
     help
-        When enabled, diptychInit() calls fs_mount_sd(). Required for any
+        When enabled, spangapInit() calls fs_mount_sd(). Required for any
         module that writes to /sdcard (recordings, log files on SD, etc.).
         Pick the bus type below; pins are board-specific — set them in
         your project's sdkconfig.defaults.
 
-choice DIPTYCH_SDCARD_BUS
+choice SPANGAP_SDCARD_BUS
     prompt "SD card bus"
-    depends on DIPTYCH_SDCARD
-    default DIPTYCH_SDCARD_BUS_SDMMC
+    depends on SPANGAP_SDCARD
+    default SPANGAP_SDCARD_BUS_SDMMC
     help
         SDMMC uses the ESP32-S3's dedicated SDIO peripheral (faster,
         dedicated pins). SPI uses the shared SPI bus via spi_helper —
         right choice for boards like T-Deck Plus where the SD slot
         shares SCK/MOSI/MISO with display + LoRa.
 
-    config DIPTYCH_SDCARD_BUS_SDMMC
+    config SPANGAP_SDCARD_BUS_SDMMC
         bool "SDMMC (dedicated SDIO peripheral)"
-    config DIPTYCH_SDCARD_BUS_SPI
+    config SPANGAP_SDCARD_BUS_SPI
         bool "SPI (shared SPI bus via spi_helper)"
 endchoice
 
 # ── SDMMC variant pins ──
 
-config DIPTYCH_SDCARD_PIN_CLK
+config SPANGAP_SDCARD_PIN_CLK
     int "SDMMC CLK pin"
-    depends on DIPTYCH_SDCARD_BUS_SDMMC
+    depends on SPANGAP_SDCARD_BUS_SDMMC
 
-config DIPTYCH_SDCARD_PIN_CMD
+config SPANGAP_SDCARD_PIN_CMD
     int "SDMMC CMD pin"
-    depends on DIPTYCH_SDCARD_BUS_SDMMC
+    depends on SPANGAP_SDCARD_BUS_SDMMC
 
-config DIPTYCH_SDCARD_PIN_D0
+config SPANGAP_SDCARD_PIN_D0
     int "SDMMC D0 pin"
-    depends on DIPTYCH_SDCARD_BUS_SDMMC
+    depends on SPANGAP_SDCARD_BUS_SDMMC
 
-config DIPTYCH_SDCARD_4BIT
+config SPANGAP_SDCARD_4BIT
     bool "4-bit SDMMC bus (D0..D3 wired)"
-    depends on DIPTYCH_SDCARD_BUS_SDMMC
+    depends on SPANGAP_SDCARD_BUS_SDMMC
     default n
     help
         Enable when the board has all four data lines (D0..D3) routed.
@@ -70,23 +70,23 @@ config DIPTYCH_SDCARD_4BIT
         Sense included) only expose D0; leave off unless you know the
         SD slot has the wider bus.
 
-config DIPTYCH_SDCARD_PIN_D1
+config SPANGAP_SDCARD_PIN_D1
     int "SDMMC D1 pin"
-    depends on DIPTYCH_SDCARD_4BIT
+    depends on SPANGAP_SDCARD_4BIT
 
-config DIPTYCH_SDCARD_PIN_D2
+config SPANGAP_SDCARD_PIN_D2
     int "SDMMC D2 pin"
-    depends on DIPTYCH_SDCARD_4BIT
+    depends on SPANGAP_SDCARD_4BIT
 
-config DIPTYCH_SDCARD_PIN_D3
+config SPANGAP_SDCARD_PIN_D3
     int "SDMMC D3 pin"
-    depends on DIPTYCH_SDCARD_4BIT
+    depends on SPANGAP_SDCARD_4BIT
 
 # ── SPI variant pins ──
 
-config DIPTYCH_SDCARD_SPI_HOST
+config SPANGAP_SDCARD_SPI_HOST
     int "SPI host (2 = SPI2/FSPI, 3 = SPI3/HSPI)"
-    depends on DIPTYCH_SDCARD_BUS_SPI
+    depends on SPANGAP_SDCARD_BUS_SPI
     range 2 3
     default 2
     help
@@ -94,25 +94,25 @@ config DIPTYCH_SDCARD_SPI_HOST
         any other driver on the same bus (e.g. the LoRa transport in
         reticulous) initialises via spi_helper.
 
-config DIPTYCH_SDCARD_SPI_PIN_CS
+config SPANGAP_SDCARD_SPI_PIN_CS
     int "SPI SD CS pin"
-    depends on DIPTYCH_SDCARD_BUS_SPI
+    depends on SPANGAP_SDCARD_BUS_SPI
 
-config DIPTYCH_SDCARD_SPI_PIN_SCK
+config SPANGAP_SDCARD_SPI_PIN_SCK
     int "SPI SCK pin (shared bus)"
-    depends on DIPTYCH_SDCARD_BUS_SPI
+    depends on SPANGAP_SDCARD_BUS_SPI
 
-config DIPTYCH_SDCARD_SPI_PIN_MOSI
+config SPANGAP_SDCARD_SPI_PIN_MOSI
     int "SPI MOSI pin (shared bus)"
-    depends on DIPTYCH_SDCARD_BUS_SPI
+    depends on SPANGAP_SDCARD_BUS_SPI
 
-config DIPTYCH_SDCARD_SPI_PIN_MISO
+config SPANGAP_SDCARD_SPI_PIN_MISO
     int "SPI MISO pin (shared bus)"
-    depends on DIPTYCH_SDCARD_BUS_SPI
+    depends on SPANGAP_SDCARD_BUS_SPI
 
-config DIPTYCH_SDCARD_SPI_FREQ_KHZ
+config SPANGAP_SDCARD_SPI_FREQ_KHZ
     int "SPI SD clock (kHz)"
-    depends on DIPTYCH_SDCARD_BUS_SPI
+    depends on SPANGAP_SDCARD_BUS_SPI
     range 400 40000
     default 20000
     help
@@ -120,7 +120,7 @@ config DIPTYCH_SDCARD_SPI_FREQ_KHZ
         SPI mode; many cards happily run at 40 MHz with short wiring,
         but 20 MHz is a safe default on shared-bus boards.
 
-config DIPTYCH_OTA
+config SPANGAP_OTA
     bool "OTA (signed-manifest over-the-air updates)"
     default y
     help
@@ -130,11 +130,11 @@ config DIPTYCH_OTA
         slot. Requires the consumer to ship `idf.py ota-keygen` output
         (keys/ota_priv.pem gitignored, main/ota_pubkey.h committed) and
         to call `otaSetPubkey(OTA_PUBKEY_PEM, OTA_PUBKEY_PEM_LEN)` from
-        app_main after diptychInit(). When n, the firmware can only be
+        app_main after spangapInit(). When n, the firmware can only be
         updated by re-flashing over USB / JTAG — but app+fixed partitions
         get twice the space (no A/B pairing).
 
-config DIPTYCH_APP_PERCENT
+config SPANGAP_APP_PERCENT
     int "App share of available flash (%)"
     range 10 90
     default 75
@@ -147,12 +147,12 @@ config DIPTYCH_APP_PERCENT
         With OTA on, both app and fixed are paired A/B (so each individual
         slot is half the share). With OTA off, each gets the full share.
 
-        Diptych regenerates partitions.csv from this value + flash size +
+        Spangap regenerates partitions.csv from this value + flash size +
         OTA on/off at every reconfigure — never edit partitions.csv by hand.
 
-config DIPTYCH_OTA_URL
+config SPANGAP_OTA_URL
     string "OTA manifest URL"
-    depends on DIPTYCH_OTA
+    depends on SPANGAP_OTA
     default ""
     help
         URL the firmware fetches at version-check time. Becomes the
@@ -162,7 +162,7 @@ config DIPTYCH_OTA_URL
         overlay. Empty value means OTA is configured but won't actually
         check anything until s.sys.ota.url is set at runtime.
 
-config DIPTYCH_WG
+config SPANGAP_WG
     bool "WireGuard tunnel"
     default y
     select LWIP_PPP_SUPPORT
@@ -171,7 +171,7 @@ config DIPTYCH_WG
         (with netif->state workaround). Enables the wg.* CLI commands,
         wg.* config keys, and auto-tunnel-up on STA upstream.
 
-config DIPTYCH_DUCKDNS
+config SPANGAP_DUCKDNS
     bool "DuckDNS dynamic DNS"
     default y
     help
@@ -179,7 +179,7 @@ config DIPTYCH_DUCKDNS
         public IP. Enables the duckdns CLI command and s.duckdns.*
         config keys.
 
-config DIPTYCH_UPNP
+config SPANGAP_UPNP
     bool "UPnP IGD port mapping"
     default y
     help
@@ -187,33 +187,33 @@ config DIPTYCH_UPNP
         configured ports (HTTPS, RTSP). Enables the upnp CLI command
         and s.upnp.* config keys.
 
-config DIPTYCH_ACME
+config SPANGAP_ACME
     bool "ACME (Let's Encrypt) TLS certificates"
     default y
     help
         Auto-renews a publicly-trusted TLS certificate via the ACME
         protocol (HTTP-01 or DNS-01-via-DuckDNS). Enables the acme
         CLI command and s.acme.* config keys. DNS-01 also requires
-        DIPTYCH_DUCKDNS.
+        SPANGAP_DUCKDNS.
 
-config DIPTYCH_LCD
+config SPANGAP_LCD
     bool "LCD display + LVGL launcher"
     default n
     help
         Phone-style on-device UI: owns the display + input devices and the
         single LVGL context, paints a launcher of program icons with an
         opaque status bar, and lets other components register programs via
-        lcdRegister(). lcdInit() is called by diptychInit(); the consumer
+        lcdRegister(). lcdInit() is called by spangapInit(); the consumer
         must implement the lcd_board.h HAL contract (boardLcdInit /
         boardLcdBacklight / boardLcdShutdown / boardTouchInit) for its board
         and add the `lvgl` + `esp_lcd_touch_gt911` managed dependencies. Pulls
         in LVGL v9, esp_lcd and esp_lcd_touch only when enabled.
 
-config DIPTYCH_RESET_ON_OFF
+config SPANGAP_RESET_ON_OFF
     bool "Reset button acts as on/off switch"
     default n
     help
-        When enabled, diptychInit() defaults s.sys.reset_on_off to 1 so the
+        When enabled, spangapInit() defaults s.sys.reset_on_off to 1 so the
         hardware reset button toggles the device between on and a powered-down
         deep sleep. The on/off state persists in s.sys.power_on; on power-down
         the board's resetOnOffSetPowerOff() hook cuts peripheral power and the
@@ -222,39 +222,10 @@ config DIPTYCH_RESET_ON_OFF
 
 endmenu
 
-# ─── vendored esp_wireguard tuning (only meaningful when DIPTYCH_WG=y) ───
-
-menu "WireGuard (vendored fork — internal)"
-    visible if DIPTYCH_WG
-
-choice WIREGUARD_ESP_ADAPTER_SELECTION
-    prompt "TCP/IP adapter to use"
-    default WIREGUARD_ESP_NETIF
-    config WIREGUARD_ESP_TCPIP_ADAPTER
-        bool "TCP/IP Adapter (pre esp-idf v4.1, ESP8266 RTOS SDK)"
-    config WIREGUARD_ESP_NETIF
-        bool "ESP-NETIF"
-endchoice
-
-config WIREGUARD_MAX_PEERS
-    int "Max number of peers"
-    default 1
-
-config WIREGUARD_MAX_SRC_IPS
-    int "Max number of SRC IP addresses"
-    default 2
-
-config MAX_INITIATIONS_PER_SECOND
-    int "Per device limit on accepting (valid) initiation requests"
-    default 2
-
-choice WIREGUARD_x25519_IMPLEMENTATION
-    prompt "x25519 implementation to use"
-    default WIREGUARD_x25519_IMPLEMENTATION_DEFAULT
-    config WIREGUARD_x25519_IMPLEMENTATION_DEFAULT
-        bool "Default (originally from wireguard-lwip)"
-    config WIREGUARD_x25519_IMPLEMENTATION_NACL
-        bool "NaCL"
-endchoice
-
-endmenu
+# The vendored esp_wireguard tuning menu ("WireGuard (vendored fork —
+# internal)", visible if SPANGAP_WG) moved to wg/esp-idf/Kconfig in Phase 2
+# of the straddles plan. The SPANGAP_WG toggle above stays here because
+# spangapInit()'s conditional wgInit() call and spangap.h's conditional
+# `#include "wg.h"` reference it — once those move into a generated
+# straddle dispatcher, SPANGAP_WG (and its siblings UPNP/DUCKDNS/ACME/OTA/LCD)
+# move out alongside the code that reads them.

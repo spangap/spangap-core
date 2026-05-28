@@ -1,0 +1,7 @@
+# Runs each time STA connects to upstream network (NET_EV_UPSTREAM_UP) — on a
+# temp task, ok to block. AP-only mode does not trigger this.
+#
+# Spangap default: just block until NTP gives us a sane wall clock. Apps that
+# enable OTA should override this file in their own data/factory_state/net_up
+# to add `version` (auto-check for new firmware on each upstream-up).
+date wait 60

@@ -103,12 +103,12 @@ esp_err_t fsLittlefsInfo(const char* label, size_t* total, size_t* used);
 
 /** Mount an SD card at /sdcard (FAT on SDMMC slot). Pin numbers and bus
  *  width are read from Kconfig:
- *    CONFIG_DIPTYCH_SDCARD            — gate (no-op return when n)
- *    CONFIG_DIPTYCH_SDCARD_PIN_CLK    — required
- *    CONFIG_DIPTYCH_SDCARD_PIN_CMD    — required
- *    CONFIG_DIPTYCH_SDCARD_PIN_D0     — required
- *    CONFIG_DIPTYCH_SDCARD_4BIT       — enable 4-bit bus
- *    CONFIG_DIPTYCH_SDCARD_PIN_D1/D2/D3 — required when 4BIT
+ *    CONFIG_SPANGAP_SDCARD            — gate (no-op return when n)
+ *    CONFIG_SPANGAP_SDCARD_PIN_CLK    — required
+ *    CONFIG_SPANGAP_SDCARD_PIN_CMD    — required
+ *    CONFIG_SPANGAP_SDCARD_PIN_D0     — required
+ *    CONFIG_SPANGAP_SDCARD_4BIT       — enable 4-bit bus
+ *    CONFIG_SPANGAP_SDCARD_PIN_D1/D2/D3 — required when 4BIT
  *  Returns true on success. After this returns true, sdAvailable() is true.
  *  Call after fs_init(). One-shot: subsequent calls are no-ops. */
 bool fs_mount_sd(void);

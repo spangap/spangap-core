@@ -1,0 +1,14 @@
+description: "spangap core: runtime, networking, web/auth/TLS, storage, log/CLI, ITS, WebRTC plumbing for ESP32-S3 device apps."
+url: https://github.com/spangap/spangap
+version: "0.1.0"
+license: "MIT"
+targets:
+  - esp32s3
+dependencies:
+  idf:
+    version: ">=5.5"
+  espressif/mdns: "^1.5.0"
+  joltwallet/littlefs: "^1.20.4"
+  # esp_wireguard is vendored under src/esp_wireguard/ for now (waiting on
+  # upstream netif->state fix to propagate). When that lands, drop the
+  # vendored copy and add: trombik/esp_wireguard: ">=<fixed-version>".

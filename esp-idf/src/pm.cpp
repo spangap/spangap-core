@@ -40,7 +40,7 @@ void rtcRamSetValid() { rtcAppMagic = RTC_APP_MAGIC; }
  *
  * Two persisted keys:
  *   s.sys.reset_on_off — feature enable (gate; defaulted on by boards that set
- *                        CONFIG_DIPTYCH_RESET_ON_OFF).
+ *                        CONFIG_SPANGAP_RESET_ON_OFF).
  *   s.sys.power_on     — last/desired power state (1=on, 0=off); the value this
  *                        handler toggles on each reset-button press.
  *

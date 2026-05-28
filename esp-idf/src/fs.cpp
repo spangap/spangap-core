@@ -31,7 +31,7 @@
 #include "ff.h"
 #include "sdmmc_cmd.h"
 #include "driver/sdmmc_host.h"
-#if CONFIG_DIPTYCH_SDCARD_BUS_SPI
+#if CONFIG_SPANGAP_SDCARD_BUS_SPI
 #include "driver/sdspi_host.h"
 #include "driver/spi_master.h"
 #include "spi_helper.h"
@@ -697,13 +697,13 @@ void fs_factory_reset() {
 /* ---- Optional SD card mount (FAT on SDMMC slot) ----
  * Mount logic lives here so /sdcard plumbing (sdAvailable(), IDF log silencing,
  * FATFS type detection) is shared. Pin numbers and bus width come from
- * Kconfig — see fs.h's fs_mount_sd() for the CONFIG_DIPTYCH_SDCARD_* knobs. */
+ * Kconfig — see fs.h's fs_mount_sd() for the CONFIG_SPANGAP_SDCARD_* knobs. */
 
 static sdmmc_card_t* sdCard = nullptr;
 /* sdReady + sdAvailable() defined earlier so the fs worker (LISTDIR root case)
  * can gate the synthetic /sdcard entry on whether the card mounted. */
 
-#if CONFIG_DIPTYCH_SDCARD && CONFIG_DIPTYCH_SDCARD_BUS_SPI
+#if CONFIG_SPANGAP_SDCARD && CONFIG_SPANGAP_SDCARD_BUS_SPI
 /* SD shares the SPI bus with the LCD and (on the T-Deck) the LoRa radio. The
  * IDF's own per-device bus lock isn't enough: esp_lcd releases it the moment it
  * queues its async colour DMA, so an SD transaction can start mid-DMA and trip
@@ -719,7 +719,7 @@ static esp_err_t sdspiLockedDoTransaction(int slot, sdmmc_command_t* cmdinfo) {
 #endif
 
 bool fs_mount_sd(void) {
-#if !CONFIG_DIPTYCH_SDCARD
+#if !CONFIG_SPANGAP_SDCARD
     return false;
 #else
     if (sdReady) return true;  /* one-shot — subsequent calls are no-ops */
@@ -738,9 +738,9 @@ bool fs_mount_sd(void) {
 
     esp_err_t ret;
 
-#if CONFIG_DIPTYCH_SDCARD_BUS_SDMMC
+#if CONFIG_SPANGAP_SDCARD_BUS_SDMMC
     sdmmc_host_t host = SDMMC_HOST_DEFAULT();
-#if CONFIG_DIPTYCH_SDCARD_4BIT
+#if CONFIG_SPANGAP_SDCARD_4BIT
     host.flags = SDMMC_HOST_FLAG_4BIT;
 #else
     host.flags = SDMMC_HOST_FLAG_1BIT;
@@ -748,43 +748,43 @@ bool fs_mount_sd(void) {
     host.max_freq_khz = SDMMC_FREQ_HIGHSPEED;
 
     sdmmc_slot_config_t slot = SDMMC_SLOT_CONFIG_DEFAULT();
-#if CONFIG_DIPTYCH_SDCARD_4BIT
+#if CONFIG_SPANGAP_SDCARD_4BIT
     slot.width = 4;
 #else
     slot.width = 1;
 #endif
-    slot.clk = (gpio_num_t)CONFIG_DIPTYCH_SDCARD_PIN_CLK;
-    slot.cmd = (gpio_num_t)CONFIG_DIPTYCH_SDCARD_PIN_CMD;
-    slot.d0  = (gpio_num_t)CONFIG_DIPTYCH_SDCARD_PIN_D0;
-#if CONFIG_DIPTYCH_SDCARD_4BIT
-    slot.d1 = (gpio_num_t)CONFIG_DIPTYCH_SDCARD_PIN_D1;
-    slot.d2 = (gpio_num_t)CONFIG_DIPTYCH_SDCARD_PIN_D2;
-    slot.d3 = (gpio_num_t)CONFIG_DIPTYCH_SDCARD_PIN_D3;
+    slot.clk = (gpio_num_t)CONFIG_SPANGAP_SDCARD_PIN_CLK;
+    slot.cmd = (gpio_num_t)CONFIG_SPANGAP_SDCARD_PIN_CMD;
+    slot.d0  = (gpio_num_t)CONFIG_SPANGAP_SDCARD_PIN_D0;
+#if CONFIG_SPANGAP_SDCARD_4BIT
+    slot.d1 = (gpio_num_t)CONFIG_SPANGAP_SDCARD_PIN_D1;
+    slot.d2 = (gpio_num_t)CONFIG_SPANGAP_SDCARD_PIN_D2;
+    slot.d3 = (gpio_num_t)CONFIG_SPANGAP_SDCARD_PIN_D3;
 #endif
     slot.flags |= SDMMC_SLOT_FLAG_INTERNAL_PULLUP;
 
     ret = esp_vfs_fat_sdmmc_mount(FS_SDCARD, &host, &slot, &mount_config, &sdCard);
 
-#elif CONFIG_DIPTYCH_SDCARD_BUS_SPI
+#elif CONFIG_SPANGAP_SDCARD_BUS_SPI
     /* Bring up the shared SPI bus (idempotent — LoRa, display etc.
      * may have got here first). */
     spi_bus_config_t bus = {};
-    bus.sclk_io_num     = CONFIG_DIPTYCH_SDCARD_SPI_PIN_SCK;
-    bus.mosi_io_num     = CONFIG_DIPTYCH_SDCARD_SPI_PIN_MOSI;
-    bus.miso_io_num     = CONFIG_DIPTYCH_SDCARD_SPI_PIN_MISO;
+    bus.sclk_io_num     = CONFIG_SPANGAP_SDCARD_SPI_PIN_SCK;
+    bus.mosi_io_num     = CONFIG_SPANGAP_SDCARD_SPI_PIN_MOSI;
+    bus.miso_io_num     = CONFIG_SPANGAP_SDCARD_SPI_PIN_MISO;
     bus.quadwp_io_num   = -1;
     bus.quadhd_io_num   = -1;
     bus.max_transfer_sz = 4096;
-    /* Kconfig DIPTYCH_SDCARD_SPI_HOST is the peripheral *name* (2 = SPI2/FSPI,
+    /* Kconfig SPANGAP_SDCARD_SPI_HOST is the peripheral *name* (2 = SPI2/FSPI,
      * 3 = SPI3/HSPI), matching how board headers spell BOARD_*_SPI_HOST. The
      * IDF spi_host_device_t enum is offset by one (SPI1_HOST=0, SPI2_HOST=1,
      * SPI3_HOST=2), so map by name rather than casting the raw int — a straight
      * cast put the SD on SPI3 while a board's shared bus lived on SPI2. */
-    static_assert(CONFIG_DIPTYCH_SDCARD_SPI_HOST == 2 ||
-                  CONFIG_DIPTYCH_SDCARD_SPI_HOST == 3,
-                  "DIPTYCH_SDCARD_SPI_HOST must be 2 (SPI2) or 3 (SPI3)");
+    static_assert(CONFIG_SPANGAP_SDCARD_SPI_HOST == 2 ||
+                  CONFIG_SPANGAP_SDCARD_SPI_HOST == 3,
+                  "SPANGAP_SDCARD_SPI_HOST must be 2 (SPI2) or 3 (SPI3)");
     spi_host_device_t host_id =
-        (CONFIG_DIPTYCH_SDCARD_SPI_HOST == 2) ? SPI2_HOST : SPI3_HOST;
+        (CONFIG_SPANGAP_SDCARD_SPI_HOST == 2) ? SPI2_HOST : SPI3_HOST;
     esp_err_t br = spiHelperInitBus(host_id, &bus);
     if (br != ESP_OK) {
         warn("SD: SPI bus init failed: %s\n", esp_err_to_name(br));
@@ -796,17 +796,17 @@ bool fs_mount_sd(void) {
 
     sdmmc_host_t host = SDSPI_HOST_DEFAULT();
     host.slot = host_id;
-    host.max_freq_khz = CONFIG_DIPTYCH_SDCARD_SPI_FREQ_KHZ;
+    host.max_freq_khz = CONFIG_SPANGAP_SDCARD_SPI_FREQ_KHZ;
     /* Serialize SD transactions against the LCD/LoRa on the shared bus. */
     host.do_transaction = &sdspiLockedDoTransaction;
 
     sdspi_device_config_t dev = SDSPI_DEVICE_CONFIG_DEFAULT();
     dev.host_id = host_id;
-    dev.gpio_cs = (gpio_num_t)CONFIG_DIPTYCH_SDCARD_SPI_PIN_CS;
+    dev.gpio_cs = (gpio_num_t)CONFIG_SPANGAP_SDCARD_SPI_PIN_CS;
 
     ret = esp_vfs_fat_sdspi_mount(FS_SDCARD, &host, &dev, &mount_config, &sdCard);
 #else
-#error "DIPTYCH_SDCARD enabled but no bus type selected (SDMMC or SPI)"
+#error "SPANGAP_SDCARD enabled but no bus type selected (SDMMC or SPI)"
 #endif
 
     /* Restore IDF log defaults — real I/O errors should be visible from now on. */
@@ -837,7 +837,7 @@ bool fs_mount_sd(void) {
          ((uint64_t)sdCard->csd.capacity) * sdCard->csd.sector_size / (1024 * 1024), fsName);
     sdReady = true;
     return true;
-#endif  /* CONFIG_DIPTYCH_SDCARD */
+#endif  /* CONFIG_SPANGAP_SDCARD */
 }
 
 /* Unmount, reformat, and remount the on-flash `state` partition. /state is
@@ -856,7 +856,7 @@ void fsFormatFlash(void) {
 /* Reformat the SD card in place (FAT). The card stays mounted at /sdcard.
  * Returns false if no card is mounted or SD support is compiled out. */
 bool fsFormatSd(void) {
-#if !CONFIG_DIPTYCH_SDCARD
+#if !CONFIG_SPANGAP_SDCARD
     return false;
 #else
     if (!sdReady || !sdCard) return false;
@@ -867,7 +867,7 @@ bool fsFormatSd(void) {
 }
 
 /* Choose the active state store for this boot and seed it on first boot.
- * Call ONCE from diptychInit(), AFTER fs_mount_sd() and BEFORE storageLoad():
+ * Call ONCE from spangapInit(), AFTER fs_mount_sd() and BEFORE storageLoad():
  *   - if the SD mounted and /sdcard/state is a directory, that becomes the
  *     active store; otherwise it stays the on-flash /state;
  *   - if the chosen store is empty (fresh flash, or a freshly `mkdir`'d
@@ -936,7 +936,7 @@ void fs_init() {
 
     /* SD probe + active-state-store selection + first-boot factory copy do
      * NOT happen here. They run in fsSelectStateStore(), called from
-     * diptychInit() AFTER fs_mount_sd() — mounting the SD that early (before
+     * spangapInit() AFTER fs_mount_sd() — mounting the SD that early (before
      * the bus/card is reliably ready) failed and poisoned the later retry.
      * fs_init() only brings up LittleFS + the workers. */
 

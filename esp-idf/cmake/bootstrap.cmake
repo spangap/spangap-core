@@ -1,17 +1,13 @@
-# diptych-core pre-project bootstrap. Consumers `include()` this file BEFORE
+# spangap-core pre-project bootstrap. Consumers `include()` this file BEFORE
 # `project()`, like:
 #
-#   foreach(_p IN ITEMS
-#           "${CMAKE_SOURCE_DIR}/../diptych/diptych-core"            # path: dev override
-#           "${CMAKE_SOURCE_DIR}/managed_components/diptych__diptych-core")  # registry install
-#       if(EXISTS "${_p}/cmake/bootstrap.cmake")
-#           include("${_p}/cmake/bootstrap.cmake")
-#           break()
-#       endif()
-#   endforeach()
+#   include("${CMAKE_SOURCE_DIR}/managed_components/spangap__spangap-core/cmake/bootstrap.cmake")
+#
+# The build tooling stages spangap-core into managed_components/ before CMake
+# runs — committed consumer files carry no workspace-relative paths.
 #
 # What it does:
-#   1. Prepends diptych's sdkconfig.defaults.diptych to SDKCONFIG_DEFAULTS so
+#   1. Prepends spangap's sdkconfig.defaults.spangap to SDKCONFIG_DEFAULTS so
 #      the consumer's sdkconfig.defaults can stay small (consumer values still
 #      override on collision — IDF processes the list in order).
 #   2. Runs the sdkconfig.defaults staleness check: if defaults were edited
@@ -19,23 +15,23 @@
 #      edits, regenerate sdkconfig automatically. This works around IDF's
 #      one-shot defaults behavior (without it, edited defaults are silently
 #      ignored until you `rm sdkconfig`).
-#   3. Generates `${CMAKE_SOURCE_DIR}/partitions.csv` from CONFIG_DIPTYCH_OTA,
-#      CONFIG_DIPTYCH_APP_PERCENT, and CONFIG_ESPTOOLPY_FLASHSIZE_*MB. With
+#   3. Generates `${CMAKE_SOURCE_DIR}/partitions.csv` from CONFIG_SPANGAP_OTA,
+#      CONFIG_SPANGAP_APP_PERCENT, and CONFIG_ESPTOOLPY_FLASHSIZE_*MB. With
 #      OTA on, partitions are paired A/B; with OTA off they're single (and
 #      twice the size). Tune via `idf.py menuconfig`.
 
-# This file lives in diptych-core/cmake/bootstrap.cmake; one level up is the
-# component root, where sdkconfig.defaults.diptych and partitions.csv live.
-get_filename_component(_DIPTYCH_CORE_DIR "${CMAKE_CURRENT_LIST_DIR}/.." ABSOLUTE)
+# This file lives in spangap-core/cmake/bootstrap.cmake; one level up is the
+# component root, where sdkconfig.defaults.spangap and partitions.csv live.
+get_filename_component(_SPANGAP_CORE_DIR "${CMAKE_CURRENT_LIST_DIR}/.." ABSOLUTE)
 
-# ─── 1. Layer diptych's sdkconfig.defaults in front of the consumer's ───
-set(_DIPTYCH_DEFAULTS "${_DIPTYCH_CORE_DIR}/sdkconfig.defaults.diptych")
+# ─── 1. Layer spangap's sdkconfig.defaults in front of the consumer's ───
+set(_SPANGAP_DEFAULTS "${_SPANGAP_CORE_DIR}/sdkconfig.defaults.spangap")
 set(_CONSUMER_DEFAULTS "${CMAKE_SOURCE_DIR}/sdkconfig.defaults")
-if(EXISTS "${_DIPTYCH_DEFAULTS}")
+if(EXISTS "${_SPANGAP_DEFAULTS}")
     if(EXISTS "${_CONSUMER_DEFAULTS}")
-        set(SDKCONFIG_DEFAULTS "${_DIPTYCH_DEFAULTS};${_CONSUMER_DEFAULTS}")
+        set(SDKCONFIG_DEFAULTS "${_SPANGAP_DEFAULTS};${_CONSUMER_DEFAULTS}")
     else()
-        set(SDKCONFIG_DEFAULTS "${_DIPTYCH_DEFAULTS}")
+        set(SDKCONFIG_DEFAULTS "${_SPANGAP_DEFAULTS}")
     endif()
 endif()
 
@@ -54,7 +50,7 @@ endif()
 set(_SDKCONFIG "${CMAKE_SOURCE_DIR}/sdkconfig")
 set(_SDKSNAPSHOT "${CMAKE_BINARY_DIR}/sdkconfig.from_defaults")
 set(_DEFHASH_FILE "${CMAKE_BINARY_DIR}/sdkconfig.defaults.hash")
-set(_SDK_REGENERATED FALSE PARENT_SCOPE)
+set(_SDK_REGENERATED FALSE)
 
 if(EXISTS "${_SDKCONFIG}" AND EXISTS "${_DEFHASH_FILE}" AND SDKCONFIG_DEFAULTS)
     # Combined hash of all defaults files in order
@@ -99,18 +95,18 @@ endif()
 # Stash the values into the cache so project_include.cmake can finalize the
 # snapshot post-project (after IDF has read sdkconfig.defaults and possibly
 # rewritten sdkconfig).
-set(_DIPTYCH_SDK_REGENERATED ${_SDK_REGENERATED} CACHE INTERNAL "")
-set(_DIPTYCH_SDKCONFIG "${_SDKCONFIG}" CACHE INTERNAL "")
-set(_DIPTYCH_SDKSNAPSHOT "${_SDKSNAPSHOT}" CACHE INTERNAL "")
-set(_DIPTYCH_DEFHASH_FILE "${_DEFHASH_FILE}" CACHE INTERNAL "")
-set(_DIPTYCH_SDKCONFIG_DEFAULTS_LIST "${SDKCONFIG_DEFAULTS}" CACHE INTERNAL "")
+set(_SPANGAP_SDK_REGENERATED ${_SDK_REGENERATED} CACHE INTERNAL "")
+set(_SPANGAP_SDKCONFIG "${_SDKCONFIG}" CACHE INTERNAL "")
+set(_SPANGAP_SDKSNAPSHOT "${_SDKSNAPSHOT}" CACHE INTERNAL "")
+set(_SPANGAP_DEFHASH_FILE "${_DEFHASH_FILE}" CACHE INTERNAL "")
+set(_SPANGAP_SDKCONFIG_DEFAULTS_LIST "${SDKCONFIG_DEFAULTS}" CACHE INTERNAL "")
 
 # ─── 3. Generate partitions.csv from Kconfig values ───
 # Walk SDKCONFIG_DEFAULTS in order (so later files override earlier), then
 # sdkconfig last (highest precedence, reflects any menuconfig edits). On the
 # first build `sdkconfig` doesn't exist yet — we generate from defaults, IDF
 # processes the same defaults, the resulting sdkconfig matches.
-set(_FLASH_MB 8)        # matches diptych default in sdkconfig.defaults.diptych
+set(_FLASH_MB 8)        # matches spangap default in sdkconfig.defaults.spangap
 set(_OTA y)             # matches Kconfig default
 set(_APP_PCT 75)        # matches Kconfig default
 
@@ -123,18 +119,18 @@ foreach(_f IN LISTS _PARTGEN_FILES)
     foreach(_line IN LISTS _lines)
         if(_line MATCHES "^CONFIG_ESPTOOLPY_FLASHSIZE_([0-9]+)MB=y$")
             set(_FLASH_MB "${CMAKE_MATCH_1}")
-        elseif(_line STREQUAL "CONFIG_DIPTYCH_OTA=y")
+        elseif(_line STREQUAL "CONFIG_SPANGAP_OTA=y")
             set(_OTA y)
-        elseif(_line STREQUAL "# CONFIG_DIPTYCH_OTA is not set")
+        elseif(_line STREQUAL "# CONFIG_SPANGAP_OTA is not set")
             set(_OTA n)
-        elseif(_line MATCHES "^CONFIG_DIPTYCH_APP_PERCENT=([0-9]+)$")
+        elseif(_line MATCHES "^CONFIG_SPANGAP_APP_PERCENT=([0-9]+)$")
             set(_APP_PCT "${CMAKE_MATCH_1}")
         endif()
     endforeach()
 endforeach()
 
 execute_process(
-    COMMAND python3 "${_DIPTYCH_CORE_DIR}/scripts/gen-partitions.py"
+    COMMAND python3 "${_SPANGAP_CORE_DIR}/scripts/gen-partitions.py"
         --flash-mb ${_FLASH_MB}
         --ota ${_OTA}
         --app-percent ${_APP_PCT}
@@ -143,6 +139,6 @@ execute_process(
 
 # Stash for post-project so we can report `fixed` utilization against the
 # partition we just generated.
-set(_DIPTYCH_PART_FLASH_MB ${_FLASH_MB} CACHE INTERNAL "")
-set(_DIPTYCH_PART_OTA ${_OTA} CACHE INTERNAL "")
-set(_DIPTYCH_PART_APP_PCT ${_APP_PCT} CACHE INTERNAL "")
+set(_SPANGAP_PART_FLASH_MB ${_FLASH_MB} CACHE INTERNAL "")
+set(_SPANGAP_PART_OTA ${_OTA} CACHE INTERNAL "")
+set(_SPANGAP_PART_APP_PCT ${_APP_PCT} CACHE INTERNAL "")

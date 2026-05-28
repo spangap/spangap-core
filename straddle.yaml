@@ -1,0 +1,17 @@
+# Phase-1 ur-straddle for the spangap platform.
+#
+# This is the wrapper that lets the existing spangap-core/ (firmware) + browser/
+# (Vue/Quasar) tree be picked up by the new straddles workflow without any
+# decomposition. Phase 2 splits networking/auth/web stack out into a sibling
+# `spangap/spangap-web` straddle and the LCD launcher into `spangap/lcd`; until
+# then, both halves live here.
+schema_version: 1
+name: spangap/spangap-core
+prefix: ""                 # platform symbols read as language primitives (storageGet, cliRegister, info, ...)
+version: 0.1.0
+firmware: esp-idf         # ESP-IDF managed component. The build CLI stages this into
+                          # staging/components/spangap__spangap-core/ at build time, so
+                          # the source-tree dirname is independent of the eventual
+                          # ESP-IDF component name consumers see (`spangap-core`).
+browser: browser
+platforms: [idf]

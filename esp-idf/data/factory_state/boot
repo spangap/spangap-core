@@ -1,0 +1,4 @@
+# Startup commands — runs on every boot
+
+cert self-signed
+logfile on

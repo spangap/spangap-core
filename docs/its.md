@@ -2,7 +2,7 @@
 
 Socket-style point-to-point connections between FreeRTOS tasks. Header: `its.h`.
 
-ITS is diptych's only inter-task communication primitive. Every cross-task signal — HTTP requests, log lines, CLI commands, config-change notifications, file I/O — flows through ITS, and consumer apps use it the same way for their own tasks. Tasks open numbered "ports" the way a UNIX server opens TCP ports; clients connect to a server's task by name and port. Per-task aux messages handle the things that don't fit a connection model.
+ITS is spangap's only inter-task communication primitive. Every cross-task signal — HTTP requests, log lines, CLI commands, config-change notifications, file I/O — flows through ITS, and consumer apps use it the same way for their own tasks. Tasks open numbered "ports" the way a UNIX server opens TCP ports; clients connect to a server's task by name and port. Per-task aux messages handle the things that don't fit a connection model.
 
 ## Concepts
 
@@ -22,17 +22,17 @@ A 16-bit number identifying an endpoint within a task. Servers explicitly open p
 
 By convention, port numbers are arbitrary but stable: each module's header file declares its port constants so other tasks can use them by name.
 
-### Diptych-side ports
+### Spangap-side ports
 
 | Module | Constants |
 |--------|-----------|
-| [net.h](../diptych-core/include/net.h) | `NET_PORT_REG_PORT=0` (TCP endpoint registration), `NET_CMD_PORT=1` (CLI control) |
-| [web.h](../diptych-core/include/web.h) | `WEB_HTTP_PORT=80`, `WEB_HTTPS_PORT=443`, `WEB_PATH_REG_PORT=0` (URL registration) |
-| [webrtc_task.h](../diptych-core/include/webrtc_task.h) | `WEBRTC_PORT=4433` |
-| [log.h](../diptych-core/include/log.h) | `LOG_PORT_TCP=8080` (stream, `nc`), `LOG_PORT_DC=1` (packet, WebRTC `log:1`) |
-| [cli.h](../diptych-core/include/cli.h) | `CLI_PORT_TCP=8081` (stream, `nc` + serial), `CLI_PORT_DC=1` (packet, WebRTC `cli:1`) |
-| [storage.h](../diptych-core/include/storage.h) | `STORAGE_CONFIG_PORT=1` (packet, WebRTC `storage:1`), `STORAGE_CHANGE_PORT=42` (change dispatch), `STORAGE_SAVE_PORT=43` (save-now signal) |
-| [fs.h](../diptych-core/include/fs.h) | `FS_OP_PORT=1` (POSIX ops aux, on `fs`), `FS_STREAM_PORT=2` (streaming write, on `fs_strm`), `FS_READ_PORT=3` (streaming read, on `fs_strm`), `FS_STREAM_SYNC_PORT=4` (stream-sync aux, on `fs_strm`) |
+| [net.h](../spangap-core/include/net.h) | `NET_PORT_REG_PORT=0` (TCP endpoint registration), `NET_CMD_PORT=1` (CLI control) |
+| [web.h](../spangap-core/include/web.h) | `WEB_HTTP_PORT=80`, `WEB_HTTPS_PORT=443`, `WEB_PATH_REG_PORT=0` (URL registration) |
+| [webrtc_task.h](../spangap-core/include/webrtc_task.h) | `WEBRTC_PORT=4433` |
+| [log.h](../spangap-core/include/log.h) | `LOG_PORT_TCP=8080` (stream, `nc`), `LOG_PORT_DC=1` (packet, WebRTC `log:1`) |
+| [cli.h](../spangap-core/include/cli.h) | `CLI_PORT_TCP=8081` (stream, `nc` + serial), `CLI_PORT_DC=1` (packet, WebRTC `cli:1`) |
+| [storage.h](../spangap-core/include/storage.h) | `STORAGE_CONFIG_PORT=1` (packet, WebRTC `storage:1`), `STORAGE_CHANGE_PORT=42` (change dispatch), `STORAGE_SAVE_PORT=43` (save-now signal) |
+| [fs.h](../spangap-core/include/fs.h) | `FS_OP_PORT=1` (POSIX ops aux, on `fs`), `FS_STREAM_PORT=2` (streaming write, on `fs_strm`), `FS_READ_PORT=3` (streaming read, on `fs_strm`), `FS_STREAM_SYNC_PORT=4` (stream-sync aux, on `fs_strm`) |
 
 Consumer apps add their own port constants in their own headers. One might, for example, reserve a `CAMERA_CMD_PORT`, `RECORD_CMD_PORT`, `RTSP_PORT=554`, etc., one per server task.
 
@@ -59,7 +59,7 @@ By default `itsSendAux` returns once the message is in the receiver's inbox queu
 
 ## API
 
-All functions are in [`its.h`](../diptych-core/include/its.h). Errors are logged via `ESP_LOGE("its", "[%s] ...", pcTaskGetName(NULL), ...)` — ITS uses ESP-IDF's logging directly (rather than `info()`/`warn()` macros) so the layer can stand alone. The calling task's name is prepended to every error log so consumers without a custom reformatter can still see who triggered the failure (ITS by definition runs on whatever task is using it, so the caller-task identity is the most important breadcrumb). Errors that involve a *second* task — connect/forward/aux send targeting another task — also embed the remote task name in the message body in `[brackets]`.
+All functions are in [`its.h`](../spangap-core/include/its.h). Errors are logged via `ESP_LOGE("its", "[%s] ...", pcTaskGetName(NULL), ...)` — ITS uses ESP-IDF's logging directly (rather than `info()`/`warn()` macros) so the layer can stand alone. The calling task's name is prepended to every error log so consumers without a custom reformatter can still see who triggered the failure (ITS by definition runs on whatever task is using it, so the caller-task identity is the most important breadcrumb). Errors that involve a *second* task — connect/forward/aux send targeting another task — also embed the remote task name in the message body in `[brackets]`.
 
 ### Stream buffer pool
 
@@ -287,7 +287,7 @@ Two reasons:
 - The inbox queue is in PSRAM. `xQueueSendFromISR` on a PSRAM-backed queue crashes or hangs when the cache is disabled (which it is during any SPI flash operation — OTA, LittleFS commit, etc.). FreeRTOS doesn't enforce this; the symptom is a sporadic crash that only manifests during a flash write.
 - ITS internals take spinlocks/mutexes and do non-trivial work per send (pool lookup, length checks, sender notify). Not bounded enough for an ISR anyway.
 
-The right pattern for ISR → task communication on diptych is:
+The right pattern for ISR → task communication on spangap is:
 
 1. ISR writes a heap-resident flag (any plain global / volatile bool / counter).
 2. ISR calls `vTaskNotifyGiveFromISR(taskHandle, &hp)` + `portYIELD_FROM_ISR(hp)`.

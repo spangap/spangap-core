@@ -103,7 +103,7 @@ static bool isAllDigits(const char* s, size_t len) {
  *  rejected writes with longer segments — storageSet returned without
  *  setting anything, and inbound LXMs never persisted. Outbound keys (mids
  *  like `o_<ts>_<id>`) escaped notice because they're short. Subscriber
- *  notification keys are already 128 bytes (see diptych-core CLAUDE.md);
+ *  notification keys are already 128 bytes (see spangap-core CLAUDE.md);
  *  this aligns the path parser with that. */
 static cJSON* navigatePath(cJSON* root, const char* dotPath) {
   if (!root || !dotPath || !*dotPath) return nullptr;

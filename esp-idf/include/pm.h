@@ -73,10 +73,10 @@ void heapDump(const char* reason);
 
 /** Register a board callback that cuts power to the peripherals (e.g. drives a
  *  power-enable GPIO to its inactive level). resetOnOffHandler() invokes it
- *  just before deep sleep. Register before diptychInit(). NULL = no-op. */
+ *  just before deep sleep. Register before spangapInit(). NULL = no-op. */
 void resetOnOffSetPowerOff(void (*fn)(void));
 
-/** Reset button as on/off switch. Called inside diptychInit() (right after the
+/** Reset button as on/off switch. Called inside spangapInit() (right after the
  *  deep-sleep wake handler) and a no-op unless s.sys.reset_on_off is set. On a
  *  reset-button press it toggles the persisted s.sys.power_on state: "on" lets
  *  boot continue; "off" cuts peripheral power (via resetOnOffSetPowerOff) and

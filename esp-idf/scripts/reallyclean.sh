@@ -1,5 +1,5 @@
 #!/bin/bash
-# reallyclean — remove every build/cache artifact in a diptych-consuming
+# reallyclean — remove every build/cache artifact in a spangap-consuming
 # project, going beyond `idf.py fullclean` (which only nukes build/).
 #
 # Invoked from the consumer's idf_ext.py as a Python idf.py action, NOT

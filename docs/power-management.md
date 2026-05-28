@@ -35,7 +35,7 @@ ESP types delegate to `esp_pm_lock_*()`. `PM_NO_DEEP_SLEEP` is tracked in our ow
 
 ## Lock Holders
 
-Diptych itself takes these:
+Spangap itself takes these:
 
 | Name | Type | Holder |
 |------|------|--------|
@@ -45,7 +45,7 @@ Diptych itself takes these:
 | `"boot"` | NO_DEEP_SLEEP | during `waitForTime()` until NTP syncs |
 | `"cron"` | NO_DEEP_SLEEP | held by default; released when `s.cron.enable=1` AND cron entries exist |
 
-Consumer apps add their own — anything that needs to keep the CPU awake while running (a streaming server, a peripheral driver) acquires its own named lock and shows up in `pm` output alongside diptych's.
+Consumer apps add their own — anything that needs to keep the CPU awake while running (a streaming server, a peripheral driver) acquires its own named lock and shows up in `pm` output alongside spangap's.
 
 ## Deep Sleep Triggering
 
@@ -142,7 +142,7 @@ The lwIP timer thread (~1.3mA), started by `esp_netif_init()`, cannot be stopped
 
 ## Key Files
 
-- [`pm.cpp`](../diptych-core/src/pm.cpp) — `pmInit()`, `pmLockCreate/Acquire/Release`, `pmGpioWakeEnable/Disable`, `pmPollUsb()`, `cliUsbDown()`/`cliUsbUp()`, `pm` command, deep sleep lock table
-- [`pm.h`](../diptych-core/include/pm.h) — `pm_lock_type_t` enum, `pmLockCreate/Acquire/Release` API, `pmGpioWakeEnable/Disable`, `deepSleepAllowed()`
-- [`net.cpp`](../diptych-core/src/net.cpp) — `esp_wifi_deinit()`/`esp_wifi_init()`, `esp_sleep_enable_wifi_wakeup()`, `"net"` deep sleep lock
+- [`pm.cpp`](../spangap-core/src/pm.cpp) — `pmInit()`, `pmLockCreate/Acquire/Release`, `pmGpioWakeEnable/Disable`, `pmPollUsb()`, `cliUsbDown()`/`cliUsbUp()`, `pm` command, deep sleep lock table
+- [`pm.h`](../spangap-core/include/pm.h) — `pm_lock_type_t` enum, `pmLockCreate/Acquire/Release` API, `pmGpioWakeEnable/Disable`, `deepSleepAllowed()`
+- [`net.cpp`](../spangap-core/src/net.cpp) — `esp_wifi_deinit()`/`esp_wifi_init()`, `esp_sleep_enable_wifi_wakeup()`, `"net"` deep sleep lock
 - consumer's `sdkconfig.defaults` — PM, tickless idle, profiling config
