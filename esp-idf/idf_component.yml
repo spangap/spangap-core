@@ -1,7 +1,7 @@
 description: "spangap core: runtime, networking, web/auth/TLS, storage, log/CLI, ITS, WebRTC plumbing for ESP32-S3 device apps."
 url: https://github.com/spangap/spangap
 version: "0.1.0"
-license: "MIT"
+license: "Apache-2.0"
 targets:
   - esp32s3
 dependencies:

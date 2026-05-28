@@ -1,69 +1,72 @@
-# spangap-core
+# spangap-core (esp-idf)
 
-ESP-IDF managed component: runtime, networking, web/auth/TLS, storage, log/CLI, inter-task streaming (ITS), WebRTC plumbing for ESP32-S3 device applications.
+The firmware half of the [spangap-core](..) straddle — an ESP-IDF
+managed component published as `spangap/spangap-core`.
 
-Half of the [spangap](../) dual-side platform; pairs with [spangap-browser](../browser).
+## What this subdir owns
 
-## Install
+Standard IDF component layout:
 
-In your project's `main/idf_component.yml`:
+```
+esp-idf/
+├── idf_component.yml           name spangap-core, namespace spangap, dep on spangap/esp_wireguard
+├── CMakeLists.txt              globs src/*.{cpp,c}, INCLUDE_DIRS include, REQUIRES platform deps
+├── Kconfig                     component config (e.g. CONFIG_SPANGAP_LCD)
+├── project_include.cmake       project-scope cmake helpers picked up by consumers
+├── sdkconfig.defaults.spangap  the sdkconfig consumers should layer first
+├── cmake/                      cmake helpers (e.g. spangap_create_factory_image)
+├── data/                       factory_state/ image flashed to /fixed
+├── include/                    public headers (consumed by app + transitive consumers)
+├── src/                        implementations + private headers
+└── scripts/                    operator scripts (partitions, OTA keygen/release, icon raster,
+                                timezones, size report, build epoch)
+```
+
+## How a consumer pulls it in
+
+Registry shape (the committed `idf_component.yml` of the consumer):
 
 ```yaml
 dependencies:
   spangap/spangap-core: "^0.1.0"
 ```
 
-This pulls `spangap-core` from components.espressif.com and its transitive dep `spangap/esp_wireguard`.
-
-For local development against a sibling spangap checkout:
+Sibling-checkout development:
 
 ```yaml
 dependencies:
   spangap/spangap-core:
     version: "^0.1.0"
-    path: "../../path/to/spangap/core"
+    path: "../../path/to/spangap-core/esp-idf"
 ```
 
-## Use
+The consumer's top-level `CMakeLists.txt` typically locates the sibling
+checkout via the path injected by `--spangap`, layers
+`sdkconfig.defaults.spangap` first, then its own.
 
-In `app_main()`:
+## Working in this subdir
 
-```cpp
-#include "log.h"
-#include "fs.h"
-#include "storage.h"
-#include "its.h"
-#include "pm.h"
-#include "cli.h"
-#include "net.h"
-#include "web.h"
-#include "tls.h"
-#include "ntp.h"
-#include "ota.h"
-#include "ota_pubkey.h"   // your project's OTA verification key
+- All files in `src/` compile as part of the component. Files reference
+  each other via `#include "foo.h"` — both `include/` and `src/` are on
+  the include path within the component.
+- Public headers (the API surface) live in `include/`. The CMake
+  `REQUIRES` list must cover everything that appears as a type or
+  symbol in those headers.
+- Camera, audio, detect, recording, RTSP, AVI playback — none of these
+  belong here. They are app concerns in the consuming straddle.
+- OTA takes a public key at init (`otaInit(pubkey_pem, len)`). The
+  consumer supplies `OTA_PUBKEY_PEM` from a header that core never
+  includes.
 
-extern "C" void app_main() {
-    pmInit();
-    logInit();
-    fs_init();
-    storageInit();
-    itsInit();
-    cliInit();
-    netInit();
-    webInit();
-    tlsInit();
-    ntpInit();
-    otaInit(OTA_PUBKEY_PEM, OTA_PUBKEY_PEM_LEN);
-    // ... your application init here
-}
-```
+## Read next
 
-Each subsystem self-registers its CLI commands, storage defaults, cron entries (if any), and WebSocket / HTTP handlers as part of its init.
+- [INTERNALS.md](INTERNALS.md) for the component-scope developer notes
+  (heap-tracking guard, `--wrap` workaround, CMake details).
+- [../README.md](../README.md) for the straddle-level overview.
+- [../INTERNALS.md](../INTERNALS.md) for the module-by-module deep dive.
 
-## Public headers
+## See also
 
-The component exposes its API via `include/`. See the [parent CLAUDE.md](../CLAUDE.md) for the conventions (logging macros, `safeStrncpy`, config-key namespaces, ITS architecture) and the per-subsystem deep dives in [docs/](../docs/).
-
-## Development
-
-`CLAUDE.md` (this dir) describes the scope of the core component for AI tooling. The platform-wide CLAUDE.md is at `../CLAUDE.md`.
+- [README-old.md](README-old.md) — pre-split consumer guide (still
+  accurate as a quickstart).
+- [CLAUDE.md](CLAUDE.md) — pre-split component-scope notes.
