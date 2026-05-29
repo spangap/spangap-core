@@ -196,18 +196,13 @@ config SPANGAP_ACME
         CLI command and s.acme.* config keys. DNS-01 also requires
         SPANGAP_DUCKDNS.
 
-config SPANGAP_LCD
-    bool "LCD display + LVGL launcher"
-    default n
-    help
-        Phone-style on-device UI: owns the display + input devices and the
-        single LVGL context, paints a launcher of program icons with an
-        opaque status bar, and lets other components register programs via
-        lcdRegister(). lcdInit() is called by spangapInit(); the consumer
-        must implement the lcd_board.h HAL contract (boardLcdInit /
-        boardLcdBacklight / boardLcdShutdown / boardTouchInit) for its board
-        and add the `lvgl` + `esp_lcd_touch_gt911` managed dependencies. Pulls
-        in LVGL v9, esp_lcd and esp_lcd_touch only when enabled.
+## CONFIG_SPANGAP_LCD lived here until the straddle split. It is now an
+## auto-generated presence symbol emitted by spangap-inside into the synthetic
+## `_spangap_present` component's Kconfig.projbuild whenever spangap/spangap-lcd
+## is staged in this build (driven by the buildable's requires:/optional_requires:
+## and the --no-lcd / --exclude flags). Source code still gates on the same
+## CONFIG_SPANGAP_LCD spelling — it's a shortcut alias the build system emits
+## alongside the generic CONFIG_STRADDLE_SPANGAP_LCD. See spangap/INTERNALS.md.
 
 config SPANGAP_RESET_ON_OFF
     bool "Reset button acts as on/off switch"
