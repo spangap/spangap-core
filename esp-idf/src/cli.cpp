@@ -158,6 +158,10 @@ static char cliUsbPersistCwd[256];
 static volatile bool cliUsbSerialAutoResumeLog = false;
 static int cliActiveSlot = -1;
 
+/* Defined further down (extern "C" so log.cpp can read it). Declared here so
+ * the line editor's ';' handler can flip it before the command runs. */
+extern "C" volatile bool serialInCli;
+
 /** Collapse /, ., .. in an absolute path in place. */
 static bool cliCollapseAbsolute(char* path, size_t cap) {
     size_t inLen = strlen(path);
@@ -296,8 +300,9 @@ static bool cliIsAnsi() {
            cliSlots[cliActiveSlot].mode == CLI_ANSI;
 }
 
-/** True if trimmed line ends with ';' — one-shot stay in CLI when s.cli.sticky is 0. */
-static bool cliLineOneShotSticky(const char* line) {
+/** True if trimmed line ends with ';' — serial CLI's "run this and switch
+ *  back to log output" signal. */
+static bool cliLineEndsWithSemicolon(const char* line) {
   const char* p = line;
   size_t n = strlen(p);
   while (n > 0 && (p[n - 1] == ' ' || p[n - 1] == '\t')) n--;
@@ -381,7 +386,30 @@ static void cronCliWrite(const char* data, size_t len) {
 
 /* ---- Line editor helpers ---- */
 
-static constexpr int PROMPT_LEN = 2;  /* "$ " */
+/** Build "<hostname> $ " into out; returns visible length. Hostname comes from
+ *  s.net.hostname (netInit defaults it to CONFIG_SPANGAP_PROJECT_NAME on first
+ *  boot — e.g. "reticulous", "seccam"). Re-read every prompt so a live
+ *  `set s.net.hostname=…` is reflected immediately. The fallback only matters
+ *  if storage is unreadable before netInit has run; we use the same project
+ *  name so the prompt is never the misleading platform name "spangap". */
+static int cliPromptBuild(char* out, size_t outSize) {
+  char host[48];
+  storageGetStr("s.net.hostname", host, sizeof(host), CONFIG_SPANGAP_PROJECT_NAME);
+  if (!host[0]) safeStrncpy(host, CONFIG_SPANGAP_PROJECT_NAME, sizeof(host));
+  int n = snprintf(out, outSize, "%s $ ", host);
+  return n;
+}
+
+static void cliWritePrompt(cli_write_fn write) {
+  char buf[64];
+  int n = cliPromptBuild(buf, sizeof(buf));
+  if (n > 0) write(buf, n);
+}
+
+static int cliPromptLen() {
+  char buf[64];
+  return cliPromptBuild(buf, sizeof(buf));
+}
 
 /* Replace entire edit buffer, redraw line */
 static void cliEditReplace(cli_edit& e, const char* text, cli_write_fn write) {
@@ -602,18 +630,30 @@ static void cliEditChar(cli_edit& e, char c, cli_write_fn write) {
       e.buf[0] = '\0';
       e.histIdx = -1;
       e.savedValid = false;
+      /* Serial: stay in CLI by default; a trailing ';' on the line is the
+       * explicit "run this and switch back to log" signal. TCP/WS clients
+       * always stay (no log to fall back to on those transports). */
       bool stayCli = true;
-      if (cliActiveSlot >= 0 && cliSlots[cliActiveSlot].usbSerial) {
-        bool sticky = storageGetInt("s.cli.sticky", 0) != 0;
-        stayCli = sticky || cliLineOneShotSticky(lineCopy);
+      bool resumeLog = false;
+      if (cliActiveSlot >= 0 && cliSlots[cliActiveSlot].usbSerial &&
+          cliLineEndsWithSemicolon(lineCopy)) {
+        stayCli = false;
+        resumeLog = true;
       }
       write("\r\n", 2);
+      if (resumeLog) {
+        /* Trailing ';' on serial: brief overwrite-style "Resuming log"
+         * before the command runs, so the user knows the view switched. */
+        write(RESET, sizeof(RESET) - 1);
+        write("\rResuming log\r\r", 15);
+        serialInCli = false;
+      }
       cliOut = write;
       cliProcess(lineCopy);
       if (stayCli) {
         if (ansi) {
           write(RESET, sizeof(RESET) - 1);
-          write("$ ", 2);
+          cliWritePrompt(write);
         }
         write("\033[0 q", 5);
       } else {
@@ -624,12 +664,17 @@ static void cliEditChar(cli_edit& e, char c, cli_write_fn write) {
     } else {
       /* Empty enter */
       if (cliActiveSlot >= 0 && cliSlots[cliActiveSlot].usbSerial) {
-        /* Serial: kick back to log view */
+        /* Serial: announce the switch then kick back to log view. The serial
+         * task stays silent on this disconnect — the banner here is the
+         * complete handoff message. */
+        write(RESET, sizeof(RESET) - 1);
+        write("\r\n\r\nResuming log\r\n\r\n", 20);
         if (cliSlots[cliActiveSlot].itsHandle >= 0)
           itsDisconnect(cliSlots[cliActiveSlot].itsHandle);
       } else if (ansi) {
         /* WS/TCP ANSI: just re-prompt */
-        write("\r\n$ ", 4);
+        write("\r\n", 2);
+        cliWritePrompt(write);
         write("\033[0 q", 5);
       }
     }
@@ -640,7 +685,7 @@ static void cliEditChar(cli_edit& e, char c, cli_write_fn write) {
       e.cursor--;
       if (e.len == 0 && ansi) {
         char tmp[16];
-        int n = snprintf(tmp, sizeof(tmp), "\033[%dG\033[K", PROMPT_LEN + 1);
+        int n = snprintf(tmp, sizeof(tmp), "\033[%dG\033[K", cliPromptLen() + 1);
         write(RESET, sizeof(RESET) - 1);
         write(tmp, n);
         write("\033[0 q", 5);
@@ -753,12 +798,12 @@ static void cliInitSlot(cli_slot_t& cl, int slot) {
    * relying on timeouts). */
   if (cl.mode == CLI_ANSI && !cl.usbSerial) {
     cliActiveSlot = slot;
-    itsCliWrite("$ ", 2);
+    cliWritePrompt(itsCliWrite);
     itsCliWrite("\033[0 q", 5);
     cliActiveSlot = -1;
   } else if (cl.mode == CLI_LINE && !cl.usbSerial) {
     cliActiveSlot = slot;
-    itsCliWrite("$ ", 2);
+    cliWritePrompt(itsCliWrite);
     cliActiveSlot = -1;
   }
 }
@@ -881,7 +926,7 @@ static void cliTaskFn(void* arg) {
               cliProcess(cl.lineBuf);
             }
             cl.lineLen = 0;
-            itsCliWrite("$ ", 2);
+            cliWritePrompt(itsCliWrite);
           } else if (cl.lineLen < (int)sizeof(cl.lineBuf) - 1) {
             cl.lineBuf[cl.lineLen++] = c;
           }
@@ -940,17 +985,30 @@ static void serialTaskFn(void* arg) {
     /* Poll serial input */
     char c;
     while (read(STDIN_FILENO, &c, 1) == 1) {
+      if (c == 0x03) {
+        /* Ctrl-C on serial: abort any CLI line in flight, print a hint
+         * (so the user doesn't think Ctrl-C exits the monitor — Ctrl-]
+         * does), resume log. No-op for the CLI line abort if we're
+         * already in log mode. */
+        if (cliHandle >= 0) {
+          itsDisconnect(cliHandle);
+          cliHandle = -1;
+        }
+        serialInCli = false;
+        printf("\033[0m\r\n\r\nPress Ctrl-] to exit monitor\r\n\r\n");
+        fflush(stdout); cliFlush();
+        continue;
+      }
       if (cliHandle < 0 && c != '\n' && c != '\r') {
         /* Switch to CLI mode — suppress direct-stdout log echo */
         serialInCli = true;
         cli_connect_t req = { CLI_ANSI, 1 };
         cliHandle = itsConnect("cli", CLI_PORT_TCP, &req, sizeof(req), pdMS_TO_TICKS(500));
         if (cliHandle >= 0) {
-          printf("\033[0m");
-          if (storageGetInt("s.cli.sticky", 0) != 0)
-            printf("\r\n\r\nCLI mode. Press enter on empty line to resume log.\r\n\r\n$ ");
-          else
-            printf("\r\n$ ");
+          char host[48];
+          storageGetStr("s.net.hostname", host, sizeof(host), CONFIG_SPANGAP_PROJECT_NAME);
+          if (!host[0]) safeStrncpy(host, CONFIG_SPANGAP_PROJECT_NAME, sizeof(host));
+          printf("\033[0m\r\n\r\nCLI mode, hit return on prompt to return to log\r\n\r\n%s $ ", host);
           fflush(stdout); cliFlush();
         } else {
           /* connect failed — abort CLI mode */
@@ -971,12 +1029,11 @@ static void serialTaskFn(void* arg) {
       }
       fflush(stdout);
       cliFlush();
-      /* Check if CLI kicked us */
+      /* Check if CLI kicked us. The CLI side already printed the handoff
+       * banner ("Resuming log" / "Press Ctrl-] to exit monitor") before
+       * disconnecting — stay silent here. */
       if (!itsConnected(cliHandle)) {
         cliHandle = -1;
-        printf("\033[0m\r\033[K\r\nExiting CLI, resuming log.\r\n\r\n");
-        fflush(stdout);
-        cliFlush();
         serialInCli = false;
       }
     }
@@ -1006,16 +1063,18 @@ static void serialTaskFn(void* arg) {
 
 /* ---- Init ---- */
 
-/* Module config version. Bump when adding/changing defaults. See duckdns.cpp. */
-#define CLI_VERSION 1
+/* Module config version. Bump when adding/changing defaults. See duckdns.cpp.
+ * v2: dropped s.cli.sticky — serial CLI is always sticky now, trailing ';' is
+ * the explicit "run and return to log" signal. */
+#define CLI_VERSION 2
 
 void cliInit() {
   int v = storageGetInt("s.cli.version", 0);
   if (v < CLI_VERSION) {
     storageDefaultTree("s.cli", R"({
-      "sticky": 0,
       "start_dir": "/"
     })");
+    storageUnset("s.cli.sticky");
     storageSet("s.cli.version", CLI_VERSION);
   }
 

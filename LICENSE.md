@@ -12,9 +12,7 @@ Copyright (c) 2026 by spangap project contributors.
 
 ### Vendored in this repository
 
-None at present. Historically the `esp_wireguard` source tree was vendored
-here under `src/esp_wireguard/`; it has since moved to its own straddle
-(`spangap/wg`).
+None. This repo contains no third-party source code.
 
 ### Build-time dependencies
 

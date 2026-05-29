@@ -74,7 +74,7 @@ Dot-notation hierarchy. Keys starting with `s.` are saved to JSON; others are ep
 | `s.web.{max_connections,https_only,http_allowed,mime}` | `webInit` | configurable knobs + MIME table |
 | `s.web.map[]` | consumer wiring (typically in `app_main`) | URL→filesystem mappings, gated by `s.web.wiring_version` (overwrites on bump) |
 | `s.sys.*` | consumer (no `sysInit`) | `s.sys.banner`, `s.sys.ota.url` |
-| `s.cli.*` | `cliInit` | `s.cli.sticky`, `s.cli.start_dir` |
+| `s.cli.*` | `cliInit` | `s.cli.start_dir` |
 
 ### Consumer-side prefixes (examples)
 

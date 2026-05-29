@@ -24,7 +24,8 @@ enum cli_mode_t : uint8_t {
 
 typedef struct {
   cli_mode_t mode;
-  /** 1 if this client is the device USB serial task — honors s.cli.sticky and trailing ';' to stay in CLI. */
+  /** 1 if this client is the device USB serial task — stays in CLI mode
+   *  until an empty return, a trailing ';', or Ctrl-C switches back to log. */
   uint8_t from_usb_serial;
 } cli_connect_t;
 

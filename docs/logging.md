@@ -42,6 +42,21 @@ Inbound lines bypass `logReformat` entirely (no `<ts>` / `[task]` / level char p
 
 Line editor (`cli_edit` struct): per-handle in CLI task. Backspace, left/right arrows, insert at cursor, history, tab completion. ANSI coloring for `CLI_ANSI` mode clients.
 
+The prompt is `<s.net.hostname> $ ` (re-read every prompt, so a `set s.net.hostname=…` is reflected immediately). One-shot TCP clients keying off the prompt should match a trailing `"$ "`, not the full string.
+
+## Serial console — log/CLI mode switching
+
+The serial task is a stateful shuttle between the on-wire console and the on-device CLI. While `serialInCli=false` (the default) `logVprintf` mirrors every log line straight to `stdout`; while `true` it suppresses that mirror so command output and prompts don't get tangled with log lines. The four user-visible transitions:
+
+| Trigger | Visible effect | Mechanism |
+| --- | --- | --- |
+| Any key (not bare `\n`/`\r`) in log mode | blank line, `"CLI mode, hit return on prompt to return to log"`, blank line, `<host> $ ` | serial task `itsConnect`s `cli:1`, sets `serialInCli=true`, prints the banner, then forwards the keystroke. |
+| Empty return at the prompt | blank line, `"Resuming log"`, blank line, log resumes | line editor's empty-enter branch writes the banner over the active CLI connection, then `itsDisconnect`s — the serial task notices the disconnect and stays silent. |
+| Line ending in `;` | `\rResuming log\r\r`, command runs while logs already flow | line editor writes the overwrite-style banner, flips `serialInCli=false` *before* `cliProcess` so live log lines reach the wire during the command, then sets `cliUsbSerialAutoResumeLog=true` to finalize the disconnect after draining. |
+| Ctrl-C (0x03) on serial | blank line, `"Press Ctrl-] to exit monitor"`, blank line, log resumes | serial task intercepts `0x03` before forwarding; aborts the CLI line by `itsDisconnect`ing the handle, prints the hint via direct `printf`. No-op on the abort if already in log mode. |
+
+TCP/WS CLI clients see none of this — they always stay in CLI mode and just re-prompt on empty enter. Ctrl-C is forwarded through to the line editor as a regular byte (the line editor ignores it, no special meaning).
+
 ## Browser path
 
 `webrtc_task` forwards DCs with label `log:1` / `cli:1` / `storage:1` directly to the respective tasks via `itsConnect`. `web.cpp` no longer receives `web_path_msg_t` aux for these paths.
