@@ -62,10 +62,9 @@ CONFIG_COMPILER_CXX_RTTI=n
 CONFIG_PARTITION_TABLE_CUSTOM=y
 CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
 
-# Defaults that mirror the spangap Kconfig values — explicit so the staleness
-# check fires when these change in spangap and consumers don't have to remember
-# to `rm sdkconfig`. Consumer's sdkconfig.defaults can still override.
-CONFIG_SPANGAP_OTA=y
+# Default app-percent split (75% app / 25% fixed). Consumer can override in
+# its own sdkconfig.defaults. OTA on/off is no longer a Kconfig knob — it's
+# derived from whether spangap/ota is in the staged set (see bootstrap.cmake).
 CONFIG_SPANGAP_APP_PERCENT=75
 
 # FreeRTOS — task stats for 'top' command

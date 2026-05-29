@@ -120,20 +120,6 @@ config SPANGAP_SDCARD_SPI_FREQ_KHZ
         SPI mode; many cards happily run at 40 MHz with short wiring,
         but 20 MHz is a safe default on shared-bus boards.
 
-config SPANGAP_OTA
-    bool "OTA (signed-manifest over-the-air updates)"
-    default y
-    help
-        Pulls a signed manifest from s.sys.ota.url, verifies an ECDSA
-        P-256 signature against a consumer-supplied public key, and
-        downloads paired firmware + files binaries into the inactive
-        slot. Requires the consumer to ship `idf.py ota-keygen` output
-        (keys/ota_priv.pem gitignored, main/ota_pubkey.h committed) and
-        to call `otaSetPubkey(OTA_PUBKEY_PEM, OTA_PUBKEY_PEM_LEN)` from
-        app_main after spangapInit(). When n, the firmware can only be
-        updated by re-flashing over USB / JTAG — but app+fixed partitions
-        get twice the space (no A/B pairing).
-
 config SPANGAP_APP_PERCENT
     int "App share of available flash (%)"
     range 10 90
@@ -150,59 +136,14 @@ config SPANGAP_APP_PERCENT
         Spangap regenerates partitions.csv from this value + flash size +
         OTA on/off at every reconfigure — never edit partitions.csv by hand.
 
-config SPANGAP_OTA_URL
-    string "OTA manifest URL"
-    depends on SPANGAP_OTA
-    default ""
-    help
-        URL the firmware fetches at version-check time. Becomes the
-        default for the s.sys.ota.url config key (otaInit installs it
-        on first boot via storageDefault). At runtime the user can
-        override via CLI (`set s.sys.ota.url <url>`) or factory_state
-        overlay. Empty value means OTA is configured but won't actually
-        check anything until s.sys.ota.url is set at runtime.
-
-config SPANGAP_WG
-    bool "WireGuard tunnel"
-    default y
-    select LWIP_PPP_SUPPORT
-    help
-        ESP-IDF integration of the vendored trombik/esp_wireguard fork
-        (with netif->state workaround). Enables the wg.* CLI commands,
-        wg.* config keys, and auto-tunnel-up on STA upstream.
-
-config SPANGAP_DUCKDNS
-    bool "DuckDNS dynamic DNS"
-    default y
-    help
-        Periodic POST to www.duckdns.org with the device's current
-        public IP. Enables the duckdns CLI command and s.duckdns.*
-        config keys.
-
-config SPANGAP_UPNP
-    bool "UPnP IGD port mapping"
-    default y
-    help
-        Auto-creates UPnP port mappings on the upstream router for
-        configured ports (HTTPS, RTSP). Enables the upnp CLI command
-        and s.upnp.* config keys.
-
-config SPANGAP_ACME
-    bool "ACME (Let's Encrypt) TLS certificates"
-    default y
-    help
-        Auto-renews a publicly-trusted TLS certificate via the ACME
-        protocol (HTTP-01 or DNS-01-via-DuckDNS). Enables the acme
-        CLI command and s.acme.* config keys. DNS-01 also requires
-        SPANGAP_DUCKDNS.
-
-## CONFIG_SPANGAP_LCD lived here until the straddle split. It is now an
-## auto-generated presence symbol emitted by spangap-inside into the synthetic
-## `_spangap_present` component's Kconfig.projbuild whenever spangap/spangap-lcd
-## is staged in this build (driven by the buildable's requires:/optional_requires:
-## and the --no-lcd / --exclude flags). Source code still gates on the same
-## CONFIG_SPANGAP_LCD spelling — it's a shortcut alias the build system emits
-## alongside the generic CONFIG_STRADDLE_SPANGAP_LCD. See spangap/INTERNALS.md.
+## CONFIG_SPANGAP_LCD / _WEB / _OTA / _WG / _UPNP / _DUCKDNS / _ACME lived here
+## until each became its own straddle. They are now auto-generated presence
+## symbols emitted by spangap-inside into the synthetic `_spangap_present`
+## component's Kconfig.projbuild whenever the corresponding straddle is staged
+## (driven by the buildable's requires: / optional_requires: / extra_requires:
+## and the --exclude / --include / --no-X flags). Source code keeps the same
+## CONFIG_SPANGAP_<NAME> spelling — they're shortcut aliases of the generic
+## CONFIG_STRADDLE_<NAME> symbol. See spangap/INTERNALS.md.
 
 config SPANGAP_RESET_ON_OFF
     bool "Reset button acts as on/off switch"

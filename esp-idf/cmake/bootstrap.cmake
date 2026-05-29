@@ -7,33 +7,36 @@
 # runs — committed consumer files carry no workspace-relative paths.
 #
 # What it does:
-#   1. Prepends spangap's sdkconfig.defaults.spangap to SDKCONFIG_DEFAULTS so
-#      the consumer's sdkconfig.defaults can stay small (consumer values still
-#      override on collision — IDF processes the list in order).
+#   1. Prepends spangap's sdkconfig.defaults.spangap to SDKCONFIG_DEFAULTS,
+#      and appends the spangap-inside-generated staging/sdkconfig.spangap-overrides
+#      (which carries CLI-driven values like --flash-size). Order: platform
+#      defaults → consumer's sdkconfig.defaults → CLI overrides. Later wins.
 #   2. Runs the sdkconfig.defaults staleness check: if defaults were edited
 #      after the last `idf.py reconfigure` and the user has no manual menuconfig
 #      edits, regenerate sdkconfig automatically. This works around IDF's
 #      one-shot defaults behavior (without it, edited defaults are silently
-#      ignored until you `rm sdkconfig`).
-#   3. Generates `${CMAKE_SOURCE_DIR}/partitions.csv` from CONFIG_SPANGAP_OTA,
-#      CONFIG_SPANGAP_APP_PERCENT, and CONFIG_ESPTOOLPY_FLASHSIZE_*MB. With
-#      OTA on, partitions are paired A/B; with OTA off they're single (and
-#      twice the size). Tune via `idf.py menuconfig`.
+#      ignored until you `rm sdkconfig`). The check covers the override file
+#      too, so changing --flash-size between builds takes effect.
+#   3. Generates `${CMAKE_SOURCE_DIR}/partitions.csv` from CONFIG_SPANGAP_APP_PERCENT,
+#      CONFIG_ESPTOOLPY_FLASHSIZE_*MB, and whether `staging/components/ota/`
+#      exists (the post-Kconfig-cleanup signal for "OTA is in this build").
+#      With OTA on, partitions are paired A/B; with OTA off they're single
+#      (and twice the size).
 
 # This file lives in spangap-core/cmake/bootstrap.cmake; one level up is the
 # component root, where sdkconfig.defaults.spangap and partitions.csv live.
 get_filename_component(_SPANGAP_CORE_DIR "${CMAKE_CURRENT_LIST_DIR}/.." ABSOLUTE)
 
-# ─── 1. Layer spangap's sdkconfig.defaults in front of the consumer's ───
+# ─── 1. Layer SDKCONFIG_DEFAULTS: platform → consumer → spangap-inside overrides ───
 set(_SPANGAP_DEFAULTS "${_SPANGAP_CORE_DIR}/sdkconfig.defaults.spangap")
 set(_CONSUMER_DEFAULTS "${CMAKE_SOURCE_DIR}/sdkconfig.defaults")
-if(EXISTS "${_SPANGAP_DEFAULTS}")
-    if(EXISTS "${_CONSUMER_DEFAULTS}")
-        set(SDKCONFIG_DEFAULTS "${_SPANGAP_DEFAULTS};${_CONSUMER_DEFAULTS}")
-    else()
-        set(SDKCONFIG_DEFAULTS "${_SPANGAP_DEFAULTS}")
+set(_SPANGAP_OVERRIDES "${CMAKE_SOURCE_DIR}/staging/sdkconfig.spangap-overrides")
+set(SDKCONFIG_DEFAULTS "")
+foreach(_f "${_SPANGAP_DEFAULTS}" "${_CONSUMER_DEFAULTS}" "${_SPANGAP_OVERRIDES}")
+    if(EXISTS "${_f}")
+        list(APPEND SDKCONFIG_DEFAULTS "${_f}")
     endif()
-endif()
+endforeach()
 
 # ─── 2. sdkconfig.defaults staleness check ───
 # IDF's default behavior: sdkconfig.defaults is one-shot — its values seed
@@ -101,13 +104,14 @@ set(_SPANGAP_SDKSNAPSHOT "${_SDKSNAPSHOT}" CACHE INTERNAL "")
 set(_SPANGAP_DEFHASH_FILE "${_DEFHASH_FILE}" CACHE INTERNAL "")
 set(_SPANGAP_SDKCONFIG_DEFAULTS_LIST "${SDKCONFIG_DEFAULTS}" CACHE INTERNAL "")
 
-# ─── 3. Generate partitions.csv from Kconfig values ───
-# Walk SDKCONFIG_DEFAULTS in order (so later files override earlier), then
-# sdkconfig last (highest precedence, reflects any menuconfig edits). On the
-# first build `sdkconfig` doesn't exist yet — we generate from defaults, IDF
-# processes the same defaults, the resulting sdkconfig matches.
+# ─── 3. Generate partitions.csv ───
+# Flash size and app-percent come from sdkconfig / SDKCONFIG_DEFAULTS (so they
+# can be tuned via menuconfig or the spangap-inside override file). OTA on/off
+# comes from the staged set — spangap-inside drops a `staging/components/ota/`
+# symlink iff ota is in the build, and that's the authoritative signal. (Reading
+# CONFIG_SPANGAP_OTA from sdkconfig would lag: on first build sdkconfig doesn't
+# exist yet, and the symbol is auto-emitted later in the configure pass.)
 set(_FLASH_MB 8)        # matches spangap default in sdkconfig.defaults.spangap
-set(_OTA y)             # matches Kconfig default
 set(_APP_PCT 75)        # matches Kconfig default
 
 set(_PARTGEN_FILES ${SDKCONFIG_DEFAULTS} "${_SDKCONFIG}")
@@ -119,15 +123,17 @@ foreach(_f IN LISTS _PARTGEN_FILES)
     foreach(_line IN LISTS _lines)
         if(_line MATCHES "^CONFIG_ESPTOOLPY_FLASHSIZE_([0-9]+)MB=y$")
             set(_FLASH_MB "${CMAKE_MATCH_1}")
-        elseif(_line STREQUAL "CONFIG_SPANGAP_OTA=y")
-            set(_OTA y)
-        elseif(_line STREQUAL "# CONFIG_SPANGAP_OTA is not set")
-            set(_OTA n)
         elseif(_line MATCHES "^CONFIG_SPANGAP_APP_PERCENT=([0-9]+)$")
             set(_APP_PCT "${CMAKE_MATCH_1}")
         endif()
     endforeach()
 endforeach()
+
+if(EXISTS "${CMAKE_SOURCE_DIR}/staging/components/ota")
+    set(_OTA y)
+else()
+    set(_OTA n)
+endif()
 
 execute_process(
     COMMAND python3 "${_SPANGAP_CORE_DIR}/scripts/gen-partitions.py"
