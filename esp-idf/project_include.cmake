@@ -23,18 +23,31 @@ if(_SPANGAP_SDKCONFIG AND EXISTS "${_SPANGAP_SDKCONFIG}")
     endif()
 endif()
 
-# spangap_create_factory_image(<partition_name> [DATA_DIR <dir>])
+# spangap_create_factory_image([PARTITION <name>] [DATA_DIR <dir>])
 #
-# Builds a LittleFS factory image for <partition_name> by merging:
+# Builds a LittleFS factory image for the read-only data partition by merging:
 #   1. spangap-core's static factory_state/ defaults — including the
 #      platform-owned `factory_state/storage/external/s.time.zones.json`
 #      (refresh with spangap-core's `make timezones`; see scripts/update-zones.py).
 #   2. the consumer's own data/ (or DATA_DIR if specified) — wins on collisions.
 #
+# PARTITION defaults to `${SPANGAP_FIXED_PARTITION}` — set by bootstrap.cmake
+# to "fixed_a" when OTA is staged (paired A/B layout) or "fixed" when OTA is
+# off (single partition). Override only if you have a non-standard layout.
+#
 # Calls `littlefs_create_partition_image(... FLASH_IN_PROJECT)` so the image
 # is bundled into `idf.py flash`.
-function(spangap_create_factory_image partition_name)
-    cmake_parse_arguments(_DCFI "" "DATA_DIR" "" ${ARGN})
+function(spangap_create_factory_image)
+    cmake_parse_arguments(_DCFI "" "PARTITION;DATA_DIR" "" ${ARGN})
+    set(partition_name "${_DCFI_PARTITION}")
+    if(NOT partition_name)
+        set(partition_name "${SPANGAP_FIXED_PARTITION}")
+    endif()
+    if(NOT partition_name)
+        message(FATAL_ERROR
+            "spangap_create_factory_image: no PARTITION specified and "
+            "SPANGAP_FIXED_PARTITION isn't set (bootstrap.cmake didn't run?)")
+    endif()
     set(_consumer_data "${_DCFI_DATA_DIR}")
     if(NOT _consumer_data)
         set(_consumer_data "${CMAKE_SOURCE_DIR}/data")

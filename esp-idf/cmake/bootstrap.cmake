@@ -131,9 +131,14 @@ endforeach()
 
 if(EXISTS "${CMAKE_SOURCE_DIR}/staging/components/ota")
     set(_OTA y)
+    set(_SPANGAP_FIXED_PARTITION "fixed_a")
 else()
     set(_OTA n)
+    set(_SPANGAP_FIXED_PARTITION "fixed")
 endif()
+# Exposed so the factory-image / lcd-icons helpers can default to the
+# correct partition name without the consumer having to know the layout.
+set(SPANGAP_FIXED_PARTITION "${_SPANGAP_FIXED_PARTITION}" CACHE INTERNAL "")
 
 execute_process(
     COMMAND python3 "${_SPANGAP_CORE_DIR}/scripts/gen-partitions.py"
