@@ -149,6 +149,12 @@ static struct cli_slot_t {
     char lineBuf[128];
     int lineLen;
     char cwd[256];
+    /* True when the slot wants to disconnect once its outgoing stream is
+     * fully drained. Set by trailing-';' (LINE / ANSI hangup) and by serial
+     * empty-enter. The main loop polls itsSendIsEmpty and tears the
+     * connection down when it goes true — avoids the itsSendDrain blocking
+     * race that lost bytes on the wire. */
+    bool pendingClose;
 } cliSlots[CLI_MAX_CLIENTS];
 
 /** USB serial reconnects after each command when sticky=0 — keep cwd across sessions */
@@ -298,6 +304,14 @@ static void itsCliWrite(const char* data, size_t len) {
 static bool cliIsAnsi() {
     return cliActiveSlot >= 0 &&
            cliSlots[cliActiveSlot].mode == CLI_ANSI;
+}
+
+/* Mark the active CLI slot for shutdown. Serial gets a "Returning to log"
+ * banner first (via the caller). The main loop tears the ITS handle down
+ * once the slot's outgoing stream is fully drained — no race-prone
+ * itsSendDrain-then-disconnect inline. */
+static void cliRequestSessionEnd() {
+    if (cliActiveSlot >= 0) cliSlots[cliActiveSlot].pendingClose = true;
 }
 
 /** True if trimmed line ends with ';' — serial CLI's "run this and switch
@@ -592,6 +606,21 @@ static void cliEditChar(cli_edit& e, char c, cli_write_fn write) {
   }
   if (c == '\033') { e.escState = 1; return; }
 
+  /* ^D — end-of-input. Always closes (serial: returns to log; TCP/SSH/WS:
+   * disconnects). Any in-progress line is discarded — readline-style
+   * "forward-delete" isn't worth the complexity, and a user who hits ^D
+   * usually wants to leave, not edit. */
+  if (c == 0x04) {
+    if (cliActiveSlot >= 0 && cliSlots[cliActiveSlot].usbSerial) {
+      write(RESET, sizeof(RESET) - 1);
+      write("\r\n\r\nReturning to log\r\n\r\n", 23);
+    } else if (ansi) {
+      write("\r\n", 2);
+    }
+    cliRequestSessionEnd();
+    return;
+  }
+
   /* ^A / ^E — beginning / end of line (readline) */
   if (c == 0x01) {
     if (e.cursor > 0) {
@@ -630,26 +659,32 @@ static void cliEditChar(cli_edit& e, char c, cli_write_fn write) {
       e.buf[0] = '\0';
       e.histIdx = -1;
       e.savedValid = false;
-      /* Serial: stay in CLI by default; a trailing ';' on the line is the
-       * explicit "run this and switch back to log" signal. TCP/WS clients
-       * always stay (no log to fall back to on those transports). */
+      /* Trailing ';' is the "run this and disconnect" signal:
+       *   serial → return to log view (handoff to log task)
+       *   anything else (TCP / WS / DC / SSH exec) → close the ITS connection
+       * Lines without ';' stay connected (interactive). */
       bool stayCli = true;
       bool resumeLog = false;
-      if (cliActiveSlot >= 0 && cliSlots[cliActiveSlot].usbSerial &&
-          cliLineEndsWithSemicolon(lineCopy)) {
+      bool itsHangup = false;
+      if (cliActiveSlot >= 0 && cliLineEndsWithSemicolon(lineCopy)) {
         stayCli = false;
-        resumeLog = true;
+        if (cliSlots[cliActiveSlot].usbSerial) resumeLog = true;
+        else                                    itsHangup = true;
       }
       write("\r\n", 2);
       if (resumeLog) {
-        /* Trailing ';' on serial: brief overwrite-style "Resuming log"
+        /* Trailing ';' on serial: brief overwrite-style "Returning to log"
          * before the command runs, so the user knows the view switched. */
         write(RESET, sizeof(RESET) - 1);
-        write("\rResuming log\r\r", 15);
+        write("\rReturning to log\r\r", 17);
         serialInCli = false;
       }
       cliOut = write;
       cliProcess(lineCopy);
+      /* If the just-run command (e.g. `exit`) requested session end, treat
+       * it like a hangup — skip the prompt redraw. */
+      if (stayCli && cliActiveSlot >= 0 && cliSlots[cliActiveSlot].pendingClose)
+        stayCli = false;
       if (stayCli) {
         if (ansi) {
           write(RESET, sizeof(RESET) - 1);
@@ -659,18 +694,22 @@ static void cliEditChar(cli_edit& e, char c, cli_write_fn write) {
       } else {
         /* Reset ANSI before handoff to log; command output already ends with newline */
         write(RESET, sizeof(RESET) - 1);
-        cliUsbSerialAutoResumeLog = true;
+        if (resumeLog) cliUsbSerialAutoResumeLog = true;
+        if (itsHangup) {
+          /* Don't disconnect inline — let the main loop tear down once the
+           * outbound stream has actually drained. itsSendDrain-here races
+           * with the recv task and truncates verbose command output. */
+          cliSlots[cliActiveSlot].pendingClose = true;
+        }
       }
     } else {
       /* Empty enter */
       if (cliActiveSlot >= 0 && cliSlots[cliActiveSlot].usbSerial) {
-        /* Serial: announce the switch then kick back to log view. The serial
-         * task stays silent on this disconnect — the banner here is the
-         * complete handoff message. */
+        /* Serial: announce the switch then kick back to log view. The main
+         * loop disconnects once the banner has drained. */
         write(RESET, sizeof(RESET) - 1);
-        write("\r\n\r\nResuming log\r\n\r\n", 20);
-        if (cliSlots[cliActiveSlot].itsHandle >= 0)
-          itsDisconnect(cliSlots[cliActiveSlot].itsHandle);
+        write("\r\n\r\nReturning to log\r\n\r\n", 23);
+        cliRequestSessionEnd();
       } else if (ansi) {
         /* WS/TCP ANSI: just re-prompt */
         write("\r\n", 2);
@@ -762,6 +801,13 @@ static void cliBuiltinInit() {
     cliCmdSysInit();
     pmRegisterCmds();
     logRegisterCmds();
+    cliRegisterCmd("exit", [](const char* a) {
+        if (strcmp(a, "help") == 0) { cliPrintf("  %-*s end this CLI session\n", CLI_HELP_COL, "exit"); return; }
+        if (cliActiveSlot >= 0 && cliSlots[cliActiveSlot].usbSerial) {
+            cliPrintf("\r\n\r\nReturning to log\r\n\r\n");
+        }
+        cliRequestSessionEnd();
+    });
     cliRegisterCmd("help", [](const char* a) {
         if (strcmp(a, "help") == 0) { cliPrintf("  %-*s show commands\n", CLI_HELP_COL, "help [<cmd>]"); return; }
         auto& cmds = cliCmds();
@@ -916,23 +962,59 @@ static void cliTaskFn(void* arg) {
         for (size_t i = 0; i < n; i++)
           cliEditChar(cl.edit, buf[i], itsCliWrite);
       } else {
-        /* LINE mode: buffer until newline */
+        /* LINE mode: buffer until newline. Trailing ';' is the "run this
+         * and disconnect" signal (same convention serial uses for handing
+         * back to log; see the line-editor path above). Used by ssh exec
+         * to get one-shot command semantics. */
+        bool hangup = false;
         for (size_t i = 0; i < n; i++) {
           char c = buf[i];
+          if (c == 0x04) {  /* ^D — EOF, disconnect */
+            hangup = true;
+            break;
+          }
           if (c == '\n' || c == '\r') {
             cl.lineBuf[cl.lineLen] = '\0';
+            hangup = cliLineEndsWithSemicolon(cl.lineBuf);
             if (cl.lineLen > 0) {
               cliOut = itsCliWrite;
               cliProcess(cl.lineBuf);
             }
             cl.lineLen = 0;
+            if (hangup) break;
             cliWritePrompt(itsCliWrite);
           } else if (cl.lineLen < (int)sizeof(cl.lineBuf) - 1) {
             cl.lineBuf[cl.lineLen++] = c;
           }
         }
+        if (hangup) {
+          /* Defer disconnect to the main loop (see pendingClose handling)
+           * so output drains fully without racing the recv task. */
+          cl.pendingClose = true;
+        }
       }
       cliActiveSlot = -1;
+    }
+
+    /* Deferred-close sweep: any slot that asked to close (via trailing ';'
+     * or serial empty-enter) gets torn down once its outgoing stream has
+     * fully drained. itsSendIsEmpty mirrors itsIsEmpty on the peer's recv
+     * direction, so this fires the instant the SSH/web/log consumer has
+     * read the last byte of command output.
+     *
+     * ITS disconnect callbacks only fire on the REMOTE end of a closed
+     * connection — when we close locally, cli's own onDisconnect doesn't
+     * fire, so the slot has to be reset inline here or it leaks (and
+     * after CLI_MAX_CLIENTS leaks, new sessions get "shell request failed"). */
+    for (int s = 0; s < CLI_MAX_CLIENTS; s++) {
+      if (!cliSlots[s].pendingClose) continue;
+      int h = cliSlots[s].itsHandle;
+      if (h < 0) { cliSlots[s].pendingClose = false; continue; }
+      if (itsSendIsEmpty(h)) {
+        itsDisconnect(h);
+        cliSlots[s] = {};
+        cliSlots[s].itsHandle = -1;
+      }
     }
 
     /* Cron commands */
