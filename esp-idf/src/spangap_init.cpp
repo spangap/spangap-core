@@ -22,6 +22,7 @@
  *     spangapPostAppInit();  // finalise: rtcRamSetValid, boot script, cronPoll
  */
 #include "spangap.h"
+#include "auth.h"
 
 #include <cstdio>
 #include <cstring>
@@ -150,6 +151,10 @@ extern "C" void spangapInit(void) {
     logInit();
     cliInit();
     pmInit();
+    /* Bring up the realm/password/cookie store + CLI before sibling straddles
+     * (sshd, web) — both need authLogin/authCheck. The HTTP face is wired by
+     * spangap-web's authWebInit() inside webInit(). */
+    authInit();
 
     /* Deep-sleep wake decision (may go straight back to sleep) + build IDs. */
     cronWakeupHandler();

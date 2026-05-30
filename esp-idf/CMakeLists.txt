@@ -37,7 +37,8 @@ set(_REQ
     esp_rom
     esp_app_format
     app_update
-    lwip)
+    lwip
+    mbedtls)
 
 idf_component_register(
     SRCS ${CORE_SRCS}
