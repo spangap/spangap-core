@@ -521,7 +521,15 @@ static void processInboxMsg(its_task_t* me, uint8_t* buf) {
             xSemaphoreGive(cli->ackSem);
         }
 
-    } else if (hdr->msg == ITS_MSG_DISCONNECT && me->isServer) {
+    } else if (hdr->msg == ITS_MSG_DISCONNECT && me->isServer &&
+               /* Payload form distinguishes the disconnect direction so dual
+                * server+client tasks (e.g. sshd) route both kinds correctly.
+                * Client-side close → len==1 (just serverRef). Server-side
+                * close → len==1+sizeof(cb) (clientRef + embedded callback).
+                * Without this check, sshd's me->isServer=true short-circuits
+                * the dispatch and the client-side cb path at line 540+
+                * never runs — silently dropping cli→sshd disconnects. */
+               hdr->len == 1) {
         int handle = hdr->handle;
         int8_t ref = -1;
         uint16_t port = hdr->itsPort;
