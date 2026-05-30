@@ -140,8 +140,8 @@ config SPANGAP_APP_PERCENT
 ## until each became its own straddle. They are now auto-generated presence
 ## symbols emitted by spangap-inside into the synthetic `_spangap_present`
 ## component's Kconfig.projbuild whenever the corresponding straddle is staged
-## (driven by the buildable's requires: / optional_requires: / extra_requires:
-## and the --exclude / --include / --no-X flags). Source code keeps the same
+## (driven by the buildable's requires: / optional_requires: plus any
+## --include <name> and minus any --exclude / --no-X). Source code keeps the same
 ## CONFIG_SPANGAP_<NAME> spelling — they're shortcut aliases of the generic
 ## CONFIG_STRADDLE_<NAME> symbol. See spangap/INTERNALS.md.
 

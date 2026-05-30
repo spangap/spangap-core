@@ -1,5 +1,6 @@
 *.bak
 .DS_Store
+._*
 .claude/
 *.avi
 *.wav
@@ -28,3 +29,13 @@ scripts/.zones_etag
 # OTA signing — private key never committed; public key (.pub.pem) + the
 # generated main/ota_pubkey.h are committed so a clean checkout can verify.
 keys/ota_priv.pem
+
+# Auto-generated artifacts (added by maintenance sweep)
+esp-idf/managed_components/
+esp-idf/dependencies.lock
+esp-idf/sdkconfig
+esp-idf/sdkconfig.old
+esp-idf/staging/
+__pycache__/
+*.pyc
+*.pyo
