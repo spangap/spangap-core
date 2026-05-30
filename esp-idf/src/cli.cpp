@@ -285,20 +285,44 @@ static int cliAllocSlot(int itsHandle) {
     return -1;
 }
 
-static void itsCliWrite(const char* data, size_t len) {
-    if (cliActiveSlot < 0) return;
-    int h = cliSlots[cliActiveSlot].itsHandle;
-    if (h < 0) return;
-    /* Stream-mode (TCP/serial) may partial-send under back-pressure; retry
-       with a short timeout so verbose commands aren't truncated. Packet-mode
-       (DC) either delivers the whole body or returns 0 — same loop handles
-       both: one non-zero return closes the packet, zero means try again. */
+static void itsSendAll(int h, const char* data, size_t len) {
     while (len > 0) {
         size_t sent = itsSend(h, data, len, pdMS_TO_TICKS(100));
         if (sent == 0) break;
         data += sent;
         len -= sent;
     }
+}
+
+static void itsCliWrite(const char* data, size_t len) {
+    if (cliActiveSlot < 0) return;
+    auto& cl = cliSlots[cliActiveSlot];
+    int h = cl.itsHandle;
+    if (h < 0) return;
+    /* SSH raw-PTY (ANSI mode, non-serial) has no ONLCR layer — lone '\n'
+     * staircases. Translate to "\r\n" in-flight. Serial users have tio's
+     * ONLCR; LINE mode (browser xterm, ssh exec) goes to a terminal whose
+     * own ONLCR handles it. So only the ANSI+non-serial path needs CRLF. */
+    bool addCr = cl.mode == CLI_ANSI && !cl.usbSerial;
+    /* Stream-mode (TCP/serial) may partial-send under back-pressure; retry
+       with a short timeout so verbose commands aren't truncated. Packet-mode
+       (DC) either delivers the whole body or returns 0 — itsSendAll handles
+       both: one non-zero return closes the packet, zero means try again. */
+    if (!addCr) { itsSendAll(h, data, len); return; }
+    /* Walk the buffer, flushing runs that don't contain a bare '\n', and
+     * substituting "\r\n" for each one we find. A '\n' preceded by '\r' in
+     * the same write is already CRLF and passes through unchanged. */
+    const char* start = data;
+    for (size_t i = 0; i < len; i++) {
+        if (data[i] != '\n') continue;
+        if (i > 0 && data[i - 1] == '\r') continue;
+        if (i > (size_t)(start - data))
+            itsSendAll(h, start, data + i - start);
+        itsSendAll(h, "\r\n", 2);
+        start = data + i + 1;
+    }
+    if ((size_t)(start - data) < len)
+        itsSendAll(h, start, len - (size_t)(start - data));
 }
 
 static bool cliIsAnsi() {
