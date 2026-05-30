@@ -911,13 +911,19 @@ void fs_init() {
     }
 
     /* Resolve "fixed" partition based on running app slot.
-     * app0 → fixed_a, app1 → fixed_b. OTA writes the inactive pair together
-     * and otadata flips both atomically by association. */
+     * OTA on:  app0 → fixed_a, app1 → fixed_b. OTA writes the inactive pair
+     *          together and otadata flips both atomically by association.
+     * OTA off: a single "fixed" partition (no suffix) — the running app is
+     *          the factory app and neither _OTA_0 nor _OTA_1 matches. */
     {
         const esp_partition_t* run = esp_ota_get_running_partition();
-        const char* lbl = (run && run->subtype == ESP_PARTITION_SUBTYPE_APP_OTA_1)
-                              ? "fixed_b"
-                              : "fixed_a";
+        const char* lbl;
+        if (run && run->subtype == ESP_PARTITION_SUBTYPE_APP_OTA_1)
+            lbl = "fixed_b";
+        else if (run && run->subtype == ESP_PARTITION_SUBTYPE_APP_OTA_0)
+            lbl = "fixed_a";
+        else
+            lbl = "fixed";
         safeStrncpy(fixedLabel, lbl, sizeof(fixedLabel));
     }
 
