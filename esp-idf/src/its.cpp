@@ -1122,7 +1122,14 @@ void itsDisconnect(int handle) {
             hdr->len = 1 + sizeof(cb);
             buf[sizeof(its_header_t)] = (uint8_t)clientRef;
             memcpy(buf + sizeof(its_header_t) + 1, &cb, sizeof(cb));
-            notified = inboxSend(ce, buf, sizeof(buf), 0);
+            /* 100ms blocking — matches the client-side branch below. Earlier
+             * timeout=0 here silently dropped the kick under inbox bursts
+             * (e.g. cli closing a busy SSH session: sshd's inbox briefly
+             * fills with channel-data events, the disconnect kick is the
+             * one that gets discarded, sshd never tears the session down,
+             * Mac SSH hangs on Ctrl-D forever). Disconnects are rare; a
+             * brief block here is the cheap correct fix. */
+            notified = inboxSend(ce, buf, sizeof(buf), pdMS_TO_TICKS(100));
         }
         if (noPool && !notified) {
             poolRetainOnFree(toIdx); poolRetainOnFree(fromIdx);
