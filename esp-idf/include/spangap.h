@@ -63,6 +63,16 @@ extern "C" {
  *  don't pass it. */
 void spangapInit(void);
 
+/** Run every staged straddle's declared `init:` hook (straddle.yaml), in
+ *  (order, dependency-topo) order. DEFINED by the generated
+ *  staging/spangap_init_dispatch.gen.cpp, which spangap-inside writes for
+ *  every buildable (empty body when nothing declares init:). Call once from
+ *  app_main, after the core/net foundation is up and before the consumer's
+ *  own task graph. From then on a straddle that declares `init:` initializes
+ *  automatically when staged — no app_main edit. The buildable wires the
+ *  generated file into its main component's SRCS (guarded on EXISTS). */
+void spangapInitStraddles(void);
+
 /** Finalise platform startup after the consumer has brought up its own
  *  modules. Runs:
  *

@@ -22,11 +22,28 @@ enum cli_mode_t : uint8_t {
     CLI_LINE,       /* line mode: complete lines, no echo, no prompt */
 };
 
+/* Whether the CLI emits ANSI *color* escapes (the cyan input echo + resets).
+ * Orthogonal to cli_mode_t: cursor/line-edit control sequences are always sent
+ * in CLI_ANSI mode — this gates color only. Mirrors log's LOG_ANSI/LOG_NO_ANSI.
+ * Value 0 == CLI_COLOR so a zero-filled / legacy connect payload keeps color
+ * (back-compat: interactive CLI_ANSI clients were colored by default). */
+enum cli_color_t : uint8_t {
+    CLI_COLOR,      /* emit color escapes */
+    CLI_NO_COLOR,   /* suppress color; keep cursor/editing sequences */
+};
+
 typedef struct {
   cli_mode_t mode;
   /** 1 if this client is the device USB serial task — stays in CLI mode
    *  until an empty return, a trailing ';', or Ctrl-C switches back to log. */
   uint8_t from_usb_serial;
+  /** Color policy; defaults to CLI_COLOR (0) when the field is absent/zeroed. */
+  cli_color_t color;
+  /** 1 = suppress the connect-time prompt. For one-shot clients (ssh `exec`,
+   *  which sends "cmd;\n" and is closed by the trailing ';') the prompt would
+   *  just prefix the command output. Interactive/`nc` clients leave it 0 so
+   *  they can read-until-prompt. */
+  uint8_t no_prompt;
 } cli_connect_t;
 
 /* ---- CLI command API ---- */

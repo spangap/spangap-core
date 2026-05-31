@@ -531,10 +531,14 @@ static void logPasteBack(int handle, long backlogBytes, bool ansi) {
 /** TCP (stream mode): net-forwarded for `nc` access. No ANSI — plain
  *  bytes so the pipe stays clean for line-oriented tools. */
 static int logTcpConnect(int handle, const void* data, size_t len) {
-  (void)data; (void)len;
   int s = logAllocSlot(handle);
   if (s < 0) return -1;
+  /* Default plain — nc/pipes connect with no payload and want clean bytes.
+   * A client may opt into level coloring by sending a log_connect_t{LOG_ANSI}
+   * (e.g. sshd's `subsystem log` when s.sshd.logcolor=1). */
   logSlots[s].ansi = LOG_NO_ANSI;
+  if (data && len >= sizeof(log_connect_t))
+    logSlots[s].ansi = ((const log_connect_t*)data)->ansi;
   return s;
 }
 

@@ -146,6 +146,8 @@ static struct cli_slot_t {
     cli_edit edit;
     cli_mode_t mode;
     bool usbSerial;
+    bool color;        /* emit ANSI color escapes (CLI_ANSI input echo) */
+    bool noPrompt;     /* suppress connect-time prompt (one-shot exec clients) */
     char lineBuf[128];
     int lineLen;
     char cwd[256];
@@ -330,6 +332,19 @@ static bool cliIsAnsi() {
            cliSlots[cliActiveSlot].mode == CLI_ANSI;
 }
 
+/* True iff the active slot wants ANSI *color* (color flag set + ANSI mode). */
+static bool cliWantsColor() {
+    return cliActiveSlot >= 0 &&
+           cliSlots[cliActiveSlot].mode == CLI_ANSI &&
+           cliSlots[cliActiveSlot].color;
+}
+
+/* Write a color escape only when the active slot wants color; a no-op
+ * otherwise. Cursor/line-edit sequences are written directly (never gated). */
+static void cliColorWrite(cli_write_fn write, const char* seq, size_t len) {
+    if (cliWantsColor()) write(seq, len);
+}
+
 /* Mark the active CLI slot for shutdown. Serial gets a "Returning to log"
  * banner first (via the caller). The main loop tears the ITS handle down
  * once the slot's outgoing stream is fully drained — no race-prone
@@ -465,10 +480,10 @@ static void cliEditReplace(cli_edit& e, const char* text, cli_write_fn write) {
   e.len = newLen;
   e.cursor = newLen;
   if (newLen > 0) {
-    if (ansi) write(CYAN, sizeof(CYAN) - 1);
+    if (ansi) cliColorWrite(write, CYAN, sizeof(CYAN) - 1);
     write(e.buf, newLen);
   } else {
-    if (ansi) write(RESET, sizeof(RESET) - 1);
+    if (ansi) cliColorWrite(write, RESET, sizeof(RESET) - 1);
   }
 }
 
@@ -636,7 +651,7 @@ static void cliEditChar(cli_edit& e, char c, cli_write_fn write) {
    * usually wants to leave, not edit. */
   if (c == 0x04) {
     if (cliActiveSlot >= 0 && cliSlots[cliActiveSlot].usbSerial) {
-      write(RESET, sizeof(RESET) - 1);
+      cliColorWrite(write, RESET, sizeof(RESET) - 1);
       write("\r\n\r\nReturning to log\r\n\r\n", 23);
     } else if (ansi) {
       write("\r\n", 2);
@@ -699,7 +714,7 @@ static void cliEditChar(cli_edit& e, char c, cli_write_fn write) {
       if (resumeLog) {
         /* Trailing ';' on serial: brief overwrite-style "Returning to log"
          * before the command runs, so the user knows the view switched. */
-        write(RESET, sizeof(RESET) - 1);
+        cliColorWrite(write, RESET, sizeof(RESET) - 1);
         write("\rReturning to log\r\r", 17);
         serialInCli = false;
       }
@@ -711,13 +726,13 @@ static void cliEditChar(cli_edit& e, char c, cli_write_fn write) {
         stayCli = false;
       if (stayCli) {
         if (ansi) {
-          write(RESET, sizeof(RESET) - 1);
+          cliColorWrite(write, RESET, sizeof(RESET) - 1);
           cliWritePrompt(write);
         }
         write("\033[0 q", 5);
       } else {
         /* Reset ANSI before handoff to log; command output already ends with newline */
-        write(RESET, sizeof(RESET) - 1);
+        cliColorWrite(write, RESET, sizeof(RESET) - 1);
         if (resumeLog) cliUsbSerialAutoResumeLog = true;
         if (itsHangup) {
           /* Don't disconnect inline — let the main loop tear down once the
@@ -731,7 +746,7 @@ static void cliEditChar(cli_edit& e, char c, cli_write_fn write) {
       if (cliActiveSlot >= 0 && cliSlots[cliActiveSlot].usbSerial) {
         /* Serial: announce the switch then kick back to log view. The main
          * loop disconnects once the banner has drained. */
-        write(RESET, sizeof(RESET) - 1);
+        cliColorWrite(write, RESET, sizeof(RESET) - 1);
         write("\r\n\r\nReturning to log\r\n\r\n", 23);
         cliRequestSessionEnd();
       } else if (ansi) {
@@ -749,7 +764,7 @@ static void cliEditChar(cli_edit& e, char c, cli_write_fn write) {
       if (e.len == 0 && ansi) {
         char tmp[16];
         int n = snprintf(tmp, sizeof(tmp), "\033[%dG\033[K", cliPromptLen() + 1);
-        write(RESET, sizeof(RESET) - 1);
+        cliColorWrite(write, RESET, sizeof(RESET) - 1);
         write(tmp, n);
         write("\033[0 q", 5);
       } else {
@@ -759,7 +774,7 @@ static void cliEditChar(cli_edit& e, char c, cli_write_fn write) {
     }
   } else if (c >= 0x20 && e.len < (int)sizeof(e.buf) - 1) {
     if (e.len == 0 && ansi)
-      write(CYAN, sizeof(CYAN) - 1);
+      cliColorWrite(write, CYAN, sizeof(CYAN) - 1);
     memmove(e.buf + e.cursor + 1, e.buf + e.cursor, e.len - e.cursor);
     e.buf[e.cursor] = c;
     e.len++;
@@ -871,7 +886,7 @@ static void cliInitSlot(cli_slot_t& cl, int slot) {
     cliWritePrompt(itsCliWrite);
     itsCliWrite("\033[0 q", 5);
     cliActiveSlot = -1;
-  } else if (cl.mode == CLI_LINE && !cl.usbSerial) {
+  } else if (cl.mode == CLI_LINE && !cl.usbSerial && !cl.noPrompt) {
     cliActiveSlot = slot;
     cliWritePrompt(itsCliWrite);
     cliActiveSlot = -1;
@@ -887,6 +902,8 @@ static int cliTcpConnect(int handle, const void* data, size_t len) {
   cl.edit = {};
   cl.lineLen = 0;
   cl.usbSerial = false;
+  cl.color = true;          /* default on; a cli_connect_t may opt out */
+  cl.noPrompt = false;      /* default: send the connect-time prompt */
   if (len >= sizeof(net_connect_t)) {
     /* Raw TCP/TLS from net — line-oriented, no echo */
     cl.mode = CLI_LINE;
@@ -894,6 +911,8 @@ static int cliTcpConnect(int handle, const void* data, size_t len) {
     const auto* cc = (const cli_connect_t*)data;
     cl.mode = cc->mode;
     cl.usbSerial = cc->from_usb_serial != 0;
+    cl.color = (cc->color == CLI_COLOR);
+    cl.noPrompt = cc->no_prompt != 0;
   } else if (len >= 1) {
     cl.mode = *(const cli_mode_t*)data;
   } else {
@@ -914,6 +933,8 @@ static int cliDcConnect(int handle, const void* data, size_t len) {
   cl.edit = {};
   cl.lineLen = 0;
   cl.usbSerial = false;
+  cl.color = false;         /* LINE mode echoes nothing — color is moot */
+  cl.noPrompt = false;
   cl.mode = CLI_LINE;
   cliInitSlot(cl, slot);
   return slot;
@@ -1108,7 +1129,7 @@ static void serialTaskFn(void* arg) {
       if (cliHandle < 0 && c != '\n' && c != '\r') {
         /* Switch to CLI mode — suppress direct-stdout log echo */
         serialInCli = true;
-        cli_connect_t req = { CLI_ANSI, 1 };
+        cli_connect_t req = { CLI_ANSI, 1, CLI_COLOR, 0 };
         cliHandle = itsConnect("cli", CLI_PORT_TCP, &req, sizeof(req), pdMS_TO_TICKS(500));
         if (cliHandle >= 0) {
           char host[48];
