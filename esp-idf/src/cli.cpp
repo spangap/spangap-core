@@ -53,6 +53,10 @@ static std::vector<cli_cmd_entry_t>& cliCmds() {
     return v;
 }
 
+bool cliWantsHelp(const char* args) {
+    return strcmp(args, "help") == 0 || strcmp(args, "-h") == 0 || strcmp(args, "--help") == 0;
+}
+
 void cliRegisterCmd(const char* cmd, cli_cmd_cb_t cb) {
     auto& cmds = cliCmds();
     /* Insert sorted alphabetically (keeps `help` output ordered). */
@@ -841,22 +845,26 @@ static void cliBuiltinInit() {
     pmRegisterCmds();
     logRegisterCmds();
     cliRegisterCmd("exit", [](const char* a) {
-        if (strcmp(a, "help") == 0) { cliPrintf("  %-*s end this CLI session\n", CLI_HELP_COL, "exit"); return; }
+        if (cliWantsHelp(a)) { cliPrintf("%-*s end this CLI session\n", CLI_HELP_COL, "exit"); return; }
         if (cliActiveSlot >= 0 && cliSlots[cliActiveSlot].usbSerial) {
             cliPrintf("\r\n\r\nReturning to log\r\n\r\n");
         }
         cliRequestSessionEnd();
     });
     cliRegisterCmd("help", [](const char* a) {
-        if (strcmp(a, "help") == 0) { cliPrintf("  %-*s show commands\n", CLI_HELP_COL, "help [<cmd>]"); return; }
+        if (strcmp(a, "help") == 0) { cliPrintf("%-*s list commands\n", CLI_HELP_COL, "help [<cmd>]"); return; }
         auto& cmds = cliCmds();
-        if (*a) {
+        /* `help <cmd>` → that command's fuller (-h) help. */
+        if (*a && strcmp(a, "-h") != 0 && strcmp(a, "--help") != 0) {
             for (auto& e : cmds)
-                if (strcmp(e.cmd, a) == 0) { e.cb("help"); return; }
+                if (strcmp(e.cmd, a) == 0) { e.cb("-h"); return; }
             cliPrintf("unknown command: %s\n", a);
-        } else {
-            for (auto& e : cmds) e.cb("help");
+            return;
         }
+        /* Bare `help` / `help -h` → one line per command. The banner appears
+         * once here, not in every command's one-liner. */
+        cliPrintf("Type '<command> -h' for more on any command.\n\n");
+        for (auto& e : cmds) e.cb("help");
     });
 }
 

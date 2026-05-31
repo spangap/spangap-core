@@ -212,29 +212,29 @@ static auth_err_t authForceSetPassword(const char* realm, const char* newPw) {
 }
 
 static void authCliCmd(const char* args) {
-    if (args[0] == '\0' || strcmp(args, "help") == 0) {
-        cliPrintf("  %-*s status / realms / passwd\n", CLI_HELP_COL, "auth ...");
-        cliPrintf("  %-*s show enabled + realm state\n", CLI_HELP_COL, "auth status");
-        cliPrintf("  %-*s list realms with set/locked/unset state\n", CLI_HELP_COL, "auth realms");
-        cliPrintf("  %-*s set (overwrite) a realm password\n", CLI_HELP_COL, "auth passwd <realm> <newpw>");
+    if (strcmp(args, "help") == 0) { cliPrintf("%-*s auth status; realms; passwd\n", CLI_HELP_COL, "auth [...]"); return; }
+    if (strcmp(args, "-h") == 0 || strcmp(args, "--help") == 0) {
+        cliPrintf("%-*s show enabled + realm state\n", CLI_HELP_COL, "auth");
+        cliPrintf("%-*s list realms with set/locked/unset state\n", CLI_HELP_COL, "auth realms");
+        cliPrintf("%-*s set (overwrite) a realm password\n", CLI_HELP_COL, "auth passwd <realm> <newpw>");
         return;
     }
-    if (strcmp(args, "status") == 0) {
-        cliPrintf("  enabled: %s\n", authEnabled() ? "yes" : "no");
-        cliPrintf("  realms:  %d\n", realmCount());
-        cliPrintf("  cookies: %d / %d\n", cookieCount(), MAX_COOKIES);
+    if (args[0] == '\0') {
+        cliPrintf("enabled: %s\n", authEnabled() ? "yes" : "no");
+        cliPrintf("realms:  %d\n", realmCount());
+        cliPrintf("cookies: %d / %d\n", cookieCount(), MAX_COOKIES);
         return;
     }
     if (strcmp(args, "realms") == 0) {
         int n = realmCount();
-        if (n == 0) { cliPrintf("  (none)\n"); return; }
+        if (n == 0) { cliPrintf("(none)\n"); return; }
         for (int i = 0; i < n; i++) {
             char name[32], hash[128];
             if (!realmGet(i, name, sizeof(name), hash, sizeof(hash))) continue;
             const char* state = hash[0] == '\0' ? "unset"
                               : strcmp(hash, "--") == 0 ? "locked"
                               : "set";
-            cliPrintf("  [%d] %-20s %s\n", i, name, state);
+            cliPrintf("[%d] %-20s %s\n", i, name, state);
         }
         return;
     }
@@ -245,22 +245,22 @@ static void authCliCmd(const char* args) {
         if (!sp || sp == p) { cliPrintf("usage: auth passwd <realm> <newpw>\n"); return; }
         char realm[32];
         size_t n = (size_t)(sp - p);
-        if (n >= sizeof(realm)) { cliPrintf("  realm name too long\n"); return; }
+        if (n >= sizeof(realm)) { cliPrintf("realm name too long\n"); return; }
         memcpy(realm, p, n); realm[n] = '\0';
         const char* pw = sp + 1;
         while (*pw == ' ') pw++;
         if (!*pw) { cliPrintf("usage: auth passwd <realm> <newpw>\n"); return; }
         auth_err_t e = authForceSetPassword(realm, pw);
         switch (e) {
-            case AUTH_OK:                  cliPrintf("  ok\n"); break;
-            case AUTH_NO_SUCH_REALM:       cliPrintf("  no such realm: '%s'\n", realm); break;
-            case AUTH_SAME_AS_OTHER_REALM: cliPrintf("  password matches another realm\n"); break;
-            case AUTH_WRONG_PASSWORD:      cliPrintf("  empty password not allowed\n"); break;
-            default:                       cliPrintf("  error %d\n", (int)e); break;
+            case AUTH_OK:                  cliPrintf("ok\n"); break;
+            case AUTH_NO_SUCH_REALM:       cliPrintf("no such realm: '%s'\n", realm); break;
+            case AUTH_SAME_AS_OTHER_REALM: cliPrintf("password matches another realm\n"); break;
+            case AUTH_WRONG_PASSWORD:      cliPrintf("empty password not allowed\n"); break;
+            default:                       cliPrintf("error %d\n", (int)e); break;
         }
         return;
     }
-    cliPrintf("  unknown subcommand. try `auth help`\n");
+    cliPrintf("unknown subcommand. try `auth -h`\n");
 }
 
 /* ---- Public API ---- */

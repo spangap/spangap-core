@@ -27,6 +27,6 @@ Remote-access stack: UPnP punches NAT holes, DuckDNS provides a stable hostname,
 - **Crypto**: ES256 JWS signatures (EC P-256 + SHA-256). DER-to-raw signature conversion for JWS. Base64url encoding via mbedTLS.
 - **Account**: EC P-256 account key stored at `/state/acme_key.pem`. Account URL in `s.acme.url`. Created automatically on first run.
 - **Cert storage**: PEM cert chain at `/state/tls_cert.pem`, domain key at `/state/tls_key.pem`.
-- **Renewal**: `cert acme [days]` CLI command. Default crontab: `0 3 * * 0 N cert acme 30`. Also called by `acmeCheck()` on boot after `waitForTime`.
+- **Renewal**: `acme renew [days]` CLI command (bare `acme` shows status). Default crontab: `0 3 * * 0 N acme renew 30`. Also called by `acmeCheck()` on boot after `waitForTime`.
 - **Task**: 16 KB temp task on core 0. ~30–60 s for full flow.
 - **Config**: `s.acme.enable` (0=off), `s.net.dns.fqdn` (full domain), `s.acme.method`, `s.acme.webdir`, `s.acme.url` (account URL).

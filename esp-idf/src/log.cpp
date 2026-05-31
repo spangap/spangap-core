@@ -980,12 +980,13 @@ const char* cfd(int fd) {
 /* ---- CLI commands: log, logfile, logrotate ---- */
 
 static void cmdLogfile(const char* a) {
-    if (strcmp(a, "help") == 0) {
-        cliPrintf("  %-*s show current log-file status\n", CLI_HELP_COL, "logfile");
-        cliPrintf("  %-*s enable, today's YYYYMMDD.log\n", CLI_HELP_COL, "logfile on");
-        cliPrintf("  %-*s disable\n", CLI_HELP_COL, "logfile off");
-        cliPrintf("  %-*s use given filename\n", CLI_HELP_COL, "logfile <name>");
-        cliPrintf("  %-*s as above, with level (error/warn/info/debug/verbose)\n",
+    if (strcmp(a, "help") == 0) { cliPrintf("%-*s log-file status/control\n", CLI_HELP_COL, "logfile [<level>] [on|off|<name>]"); return; }
+    if (cliWantsHelp(a)) {
+        cliPrintf("%-*s show current log-file status\n", CLI_HELP_COL, "logfile");
+        cliPrintf("%-*s enable, today's YYYYMMDD.log\n", CLI_HELP_COL, "logfile on");
+        cliPrintf("%-*s disable\n", CLI_HELP_COL, "logfile off");
+        cliPrintf("%-*s use given filename\n", CLI_HELP_COL, "logfile <name>");
+        cliPrintf("%-*s as above, with level (error/warn/info/debug/verbose)\n",
                   CLI_HELP_COL, "logfile <level> <name|on|off>");
         return;
     }
@@ -996,8 +997,8 @@ static void cmdLogfile(const char* a) {
         storageGetStr("s.log.file.name", name, sizeof(name));
         storageGetStr("s.log.file.level", level, sizeof(level), "verbose");
         storageGetStr("s.log.dir", dir, sizeof(dir), "/sdcard/log");
-        if (name[0]) cliPrintf("  %s/%s (%s)\n", dir, name, level);
-        else         cliPrintf("  off (level=%s when on)\n", level);
+        if (name[0]) cliPrintf("%s/%s (%s)\n", dir, name, level);
+        else         cliPrintf("off (level=%s when on)\n", level);
         return;
     }
 
@@ -1022,7 +1023,7 @@ static void cmdLogfile(const char* a) {
 
     if (strcmp(action, "off") == 0) {
         storageSet("s.log.file.name", "");
-        cliPrintf("  off\n");
+        cliPrintf("off\n");
         return;
     }
 
@@ -1043,7 +1044,7 @@ static void cmdLogfile(const char* a) {
     char dir[64]; storageGetStr("s.log.dir", dir, sizeof(dir), "/sdcard/log");
     char curLevel[16];
     storageGetStr("s.log.file.level", curLevel, sizeof(curLevel), "verbose");
-    cliPrintf("  %s/%s (%s)\n", dir, name, curLevel);
+    cliPrintf("%s/%s (%s)\n", dir, name, curLevel);
 }
 
 /* ---- CLI command: logrotate ---- */
@@ -1067,8 +1068,8 @@ static time_t logDateToTime(const char* name) {
 }
 
 static void cmdLogrotate(const char* a) {
-    if (strcmp(a, "help") == 0) {
-        cliPrintf("  %-*s rotate log, delete old files\n", CLI_HELP_COL, "logrotate [days]");
+    if (cliWantsHelp(a)) {
+        cliPrintf("%-*s rotate log, delete old files\n", CLI_HELP_COL, "logrotate [days]");
         return;
     }
 
@@ -1111,23 +1112,24 @@ static void cmdLogrotate(const char* a) {
         }
     }
     heap_caps_free(listing);
-    if (deleted) cliPrintf("  deleted %d old log file%s\n", deleted, deleted > 1 ? "s" : "");
+    if (deleted) cliPrintf("deleted %d old log file%s\n", deleted, deleted > 1 ? "s" : "");
 }
 
 void logRegisterCmds() {
     cliRegisterCmd("logfile", cmdLogfile);
     cliRegisterCmd("logrotate", cmdLogrotate);
     cliRegisterCmd("log", [](const char* a) {
-        if (strcmp(a, "help") == 0) {
-            cliPrintf("  %-*s show/set log level\n", CLI_HELP_COL, "log [tag] [level]");
-            cliPrintf("  %-*s toggle timestamps\n", CLI_HELP_COL, "log [no]timestamp");
+        if (strcmp(a, "help") == 0) { cliPrintf("%-*s show/set log level\n", CLI_HELP_COL, "log [tag] [level]"); return; }
+        if (cliWantsHelp(a)) {
+            cliPrintf("%-*s show/set log level\n", CLI_HELP_COL, "log [tag] [level]");
+            cliPrintf("%-*s toggle timestamps\n", CLI_HELP_COL, "log [no]timestamp");
             return;
         }
         if (strcmp(a, "timestamp") == 0) { storageSet("s.log.timestamp", 1); return; }
         if (strcmp(a, "notimestamp") == 0) { storageSet("s.log.timestamp", 0); return; }
         if (!*a) {
             char val[16]; storageGetStr("s.log.level", val, sizeof(val), "info");
-            cliPrintf("  %s\n", val);
+            cliPrintf("%s\n", val);
             return;
         }
         char first[24] = {};
@@ -1144,7 +1146,7 @@ void logRegisterCmds() {
         else if (!*rest) {
             char key[32]; snprintf(key, sizeof(key), "s.log.tag.%.19s", first);
             char val[16]; storageGetStr(key, val, sizeof(val), "-");
-            cliPrintf("  %s: %s\n", first, val[0] == '-' ? "(default)" : val);
+            cliPrintf("%s: %s\n", first, val[0] == '-' ? "(default)" : val);
         } else logSetTag(first, rest);
     });
 }

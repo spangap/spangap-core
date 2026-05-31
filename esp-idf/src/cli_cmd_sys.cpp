@@ -14,7 +14,7 @@
 #include "freertos/semphr.h"
 
 static void cmdReboot(const char* a) {
-    if (strcmp(a, "help") == 0) { cliPrintf("  %-*s restart device\n", CLI_HELP_COL, "reboot"); return; }
+    if (cliWantsHelp(a)) { cliPrintf("%-*s restart device\n", CLI_HELP_COL, "reboot"); return; }
     storageSave();  /* flush pending settings before reboot */
     cliPrintf("rebooting...\n");
     fflush(stdout);
@@ -32,7 +32,7 @@ static void resetFactoryTask(void*) {
 }
 
 static void cmdResetFactory(const char* a) {
-    if (strcmp(a, "help") == 0) { cliPrintf("  %-*s factory reset: format flash state, reboot\n", CLI_HELP_COL, "reset factory"); return; }
+    if (cliWantsHelp(a)) { cliPrintf("%-*s factory reset: format flash state, reboot\n", CLI_HELP_COL, "reset factory"); return; }
     if (fsStateOnSd()) {
         cliPrintf("You've booted with an SDcard present: 'reset factory' is "
                   "only for wiping all user state in device flash. Boot "
@@ -79,7 +79,7 @@ static bool runFmtWorker(TaskFunction_t fn, const char* name) {
 }
 
 static void cmdFormatFlash(const char* a) {
-    if (strcmp(a, "help") == 0) { cliPrintf("  %-*s unmount, format, remount the flash state partition\n", CLI_HELP_COL, "format flash"); return; }
+    if (cliWantsHelp(a)) { cliPrintf("%-*s unmount, format, remount the flash state partition\n", CLI_HELP_COL, "format flash"); return; }
     cliPrintf("formatting flash state partition...\n");
     fflush(stdout);
     runFmtWorker(formatFlashWorker, "ffmt");
@@ -87,7 +87,7 @@ static void cmdFormatFlash(const char* a) {
 }
 
 static void cmdFormatSd(const char* a) {
-    if (strcmp(a, "help") == 0) { cliPrintf("  %-*s reformat the SD card (FAT), kept mounted at /sdcard\n", CLI_HELP_COL, "format sd"); return; }
+    if (cliWantsHelp(a)) { cliPrintf("%-*s reformat the SD card (FAT), kept mounted at /sdcard\n", CLI_HELP_COL, "format sd"); return; }
     if (!sdAvailable()) { cliPrintf("format sd: no SD card mounted\n"); return; }
     cliPrintf("formatting SD card...\n");
     fflush(stdout);
@@ -96,19 +96,19 @@ static void cmdFormatSd(const char* a) {
 }
 
 static void cmdSleep(const char* a) {
-    if (strcmp(a, "help") == 0) { cliPrintf("  %-*s delay execution\n", CLI_HELP_COL, "sleep <seconds>"); return; }
+    if (cliWantsHelp(a)) { cliPrintf("%-*s delay execution\n", CLI_HELP_COL, "sleep <seconds>"); return; }
     int secs = atoi(a);
     if (secs > 0) vTaskDelay(pdMS_TO_TICKS(secs * 1000));
 }
 
 static void cmdRun(const char* a) {
-    if (strcmp(a, "help") == 0) { cliPrintf("  %-*s run CLI script file\n", CLI_HELP_COL, "run <file>"); return; }
+    if (cliWantsHelp(a)) { cliPrintf("%-*s run CLI script file\n", CLI_HELP_COL, "run <file>"); return; }
     if (!*a) { cliPrintf("usage: run <file>\n"); return; }
     cliRunFile(a);
 }
 
 static void cmdIts(const char* a) {
-    if (strcmp(a, "help") == 0) { cliPrintf("  %-*s show ITS connection + stream pool status\n", CLI_HELP_COL, "its"); return; }
+    if (cliWantsHelp(a)) { cliPrintf("%-*s ITS connection + stream pool status\n", CLI_HELP_COL, "its"); return; }
     itsStatus(cliPrintf);
 }
 

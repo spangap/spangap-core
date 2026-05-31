@@ -13,8 +13,8 @@
 #include "ff.h" /* FATFS */
 
 static void cmdLs(const char* a) {
-  if (strcmp(a, "help") == 0) {
-    cliPrintf("  %-*s list files (default: cwd)\n", CLI_HELP_COL, "ls [-la] [path]");
+  if (cliWantsHelp(a)) {
+    cliPrintf("%-*s list files (default: cwd)\n", CLI_HELP_COL, "ls [-la] [path]");
     return;
   }
   const char* arg = a;
@@ -72,7 +72,7 @@ static void cmdLs(const char* a) {
     heap_caps_free(listing);
   }
   std::sort(entries, entries + count, [](const ls_entry& a, const ls_entry& b) { return a.mtime < b.mtime; });
-  if (count == 0) cliPrintf("  (empty)\n");
+  if (count == 0) cliPrintf("(empty)\n");
   for (int i = 0; i < count; i++) {
     if (longFmt) {
       struct tm tm;
@@ -82,18 +82,18 @@ static void cmdLs(const char* a) {
         snprintf(sz, sizeof(sz), "<dir>");
       else
         fmtSize(entries[i].size, sz, sizeof(sz));
-      cliPrintf("  %-40s  %04d-%02d-%02d %02d:%02d  %7s\n", entries[i].name, tm.tm_year + 1900,
+      cliPrintf("%-40s  %04d-%02d-%02d %02d:%02d  %7s\n", entries[i].name, tm.tm_year + 1900,
                 tm.tm_mon + 1, tm.tm_mday, tm.tm_hour, tm.tm_min, sz);
     } else {
-      cliPrintf("  %s\n", entries[i].name);
+      cliPrintf("%s\n", entries[i].name);
     }
   }
   heap_caps_free(entries);
 }
 
 static void cmdCd(const char* a) {
-  if (strcmp(a, "help") == 0) {
-    cliPrintf("  %-*s change cwd (bare cd → s.cli.start_dir)\n", CLI_HELP_COL, "cd [path]");
+  if (cliWantsHelp(a)) {
+    cliPrintf("%-*s change cwd (bare cd → s.cli.start_dir)\n", CLI_HELP_COL, "cd [path]");
     return;
   }
   if (!*a) {
@@ -109,8 +109,8 @@ static void cmdCd(const char* a) {
 }
 
 static void cmdPwd(const char* a) {
-  if (strcmp(a, "help") == 0) {
-    cliPrintf("  %-*s print current directory\n", CLI_HELP_COL, "pwd");
+  if (cliWantsHelp(a)) {
+    cliPrintf("%-*s print current directory\n", CLI_HELP_COL, "pwd");
     return;
   }
   char cwd[256];
@@ -147,8 +147,8 @@ static bool mkdirParents(const char* path) {
 }
 
 static void cmdMkdir(const char* a) {
-  if (strcmp(a, "help") == 0) {
-    cliPrintf("  %-*s create directory\n", CLI_HELP_COL, "mkdir [-p] <path>");
+  if (cliWantsHelp(a)) {
+    cliPrintf("%-*s create directory\n", CLI_HELP_COL, "mkdir [-p] <path>");
     return;
   }
   const char* p = a;
@@ -226,8 +226,8 @@ static void rmRecursive(const char* filepath, bool opt_f) {
 }
 
 static void cmdRm(const char* a) {
-  if (strcmp(a, "help") == 0) {
-    cliPrintf("  %-*s remove files or dirs\n", CLI_HELP_COL, "rm [-rf] <path>...");
+  if (cliWantsHelp(a)) {
+    cliPrintf("%-*s remove files or dirs\n", CLI_HELP_COL, "rm [-rf] <path>...");
     return;
   }
   bool opt_f = false, opt_r = false;
@@ -285,8 +285,8 @@ static void cmdRm(const char* a) {
 }
 
 static void cmdCat(const char* a) {
-  if (strcmp(a, "help") == 0) {
-    cliPrintf("  %-*s print file(s) to CLI\n", CLI_HELP_COL, "cat <file>...");
+  if (cliWantsHelp(a)) {
+    cliPrintf("%-*s print file(s) to CLI\n", CLI_HELP_COL, "cat <file>...");
     return;
   }
   if (!*a) {
@@ -334,8 +334,8 @@ static void cmdCat(const char* a) {
 }
 
 static void cmdDf(const char* a) {
-  if (strcmp(a, "help") == 0) {
-    cliPrintf("  %-*s show disk usage\n", CLI_HELP_COL, "df [/path]");
+  if (cliWantsHelp(a)) {
+    cliPrintf("%-*s show disk usage\n", CLI_HELP_COL, "df [/path]");
     return;
   }
   char path[256];
@@ -385,7 +385,7 @@ static void cmdDf(const char* a) {
   fmt64(total, tBuf, sizeof(tBuf));
   fmt64(used, uBuf, sizeof(uBuf));
   int pctFree = total > 0 ? (int)((total - used) * 100 / total) : 0;
-  cliPrintf("  total  %s\n  used   %s\n  free   %d%%\n", tBuf, uBuf, pctFree);
+  cliPrintf("total  %s\nused   %s\nfree   %d%%\n", tBuf, uBuf, pctFree);
 }
 
 /* ---- cp / mv ----
@@ -504,8 +504,8 @@ static void removeTree(const char* path) {
 }
 
 static void cmdCp(const char* a) {
-  if (strcmp(a, "help") == 0) {
-    cliPrintf("  %-*s copy file or tree (cross-fs ok)\n", CLI_HELP_COL, "cp [-r] <src> <dst>");
+  if (cliWantsHelp(a)) {
+    cliPrintf("%-*s copy file or tree (cross-fs ok)\n", CLI_HELP_COL, "cp [-r] <src> <dst>");
     return;
   }
   bool opt_r = false;
@@ -543,8 +543,8 @@ static void cmdCp(const char* a) {
 }
 
 static void cmdMv(const char* a) {
-  if (strcmp(a, "help") == 0) {
-    cliPrintf("  %-*s move/rename (cross-fs ok)\n", CLI_HELP_COL, "mv <src> <dst>");
+  if (cliWantsHelp(a)) {
+    cliPrintf("%-*s move/rename (cross-fs ok)\n", CLI_HELP_COL, "mv <src> <dst>");
     return;
   }
   char words[2][256];

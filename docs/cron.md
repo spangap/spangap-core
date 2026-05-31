@@ -17,7 +17,7 @@
   ```
   */15 *    *    *    *    N    duckdns update    # duckdns
   */15 *    *    *    *    N    upnp update       # upnp (renew port mappings + refresh ext IP)
-  0    3    *    *    *    N    cert acme 30      # acme
+  0    3    *    *    *    N    acme renew 30     # acme
   0    0    *    *    *    A    logrotate 7       # log
   ```
   Modules respect user edits across reboots (delete the line, or comment it out, and `cronDefault` won't re-add until the module's version is bumped).

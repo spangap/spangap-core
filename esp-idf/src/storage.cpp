@@ -335,7 +335,7 @@ static void walkTreePrint(cJSON* node, const char* prefix, cli_write_fn write) {
   walkLeaves(node, prefix, [](const char* key, const char* val, void* ctx) {
     auto write = (cli_write_fn)ctx;
     char line[192];
-    int n = snprintf(line, sizeof(line), "  %s = %s\n", key, val);
+    int n = snprintf(line, sizeof(line), "%s = %s\n", key, val);
     if (n > 0) write(line, (size_t)n);
   }, (void*)write);
 }
@@ -1308,7 +1308,7 @@ void storageList(cli_write_fn write) {
 /* ---- CLI commands ---- */
 
 static void cmdSet(const char* a) {
-    if (strcmp(a, "help") == 0) { cliPrintf("  %-*s set config variable\n", CLI_HELP_COL, "set <key>=<value>"); return; }
+    if (cliWantsHelp(a)) { cliPrintf("%-*s set config variable\n", CLI_HELP_COL, "set <key>=<value>"); return; }
     const char* eq = strchr(a, '=');
     if (!eq || eq == a) { cliPrintf("usage: set <key>=<value>\n"); return; }
     /* Match storage's full-key capacity (storage_change_msg_t::key is 128B).
@@ -1327,13 +1327,13 @@ static void cmdSet(const char* a) {
 }
 
 static void cmdUnset(const char* a) {
-    if (strcmp(a, "help") == 0) { cliPrintf("  %-*s delete config variable\n", CLI_HELP_COL, "unset <key>"); return; }
+    if (cliWantsHelp(a)) { cliPrintf("%-*s delete config variable\n", CLI_HELP_COL, "unset <key>"); return; }
     if (!*a) { cliPrintf("usage: unset <key>\n"); return; }
     storageDeleteTree(a);
 }
 
 static void cmdShow(const char* a) {
-    if (strcmp(a, "help") == 0) { cliPrintf("  %-*s show config variables\n", CLI_HELP_COL, "show [<prefix>]"); return; }
+    if (cliWantsHelp(a)) { cliPrintf("%-*s show config variables\n", CLI_HELP_COL, "show [<prefix>]"); return; }
     auto write = [](const char* d, size_t l) { cliPrintf("%.*s", (int)l, d); };
 
     if (!*a) {
@@ -1352,7 +1352,7 @@ static void cmdShow(const char* a) {
             const char* val = nullptr;
             if (cJSON_IsString(node)) val = node->valuestring;
             else if (cJSON_IsNumber(node)) { snprintf(valBuf, sizeof(valBuf), "%d", node->valueint); val = valBuf; }
-            if (val) cliPrintf("  %s = %s\n", a, val);
+            if (val) cliPrintf("%s = %s\n", a, val);
         }
         CFG_UNLOCK();
         return;
@@ -1366,7 +1366,7 @@ static void cmdShow(const char* a) {
          * with 64-char SHA-256 hex segments. */
         char parentPath[128];
         size_t parentLen = lastDot - a;
-        if (parentLen >= sizeof(parentPath)) { CFG_UNLOCK(); cliPrintf("  (prefix too long)\n"); return; }
+        if (parentLen >= sizeof(parentPath)) { CFG_UNLOCK(); cliPrintf("(prefix too long)\n"); return; }
         memcpy(parentPath, a, parentLen);
         parentPath[parentLen] = '\0';
         cJSON* parent = navigatePath(cfgRoot, parentPath);
@@ -1388,7 +1388,7 @@ static void cmdShow(const char* a) {
                         const char* v = nullptr;
                         if (cJSON_IsString(item)) v = item->valuestring;
                         else if (cJSON_IsNumber(item)) { snprintf(vb, sizeof(vb), "%d", item->valueint); v = vb; }
-                        if (v) cliPrintf("  %s = %s\n", key, v);
+                        if (v) cliPrintf("%s = %s\n", key, v);
                     }
                     found = true;
                 }
@@ -1407,18 +1407,18 @@ static void cmdShow(const char* a) {
                     const char* v = nullptr;
                     if (cJSON_IsString(item)) v = item->valuestring;
                     else if (cJSON_IsNumber(item)) { snprintf(vb, sizeof(vb), "%d", item->valueint); v = vb; }
-                    if (v) cliPrintf("  %s = %s\n", item->string, v);
+                    if (v) cliPrintf("%s = %s\n", item->string, v);
                 }
                 found = true;
             }
         }
     }
     CFG_UNLOCK();
-    if (!found) cliPrintf("  (no matches)\n");
+    if (!found) cliPrintf("(no matches)\n");
 }
 
 static void cmdSave(const char* a) {
-    if (strcmp(a, "help") == 0) { cliPrintf("  %-*s write settings to flash now\n", CLI_HELP_COL, "save"); return; }
+    if (cliWantsHelp(a)) { cliPrintf("%-*s write settings to flash now\n", CLI_HELP_COL, "save"); return; }
     storageSave();
 }
 

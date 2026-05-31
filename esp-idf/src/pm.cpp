@@ -209,7 +209,7 @@ static void pmDumpLocks() {
     free(buf);
     cliPrintf("\nPM locks (own only):\n");
     for (pm_lock* l = pmLockList; l; l = l->next)
-      cliPrintf("  %-15.15s %-14s  %d\n", l->name ? l->name : "?",
+      cliPrintf("%-15.15s %-14s  %d\n", l->name ? l->name : "?",
                 pmTypeName(l->type), l->count);
     return;
   }
@@ -390,10 +390,10 @@ static void pmPrintModeLines(int64_t mode[PM_MODE_COUNT], int64_t deepUs,
   int sleepPct = (int)(mode[PM_MODE_LIGHT_SLEEP] * 100 / wall);
   int minPct   = (int)(mode[PM_MODE_APB_MIN] * 100 / wall);
   int maxPct   = 100 - dsPct - sleepPct - minPct;
-  cliPrintf("  deep sleep    %d%% (%d)\n", dsPct, (int)dsCount);
-  cliPrintf("  light sleep   %d%%\n", sleepPct);
-  cliPrintf("  80 MHz        %d%%\n", minPct);
-  cliPrintf("  240 MHz       %d%%\n", maxPct);
+  cliPrintf("deep sleep    %d%% (%d)\n", dsPct, (int)dsCount);
+  cliPrintf("light sleep   %d%%\n", sleepPct);
+  cliPrintf("80 MHz        %d%%\n", minPct);
+  cliPrintf("240 MHz       %d%%\n", maxPct);
 }
 #endif
 
@@ -452,13 +452,18 @@ void pmRecordDeepSleep(int64_t durationUs) {
 /* ---- CLI commands: pm, top, usb ---- */
 
 static void cmdUsb(const char* a) {
-    if (strcmp(a, "help") == 0) { cliPrintf("  %-*s reconnect or disconnect USB\n", CLI_HELP_COL, "usb up|down"); return; }
+    if (cliWantsHelp(a)) { cliPrintf("%-*s USB status; up/down to reconnect/disconnect\n", CLI_HELP_COL, "usb [up|down]"); return; }
     if (strcmp(a, "down") == 0) cliUsbDown();
     else if (strcmp(a, "up") == 0) cliUsbUp();
+#if CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG
+    else cliPrintf("usb: %s\n", usb_serial_jtag_is_connected() ? "connected" : "disconnected");
+#else
+    else cliPrintf("usb: n/a\n");
+#endif
 }
 
 static void cmdPm(const char* args) {
-    if (strcmp(args, "help") == 0) { cliPrintf("  %-*s power management\n", CLI_HELP_COL, "pm [wifi ...]"); return; }
+    if (cliWantsHelp(args)) { cliPrintf("%-*s power management status; wifi none|min|max\n", CLI_HELP_COL, "pm [wifi ...]"); return; }
     if (strstr(args, "allow") || strstr(args, "inhibit")) {
         static pm_lock_handle_t cliDeep = nullptr, cliLight = nullptr, cliSlow = nullptr;
         static bool deepHeld = false, lightHeld = false, slowHeld = false;
@@ -518,8 +523,8 @@ static void cmdPm(const char* args) {
 }
 
 static void cmdTop(const char* args) {
-    if (strcmp(args, "help") == 0) { cliPrintf("  %-*s tasks, CPU%%, heap, uptime (-h: human sizes)\n", CLI_HELP_COL, "top [-h]"); return; }
-    const bool human = (strcmp(args, "-h") == 0);
+    if (cliWantsHelp(args)) { cliPrintf("%-*s tasks, CPU%%, heap, uptime (human: readable sizes)\n", CLI_HELP_COL, "top [human]"); return; }
+    const bool human = (strcmp(args, "human") == 0);
     const int  bw = human ? 7 : 8;   /* byte-column width: fits 16MB raw, tighter for -h */
     /* Format a byte count: raw decimal by default, fmtSize ("198kB") with -h.
        Returns buf so it can be used inline as a printf %s arg. */
@@ -645,7 +650,7 @@ static void cmdTop(const char* args) {
     };
 
     /* Unified table: Task | Core | Pri | Stack | CPU% | DRAM % blk | PSRAM % blk */
-    cliPrintf("  %-12s %4s  %3s  %7s %7s %*s %6s %5s %*s %6s %5s\n",
+    cliPrintf("%-12s %4s  %3s  %7s %7s %*s %6s %5s %*s %6s %5s\n",
               "Task", "Core", "Pri", "Stack", "CPU%",
               bw, "DRAM", "%", "blk", bw, "PSRAM", "%", "blk");
     for (int i = 0; i < n2; i++) {
@@ -663,7 +668,7 @@ static void cmdTop(const char* args) {
         char drNum[16], drPct[10], psNum[16], psPct[10];
         fmtMem(drNum, sizeof(drNum), drPct, sizeof(drPct), s2[i].dram, totalDram);
         fmtMem(psNum, sizeof(psNum), psPct, sizeof(psPct), s2[i].psram, totalPsram);
-        cliPrintf("  %-12s %4s  %3d  %7s %7s %*s %6s %5u %*s %6s %5u\n",
+        cliPrintf("%-12s %4s  %3d  %7s %7s %*s %6s %5u %*s %6s %5u\n",
             s2[i].name, cb, s2[i].pri, stackBuf, cpuBuf,
             bw, drNum, drPct, (unsigned)s2[i].dblk,
             bw, psNum, psPct, (unsigned)s2[i].pblk);
@@ -673,7 +678,7 @@ static void cmdTop(const char* args) {
         char drNum[16], drPct[10], psNum[16], psPct[10];
         fmtMem(drNum, sizeof(drNum), drPct, sizeof(drPct), preDram, totalDram);
         fmtMem(psNum, sizeof(psNum), psPct, sizeof(psPct), preP, totalPsram);
-        cliPrintf("  %-12s %4s  %3s  %7s %7s %*s %6s %5u %*s %6s %5u\n",
+        cliPrintf("%-12s %4s  %3s  %7s %7s %*s %6s %5u %*s %6s %5u\n",
             "pre-sched", "-", "-", "-", "-",
             bw, drNum, drPct, (unsigned)preDblk, bw, psNum, psPct, (unsigned)prePblk);
     }
@@ -681,7 +686,7 @@ static void cmdTop(const char* args) {
         char drNum[16], drPct[10], psNum[16], psPct[10];
         fmtMem(drNum, sizeof(drNum), drPct, sizeof(drPct), delDram, totalDram);
         fmtMem(psNum, sizeof(psNum), psPct, sizeof(psPct), delP, totalPsram);
-        cliPrintf("  %-12s %4s  %3s  %7s %7s %*s %6s %5u %*s %6s %5u\n",
+        cliPrintf("%-12s %4s  %3s  %7s %7s %*s %6s %5u %*s %6s %5u\n",
             "(deleted)", "-", "-", "-", "-",
             bw, drNum, drPct, (unsigned)delDblk, bw, psNum, psPct, (unsigned)delPblk);
     }
@@ -691,9 +696,9 @@ static void cmdTop(const char* args) {
      * fraction of that same window. */
     unsigned b0 = (deltaTotal > idle0) ? (unsigned)((deltaTotal - idle0) * 1000 / deltaTotal) : 0;
     unsigned b1 = (deltaTotal > idle1) ? (unsigned)((deltaTotal - idle1) * 1000 / deltaTotal) : 0;
-    cliPrintf("\n  Total CPU:\n");
-    cliPrintf("    core0: %u.%u%%\n", b0/10, b0%10);
-    cliPrintf("    core1: %u.%u%%\n", b1/10, b1%10);
+    cliPrintf("\nTotal CPU:\n");
+    cliPrintf("core0: %u.%u%%\n", b0/10, b0%10);
+    cliPrintf("core1: %u.%u%%\n", b1/10, b1%10);
 
     /* Total RAM = per-task stack + heap (by location), plus pre-sched/deleted heap. */
     size_t ramDram = preDram + delDram, ramPsram = preP + delP;
@@ -704,26 +709,26 @@ static void cmdTop(const char* args) {
         else                                                    ramDram  += s2[i].stack;
     }
     char rb[16];
-    cliPrintf("  Total RAM usage:\n");
-    cliPrintf("    DRAM:  %s\n", fmtBytes(rb, sizeof(rb), ramDram));
-    cliPrintf("    PSRAM: %s\n", fmtBytes(rb, sizeof(rb), ramPsram));
+    cliPrintf("Total RAM usage:\n");
+    cliPrintf("DRAM:  %s\n", fmtBytes(rb, sizeof(rb), ramDram));
+    cliPrintf("PSRAM: %s\n", fmtBytes(rb, sizeof(rb), ramPsram));
 
     free(s1); free(s2);
 #endif
-    cliPrintf("\n  Heap:\n");
+    cliPrintf("\nHeap:\n");
     char ha[16], hb[16], hc[16], hd[16];
-    cliPrintf("    %-6s %*s %*s %*s  %10s\n", "", bw, "free", bw, "total", bw, "lowest", "contiguous");
-    cliPrintf("    %-6s %*s %*s %*s  %10s\n", "DRAM",
+    cliPrintf("%-6s %*s %*s %*s  %10s\n", "", bw, "free", bw, "total", bw, "lowest", "contiguous");
+    cliPrintf("%-6s %*s %*s %*s  %10s\n", "DRAM",
         bw, fmtBytes(ha, sizeof(ha), heap_caps_get_free_size(MALLOC_CAP_8BIT|MALLOC_CAP_INTERNAL)),
         bw, fmtBytes(hb, sizeof(hb), heap_caps_get_total_size(MALLOC_CAP_8BIT|MALLOC_CAP_INTERNAL)),
         bw, fmtBytes(hc, sizeof(hc), heap_caps_get_minimum_free_size(MALLOC_CAP_8BIT|MALLOC_CAP_INTERNAL)),
         fmtBytes(hd, sizeof(hd), heap_caps_get_largest_free_block(MALLOC_CAP_8BIT|MALLOC_CAP_INTERNAL)));
-    cliPrintf("    %-6s %*s %*s %*s  %10s\n", "PSRAM",
+    cliPrintf("%-6s %*s %*s %*s  %10s\n", "PSRAM",
         bw, fmtBytes(ha, sizeof(ha), heap_caps_get_free_size(MALLOC_CAP_SPIRAM)),
         bw, fmtBytes(hb, sizeof(hb), heap_caps_get_total_size(MALLOC_CAP_SPIRAM)),
         bw, fmtBytes(hc, sizeof(hc), heap_caps_get_minimum_free_size(MALLOC_CAP_SPIRAM)),
         fmtBytes(hd, sizeof(hd), heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM)));
-    cliPrintf("    %-6s %*s %*s %*s  %10s\n", "DMA",
+    cliPrintf("%-6s %*s %*s %*s  %10s\n", "DMA",
         bw, fmtBytes(ha, sizeof(ha), heap_caps_get_free_size(MALLOC_CAP_DMA)),
         bw, "-",
         bw, fmtBytes(hc, sizeof(hc), heap_caps_get_minimum_free_size(MALLOC_CAP_DMA)),
@@ -731,7 +736,7 @@ static void cmdTop(const char* args) {
 
     uint32_t up = (uint32_t)(esp_timer_get_time() / 1000000ULL);
     char eb[32]; fmtElapsed(up, eb, sizeof(eb));
-    cliPrintf("\n  Uptime: %s\n", eb);
+    cliPrintf("\nUptime: %s\n", eb);
 }
 
 /* ---- Heap dump on malloc failure ---- */

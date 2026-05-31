@@ -49,13 +49,24 @@ typedef struct {
 /* ---- CLI command API ---- */
 
 /** CLI command callback. `args` is everything after the command name (trimmed).
- *  When args == "help", print a one-line description and return. */
+ *
+ *  Help convention (uniform across all commands):
+ *    - args == "help"            → print ONE short line for the `help` listing.
+ *    - args == "-h" / "--help"   → print fuller per-command help (usage,
+ *                                  subcommands). For simple commands this is
+ *                                  the same single line.
+ *    - args == ""                → show status (no separate "status" verb).
+ *  Use cliWantsHelp(args) to cover all three help spellings in one guard when a
+ *  command's brief and detailed help are identical. */
 typedef void (*cli_cmd_cb_t)(const char* args);
 
 /** Register a CLI command. Sorted alphabetically. Longest-prefix match on dispatch. */
 void cliRegisterCmd(const char* cmd, cli_cmd_cb_t cb);
 
-/** Column width for help alignment. Usage: cliPrintf("  %-*s description\n", CLI_HELP_COL, "cmd [args]"); */
+/** True for "help", "-h", or "--help" — any help request. */
+bool cliWantsHelp(const char* args);
+
+/** Column width for help alignment. Usage: cliPrintf("%-*s description\n", CLI_HELP_COL, "cmd [args]"); */
 #define CLI_HELP_COL 23
 
 /** printf to the active CLI client (ITS handle or serial).
