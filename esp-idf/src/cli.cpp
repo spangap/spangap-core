@@ -144,7 +144,7 @@ struct cli_edit {
 };
 
 /* CLI ITS server: per-slot state */
-#define CLI_MAX_CLIENTS 5    /* up to 3 TCP + 2 DC (browser + on-device CLI) */
+#define CLI_MAX_CLIENTS 8    /* up to 6 TCP + 2 DC (browser session + on-device CLI) */
 static struct cli_slot_t {
     int itsHandle;
     cli_edit edit;
@@ -329,6 +329,95 @@ static void itsCliWrite(const char* data, size_t len) {
     }
     if ((size_t)(start - data) < len)
         itsSendAll(h, start, len - (size_t)(start - data));
+}
+
+/* Blocking single-line input read from the active slot — see cli.h. Runs on
+ * the cli task inside a command callback; the main loop is parked in the
+ * callback, so we read the slot's ITS handle directly (the same byte stream
+ * the line editor consumes) and echo through cliWrite. */
+int cliReadLine(char* out, size_t outLen, cli_echo_t echo) {
+    if (!out || outLen == 0) return -1;
+    out[0] = '\0';
+    if (cliActiveSlot < 0 || cliActiveSlot >= CLI_MAX_CLIENTS) return -1;
+    int h = cliSlots[cliActiveSlot].itsHandle;
+    if (h < 0) return -1;
+    size_t len = 0;
+    /* Read into a full-size buffer: packet-mode slots (browser DataChannel)
+     * deliver one whole packet body per itsRecv and DROP it if maxLen is
+     * smaller than the body — reading 1 byte at a time would lose every
+     * keystroke burst and spin forever. Size matches the main loop's buf. */
+    char rb[128];
+    /* Safety cap so a walked-away session can't wedge the cli task (and thus
+     * every other CLI slot) indefinitely. */
+    TickType_t deadline = xTaskGetTickCount() + pdMS_TO_TICKS(90000);
+    /* Escape-sequence skip state (persists across reads): 0 = normal,
+     * 1 = just saw ESC, 2 = inside a CSI/SS3 sequence. Strips cursor keys,
+     * function keys, and bracketed-paste markers (ESC [200~ … ESC [201~) so a
+     * typed OR pasted secret isn't polluted by the printable tail of an escape
+     * sequence (the '[', digits and '~' are >= 0x20 and would otherwise be
+     * captured as input). */
+    int esc = 0;
+    for (;;) {
+        if ((long)(deadline - xTaskGetTickCount()) <= 0) { out[0] = '\0'; return -1; }
+        /* Keep pumping the cli task's inbox while we're parked here. The accept
+         * path (processInboxMsg → cliDcConnect) only runs from itsPoll, and the
+         * main loop is stuck in this command — so without this, every new
+         * connection (browser/webrtc xterm, on-device LCD CLI; both dial cli:1,
+         * 2 DC slots) goes unacked for the whole prompt and is rejected. itsPoll
+         * dispatches connects/disconnects/data only — it runs no command — so
+         * this is not reentrant. It also wakes on this slot's own input. */
+        while (itsPoll(0)) {}
+        size_t n = itsRecv(h, rb, sizeof(rb), 0);
+        if (n == 0) {
+            if (!itsConnected(h)) { out[0] = '\0'; return -1; }
+            itsPoll(pdMS_TO_TICKS(200));   /* sleep until an inbox event or 200ms */
+            continue;
+        }
+        for (size_t i = 0; i < n; i++) {
+            char c = rb[i];
+            if (esc == 1) { esc = (c == '[' || c == 'O') ? 2 : 0; continue; }
+            if (esc == 2) { if ((unsigned char)c >= 0x40 && (unsigned char)c <= 0x7e) esc = 0; continue; }
+            if (c == 0x1b) { esc = 1; continue; }   /* ESC — start of an escape seq */
+            if (c == '\r' || c == '\n') { cliWrite("\r\n", 2); out[len] = '\0'; return (int)len; }
+            if (c == 0x03) { cliWrite("\r\n", 2); out[0] = '\0'; return -1; }   /* Ctrl-C */
+            if (c == 0x04) { if (len == 0) { out[0] = '\0'; return -1; } continue; } /* Ctrl-D */
+            if (c == 0x7f || c == 0x08) {  /* backspace / DEL */
+                if (len > 0) { len--; if (echo != CLI_ECHO_NONE) cliWrite("\b \b", 3); }
+                continue;
+            }
+            if ((unsigned char)c < 0x20) continue;  /* ignore other control chars */
+            if (len < outLen - 1) {
+                out[len++] = c;
+                if (echo == CLI_ECHO) cliWrite(&c, 1);
+                else if (echo == CLI_ECHO_STARS) cliWrite("*", 1);
+            }
+        }
+    }
+}
+
+/* Raw passthrough read from the active slot — see cli.h. Same direct-handle
+ * read as cliReadLine but verbatim: no echo, no editing, no escape stripping,
+ * and a caller-chosen (short) timeout so an interactive relay can poll input
+ * and stream output on the same task without wedging on either. */
+int cliReadRaw(char* out, size_t outLen, int timeoutMs) {
+    if (!out || outLen == 0) return -1;
+    if (cliActiveSlot < 0 || cliActiveSlot >= CLI_MAX_CLIENTS) return -1;
+    int h = cliSlots[cliActiveSlot].itsHandle;
+    if (h < 0) return -1;
+    /* Same reasoning as cliReadLine: an interactive relay (live ssh shell) parks
+     * the cli main loop in this command for its whole run, so service the inbox
+     * here or new connections are rejected the entire session. Grab buffered
+     * input first, else block in itsPoll (wakes on data OR a connect) up to the
+     * caller's timeout, then drain any further pending connects. */
+    while (itsPoll(0)) {}
+    size_t n = itsRecv(h, out, outLen, 0);
+    if (n == 0) {
+        itsPoll(pdMS_TO_TICKS(timeoutMs));
+        while (itsPoll(0)) {}
+        n = itsRecv(h, out, outLen, 0);
+    }
+    if (n == 0) return itsConnected(h) ? 0 : -1;
+    return (int)n;
 }
 
 static bool cliIsAnsi() {
@@ -969,10 +1058,14 @@ static void cliTaskFn(void* arg) {
    * RNSD_PORT_PACKET). Mark this task as a client too. 2 slots = current
    * command + headroom. */
   itsClientInit(2);
-  /* Two ports: stream-mode (TCP nc + serial) and packet-mode (WebRTC DC).
-   * Shared CLI_MAX_CLIENTS=5 slot pool — 3 TCP + 2 DC lets the browser xterm
-   * and the on-device CLI program coexist with debug nc clients. */
-  itsServerPortOpen(CLI_PORT_TCP, /*packetBased=*/false, 3, 512, 2048);
+  /* Two ports because the transports frame differently — TCP/serial is a byte
+   * stream (packetBased=false), the WebRTC DataChannel is message-oriented
+   * (packetBased=true) — and a port has one framing mode, so they can't share.
+   * Shared CLI_MAX_CLIENTS=8 slot pool — 6 TCP + 2 DC. DC has only two possible
+   * consumers (the single browser webrtc session + the on-device CLI), so it's
+   * capped at 2; the headroom goes to TCP (nc debug + sshd-in backends). The two
+   * caps sum to the pool, so DC's 2 stay guaranteed even under a TCP flood. */
+  itsServerPortOpen(CLI_PORT_TCP, /*packetBased=*/false, 6, 512, 2048);
   itsServerOnConnect(CLI_PORT_TCP, cliTcpConnect);
   itsServerOnDisconnect(CLI_PORT_TCP, cliOnDisconnect);
   itsServerPortOpen(CLI_PORT_DC,  /*packetBased=*/true,  2, 512, 2048);

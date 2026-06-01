@@ -78,6 +78,31 @@ int cliPrintf(const char* fmt, ...) __attribute__((format(printf, 1, 2)));
 /** Raw write to active CLI client (e.g. cat). No-op if no session output. */
 void cliWrite(const char* data, size_t len);
 
+/** Echo policy for cliReadLine. */
+enum cli_echo_t : uint8_t {
+    CLI_ECHO,        /* echo each character back to the client */
+    CLI_ECHO_STARS,  /* echo each character as '*' (password fields) */
+    CLI_ECHO_NONE,   /* echo nothing (silent password entry) */
+};
+
+/** Blocking single-line input read from the active CLI client. Intended to be
+ *  called from inside a CLI command callback (e.g. `ssh` prompting for a
+ *  password); it reads the same input stream the line editor would, so it
+ *  works for serial, TCP/nc and browser sessions alike. Handles backspace
+ *  (BS/DEL) and ends on CR or LF. Ctrl-C and Ctrl-D (on an empty line) abort.
+ *  Writes a trailing CRLF after the line. Returns the number of characters
+ *  read (>= 0, NUL-terminated in `out`), or -1 if aborted / no active session.
+ *  `out` is always NUL-terminated on return (empty string on -1). */
+int cliReadLine(char* out, size_t outLen, cli_echo_t echo);
+
+/** Raw read from the active CLI client: up to `outLen` bytes verbatim — no
+ *  echo, no line editing, no escape stripping. Blocks at most `timeoutMs`.
+ *  Returns the byte count (>0), 0 on timeout, or -1 if there's no active
+ *  session / it closed. For char-level relays such as an interactive ssh
+ *  shell, where keystrokes (incl. control/escape bytes) must pass through
+ *  untouched and output streams back concurrently. */
+int cliReadRaw(char* out, size_t outLen, int timeoutMs);
+
 /** Session working directory (default /sdcard when no interactive slot, e.g. cron). */
 void cliGetCwd(char* out, size_t outLen);
 
