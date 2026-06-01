@@ -103,6 +103,11 @@ int cliReadLine(char* out, size_t outLen, cli_echo_t echo);
  *  untouched and output streams back concurrently. */
 int cliReadRaw(char* out, size_t outLen, int timeoutMs);
 
+/** Active CLI client's terminal size (columns/rows), as reported at connect
+ *  time; defaults to 80x24 when the client didn't say. Used by the ssh client
+ *  for its pty-req so ncurses apps get the right geometry. */
+void cliTermSize(int* cols, int* rows);
+
 /** Session working directory (default /sdcard when no interactive slot, e.g. cron). */
 void cliGetCwd(char* out, size_t outLen);
 

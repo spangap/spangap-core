@@ -154,6 +154,7 @@ static struct cli_slot_t {
     bool noPrompt;     /* suppress connect-time prompt (one-shot exec clients) */
     char lineBuf[128];
     int lineLen;
+    int cols, rows;    /* client terminal size (0 = unknown → 80x24); for ssh pty-req */
     char cwd[256];
     /* True when the slot wants to disconnect once its outgoing stream is
      * fully drained. Set by trailing-';' (LINE / ANSI hangup) and by serial
@@ -418,6 +419,17 @@ int cliReadRaw(char* out, size_t outLen, int timeoutMs) {
     }
     if (n == 0) return itsConnected(h) ? 0 : -1;
     return (int)n;
+}
+
+/* Active slot's reported terminal size (see cli.h). 80x24 when unknown. */
+void cliTermSize(int* cols, int* rows) {
+    int c = 80, r = 24;
+    if (cliActiveSlot >= 0 && cliActiveSlot < CLI_MAX_CLIENTS) {
+        if (cliSlots[cliActiveSlot].cols > 0) c = cliSlots[cliActiveSlot].cols;
+        if (cliSlots[cliActiveSlot].rows > 0) r = cliSlots[cliActiveSlot].rows;
+    }
+    if (cols) *cols = c;
+    if (rows) *rows = r;
 }
 
 static bool cliIsAnsi() {
@@ -1023,16 +1035,28 @@ static int cliTcpConnect(int handle, const void* data, size_t len) {
  *  line editing and echo (see TerminalWindow.vue) and sends one finished
  *  command per newline; the device echoes nothing and just executes lines. */
 static int cliDcConnect(int handle, const void* data, size_t len) {
-  (void)data; (void)len;
   int slot = cliAllocSlot(handle);
   if (slot < 0) return -1;
   auto& cl = cliSlots[slot];
   cl.edit = {};
   cl.lineLen = 0;
+  /* Optional connect payload "colsxrows" (e.g. "64x26") reports the client's
+   * terminal size, used for the ssh pty-req. Defaults to 80x24 if absent. */
+  cl.cols = 80; cl.rows = 24;
+  if (data && len > 0 && len < 16) {
+    char b[16]; memcpy(b, data, len); b[len] = '\0';
+    int cc = 0, rr = 0;
+    if (sscanf(b, "%dx%d", &cc, &rr) == 2 && cc > 0 && rr > 0) { cl.cols = cc; cl.rows = rr; }
+  }
   cl.usbSerial = false;
-  cl.color = false;         /* LINE mode echoes nothing — color is moot */
+  /* CLI_ANSI: the device owns echo + line editing + history, emitting ANSI the
+   * client just renders. Clients (browser xterm, on-device LCD app) are dumb
+   * terminals that echo nothing locally — so there's no double-echo, and an
+   * interactive ssh shell needs no mode toggle (the remote pty echoes through).
+   * The LCD can't render the cursor-addressing escapes, but strips them. */
+  cl.color = true;          /* xterm renders colour; the LCD strips it */
   cl.noPrompt = false;
-  cl.mode = CLI_LINE;
+  cl.mode = CLI_ANSI;
   cliInitSlot(cl, slot);
   return slot;
 }
