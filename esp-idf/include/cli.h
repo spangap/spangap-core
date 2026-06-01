@@ -78,6 +78,22 @@ int cliPrintf(const char* fmt, ...) __attribute__((format(printf, 1, 2)));
 /** Raw write to active CLI client (e.g. cat). No-op if no session output. */
 void cliWrite(const char* data, size_t len);
 
+/** True iff the active CLI slot wants ANSI *color* — i.e. it's in CLI_ANSI mode
+ *  AND its connect payload asked for CLI_COLOR. Commands that colorize their own
+ *  output (e.g. `ls` directory entries) gate the escapes on this so no-color /
+ *  line-mode / dumb clients get clean plain text. Cursor/line-edit sequences are
+ *  separate and not governed by this. */
+bool cliWantsColor(void);
+
+/* Shared ANSI color escapes for CLI output. Emit these only when
+ * cliWantsColor() is true (the color escapes are inert width-0 sequences, so
+ * they never disturb column math — but a no-color terminal would show the raw
+ * bytes). */
+#define CLI_C_RESET "\033[0m"
+#define CLI_C_HOST  "\033[1;32m"   /* prompt hostname — bold green */
+#define CLI_C_DIR   "\033[1;34m"   /* directories     — bold blue  */
+#define CLI_C_INPUT "\033[36m"     /* input echo      — cyan       */
+
 /** Echo policy for cliReadLine. */
 enum cli_echo_t : uint8_t {
     CLI_ECHO,        /* echo each character back to the client */

@@ -73,7 +73,13 @@ static void cmdLs(const char* a) {
   }
   std::sort(entries, entries + count, [](const ls_entry& a, const ls_entry& b) { return a.mtime < b.mtime; });
   if (count == 0) cliPrintf("(empty)\n");
+  const bool color = cliWantsColor();
   for (int i = 0; i < count; i++) {
+    /* Directories print bold-blue when the client wants color. The escapes sit
+     * outside the %-40s field so column alignment (computed on the name only) is
+     * preserved. */
+    const bool hl = color && entries[i].isDir;
+    if (hl) cliWrite(CLI_C_DIR, sizeof(CLI_C_DIR) - 1);
     if (longFmt) {
       struct tm tm;
       localtime_r(&entries[i].mtime, &tm);
@@ -82,10 +88,14 @@ static void cmdLs(const char* a) {
         snprintf(sz, sizeof(sz), "<dir>");
       else
         fmtSize(entries[i].size, sz, sizeof(sz));
-      cliPrintf("%-40s  %04d-%02d-%02d %02d:%02d  %7s\n", entries[i].name, tm.tm_year + 1900,
+      cliPrintf("%-40s", entries[i].name);
+      if (hl) cliWrite(CLI_C_RESET, sizeof(CLI_C_RESET) - 1);
+      cliPrintf("  %04d-%02d-%02d %02d:%02d  %7s\n", tm.tm_year + 1900,
                 tm.tm_mon + 1, tm.tm_mday, tm.tm_hour, tm.tm_min, sz);
     } else {
-      cliPrintf("%s\n", entries[i].name);
+      cliPrintf("%s", entries[i].name);
+      if (hl) cliWrite(CLI_C_RESET, sizeof(CLI_C_RESET) - 1);
+      cliPrintf("\n");
     }
   }
   heap_caps_free(entries);

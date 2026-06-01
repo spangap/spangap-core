@@ -437,8 +437,9 @@ static bool cliIsAnsi() {
            cliSlots[cliActiveSlot].mode == CLI_ANSI;
 }
 
-/* True iff the active slot wants ANSI *color* (color flag set + ANSI mode). */
-static bool cliWantsColor() {
+/* True iff the active slot wants ANSI *color* (color flag set + ANSI mode).
+ * Public (declared in cli.h) so commands can colorize their own output. */
+bool cliWantsColor() {
     return cliActiveSlot >= 0 &&
            cliSlots[cliActiveSlot].mode == CLI_ANSI &&
            cliSlots[cliActiveSlot].color;
@@ -561,7 +562,15 @@ static int cliPromptBuild(char* out, size_t outSize) {
 static void cliWritePrompt(cli_write_fn write) {
   char buf[64];
   int n = cliPromptBuild(buf, sizeof(buf));
-  if (n > 0) write(buf, n);
+  if (n <= 0) return;
+  /* "host $ " — color the hostname bold-green, leave the " $ " separator plain.
+   * The escapes are gated by cliColorWrite and have zero visible width, so the
+   * line-editor's cursor math (cliPromptLen, which counts only buf) is unchanged. */
+  int hostLen = n > 3 ? n - 3 : n;   /* trailing " $ " is 3 chars */
+  cliColorWrite(write, CLI_C_HOST, sizeof(CLI_C_HOST) - 1);
+  write(buf, hostLen);
+  cliColorWrite(write, CLI_C_RESET, sizeof(CLI_C_RESET) - 1);
+  if (n > hostLen) write(buf + hostLen, n - hostLen);
 }
 
 static int cliPromptLen() {
