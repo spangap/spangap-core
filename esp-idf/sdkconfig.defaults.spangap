@@ -72,6 +72,10 @@ CONFIG_FREERTOS_USE_TRACE_FACILITY=y
 CONFIG_FREERTOS_GENERATE_RUN_TIME_STATS=y
 CONFIG_FREERTOS_VTASKLIST_INCLUDE_COREID=y
 
+# Per-task CPU boost (pm.cpp): slot 0 left for IDF, slot 1 (TLS_PM_BOOST) holds
+# each boosted task's CPU_FREQ_MAX handle. Must be > TLS_PM_BOOST or pm.cpp #errors.
+CONFIG_FREERTOS_THREAD_LOCAL_STORAGE_POINTERS=2
+
 # Log — compile-time max level (runtime filtering via esp_log_level_set)
 # Boot at INFO (quiet), compile VERBOSE so all levels work at runtime via "set log=..."
 CONFIG_LOG_DEFAULT_LEVEL_INFO=y

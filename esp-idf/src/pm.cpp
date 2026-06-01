@@ -162,6 +162,52 @@ void pmLockRelease(pm_lock_handle_t h) {
     storageSet("sys.going_down", 1);
 }
 
+/* ---- CPU boost (notify-driven) ---- (see pm.h / docs/plans/pm-task-boost.md) */
+#if CONFIG_FREERTOS_THREAD_LOCAL_STORAGE_POINTERS <= TLS_PM_BOOST
+#error "pm boost needs CONFIG_FREERTOS_THREAD_LOCAL_STORAGE_POINTERS > TLS_PM_BOOST (bump it in sdkconfig.defaults.spangap)"
+#endif
+
+/* One shared, recursive CPU_FREQ_MAX lock for the whole system. The count
+ * aggregates every task's auto + manual boost: 240 MHz iff the count > 0.
+ * Created lazily on first use. */
+static pm_lock_handle_t s_boostLock = nullptr;
+
+static inline void boostEnsure() {
+  if (!s_boostLock) pmLockCreate(PM_CPU_FREQ_MAX, "boost", &s_boostLock);
+}
+
+/* Lean release for the auto-boost hot path (runs on every itsPoll block): same
+ * count/stats bookkeeping as pmLockRelease, but skips the deepSleepAllowed()
+ * list-walk + going_down storageSet — the boost lock is CPU_FREQ_MAX and never
+ * gates deep sleep. (Acquire has no such side effect, so we reuse pmLockAcquire.) */
+static void boostReleaseLean(pm_lock_handle_t h) {
+  if (!h || h->count <= 0) return;
+  h->count--;
+  if (h->count == 0)
+    h->time_held += esp_timer_get_time() - h->last_taken;
+  if (h->esp_handle)
+    esp_pm_lock_release(h->esp_handle);
+}
+
+/* Per-task auto boost. TLS slot holds s_boostLock when this task currently holds
+ * its one auto count, else nullptr — so take/drop are idempotent and balanced
+ * regardless of call order. Manual pmBoost() counts are NOT tracked here, so
+ * they survive across blocks independently. */
+void pmBoostAuto(bool on) {
+  void* held = pvTaskGetThreadLocalStoragePointer(NULL, TLS_PM_BOOST);
+  if (on && !held) {
+    boostEnsure();
+    vTaskSetThreadLocalStoragePointer(NULL, TLS_PM_BOOST, s_boostLock);
+    pmLockAcquire(s_boostLock);
+  } else if (!on && held) {
+    vTaskSetThreadLocalStoragePointer(NULL, TLS_PM_BOOST, nullptr);
+    boostReleaseLean((pm_lock_handle_t)held);
+  }
+}
+
+void pmBoost(void)    { boostEnsure(); pmLockAcquire(s_boostLock); }
+void pmBoostEnd(void) { if (s_boostLock) pmLockRelease(s_boostLock); }
+
 static pm_lock_handle_t usbLock = nullptr;
 RTC_DATA_ATTR static bool rtcUsbDisabled = false;
 
@@ -534,7 +580,13 @@ static void cmdTop(const char* args) {
         return buf;
     };
 #if CONFIG_FREERTOS_USE_TRACE_FACILITY && CONFIG_FREERTOS_GENERATE_RUN_TIME_STATS
-    constexpr int MAX_SNAP = 32;
+    /* Size the snapshot buffers to the live task count, plus headroom for tasks
+       that may spawn during the 2s sampling window. A fixed cap (was 32) silently
+       truncated the task set once the system grew past it, and since the order
+       from uxTaskGetSystemState() isn't stable, a task could land in snap2 with
+       no match in snap1 -> prev stayed 0 -> delta became the task's *lifetime*
+       run counter instead of its 2s slice, printing bogus >100% rows. */
+    const int maxSnap = (int)uxTaskGetNumberOfTasks() + 8;
     struct snap {
         TaskHandle_t h;
         char name[configMAX_TASK_NAME_LEN];
@@ -544,11 +596,11 @@ static void cmdTop(const char* args) {
         size_t dram, psram; uint16_t dblk, pblk;
         uint32_t delta;
     };
-    auto* s1 = (snap*)malloc(MAX_SNAP * sizeof(snap));
-    auto* s2 = (snap*)malloc(MAX_SNAP * sizeof(snap));
+    auto* s1 = (snap*)malloc(maxSnap * sizeof(snap));
+    auto* s2 = (snap*)malloc(maxSnap * sizeof(snap));
     if (!s1 || !s2) { free(s1); free(s2); cliPrintf("top: out of memory\n"); return; }
-    memset(s1, 0, MAX_SNAP * sizeof(snap));
-    memset(s2, 0, MAX_SNAP * sizeof(snap));
+    memset(s1, 0, maxSnap * sizeof(snap));
+    memset(s2, 0, maxSnap * sizeof(snap));
     auto takeSnap = [](snap* out, int max, uint32_t& total) -> int {
         UBaseType_t n = uxTaskGetNumberOfTasks();
         auto* raw = (TaskStatus_t*)malloc(n * sizeof(TaskStatus_t));
@@ -571,18 +623,20 @@ static void cmdTop(const char* args) {
         return cnt;
     };
     uint32_t t1 = 0, t2 = 0;
-    int n1 = takeSnap(s1, MAX_SNAP, t1);
+    int n1 = takeSnap(s1, maxSnap, t1);
     vTaskDelay(pdMS_TO_TICKS(2000));
-    int n2 = takeSnap(s2, MAX_SNAP, t2);
+    int n2 = takeSnap(s2, maxSnap, t2);
     uint32_t deltaTotal = t2 - t1;
 
     /* Compute per-task CPU delta; also capture IDLE0/IDLE1 for per-core busy. */
     uint32_t idle0 = 0, idle1 = 0;
     for (int i = 0; i < n2; i++) {
-        uint32_t prev = 0;
+        uint32_t prev = 0; bool found = false;
         for (int j = 0; j < n1; j++)
-            if (s1[j].h == s2[i].h) { prev = s1[j].run; break; }
-        s2[i].delta = s2[i].run - prev;
+            if (s1[j].h == s2[i].h) { prev = s1[j].run; found = true; break; }
+        /* No baseline (task spawned mid-window, or a reused handle) -> report 0%
+           rather than letting delta default to the full lifetime counter. */
+        s2[i].delta = found ? (s2[i].run - prev) : 0;
         if (strcmp(s2[i].name, "IDLE0") == 0) idle0 = s2[i].delta;
         else if (strcmp(s2[i].name, "IDLE1") == 0) idle1 = s2[i].delta;
     }

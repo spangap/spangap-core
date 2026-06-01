@@ -4,6 +4,7 @@
 #include "freertos/semphr.h"
 #include "esp_heap_caps.h"
 #include "esp_timer.h"
+#include "pm.h"
 #include <string.h>
 
 static const char* TAG = "its";
@@ -637,7 +638,10 @@ static bool dispatchRecvCallbacks(its_task_t* me) {
 bool itsPoll(TickType_t timeout) {
     its_task_t* me = myTask();
     if (!me) {
-        if (timeout > 0) ulTaskNotifyTake(pdTRUE, timeout);
+        if (timeout > 0) {
+            pmBoostAuto(false);                                  /* floor while parked */
+            if (ulTaskNotifyTake(pdTRUE, timeout)) pmBoostAuto(true);  /* notify wake → boost */
+        }
         return false;
     }
 
@@ -654,8 +658,11 @@ bool itsPoll(TickType_t timeout) {
     if (any) return true;
     if (timeout == 0) return false;
 
-    /* Block until notification, then retry once */
-    ulTaskNotifyTake(pdTRUE, timeout);
+    /* Block until notification, then retry once. Drop to the DFS floor while
+     * parked; if we woke on a real notify (an event to handle, not a mere
+     * timeout tick) boost to 240 for the handling — held until the next block. */
+    pmBoostAuto(false);
+    if (ulTaskNotifyTake(pdTRUE, timeout)) pmBoostAuto(true);
 
     if (xQueueReceive(me->inbox, buf, 0) == pdTRUE) {
         processInboxMsg(me, buf);

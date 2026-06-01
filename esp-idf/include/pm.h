@@ -5,6 +5,8 @@
 #define SECCAM_PM_H
 
 #include <stdint.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 
 /** Lock types. ESP types delegate to esp_pm; NO_DEEP_SLEEP is ours. */
 enum pm_lock_type_t {
@@ -38,6 +40,34 @@ void pmLockRelease(pm_lock_handle_t handle);
 
 /** Returns true when no locks of any type are held. */
 bool deepSleepAllowed();
+
+/* ---- CPU boost (notify-driven) ----
+ * Tasks run at the DFS floor (80 MHz) by default. itsPoll automatically boosts
+ * to max for the handling of a wake that came from a *notify* (an ITS message,
+ * an ISR like lora's DIO1, input) — i.e. a real event — and stays at the floor
+ * for a wake that merely *timed out* (a routine housekeeping tick). The boost is
+ * held from the notify-wake until the task's next block. All boost tasks share
+ * one recursive CPU_FREQ_MAX lock; the per-task "do I currently hold the auto
+ * count" bit lives in TLS slot TLS_PM_BOOST (slot 0 is left for IDF). See
+ * docs/plans/pm-task-boost.md. */
+#define TLS_PM_BOOST 1
+
+/** Auto boost, used by itsPoll() and delay(): on=true raises (acquires) the
+ *  current task's one auto count after a notify-wake; on=false drops it before a
+ *  block. Idempotent + TLS-tracked, so take/drop stay balanced in any order.
+ *  Manual pmBoost() counts are separate and survive across these. */
+void pmBoostAuto(bool on);
+
+/** True if the current task currently holds its auto boost count. */
+static inline bool pmBoostHeld(void) {
+  return pvTaskGetThreadLocalStoragePointer(NULL, TLS_PM_BOOST) != NULL;
+}
+
+/** Manual sustained boost — for heavy timeout-path work, or continuous loops
+ *  (net's select, webrtc) that aren't notify-driven and want 240 MHz held across
+ *  their own blocks. Recursive; pair each pmBoost() with a pmBoostEnd(). */
+void pmBoost(void);
+void pmBoostEnd(void);
 
 /** Register a GPIO as a light-sleep wake source.
  *

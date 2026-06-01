@@ -5,6 +5,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/idf_additions.h"
+#include "pm.h"
 #include <sys/time.h>
 #include <sys/stat.h>
 #include <time.h>
@@ -32,7 +33,15 @@ static inline uint32_t millis() {
 }
 
 static inline void delay(uint32_t ms) {
+    if (!ms) { vTaskDelay(0); return; }   /* bare yield: nothing to do */
+    /* A delay is a timeout, not an event — but it shouldn't change whether we're
+     * handling one. Drop the auto boost to the floor while we sleep (save power),
+     * then restore it if we held it, so mid-event work resumes at speed. Manual
+     * pmBoost() holds are untouched and stay up across the delay. */
+    bool was = pmBoostHeld();
+    pmBoostAuto(false);
     vTaskDelay(pdMS_TO_TICKS(ms));
+    if (was) pmBoostAuto(true);
 }
 
 /** Task stack location. Default PSRAM — use DRAM only when the task runs
@@ -42,7 +51,11 @@ enum stack_caps_t { STACK_PSRAM, STACK_DRAM };
 
 /** Spawn a task with heap-capability-backed TCB + stack. Wraps
  *  xTaskCreatePinnedToCoreWithCaps; must be paired with killSelf()
- *  (or vTaskDeleteWithCaps) at teardown. Returns NULL on failure. */
+ *  (or vTaskDeleteWithCaps) at teardown. Returns NULL on failure.
+ *
+ *  No boost flag: CPU boost is automatic and notify-driven (itsPoll boosts the
+ *  handling of event-wakes, stays at the floor for timeout ticks). A task that
+ *  needs sustained 240 MHz calls pmBoost()/pmBoostEnd() itself. See pm-task-boost.md. */
 static inline TaskHandle_t spawnTask(TaskFunction_t fn, const char* name,
                                       uint32_t stackBytes, void* arg,
                                       UBaseType_t prio, BaseType_t core,
@@ -59,6 +72,7 @@ static inline TaskHandle_t spawnTask(TaskFunction_t fn, const char* name,
  *  so self-deletes always need the -WithCaps cleanup path (idle task
  *  won't free the heap-allocated buffers on its own). */
 [[noreturn]] static inline void killSelf() {
+    pmBoostAuto(false);            /* release any auto boost count this task holds before it vanishes */
     vTaskDeleteWithCaps(nullptr);
     /* unreachable: vTaskDeleteWithCaps(nullptr) deletes the current task */
     while (1) { vTaskDelay(portMAX_DELAY); }
