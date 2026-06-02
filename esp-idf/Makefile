@@ -7,7 +7,7 @@
 
 .PHONY: timezones
 
-# Regenerate data/factory_state/storage/external/s.time.zones.json from the
+# Regenerate data/factory_state/timezones.json from the
 # IANA->POSIX mapping (network fetch). Platform-owned: consumers inherit it via
 # the data merge, so it lives here, not per-consumer. ETag cache in build/ so a
 # clean forces a re-download. Run ahead of a release; commit the result.

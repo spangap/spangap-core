@@ -55,9 +55,9 @@ because they ship as part of the component:
 - `lcd-icons.py` — rasterize SVG launcher icons (depends on cairo +
   Pillow + cairosvg + pypng + lz4; without all four it silently ships
   label-only tiles).
-- `update-zones.py` — refresh `s.time.zones.json` (IANA → POSIX cache).
-  The result is committed here; every consumer inherits it via the
-  factory-image merge.
+- `update-zones.py` — refresh `factory_state/timezones.json` (IANA →
+  POSIX map; a plain user-state file, not a config blob). The result is
+  committed here; every consumer inherits it via the factory-image merge.
 - `size.py` — section-size report against the most recent build.
 - `build-epoch.py` — embed the build's UTC epoch into the firmware.
 

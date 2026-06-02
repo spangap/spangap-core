@@ -43,7 +43,7 @@ Each feature module self-registers its menus via `spangap-browser/stores/menu` (
 
 **Components use** `device.get("s.…")` for reading and `device.set("s.…", value)` for writing. Uses Quasar SVG icon set (no font downloads).
 
-**Timezone**: browser auto-pushes IANA timezone + POSIX string on first connect if unset. Timezone DB (`s.time.zones`) is a platform-owned external storage blob shipped from `spangap-core/data` via the factory-image merge (refresh with spangap-core's `make timezones`).
+**Timezone**: browser auto-pushes the IANA timezone name (`s.ntp.tz`) on first connect if unset; the device resolves the POSIX string itself. The IANA→POSIX DB is a platform-owned file shipped at `<stateDir>/timezones.json` (root of the state store, *not* a config subtree) via the factory-image merge (refresh with spangap-core's `make timezones`). The browser refreshes the on-device file with an HTTPS PUT to `/state/timezones.json` when GitHub's copy is newer, tracking the uploaded version in `s.ntp.zones_etag`.
 
 **Client time push**: browser sends `sys.time.set` (epoch seconds) if `sys.time.valid=0`, giving the device time even without NTP.
 

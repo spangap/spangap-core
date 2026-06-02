@@ -1,9 +1,13 @@
 #!/usr/bin/env python3
 """
 Download IANA→POSIX timezone mapping from GitHub, writing it as a nested
-JSON tree the device storage layer mounts at the `s.time.zones` key.
+JSON tree shipped as a plain user-state file the device parses on demand.
 
-Output goes to <out_dir>/factory_state/storage/external/s.time.zones.json.
+Output goes to <out_dir>/factory_state/timezones.json — the root of the
+device's state store, NOT under storage/external/. (It used to be an external
+storage blob mounted into the config tree at `s.time.zones`, which kept the
+whole ~15 KB map resident in RAM for the entire runtime. It now lives outside
+storage so ntpApplyTimezone() can parse it transiently and free it.)
 ETag cache (skips the download when GitHub says "not modified") goes to
 <cache_dir>/.zones_etag, which defaults to <out_dir>.
 
@@ -76,13 +80,13 @@ def write_zones_file(out_path, zones_nested, etag):
         json.dump(zones_nested, f, indent=2, ensure_ascii=False)
         f.write("\n")
     n = sum(1 for v in zones_nested.values() if isinstance(v, dict))
-    print(f"s.time.zones.json: updated ({n} continents)")
+    print(f"timezones.json: updated ({n} continents)")
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("out_dir", help="output staging dir (writes "
-                                    "factory_state/storage/external/s.time.zones.json under here)")
+                                    "factory_state/timezones.json under here)")
     ap.add_argument("--cache-dir", default=None,
                     help=".zones_etag location (default: out_dir)")
     ap.add_argument("--force", action="store_true",
@@ -92,8 +96,7 @@ def main():
     out_dir = os.path.abspath(args.out_dir)
     cache_dir = os.path.abspath(args.cache_dir) if args.cache_dir else out_dir
     cache_path = os.path.join(cache_dir, ".zones_etag")
-    out_path = os.path.join(out_dir, "factory_state", "storage", "external",
-                            "s.time.zones.json")
+    out_path = os.path.join(out_dir, "factory_state", "timezones.json")
 
     zones, etag = fetch_zones(cache_path, args.force)
     if zones is None:
