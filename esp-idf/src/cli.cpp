@@ -921,6 +921,28 @@ void cliProcess(const char* line) {
     cliProcess(semi + 1);
     return;
   }
+  /* Alias expansion: if the first word names a stored alias
+   * (s.cli.aliases.<word>), replace it with the alias value and append
+   * everything after the word as extra arguments. Done once — the expansion
+   * falls straight into command dispatch below, never back through cliProcess,
+   * so aliases are NOT recursively re-expanded (an alias whose value begins
+   * with another alias name runs that command, it doesn't chain). */
+  char expanded[384];
+  {
+    const char* sp = line;
+    while (*sp && *sp != ' ') sp++;
+    size_t wlen = (size_t)(sp - line);
+    char key[80];
+    if (wlen > 0 && (size_t)snprintf(key, sizeof(key), "s.cli.aliases.%.*s", (int)wlen, line) < sizeof(key) &&
+        storageExists(key)) {
+      char val[192];
+      storageGetStr(key, val, sizeof(val), "");
+      /* sp points at the first space or the terminating NUL — appending it
+       * verbatim carries the original argument text (with its leading space). */
+      snprintf(expanded, sizeof(expanded), "%s%s", val, sp);
+      line = expanded;
+    }
+  }
   /* Try registered commands (longest match first) */
   { int bestIdx = -1, bestLen = 0;
     auto& cmds = cliCmds();
@@ -942,6 +964,78 @@ void cliProcess(const char* line) {
   if (*line) cliPrintf("%s: unknown command. Type \"help\" for help.\n", line);
 }
 
+/* ---- alias / unalias ---- */
+
+#define CLI_ALIAS_PREFIX "s.cli.aliases."
+
+/* storageForEach callback — can't capture, so it prints directly. Strips the
+ * s.cli.aliases. prefix so the listing shows the bare alias name. */
+static bool cliAliasListedAny;
+static void cliAliasPrint(const char* key, const char* val) {
+  const char* name = strncmp(key, CLI_ALIAS_PREFIX, sizeof(CLI_ALIAS_PREFIX) - 1) == 0
+                         ? key + sizeof(CLI_ALIAS_PREFIX) - 1 : key;
+  cliPrintf("alias %s %s\n", name, val);
+  cliAliasListedAny = true;
+}
+
+static void cmdAlias(const char* a) {
+  if (cliWantsHelp(a)) {
+    cliPrintf("%-*s define/list command aliases\n", CLI_HELP_COL, "alias [<name> <cmd>]");
+    return;
+  }
+  /* Bare `alias` → list all defined aliases. */
+  if (!*a) {
+    cliAliasListedAny = false;
+    storageForEach(CLI_ALIAS_PREFIX, cliAliasPrint);
+    if (!cliAliasListedAny) cliPrintf("(no aliases)\n");
+    return;
+  }
+  /* First word = alias name; everything after the following space = value. */
+  const char* sp = a;
+  while (*sp && *sp != ' ') sp++;
+  size_t nlen = (size_t)(sp - a);
+  char key[80];
+  /* The name becomes a dot-notation storage key segment under
+   * s.cli.aliases.<name>, so a '.' would nest the alias into config and the
+   * first-word lookup in cliProcess could never address it — reject it. */
+  if (memchr(a, '.', nlen)) { cliPrintf("alias: name may not contain '.'\n"); return; }
+  if (nlen == 0 || (size_t)snprintf(key, sizeof(key), CLI_ALIAS_PREFIX "%.*s", (int)nlen, a) >= sizeof(key)) {
+    cliPrintf("alias: bad name\n");
+    return;
+  }
+  while (*sp == ' ') sp++;
+  /* `alias <name>` with no value → show that one alias. */
+  if (!*sp) {
+    if (storageExists(key)) {
+      char val[192];
+      storageGetStr(key, val, sizeof(val), "");
+      cliPrintf("alias %.*s %s\n", (int)nlen, a, val);
+    } else {
+      cliPrintf("alias: %.*s not set\n", (int)nlen, a);
+    }
+    return;
+  }
+  storageSet(key, sp);
+}
+
+static void cmdUnalias(const char* a) {
+  if (cliWantsHelp(a)) {
+    cliPrintf("%-*s remove a command alias\n", CLI_HELP_COL, "unalias <name>");
+    return;
+  }
+  /* Name is the first word only (ignore any trailing junk). */
+  const char* sp = a;
+  while (*sp && *sp != ' ') sp++;
+  size_t nlen = (size_t)(sp - a);
+  char key[80];
+  if (nlen == 0 || (size_t)snprintf(key, sizeof(key), CLI_ALIAS_PREFIX "%.*s", (int)nlen, a) >= sizeof(key)) {
+    cliPrintf("usage: unalias <name>\n");
+    return;
+  }
+  if (!storageExists(key)) { cliPrintf("unalias: %.*s not set\n", (int)nlen, a); return; }
+  storageUnset(key);
+}
+
 /* ---- External CLI command init functions ---- */
 extern void cliCmdFsInit();
 extern void cliCmdSysInit();
@@ -954,6 +1048,8 @@ static void cliBuiltinInit() {
     cliCmdSysInit();
     pmRegisterCmds();
     logRegisterCmds();
+    cliRegisterCmd("alias", cmdAlias);
+    cliRegisterCmd("unalias", cmdUnalias);
     cliRegisterCmd("exit", [](const char* a) {
         if (cliWantsHelp(a)) { cliPrintf("%-*s end this CLI session\n", CLI_HELP_COL, "exit"); return; }
         if (cliActiveSlot >= 0 && cliSlots[cliActiveSlot].usbSerial) {
