@@ -176,6 +176,24 @@ static inline void boostEnsure() {
   if (!s_boostLock) pmLockCreate(PM_CPU_FREQ_MAX, "boost", &s_boostLock);
 }
 
+/* Debug attribution: which tasks currently hold a boost count, so `pm` can name
+ * a leak. One entry per held count — an auto holder appears once (TLS-idempotent
+ * acquire), a manual pmBoost() holder once per un-ended call; a task holding both
+ * shows up twice. The registry mirrors s_boostLock->count exactly. */
+#define BOOST_MAX_HOLDERS 24
+static TaskHandle_t s_boostHolders[BOOST_MAX_HOLDERS];
+
+static void boostHolderAdd() {
+  TaskHandle_t t = xTaskGetCurrentTaskHandle();
+  for (int i = 0; i < BOOST_MAX_HOLDERS; i++)
+    if (!s_boostHolders[i]) { s_boostHolders[i] = t; return; }
+}
+static void boostHolderDel() {
+  TaskHandle_t t = xTaskGetCurrentTaskHandle();
+  for (int i = 0; i < BOOST_MAX_HOLDERS; i++)
+    if (s_boostHolders[i] == t) { s_boostHolders[i] = nullptr; return; }
+}
+
 /* Lean release for the auto-boost hot path (runs on every itsPoll block): same
  * count/stats bookkeeping as pmLockRelease, but skips the deepSleepAllowed()
  * list-walk + going_down storageSet — the boost lock is CPU_FREQ_MAX and never
@@ -199,14 +217,25 @@ void pmBoostAuto(bool on) {
     boostEnsure();
     vTaskSetThreadLocalStoragePointer(NULL, TLS_PM_BOOST, s_boostLock);
     pmLockAcquire(s_boostLock);
+    boostHolderAdd();
   } else if (!on && held) {
     vTaskSetThreadLocalStoragePointer(NULL, TLS_PM_BOOST, nullptr);
     boostReleaseLean((pm_lock_handle_t)held);
+    boostHolderDel();
   }
 }
 
-void pmBoost(void)    { boostEnsure(); pmLockAcquire(s_boostLock); }
-void pmBoostEnd(void) { if (s_boostLock) pmLockRelease(s_boostLock); }
+void pmBoost(void)    { boostEnsure(); pmLockAcquire(s_boostLock); boostHolderAdd(); }
+void pmBoostEnd(void) { if (s_boostLock && s_boostLock->count > 0) { pmLockRelease(s_boostLock); boostHolderDel(); } }
+
+/* Print the tasks currently pinning the boost lock — the `pm` leak readout. */
+static void pmBoostDumpHolders() {
+  cliPrintf("boost holders:");
+  bool none = true;
+  for (int i = 0; i < BOOST_MAX_HOLDERS; i++)
+    if (s_boostHolders[i]) { cliPrintf(" %s", pcTaskGetName(s_boostHolders[i])); none = false; }
+  cliPrintf(none ? " (none)\n" : "\n");
+}
 
 static pm_lock_handle_t usbLock = nullptr;
 RTC_DATA_ATTR static bool rtcUsbDisabled = false;
@@ -566,6 +595,7 @@ static void cmdPm(const char* args) {
     }
 #endif
     pmDumpLocks();
+    pmBoostDumpHolders();
 }
 
 static void cmdTop(const char* args) {
