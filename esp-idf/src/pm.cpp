@@ -569,8 +569,10 @@ static void cmdPm(const char* args) {
 }
 
 static void cmdTop(const char* args) {
-    if (cliWantsHelp(args)) { cliPrintf("%-*s tasks, CPU%%, heap, uptime (human: readable sizes)\n", CLI_HELP_COL, "top [human]"); return; }
-    const bool human = (strcmp(args, "human") == 0);
+    if (cliWantsHelp(args)) { cliPrintf("%-*s tasks, CPU%%, heap, uptime (human: readable sizes; -d/-p: sort by DRAM/PSRAM)\n", CLI_HELP_COL, "top [human] [-d|-p]"); return; }
+    const bool human   = (strstr(args, "human") != nullptr);
+    const bool byDram  = (strstr(args, "-d") != nullptr);
+    const bool byPsram = (strstr(args, "-p") != nullptr);
     const int  bw = human ? 7 : 8;   /* byte-column width: fits 16MB raw, tighter for -h */
     /* Format a byte count: raw decimal by default, fmtSize ("198kB") with -h.
        Returns buf so it can be used inline as a printf %s arg. */
@@ -676,24 +678,39 @@ static void cmdTop(const char* args) {
     }
 #endif
 
-    /* Sort live tasks: pinned by core, then CPU desc; IDLE filtered out. */
-    std::sort(s2, s2 + n2, [](const snap& a, const snap& b) {
+    /* Fold the pre-scheduler and deleted-task heap aggregates into the table as
+       pseudo-rows (h == nullptr) so they sort by RAM alongside real tasks under
+       -d/-p instead of always trailing at the bottom. */
+    auto addAgg = [&](const char* nm, size_t dr, size_t db, size_t ps, size_t pb) {
+        if ((!dr && !ps) || n2 >= maxSnap) return;
+        snap& e = s2[n2++];
+        memset(&e, 0, sizeof(e));
+        safeStrncpy(e.name, nm, sizeof(e.name));
+        e.h = nullptr;
+        e.dram = dr; e.dblk = (uint16_t)db; e.psram = ps; e.pblk = (uint16_t)pb;
+    };
+    addAgg("pre-sched", preDram, preDblk, preP, prePblk);
+    addAgg("(deleted)", delDram, delDblk, delP, delPblk);
+
+    /* Sort (IDLE always last): -d/-p order by that RAM type desc; otherwise real
+       tasks pinned by core then CPU desc, with the aggregate rows trailing. */
+    std::sort(s2, s2 + n2, [byDram, byPsram](const snap& a, const snap& b) {
         bool ai = strncmp(a.name, "IDLE", 4) == 0;
         bool bi = strncmp(b.name, "IDLE", 4) == 0;
         if (ai != bi) return !ai;
+        if (byDram)  return a.dram  > b.dram;
+        if (byPsram) return a.psram > b.psram;
+        bool as = a.h == nullptr, bs = b.h == nullptr;
+        if (as != bs) return !as;
         int ca = a.core < 0 ? 99 : a.core, cb = b.core < 0 ? 99 : b.core;
         return ca != cb ? ca < cb : a.delta > b.delta;
     });
 
-    /* Per-task percentages are each row's share of total *allocated* heap, so a
-     * column sums to 100%. pre-sched + deleted are still-live allocations (a
-     * deleted task's malloc'd memory isn't freed with it), so they count too. */
-    size_t totalDram = preDram + delDram, totalPsram = preP + delP;
-    for (int i = 0; i < n2; i++) {
-        if (strncmp(s2[i].name, "IDLE", 4) == 0) continue;
-        totalDram  += s2[i].dram;
-        totalPsram += s2[i].psram;
-    }
+    /* Per-task percentages are each row's share of the total RAM of that type
+     * physically detected on the chip (not just what's currently allocated), so
+     * a column shows true occupancy and won't sum to 100%. */
+    size_t totalDram  = heap_caps_get_total_size(MALLOC_CAP_8BIT | MALLOC_CAP_INTERNAL);
+    size_t totalPsram = heap_caps_get_total_size(MALLOC_CAP_SPIRAM);
     /* Byte count and its share of the column total, as two separate strings so
        the byte value sits under the DRAM/PSRAM header and the % gets its own. */
     auto fmtMem = [&fmtBytes](char* numOut, size_t numSz, char* pctOut, size_t pctSz,
@@ -709,6 +726,16 @@ static void cmdTop(const char* args) {
               bw, "DRAM", "%", "blk", bw, "PSRAM", "%", "blk");
     for (int i = 0; i < n2; i++) {
         if (strncmp(s2[i].name, "IDLE", 4) == 0) continue;
+        char drNum[16], drPct[10], psNum[16], psPct[10];
+        fmtMem(drNum, sizeof(drNum), drPct, sizeof(drPct), s2[i].dram, totalDram);
+        fmtMem(psNum, sizeof(psNum), psPct, sizeof(psPct), s2[i].psram, totalPsram);
+        if (s2[i].h == nullptr) {     /* pre-sched / (deleted): no CPU/stack to show */
+            cliPrintf("%-12s %4s  %3s  %7s %7s %*s %6s %5u %*s %6s %5u\n",
+                s2[i].name, "-", "-", "-", "-",
+                bw, drNum, drPct, (unsigned)s2[i].dblk,
+                bw, psNum, psPct, (unsigned)s2[i].pblk);
+            continue;
+        }
         unsigned p10 = deltaTotal > 0 ? (unsigned)(s2[i].delta * 1000 / deltaTotal) : 0;
         char cb[16];
         if (s2[i].core < 0) strcpy(cb, s2[i].core == -2 ? " ?" : " *");
@@ -719,30 +746,10 @@ static void cmdTop(const char* args) {
         const void* stkBase = pxTaskGetStackStart(s2[i].h);
         char stkMem = esp_ptr_external_ram(stkBase) ? 'P' : 'D';
         snprintf(stackBuf, sizeof(stackBuf), "%u %c", (unsigned)s2[i].stack, stkMem);
-        char drNum[16], drPct[10], psNum[16], psPct[10];
-        fmtMem(drNum, sizeof(drNum), drPct, sizeof(drPct), s2[i].dram, totalDram);
-        fmtMem(psNum, sizeof(psNum), psPct, sizeof(psPct), s2[i].psram, totalPsram);
         cliPrintf("%-12s %4s  %3d  %7s %7s %*s %6s %5u %*s %6s %5u\n",
             s2[i].name, cb, s2[i].pri, stackBuf, cpuBuf,
             bw, drNum, drPct, (unsigned)s2[i].dblk,
             bw, psNum, psPct, (unsigned)s2[i].pblk);
-    }
-    /* Pre-scheduler + deleted-task heap aggregates (no CPU/stack to show). */
-    if (preDram || preP) {
-        char drNum[16], drPct[10], psNum[16], psPct[10];
-        fmtMem(drNum, sizeof(drNum), drPct, sizeof(drPct), preDram, totalDram);
-        fmtMem(psNum, sizeof(psNum), psPct, sizeof(psPct), preP, totalPsram);
-        cliPrintf("%-12s %4s  %3s  %7s %7s %*s %6s %5u %*s %6s %5u\n",
-            "pre-sched", "-", "-", "-", "-",
-            bw, drNum, drPct, (unsigned)preDblk, bw, psNum, psPct, (unsigned)prePblk);
-    }
-    if (delDram || delP) {
-        char drNum[16], drPct[10], psNum[16], psPct[10];
-        fmtMem(drNum, sizeof(drNum), drPct, sizeof(drPct), delDram, totalDram);
-        fmtMem(psNum, sizeof(psNum), psPct, sizeof(psPct), delP, totalPsram);
-        cliPrintf("%-12s %4s  %3s  %7s %7s %*s %6s %5u %*s %6s %5u\n",
-            "(deleted)", "-", "-", "-", "-",
-            bw, drNum, drPct, (unsigned)delDblk, bw, psNum, psPct, (unsigned)delPblk);
     }
 
     /* Per-core CPU busy: deltaTotal on SMP FreeRTOS is wall-time ticks (not
@@ -751,40 +758,44 @@ static void cmdTop(const char* args) {
     unsigned b0 = (deltaTotal > idle0) ? (unsigned)((deltaTotal - idle0) * 1000 / deltaTotal) : 0;
     unsigned b1 = (deltaTotal > idle1) ? (unsigned)((deltaTotal - idle1) * 1000 / deltaTotal) : 0;
     cliPrintf("\nTotal CPU:\n");
-    cliPrintf("core0: %u.%u%%\n", b0/10, b0%10);
-    cliPrintf("core1: %u.%u%%\n", b1/10, b1%10);
+    cliPrintf("  core0: %u.%u%%\n", b0/10, b0%10);
+    cliPrintf("  core1: %u.%u%%\n", b1/10, b1%10);
 
-    /* Total RAM = per-task stack + heap (by location), plus pre-sched/deleted heap. */
-    size_t ramDram = preDram + delDram, ramPsram = preP + delP;
-    for (int i = 0; i < n2; i++) {
-        ramDram  += s2[i].dram;
-        ramPsram += s2[i].psram;
-        if (esp_ptr_external_ram(pxTaskGetStackStart(s2[i].h))) ramPsram += s2[i].stack;
-        else                                                    ramDram  += s2[i].stack;
-    }
-    char rb[16];
-    cliPrintf("Total RAM usage:\n");
-    cliPrintf("DRAM:  %s\n", fmtBytes(rb, sizeof(rb), ramDram));
-    cliPrintf("PSRAM: %s\n", fmtBytes(rb, sizeof(rb), ramPsram));
+    /* Used = allocated heap = total - free, from the same caps the Heap table
+     * prints, so used + free == total and this can't disagree with the free line
+     * below. Task stacks/TCBs are heap_caps allocations, so they're already in
+     * the allocated figure (and show up per-creator, mostly under (deleted)) —
+     * summing the per-task stack column on top would double-count them. */
+    size_t freeDram  = heap_caps_get_free_size(MALLOC_CAP_8BIT | MALLOC_CAP_INTERNAL);
+    size_t freePsram = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+    size_t ramDram  = totalDram  > freeDram  ? totalDram  - freeDram  : 0;
+    size_t ramPsram = totalPsram > freePsram ? totalPsram - freePsram : 0;
+    char rb[16], rt[16], pb[16];
+    unsigned dp10 = totalDram  ? (unsigned)((uint64_t)ramDram  * 1000 / totalDram)  : 0;
+    unsigned pp10 = totalPsram ? (unsigned)((uint64_t)ramPsram * 1000 / totalPsram) : 0;
+    cliPrintf("\nTotal RAM usage:\n");
+    snprintf(pb, sizeof(pb), "(%u.%u%%)", dp10 / 10, dp10 % 10);
+    cliPrintf("  DRAM:  %*s / %*s %8s\n",
+        bw, fmtBytes(rb, sizeof(rb), ramDram),  bw, fmtBytes(rt, sizeof(rt), totalDram),  pb);
+    snprintf(pb, sizeof(pb), "(%u.%u%%)", pp10 / 10, pp10 % 10);
+    cliPrintf("  PSRAM: %*s / %*s %8s\n",
+        bw, fmtBytes(rb, sizeof(rb), ramPsram), bw, fmtBytes(rt, sizeof(rt), totalPsram), pb);
 
     free(s1); free(s2);
 #endif
     cliPrintf("\nHeap:\n");
-    char ha[16], hb[16], hc[16], hd[16];
-    cliPrintf("%-6s %*s %*s %*s  %10s\n", "", bw, "free", bw, "total", bw, "lowest", "contiguous");
-    cliPrintf("%-6s %*s %*s %*s  %10s\n", "DRAM",
+    char ha[16], hc[16], hd[16];
+    cliPrintf("%-6s %*s %*s  %10s\n", "", bw, "free", bw, "lowest", "contiguous");
+    cliPrintf("%-6s %*s %*s  %10s\n", "DRAM",
         bw, fmtBytes(ha, sizeof(ha), heap_caps_get_free_size(MALLOC_CAP_8BIT|MALLOC_CAP_INTERNAL)),
-        bw, fmtBytes(hb, sizeof(hb), heap_caps_get_total_size(MALLOC_CAP_8BIT|MALLOC_CAP_INTERNAL)),
         bw, fmtBytes(hc, sizeof(hc), heap_caps_get_minimum_free_size(MALLOC_CAP_8BIT|MALLOC_CAP_INTERNAL)),
         fmtBytes(hd, sizeof(hd), heap_caps_get_largest_free_block(MALLOC_CAP_8BIT|MALLOC_CAP_INTERNAL)));
-    cliPrintf("%-6s %*s %*s %*s  %10s\n", "PSRAM",
+    cliPrintf("%-6s %*s %*s  %10s\n", "PSRAM",
         bw, fmtBytes(ha, sizeof(ha), heap_caps_get_free_size(MALLOC_CAP_SPIRAM)),
-        bw, fmtBytes(hb, sizeof(hb), heap_caps_get_total_size(MALLOC_CAP_SPIRAM)),
         bw, fmtBytes(hc, sizeof(hc), heap_caps_get_minimum_free_size(MALLOC_CAP_SPIRAM)),
         fmtBytes(hd, sizeof(hd), heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM)));
-    cliPrintf("%-6s %*s %*s %*s  %10s\n", "DMA",
+    cliPrintf("%-6s %*s %*s  %10s\n", "DMA",
         bw, fmtBytes(ha, sizeof(ha), heap_caps_get_free_size(MALLOC_CAP_DMA)),
-        bw, "-",
         bw, fmtBytes(hc, sizeof(hc), heap_caps_get_minimum_free_size(MALLOC_CAP_DMA)),
         fmtBytes(hd, sizeof(hd), heap_caps_get_largest_free_block(MALLOC_CAP_DMA)));
 
