@@ -1,25 +1,21 @@
 /**
  * spangapInit + spangapPostAppInit — bring up the spangap platform CORE.
  *
- * spangap-core owns only foundational primitives (fs, storage, log, cli, cron,
- * pm). Sibling straddles (spangap-net, spangap-web, spangap-lcd, wg, upnp,
- * duckdns, acme, ota, …) are NOT initialised here — the consumer's
- * `app_main` calls each straddle's `xInit()` directly in the order it wants.
- * That keeps spangap-core free of compile- AND link-time knowledge of which
- * siblings exist.
+ * spangapInit() brings up only the foundational primitives that must exist
+ * before anything else and have no sensible `init:`-hook ordering (fs, storage
+ * load, log, cli, pm, auth). The storage *task* (storageInit) and cron
+ * (cronInit) are NOT started here — like every sibling straddle, they declare
+ * an `init:` hook in their straddle.yaml and are run by the build-generated
+ * spangapInitStraddles() dispatcher. That keeps spangap-core free of compile-
+ * AND link-time knowledge of which siblings exist.
  *
- * Typical consumer pattern:
+ * Consumer pattern is now just three platform calls (plus whatever board /
+ * app-policy glue isn't itself a staged straddle):
  *
- *     spangapInit();        // core foundations
- *     tlsInit(); netInit(); ntpInit(); ntpApplyTimezone(); mdnsInit();
- *     wgInit(); upnpInit(); duckdnsInit(); acmeInit(); otaInit();
- *     webInit(); storageInit(); webrtcInit(); cronInit();
- *     #if CONFIG_SPANGAP_LCD
- *         lcdInit();
- *     #endif
- *     netRegister(NET_EV_UPSTREAM_UP, onNetUp);   // app's /state/net_up runner
- *     // ...consumer task graph...
- *     spangapPostAppInit();  // finalise: rtcRamSetValid, boot script, cronPoll
+ *     spangapInit();            // core foundations (this file)
+ *     spangapInitStraddles();   // generated dispatcher: every staged straddle's
+ *                               //   init: hook in (order, dependency) order
+ *     spangapPostAppInit();     // finalise: rtcRamSetValid, boot script, cronPoll
  */
 #include "spangap.h"
 #include "auth.h"
@@ -145,9 +141,9 @@ extern "C" void spangapInit(void) {
     /* Spangap-side foundational defaults */
     storageDefault("s.sys.banner", CONFIG_SPANGAP_BANNER);
 
-    /* Foundation tasks. Log timestamps start in UTC; once the consumer's
-     * main calls ntpApplyTimezone() (after ntpInit()), they switch to the
-     * persisted zone. */
+    /* Foundation tasks. Log timestamps start in UTC; once ntpInit() runs from
+     * the dispatcher (it applies the persisted timezone at the end), they
+     * switch to the persisted zone. */
     logInit();
     cliInit();
     pmInit();
@@ -169,8 +165,9 @@ extern "C" void spangapInit(void) {
 
     publishBuildTimes();
 
-    /* That's the lot for core. Sibling straddle inits + storageInit/cronInit
-     * are the consumer's responsibility — see header docstring. */
+    /* That's the lot for core's eager foundations. The storage task, cron, and
+     * every sibling straddle come up next via spangapInitStraddles() (their
+     * declared init: hooks) — see header docstring. */
 }
 
 extern "C" void spangapPostAppInit(void) {

@@ -15,3 +15,16 @@ firmware: esp-idf         # ESP-IDF managed component. The build CLI stages this
                           # ESP-IDF component name consumers see (`spangap-core`).
 browser: browser
 platforms: [idf]
+# Auto-init: storage + cron used to be the consumer's responsibility (called
+# by hand in app_main after spangapInit()); they're now folded into the
+# generated spangapInitStraddles() dispatcher like every other service. The
+# foundational core itself still comes up via the explicit spangapInit() call
+# the buildable makes before the dispatcher — only these two later services
+# move. storage keeps its original slot just after webInit (web registers its
+# storage routes first) and before webrtc; cron lands at the end of the service
+# band, before the app-layer straddles.
+init:
+  - call: storageInit
+    order: 75
+  - call: cronInit
+    order: 90
