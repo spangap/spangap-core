@@ -145,17 +145,6 @@ config SPANGAP_APP_PERCENT
 ## CONFIG_SPANGAP_<NAME> spelling — they're shortcut aliases of the generic
 ## CONFIG_STRADDLE_<NAME> symbol. See spangap/INTERNALS.md.
 
-config SPANGAP_RESET_ON_OFF
-    bool "Reset button acts as on/off switch"
-    default n
-    help
-        When enabled, spangapInit() defaults s.sys.reset_on_off to 1 so the
-        hardware reset button toggles the device between on and a powered-down
-        deep sleep. The on/off state persists in s.sys.power_on; on power-down
-        the board's resetOnOffSetPowerOff() hook cuts peripheral power and the
-        device deep-sleeps until the next reset. Only a reset-button press (or
-        cold power-on) toggles — software/panic/watchdog reboots keep it on.
-
 endmenu
 
 # The vendored esp_wireguard tuning menu ("WireGuard (vendored fork —

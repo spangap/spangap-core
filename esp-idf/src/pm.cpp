@@ -36,69 +36,6 @@ RTC_DATA_ATTR static uint32_t rtcAppMagic = 0;
 bool rtcRamValid()    { return rtcAppMagic == RTC_APP_MAGIC; }
 void rtcRamSetValid() { rtcAppMagic = RTC_APP_MAGIC; }
 
-/* ---- Reset button as on/off switch ----
- *
- * Two persisted keys:
- *   s.sys.reset_on_off — feature enable (gate; defaulted on by boards that set
- *                        CONFIG_SPANGAP_RESET_ON_OFF).
- *   s.sys.power_on     — last/desired power state (1=on, 0=off); the value this
- *                        handler toggles on each reset-button press.
- *
- * State lives in flash, NOT RTC: the reset button drives the EN pin, which
- * power-cycles the whole RTC domain — confirmed on the T-Deck, where the wall
- * clock returns to 1970 after a press. So RTC RAM does not survive it; flash
- * does. Only a reset-button press (or a cold power-on) toggles. An EN reset is
- * indistinguishable from a true power-on (both report ESP_RST_POWERON, both
- * wipe RTC); software/panic/watchdog reboots and deep-sleep wakes are not
- * button presses and keep the device on. The one unavoidable quirk: re-powering
- * a device that was on (battery pull / unplug) reads as a press and toggles it
- * off. */
-static void (*periphPowerOffFn)(void) = nullptr;
-void resetOnOffSetPowerOff(void (*fn)(void)) { periphPowerOffFn = fn; }
-
-void resetOnOffHandler() {
-  if (!storageGetInt("s.sys.reset_on_off", 0))
-    return;
-
-  esp_reset_reason_t rr = esp_reset_reason();
-  bool buttonPress = (rr == ESP_RST_POWERON || rr == ESP_RST_EXT ||
-                      rr == ESP_RST_UNKNOWN);
-  int wasOn = storageGetInt("s.sys.power_on", 0);
-  printf("reset-on-off: reset_reason=%d power_on=%d button=%d\n",
-         (int)rr, wasOn, buttonPress);
-  fflush(stdout);
-
-  if (!buttonPress) {
-    /* Not a reset-button press (OTA, panic, watchdog, deep-sleep wake): the
-     * device is staying on — record that so the next press toggles it off. */
-    if (!wasOn) { storageSet("s.sys.power_on", 1); storageSave(); }
-    return;
-  }
-
-  if (wasOn) {
-    /* Was on, user pressed reset → turn OFF. Persist now: storageSet only arms
-     * a coalesced save timer, and we deep-sleep before storageInit() even
-     * starts the storage task — so force the write. Then cut peripheral power
-     * and deep sleep with no wake source; only the next EN reset brings it
-     * back. */
-    storageSet("s.sys.power_on", 0);
-    storageSave();
-    printf("reset-on-off: powering down (press reset to turn on)\n");
-    fflush(stdout);
-    delay(50);
-    if (periphPowerOffFn) periphPowerOffFn();
-    esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_ALL);
-    esp_deep_sleep_start();
-    /* unreachable */
-  }
-
-  /* Was off (or cold power-on with last state off) → turn ON. */
-  storageSet("s.sys.power_on", 1);
-  storageSave();
-  printf("reset-on-off: power on\n");
-}
-
-
 /* ---- Deep sleep + PM mode stats (RTC RAM — survive deep sleep) ---- */
 RTC_DATA_ATTR static int32_t rtcDeepSleepCount = 0;
 RTC_DATA_ATTR static int64_t rtcDeepSleepUs = 0;

@@ -12,7 +12,6 @@
 #include "its.h"
 #include "pm.h"
 #include "cli.h"
-#include "net.h"
 #include "compat.h"
 #include "esp_heap_caps.h"
 
@@ -209,7 +208,13 @@ bool cronPoll(bool execute) {
     struct tm tm;
     localtime_r(&now, &tm);
 
-    bool netUp = netIsStaConnected();  /* N flag requires real upstream, not AP-only */
+    /* N flag requires real upstream, not AP-only. Read it off the storage
+     * state bus (net publishes "wifi.sta.state") rather than calling into net
+     * — core has no net dependency. No net staged → key absent → never up, so
+     * N-flagged jobs simply don't run. */
+    char netState[16] = {};
+    storageGetStr("wifi.sta.state", netState, sizeof(netState), "");
+    bool netUp = strcmp(netState, "connected") == 0;
     bool hasWork = false;
 
     struct stat st;

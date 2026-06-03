@@ -7,7 +7,6 @@
 #include "cli.h"
 #include "cron.h"
 #include "its.h"
-#include "net.h"
 #include "storage.h"
 #include "compat.h"
 #include "fs.h"
@@ -763,11 +762,11 @@ static void logTaskFn(void* arg) {
     logFileIntervalMs = atoi(val) * 1000;
   });
 
-  /* Register TCP port (non-blocking: retry from main loop so serial log
-   * connection is accepted immediately during boot). Browser side reaches
-   * us via the webrtc task's generic `<task>:<port>` router — no WS path
-   * registration. */
-  bool netRegistered = false;
+  /* The log's TCP endpoint (raw `nc` access to live + scrollback) is exposed
+   * by spangap-net, which registers LOG_PORT_TCP against this task on its
+   * behalf — the core log knows nothing about TCP. A net-less image just has
+   * no TCP listener; serial and the browser DataChannel reach the log over
+   * ITS regardless. */
 
   char buf[512];
   for (;;) {
@@ -784,13 +783,6 @@ static void logTaskFn(void* arg) {
         logPasteBack(logSlots[i].itsHandle, logSlots[i].pasteBacklog,
                      logSlots[i].ansi == LOG_ANSI);
       }
-    }
-
-    if (!netRegistered) {
-      net_port_msg_t reg = {};
-      reg.itsPort = LOG_PORT_TCP;
-      safeStrncpy(reg.nvsKey, "log_port", sizeof(reg.nvsKey));
-      netRegistered = itsSendAux("net", NET_PORT_REG_PORT, &reg, sizeof(reg), 0);
     }
 
     /* Skip the drain entirely while there are no consumers and no log file.

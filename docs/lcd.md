@@ -28,7 +28,8 @@ Two things are required in the consuming buildable straddle:
    That's the on/off switch; `CONFIG_SPANGAP_LCD` is the short-form
    presence symbol `spangap-inside` emits when the straddle is staged.
 2. **A board HAL**, registered with `lcdSetBoard()` **before** `spangapInit()`
-   (which calls `lcdInit()`). Without one, `lcdInit()` logs and bails — no
+   (the generated `spangapInitStraddles()` runs `lcdInit()` right after, in the
+   platform band). Without one, `lcdInit()` logs and bails — no
    display is brought up. See [The board HAL](#the-board-hal-lcd_boardh).
    The board-specific touch driver (e.g. `espressif/esp_lcd_touch_gt911`)
    stays in the consumer's `main/idf_component.yml` since it's board-pinned.

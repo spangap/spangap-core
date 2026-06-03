@@ -155,14 +155,6 @@ extern "C" void spangapInit(void) {
     /* Deep-sleep wake decision (may go straight back to sleep) + build IDs. */
     cronWakeupHandler();
 
-    /* Reset button as on/off switch. Opt-in via s.sys.reset_on_off; boards that
-     * enable CONFIG_SPANGAP_RESET_ON_OFF default it on. On a reset press this
-     * may cut peripheral power and deep sleep (never returns). */
-#ifdef CONFIG_SPANGAP_RESET_ON_OFF
-    storageDefault("s.sys.reset_on_off", 1);
-#endif
-    resetOnOffHandler();
-
     publishBuildTimes();
 
     /* That's the lot for core's eager foundations. The storage task, cron, and

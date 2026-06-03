@@ -7,25 +7,22 @@
  * consumers `#include` them directly:
  *
  *     #include "spangap.h"
- *     #include "net.h"        // from spangap-net (if you require it)
- *     #include "web.h"        // from spangap-web
- *     #include "wg.h"         // from wg
- *     ...
  *
  *     extern "C" void app_main() {
- *         spangapInit();      // core foundations only
- *         tlsInit(); netInit(); ntpInit(); ntpApplyTimezone();
- *         mdnsInit(); wgInit(); upnpInit(); duckdnsInit(); acmeInit();
- *         otaInit(); webInit(); storageInit(); webrtcInit(); cronInit();
- *         #if CONFIG_SPANGAP_LCD
- *             lcdInit();
- *         #endif
+ *         spangapInit();           // core foundations only
+ *         spangapInitStraddles();  // every staged straddle's init: hook
  *         // ...consumer's own task graph...
  *         spangapPostAppInit();
  *     }
  *
- * Consumers compose around the platform via netRegister(NET_EV_*, cb),
- * storageSubscribeChanges, cron entries, and /state/boot scripts.
+ * No per-straddle init calls and no #if CONFIG_SPANGAP_* guards in app_main:
+ * spangapInitStraddles() (generated per buildable by spangap-inside) brings up
+ * spangap's own components — core, net, web, lcd, in that fixed order, each only
+ * if staged — and then every other staged straddle in dependency order. A board
+ * may bracket spangapInit() with its own pre/post HAL bring-up (see hw-tdeck's
+ * tdeckPreInit/tdeckPostInit). Consumers compose around the platform via
+ * netRegister(NET_EV_*, cb), storageSubscribeChanges, cron entries, and
+ * /state/boot scripts.
  */
 #ifndef SPANGAP_H
 #define SPANGAP_H
@@ -51,8 +48,7 @@ extern "C" {
  *    line-buffered stdout → fs_init → optional fs_mount_sd (when
  *      CONFIG_SPANGAP_SDCARD=y) → fsSelectStateStore → storageLoad
  *      → project-mismatch factory reset → s.sys.banner default →
- *      logInit/cliInit/pmInit → cronWakeupHandler → resetOnOffHandler
- *      → publishBuildTimes
+ *      logInit/cliInit/pmInit → cronWakeupHandler → publishBuildTimes
  *
  *  Returns. The consumer's app_main is then responsible for sibling
  *  straddle initialisation (see header docstring above for the typical
@@ -63,14 +59,21 @@ extern "C" {
  *  don't pass it. */
 void spangapInit(void);
 
-/** Run every staged straddle's declared `init:` hook (straddle.yaml), in
- *  (order, dependency-topo) order. DEFINED by the generated
- *  staging/spangap_init_dispatch.gen.cpp, which spangap-inside writes for
- *  every buildable (empty body when nothing declares init:). Call once from
- *  app_main, after the core/net foundation is up and before the consumer's
- *  own task graph. From then on a straddle that declares `init:` initializes
- *  automatically when staged — no app_main edit. The buildable wires the
- *  generated file into its main component's SRCS (guarded on EXISTS). */
+/** Run every staged straddle's declared `init:` hook (straddle.yaml) in two
+ *  bands: first spangap's own platform components (core, net, web, lcd) in that
+ *  fixed order — each only if staged — then every other staged straddle in
+ *  dependency-topo order (a straddle inits after the ones it requires:). The
+ *  platform band is the contract: anything in the second band can count on
+ *  storage/cron, the IP stack, the web stack, and the LCD launcher already
+ *  being up, so it neither defers nor orders itself against them.
+ *
+ *  DEFINED by the generated staging/spangap_init_dispatch.gen.cpp, which
+ *  spangap-inside writes for every buildable (empty body when nothing declares
+ *  init:). Call once from app_main, right after spangapInit() and before the
+ *  consumer's own task graph. From then on a straddle that declares `init:`
+ *  initializes automatically when staged — no app_main edit. The buildable
+ *  wires the generated file into its main component's SRCS (guarded on
+ *  EXISTS). */
 void spangapInitStraddles(void);
 
 /** Finalise platform startup after the consumer has brought up its own

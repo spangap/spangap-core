@@ -5,7 +5,6 @@
 #include "fs.h"
 #include "log.h"
 #include "its.h"
-#include "net.h"
 #include "storage.h"
 #include "cron.h"
 #include "compat.h"
@@ -1118,18 +1117,18 @@ static int cliTcpConnect(int handle, const void* data, size_t len) {
   cl.usbSerial = false;
   cl.color = true;          /* default on; a cli_connect_t may opt out */
   cl.noPrompt = false;      /* default: send the connect-time prompt */
-  if (len >= sizeof(net_connect_t)) {
-    /* Raw TCP/TLS from net — line-oriented, no echo */
-    cl.mode = CLI_LINE;
-  } else if (len >= sizeof(cli_connect_t)) {
+  if (len == sizeof(cli_connect_t)) {
     const auto* cc = (const cli_connect_t*)data;
     cl.mode = cc->mode;
     cl.usbSerial = cc->from_usb_serial != 0;
     cl.color = (cc->color == CLI_COLOR);
     cl.noPrompt = cc->no_prompt != 0;
-  } else if (len >= 1) {
+  } else if (len >= 1 && len < sizeof(cli_connect_t)) {
     cl.mode = *(const cli_mode_t*)data;
   } else {
+    /* Empty, or a larger connect descriptor from a forwarder (net sends its
+     * own net_connect_t on raw TCP/TLS) — line-oriented, no echo. The CLI
+     * doesn't decode the forwarder's struct; it only needs LINE mode. */
     cl.mode = CLI_LINE;
   }
   cliInitSlot(cl, slot);
@@ -1206,20 +1205,14 @@ static void cliTaskFn(void* arg) {
    * registers commands on main task's context, so the main task's serial
    * flow is the one safe context. Registering them here would race. */
 
-  /* Register TCP port (non-blocking: retry from main loop so serial
-   * connections are accepted immediately during boot). Browser reaches us
-   * through webrtc_task's `cli:1` router — no URL/WS registration. */
-  bool netRegistered = false;
+  /* The CLI's TCP endpoint (raw `nc` access, sshd-in backends) is exposed by
+   * spangap-net, which registers CLI_PORT_TCP against this task on its behalf
+   * — the core CLI knows nothing about TCP. A net-less image simply has no
+   * TCP listener; serial, the browser DataChannel (cli:1), and the on-device
+   * terminal reach the CLI directly over ITS regardless. */
 
   for (;;) {
     while (itsPoll(pdMS_TO_TICKS(50))) {}
-
-    if (!netRegistered) {
-      net_port_msg_t reg = {};
-      reg.itsPort = CLI_PORT_TCP;
-      safeStrncpy(reg.nvsKey, "cli_port", sizeof(reg.nvsKey));
-      netRegistered = itsSendAux("net", NET_PORT_REG_PORT, &reg, sizeof(reg), 0);
-    }
 
     /* Process each active slot. Stream and packet modes both deliver bytes
        via itsRecv — packet mode returns exactly one message body per call,
