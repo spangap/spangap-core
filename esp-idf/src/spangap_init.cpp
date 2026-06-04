@@ -32,6 +32,13 @@
  * each ninja invocation by scripts/write-build-epoch.py. */
 extern "C" const uint32_t app_build_unix;
 
+/* Build invocation identity — symbols come from spangap_app_build_info.c,
+ * regenerated each ninja invocation by scripts/write-build-info.py from the
+ * SPANGAP_BUILD_* env `spangap build` exports. */
+extern "C" const char app_build_straddle[];
+extern "C" const char app_build_version[];
+extern "C" const char app_build_args[];
+
 namespace {
 
 /* --- Build identity (numeric + short string for 32-byte WS notify payload) --- */
@@ -89,6 +96,13 @@ void publishBuildTimes() {
     if (haveWebrootCrc)
         info("build: webroot crc32=0x%08x (reload SPA when this changes)\n",
              (unsigned)webrootCrc32);
+
+    /* `spangap build` invocation identity (straddle/version/flags). */
+    storageSet("sys.build.straddle", app_build_straddle);
+    storageSet("sys.build.version", app_build_version);
+    storageSet("sys.build.args", app_build_args);
+    info("build: straddle %s v%s\n", app_build_straddle, app_build_version);
+    info("build: invocation %s\n", app_build_args);
 }
 
 }  // namespace

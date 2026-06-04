@@ -12,6 +12,18 @@ if(NOT EXISTS "${_BUILD_EPOCH_C}")
 endif()
 list(APPEND CORE_SRCS "${_BUILD_EPOCH_C}")
 
+# Build invocation identity — `app_build_straddle` / `app_build_version` /
+# `app_build_args`, populated from the SPANGAP_BUILD_* env that `spangap build`
+# exports around idf.py. Same lives-in-the-build-dir, regenerate-every-build
+# treatment as the epoch above so the strings track the producing invocation.
+set(_BUILD_INFO_C "${CMAKE_CURRENT_BINARY_DIR}/spangap_app_build_info.c")
+if(NOT EXISTS "${_BUILD_INFO_C}")
+    execute_process(
+        COMMAND python3 "${CMAKE_CURRENT_LIST_DIR}/scripts/write-build-info.py" "${_BUILD_INFO_C}"
+        COMMAND_ERROR_IS_FATAL ANY)
+endif()
+list(APPEND CORE_SRCS "${_BUILD_INFO_C}")
+
 # Narrowed REQUIRES — net/tls/mdns/http_client/web/auth/webrtc/lcd/wg/etc.
 # moved to sibling straddles in Phase 2 of the straddles plan. esp_wifi stays
 # because pm.cpp queries it; lwip stays because cli/log/cron register ITS
@@ -74,6 +86,15 @@ add_custom_target(spangap_build_epoch ALL
     COMMAND python3 "${CMAKE_CURRENT_LIST_DIR}/scripts/write-build-epoch.py" "${_BUILD_EPOCH_C}"
     COMMENT "Generate spangap build epoch (always)")
 add_dependencies(${COMPONENT_LIB} spangap_build_epoch)
+
+# Same always-rerun treatment for the build invocation identity — re-reads the
+# SPANGAP_BUILD_* env each ninja invocation so a rebuild after `spangap build`
+# with different flags relinks the new strings in.
+add_custom_target(spangap_build_info ALL
+    BYPRODUCTS "${_BUILD_INFO_C}"
+    COMMAND python3 "${CMAKE_CURRENT_LIST_DIR}/scripts/write-build-info.py" "${_BUILD_INFO_C}"
+    COMMENT "Generate spangap build invocation info (always)")
+add_dependencies(${COMPONENT_LIB} spangap_build_info)
 
 # IDF 5.5 heap-task-tracking eager-bookkeeping bypass — see
 # docs/idf-tweaks.md and src/heap_track_stub.c. We --wrap three IDF
