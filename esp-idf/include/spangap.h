@@ -20,7 +20,7 @@
  * spangap's own components — core, net, web, lcd, in that fixed order, each only
  * if staged — and then every other staged straddle in dependency order. A board
  * may bracket spangapInit() with its own pre/post HAL bring-up (see hw-tdeck's
- * tdeckPreInit/tdeckPostInit). Consumers compose around the platform via
+ * tdeckStart/tdeckInit). Consumers compose around the platform via
  * netRegister(NET_EV_*, cb), storageSubscribeChanges, cron entries, and
  * /state/boot scripts.
  */
@@ -58,6 +58,21 @@ extern "C" {
  *  spangap-core itself via scripts/write-build-epoch.py — consumers
  *  don't pass it. */
 void spangapInit(void);
+
+/** Run every staged straddle's declared `start:` hook (straddle.yaml) as the
+ *  FIRST statement in app_main, BEFORE spangapInit() — i.e. before fs/storage/
+ *  log/cli exist. This is the bare-hardware band for board bring-up the
+ *  platform itself depends on: powering a peripheral rail before spangapInit()'s
+ *  fs_mount_sd() touches the SD bus, registering the display/touch HAL before
+ *  spangap-lcd's lcdInit(). CONTRACT (the strict inverse of
+ *  spangapInitStraddles): a start hook runs on bare hardware — no info(),
+ *  storage, fs_* helpers, or ITS are up yet; raw peripherals only. Ordered through the same
+ *  init_order() walk as init: (a board lands early because its dependents
+ *  require: it). By convention a start hook is named xStart.
+ *
+ *  DEFINED by the generated staging/spangap_init_dispatch.gen.cpp (empty body
+ *  when nothing declares start:). Call once, as app_main's first statement. */
+void spangapStartStraddles(void);
 
 /** Run every staged straddle's declared `init:` hook (straddle.yaml) in two
  *  bands: first spangap's own platform components (core, net, web, lcd) in that

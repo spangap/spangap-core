@@ -1,0 +1,156 @@
+menu "spangap: spangap-core"
+
+config SPANGAP_PROJECT_NAME
+    string "Project name (immutable identity)"
+    default "spangap"
+    help
+        Compile-time project identity. Stored verbatim in s.sys.project at
+        first boot. On every subsequent boot, spangapInit() compares the
+        loaded value to this string and factory-resets /state if they
+        differ — so flashing a different spangap project (e.g. seccam →
+        reticulous) over the same flash chip starts with a clean state.
+
+        Not user-editable at runtime. For the user-facing display name,
+        use SPANGAP_BANNER (s.sys.banner) instead.
+
+config SPANGAP_BANNER
+    string "System banner / progname"
+    default "spangap device"
+    help
+        Default value for the s.sys.banner config key, displayed by the
+        browser SPA in the menu bar and used by the device as its
+        identifying name. Editable at runtime via `set s.sys.banner ...`.
+
+config SPANGAP_SDCARD
+    bool "Mount SD card on boot"
+    default n
+    help
+        When enabled, spangapInit() calls fs_mount_sd(). Required for any
+        module that writes to /sdcard (recordings, log files on SD, etc.).
+        Pick the bus type below; pins are board-specific — set them in
+        your project's sdkconfig.defaults.
+
+choice SPANGAP_SDCARD_BUS
+    prompt "SD card bus"
+    depends on SPANGAP_SDCARD
+    default SPANGAP_SDCARD_BUS_SDMMC
+    help
+        SDMMC uses the ESP32-S3's dedicated SDIO peripheral (faster,
+        dedicated pins). SPI uses the shared SPI bus via spi_helper —
+        right choice for boards like T-Deck Plus where the SD slot
+        shares SCK/MOSI/MISO with display + LoRa.
+
+    config SPANGAP_SDCARD_BUS_SDMMC
+        bool "SDMMC (dedicated SDIO peripheral)"
+    config SPANGAP_SDCARD_BUS_SPI
+        bool "SPI (shared SPI bus via spi_helper)"
+endchoice
+
+# ── SDMMC variant pins ──
+
+config SPANGAP_SDCARD_PIN_CLK
+    int "SDMMC CLK pin"
+    depends on SPANGAP_SDCARD_BUS_SDMMC
+
+config SPANGAP_SDCARD_PIN_CMD
+    int "SDMMC CMD pin"
+    depends on SPANGAP_SDCARD_BUS_SDMMC
+
+config SPANGAP_SDCARD_PIN_D0
+    int "SDMMC D0 pin"
+    depends on SPANGAP_SDCARD_BUS_SDMMC
+
+config SPANGAP_SDCARD_4BIT
+    bool "4-bit SDMMC bus (D0..D3 wired)"
+    depends on SPANGAP_SDCARD_BUS_SDMMC
+    default n
+    help
+        Enable when the board has all four data lines (D0..D3) routed.
+        Roughly 4× throughput over 1-bit. Most ESP32-S3 dev boards (XIAO
+        Sense included) only expose D0; leave off unless you know the
+        SD slot has the wider bus.
+
+config SPANGAP_SDCARD_PIN_D1
+    int "SDMMC D1 pin"
+    depends on SPANGAP_SDCARD_4BIT
+
+config SPANGAP_SDCARD_PIN_D2
+    int "SDMMC D2 pin"
+    depends on SPANGAP_SDCARD_4BIT
+
+config SPANGAP_SDCARD_PIN_D3
+    int "SDMMC D3 pin"
+    depends on SPANGAP_SDCARD_4BIT
+
+# ── SPI variant pins ──
+
+config SPANGAP_SDCARD_SPI_HOST
+    int "SPI host (2 = SPI2/FSPI, 3 = SPI3/HSPI)"
+    depends on SPANGAP_SDCARD_BUS_SPI
+    range 2 3
+    default 2
+    help
+        Which SPI peripheral the SD card sits on. Must match the host
+        any other driver on the same bus (e.g. the LoRa transport in
+        reticulous) initialises via spi_helper.
+
+config SPANGAP_SDCARD_SPI_PIN_CS
+    int "SPI SD CS pin"
+    depends on SPANGAP_SDCARD_BUS_SPI
+
+config SPANGAP_SDCARD_SPI_PIN_SCK
+    int "SPI SCK pin (shared bus)"
+    depends on SPANGAP_SDCARD_BUS_SPI
+
+config SPANGAP_SDCARD_SPI_PIN_MOSI
+    int "SPI MOSI pin (shared bus)"
+    depends on SPANGAP_SDCARD_BUS_SPI
+
+config SPANGAP_SDCARD_SPI_PIN_MISO
+    int "SPI MISO pin (shared bus)"
+    depends on SPANGAP_SDCARD_BUS_SPI
+
+config SPANGAP_SDCARD_SPI_FREQ_KHZ
+    int "SPI SD clock (kHz)"
+    depends on SPANGAP_SDCARD_BUS_SPI
+    range 400 40000
+    default 20000
+    help
+        Bus clock used after card init. SD spec allows up to 25 MHz in
+        SPI mode; many cards happily run at 40 MHz with short wiring,
+        but 20 MHz is a safe default on shared-bus boards.
+
+config SPANGAP_APP_PERCENT
+    int "App share of available flash (%)"
+    range 10 90
+    default 75
+    help
+        After NVS, otadata, and the /state partition are reserved, the
+        remaining flash is split between app (firmware code) and fixed
+        (read-only LittleFS for the SPA + factory defaults). This knob
+        is the percentage that goes to app; the rest goes to fixed.
+
+        With OTA on, both app and fixed are paired A/B (so each individual
+        slot is half the share). With OTA off, each gets the full share.
+
+        Spangap regenerates partitions.csv from this value + flash size +
+        OTA on/off at every reconfigure — never edit partitions.csv by hand.
+
+## CONFIG_SPANGAP_LCD / _WEB / _OTA / _WG / _UPNP / _DUCKDNS / _ACME lived here
+## until each became its own straddle. They are now auto-generated presence
+## symbols emitted by spangap-inside into the synthetic `_spangap_present`
+## component's Kconfig.projbuild whenever the corresponding straddle is staged
+## (driven by the buildable's requires: / optional_requires: plus any
+## --with <name> and minus any --without / --no-X). Source code keeps the same
+## CONFIG_SPANGAP_<NAME> spelling — they're shortcut aliases of the generic
+## CONFIG_STRADDLE_<NAME> symbol. See spangap/INTERNALS.md.
+
+endmenu
+
+# The vendored esp_wireguard tuning menu ("WireGuard (vendored fork —
+# internal)", visible if SPANGAP_WG) moved to wg/esp-idf/Kconfig in Phase 2
+# of the straddles plan. The SPANGAP_WG toggle above stays here because
+# spangapInit()'s conditional wgInit() call and spangap.h's conditional
+# `#include "wg.h"` reference it — once those move into a generated
+# straddle dispatcher, SPANGAP_WG (and its siblings UPNP/DUCKDNS/ACME/OTA/LCD)
+# move out alongside the code that reads them.

@@ -625,10 +625,23 @@ static bool dispatchRecvCallbacks(its_task_t* me) {
         }
         if (!cb || !buf) continue;
         size_t avail = xStreamBufferBytesAvailable(buf);
-        /* Packet mode: avail <= 4 is either empty or a lone in-flight header;
-         * avail > 4 guarantees at least one complete packet at the head. */
+        /* Packet mode: avail <= 4 is either empty or a lone in-flight header. */
         size_t threshold = c->packetBased ? 4 : 0;
-        if (avail > threshold) { cb(i, avail); any = true; }
+        if (avail > threshold) {
+            cb(i, avail);
+            /* Report activity only if the callback made real progress —
+             * drained bytes, or tore the conn down. `avail > threshold` is NOT
+             * proof a callback can advance: it may apply backpressure and
+             * early-return without draining (e.g. iface-tcp drops an inbound
+             * rnsd packet while its net side is down). Counting that as
+             * activity makes itsPoll skip its blocking wait and spin on the
+             * same undrained buffer, starving IDLE and tripping the task WDT.
+             * The next real arrival re-notifies us, so blocking loses nothing.
+             * `!c->active` short-circuits before touching a buffer the
+             * callback may have freed via itsDisconnect. */
+            if (!c->active || xStreamBufferBytesAvailable(buf) < avail)
+                any = true;
+        }
     }
     return any;
 }

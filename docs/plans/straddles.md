@@ -396,18 +396,18 @@ Reticulum on spangap is the canonical example; the same shape applies to seccam,
   `reticulous/rns` (prefix: `rns`) — `esp-idf/`: cmdline `rnsd` core + the µReticulum fork; `browser/`: RNS state/management panels; `esp-idf/lcd/`: on-device RNS UI. `requires: [spangap/spangap-core]` only — no IP layer at the protocol level so a LoRa-only or ESPNOW-only build pulls no networking weight it doesn't need.
 
 - **Transport straddles** — one per transport mechanism. Each plugs an interface into `rns` and contributes its own configuration UI on the browser/LCD activators. All four are in scope today; today's `reticulous/main/*` carries each of them in some form.
-  `reticulous/tr-tcp` (prefix: `rns_tcp`) — RNS-over-TCP client + server interfaces. `requires: [reticulous/rns, spangap/spangap-net]`.
-  `reticulous/tr-auto` (prefix: `rns_auto`) — UDP-multicast AutoInterface for LAN peer discovery. `requires: [reticulous/rns, spangap/spangap-net]`.
-  `reticulous/tr-espnow` (prefix: `rns_espnow`) — ESPNOW peer-to-peer over the WiFi radio. Brings the radio up itself; no IP stack required. `requires: [reticulous/rns]`.
-  `reticulous/tr-lora` (prefix: `rns_lora`) — SX1262 LoRa over SPI. `requires: [reticulous/rns]`.
+  `reticulous/iface-tcp` (prefix: `rns_tcp`) — RNS-over-TCP client + server interfaces. `requires: [reticulous/rns, spangap/spangap-net]`.
+  `reticulous/iface-auto` (prefix: `rns_auto`) — UDP-multicast AutoInterface for LAN peer discovery. `requires: [reticulous/rns, spangap/spangap-net]`.
+  `reticulous/iface-espnow` (prefix: `rns_espnow`) — ESPNOW peer-to-peer over the WiFi radio. Brings the radio up itself; no IP stack required. `requires: [reticulous/rns]`.
+  `reticulous/iface-lora` (prefix: `rns_lora`) — SX1262 LoRa over SPI. `requires: [reticulous/rns]`.
 
 - **Layered-protocol straddle** — one repo per layered protocol, riding RNS the way TCP/UDP ride IP.
   `reticulous/lxmf` (prefix: `lxmf`) — LXMF messaging: `esp-idf/` + `browser/` panels + `esp-idf/lcd/` slice. `requires: [reticulous/rns]`.
 
 - **Buildable board straddle** — partition layout, board HAL, plus the `requires:` line that names which protocol/transport straddles to include and which UI activators to turn on. **This is the straddle that actually produces a flashable device image.**
-  `reticulous/hw-tdeck` — `requires: [reticulous/rns, reticulous/lxmf, reticulous/tr-tcp, reticulous/tr-auto, reticulous/tr-espnow, reticulous/tr-lora, spangap/spangap-web, spangap/spangap-lcd]` gives a T-Deck with the full RNS + LXMF stack over all four transports plus both UI surfaces.
+  `reticulous/hw-tdeck` — `requires: [reticulous/rns, reticulous/lxmf, reticulous/iface-tcp, reticulous/iface-auto, reticulous/iface-espnow, reticulous/iface-lora, spangap/spangap-web, spangap/spangap-lcd]` gives a T-Deck with the full RNS + LXMF stack over all four transports plus both UI surfaces.
 
-A board straddle picks whichever combination of protocol/transport straddles it wants and whichever UI activators apply; the resolver assembles them. A LoRa-only sensor board with no WiFi is simply a board straddle that requires `rns + tr-lora` and skips `spangap-net` entirely.
+A board straddle picks whichever combination of protocol/transport straddles it wants and whichever UI activators apply; the resolver assembles them. A LoRa-only sensor board with no WiFi is simply a board straddle that requires `rns + iface-lora` and skips `spangap-net` entirely.
 
 ### UI activators: one dep, every straddle's UI
 
@@ -656,10 +656,10 @@ Paths on the left reflect the post-Phase-1 workspace (after the `spangap/` → `
 | `spangap-core/esp-idf/src/{wg,upnp,duckdns,acme,ota}.cpp` + paired headers | `spangap/wg`, `spangap/upnp`, `spangap/duckdns`, `spangap/acme`, `spangap/ota` (one repo each; each carries its `browser/` settings panel inline) |
 | `spangap-core/scripts/{flasher,spangap-cli,reallyclean.sh}` | `spangap/spangap` (alongside CLI shim, brew formula, install script, build-container Dockerfile) |
 | `reticulous/main/{rnsd,ports}.*` + `reticulous/components/{microreticulum,bzip2}/*` | `reticulous/rns`'s `esp-idf/` (prefix: `rns`) |
-| `reticulous/main/{tcp}.*` | `reticulous/tr-tcp`'s `esp-idf/` (prefix: `rns_tcp`) |
-| `reticulous/main/{auto}.*` | `reticulous/tr-auto`'s `esp-idf/` (prefix: `rns_auto`) |
-| `reticulous/main/{espnow}.*` | `reticulous/tr-espnow`'s `esp-idf/` (prefix: `rns_espnow`) |
-| `reticulous/main/{lora,esp_idf_hal}.*` | `reticulous/tr-lora`'s `esp-idf/` (prefix: `rns_lora`) |
+| `reticulous/main/{tcp}.*` | `reticulous/iface-tcp`'s `esp-idf/` (prefix: `rns_tcp`) |
+| `reticulous/main/{auto}.*` | `reticulous/iface-auto`'s `esp-idf/` (prefix: `rns_auto`) |
+| `reticulous/main/{espnow}.*` | `reticulous/iface-espnow`'s `esp-idf/` (prefix: `rns_espnow`) |
+| `reticulous/main/{lora,esp_idf_hal}.*` | `reticulous/iface-lora`'s `esp-idf/` (prefix: `rns_lora`) |
 | `reticulous/main/{lxmf,lxmf_lcd}.*` | `reticulous/lxmf`'s `esp-idf/` (prefix: `lxmf`) |
 | `reticulous/main/{nomad,nomad_lcd}.*` | `reticulous/nomad`'s `esp-idf/` (prefix: `nomad`) |
 | `reticulous/web-interface/src/*` RNS state/management panels | `reticulous/rns`'s `browser/` |
@@ -697,8 +697,8 @@ Phase 2 (real platform split): `spangap-core` narrowed to its foundation (`its`,
     Notes from the landing:
     - `MapWindow.vue` ended up in `rns`, not `maps`. Despite the name it's an RNS path-table view, not a map render; classifying it with `maps` would have inverted the dep direction (`maps` doesn't `require:` rnsd state). `maps` ships no browser half today — its only UI surface is the on-device LCD launcher.
     - `AnnouncesWindow.vue` lives in `lxmf`, not `rns`. It's tightly coupled to the `AnnouncesView` chat component, the `useLxmf()` composable, and the shared `messagesVisible` ref (clicking an announce opens that peer's thread). Putting it in `rns` would have forced core to depend on lxmf — wrong direction.
-    - `tr-espnow` `requires: spangap-net` despite the spec saying "Brings the radio up itself; no IP stack required" — today's code still pulls `net.h` for `netIsUp()` and `NET_EV_UP/DOWN` subscription. Defer the radio-ownership rework until a real driver lands.
-    - `tr-lora` does the same `PRIVATE` include trick `ota` uses — `target_include_directories(${COMPONENT_LIB} PRIVATE "${CMAKE_SOURCE_DIR}/main")` — so `lora.cpp` can `#include "tdeck.h"` for the `BOARD_LORA_*` pin map without a circular dep on `hw-tdeck`. A future "board HAL service" abstraction would lift this; not yet motivated.
+    - `iface-espnow` `requires: spangap-net` despite the spec saying "Brings the radio up itself; no IP stack required" — today's code still pulls `net.h` for `netIsUp()` and `NET_EV_UP/DOWN` subscription. Defer the radio-ownership rework until a real driver lands.
+    - `iface-lora` does the same `PRIVATE` include trick `ota` uses — `target_include_directories(${COMPONENT_LIB} PRIVATE "${CMAKE_SOURCE_DIR}/main")` — so `lora.cpp` can `#include "tdeck.h"` for the `BOARD_LORA_*` pin map without a circular dep on `hw-tdeck`. A future "board HAL service" abstraction would lift this; not yet motivated.
     - LCD slices live at `esp-idf/lcd/src/<x>_lcd.cpp` (per the spec's layout) but the CLI doesn't yet implement activator-driven source-list exclusion; until then the slice's `.cpp` body stays wrapped in `#if CONFIG_SPANGAP_LCD` and the consumer's `app_main` keeps the same `#if` guard around `xLcdRegister()` calls. The slice's public `xLcdRegister()` declaration moved into each straddle's main header so `main.cpp` no longer carries forward `extern "C"` declarations.
     - `rns` vendors `microreticulum/` + `bzip2/` as **nested sub-components** under its `esp-idf/components/`. EXTRA_COMPONENT_DIRS doesn't recurse, so the consumer's top-level `CMakeLists.txt` adds each `staging/components/*/components/` to the search path explicitly (a one-line `file(GLOB)` per buildable straddle). This is the only structural deviation from one-component-per-straddle in the workspace today.
     - Cross-straddle browser imports use bare-specifier package names (`import { useWinZoom } from 'rns/lib/winZoom'`). The CLI doesn't yet write Vite aliases for these — they resolve via npm `file:` deps in `hw-tdeck/web-interface/package.json`, mirroring the existing `spangap-browser` symlink pattern.
@@ -708,16 +708,16 @@ Phase 2 (real platform split): `spangap-core` narrowed to its foundation (`its`,
 
     **Feature straddles (firmware-only, no device image):**
     - `reticulous/rns` (`prefix: rns`) — rnsd core + the µReticulum fork + vendored bzip2. `requires: [spangap/spangap-core]`.
-    - `reticulous/tr-tcp` (`prefix: rns_tcp`) — TCP transport. `requires: [reticulous/rns, spangap/spangap-net]`.
-    - `reticulous/tr-auto` (`prefix: rns_auto`) — UDP-multicast AutoInterface (LAN peer discovery). `requires: [reticulous/rns, spangap/spangap-net]`.
-    - `reticulous/tr-espnow` (`prefix: rns_espnow`) — ESPNOW transport; brings the WiFi radio up itself. `requires: [reticulous/rns]`.
-    - `reticulous/tr-lora` (`prefix: rns_lora`) — SX1262 LoRa, carries the RadioLib ESP-IDF HAL (`esp_idf_hal.cpp/h`). `requires: [reticulous/rns]`.
+    - `reticulous/iface-tcp` (`prefix: rns_tcp`) — TCP transport. `requires: [reticulous/rns, spangap/spangap-net]`.
+    - `reticulous/iface-auto` (`prefix: rns_auto`) — UDP-multicast AutoInterface (LAN peer discovery). `requires: [reticulous/rns, spangap/spangap-net]`.
+    - `reticulous/iface-espnow` (`prefix: rns_espnow`) — ESPNOW transport; brings the WiFi radio up itself. `requires: [reticulous/rns]`.
+    - `reticulous/iface-lora` (`prefix: rns_lora`) — SX1262 LoRa, carries the RadioLib ESP-IDF HAL (`esp_idf_hal.cpp/h`). `requires: [reticulous/rns]`.
     - `reticulous/lxmf` (`prefix: lxmf`) — LXMF messaging + its on-device LCD UI. `requires: [reticulous/rns]`.
     - `reticulous/nomad` (`prefix: nomad`) — Nomad Network page client + its on-device LCD UI. Sits on rnsd's byte-array API directly (not on LXMF). `requires: [reticulous/rns]`.
     - `reticulous/maps` (`prefix: maps`) — offline RGB565 map viewer as an LCD launcher program. No RNS dep — published under the `reticulous/` org but consumable by any LCD buildable straddle. Reads the GPS fix via ephemeral storage keys, so no compile-time GPS dep — the GNSS chip lives in `hw-tdeck` until a GPS service abstraction earns its own straddle. `requires: [spangap/spangap-core, spangap/spangap-lcd]`. Doubles as the docs' "first non-RNS feature straddle" walkthrough.
 
     **Buildable straddle (builds the device image):**
-    - `reticulous/hw-tdeck` — owns the T-Deck Plus board HAL (`tdeck.cpp/h`), the GNSS receiver task (`gps.cpp/h` — board-specific until a GPS service abstraction earns its own straddle), partition layout, OTA pubkey, browser SPA shell, and `app_main` (which drives the explicit per-straddle `init()` sequence — see Phase 2 layering rework). `requires: [reticulous/rns, reticulous/tr-tcp, reticulous/tr-auto, reticulous/tr-espnow, reticulous/tr-lora, reticulous/lxmf, reticulous/nomad, reticulous/maps, spangap/spangap-core, spangap/spangap-net, spangap/spangap-web, spangap/spangap-lcd, spangap/wg, spangap/upnp, spangap/duckdns, spangap/acme, spangap/ota]`.
+    - `reticulous/hw-tdeck` — owns the T-Deck Plus board HAL (`tdeck.cpp/h`), the GNSS receiver task (`gps.cpp/h` — board-specific until a GPS service abstraction earns its own straddle), partition layout, OTA pubkey, browser SPA shell, and `app_main` (which drives the explicit per-straddle `init()` sequence — see Phase 2 layering rework). `requires: [reticulous/rns, reticulous/iface-tcp, reticulous/iface-auto, reticulous/iface-espnow, reticulous/iface-lora, reticulous/lxmf, reticulous/nomad, reticulous/maps, spangap/spangap-core, spangap/spangap-net, spangap/spangap-web, spangap/spangap-lcd, spangap/wg, spangap/upnp, spangap/duckdns, spangap/acme, spangap/ota]`.
 11. **Convert `seccam` to its straddle shape** — `seccam/seccam` initially. Further decomposition into protocol/web/lcd parallels can wait until the codebase grows into it.
 
 ### Phase 4 — Public

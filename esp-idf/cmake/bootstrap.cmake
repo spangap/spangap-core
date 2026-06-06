@@ -27,12 +27,17 @@
 # component root, where sdkconfig.defaults.spangap and partitions.csv live.
 get_filename_component(_SPANGAP_CORE_DIR "${CMAKE_CURRENT_LIST_DIR}/.." ABSOLUTE)
 
-# ─── 1. Layer SDKCONFIG_DEFAULTS: platform → consumer → spangap-inside overrides ───
+# ─── 1. Layer SDKCONFIG_DEFAULTS: platform → straddle kconfig: → consumer → overrides ───
+# _SPANGAP_FRAGMENTS is the spangap-inside-collected `kconfig:` blocks from every
+# staged straddle (board pins etc.) — see write_sdkconfig_fragments. It sits
+# above the bare platform defaults but below the buildable's own sdkconfig.defaults
+# and the CLI overrides, so the building straddle and explicit CLI flags still win.
 set(_SPANGAP_DEFAULTS "${_SPANGAP_CORE_DIR}/sdkconfig.defaults.spangap")
+set(_SPANGAP_FRAGMENTS "${CMAKE_SOURCE_DIR}/staging/sdkconfig.spangap-fragments")
 set(_CONSUMER_DEFAULTS "${CMAKE_SOURCE_DIR}/sdkconfig.defaults")
 set(_SPANGAP_OVERRIDES "${CMAKE_SOURCE_DIR}/staging/sdkconfig.spangap-overrides")
 set(SDKCONFIG_DEFAULTS "")
-foreach(_f "${_SPANGAP_DEFAULTS}" "${_CONSUMER_DEFAULTS}" "${_SPANGAP_OVERRIDES}")
+foreach(_f "${_SPANGAP_DEFAULTS}" "${_SPANGAP_FRAGMENTS}" "${_CONSUMER_DEFAULTS}" "${_SPANGAP_OVERRIDES}")
     if(EXISTS "${_f}")
         list(APPEND SDKCONFIG_DEFAULTS "${_f}")
     endif()
