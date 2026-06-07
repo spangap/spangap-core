@@ -47,7 +47,7 @@ extern "C" {
  *
  *    line-buffered stdout → fs_init → optional fs_mount_sd (when
  *      CONFIG_SPANGAP_SDCARD=y) → fsSelectStateStore → storageLoad
- *      → project-mismatch factory reset → s.sys.banner default →
+ *      → project-mismatch factory reset →
  *      logInit/cliInit/pmInit → cronWakeupHandler → publishBuildTimes
  *
  *  Returns. The consumer's app_main is then responsible for sibling

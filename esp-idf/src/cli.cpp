@@ -552,8 +552,8 @@ static void cronCliWrite(const char* data, size_t len) {
  *  name so the prompt is never the misleading platform name "spangap". */
 static int cliPromptBuild(char* out, size_t outSize) {
   char host[48];
-  storageGetStr("s.net.hostname", host, sizeof(host), CONFIG_SPANGAP_PROJECT_NAME);
-  if (!host[0]) safeStrncpy(host, CONFIG_SPANGAP_PROJECT_NAME, sizeof(host));
+  storageGetStr("s.net.hostname", host, sizeof(host), CONFIG_SPANGAP_FW_HOSTNAME);
+  if (!host[0]) safeStrncpy(host, CONFIG_SPANGAP_FW_HOSTNAME, sizeof(host));
   int n = snprintf(out, outSize, "%s $ ", host);
   return n;
 }
@@ -1356,8 +1356,8 @@ static void serialTaskFn(void* arg) {
         cliHandle = itsConnect("cli", CLI_PORT_TCP, &req, sizeof(req), pdMS_TO_TICKS(500));
         if (cliHandle >= 0) {
           char host[48];
-          storageGetStr("s.net.hostname", host, sizeof(host), CONFIG_SPANGAP_PROJECT_NAME);
-          if (!host[0]) safeStrncpy(host, CONFIG_SPANGAP_PROJECT_NAME, sizeof(host));
+          storageGetStr("s.net.hostname", host, sizeof(host), CONFIG_SPANGAP_FW_HOSTNAME);
+          if (!host[0]) safeStrncpy(host, CONFIG_SPANGAP_FW_HOSTNAME, sizeof(host));
           printf("\033[0m\r\n\r\nCLI mode, hit return on prompt to return to log\r\n\r\n%s $ ", host);
           fflush(stdout); cliFlush();
         } else {

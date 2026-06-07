@@ -11,15 +11,47 @@ config SPANGAP_PROJECT_NAME
         reticulous) over the same flash chip starts with a clean state.
 
         Not user-editable at runtime. For the user-facing display name,
-        use SPANGAP_BANNER (s.sys.banner) instead.
+        use SPANGAP_FW_NAME (fw.name) instead.
 
-config SPANGAP_BANNER
-    string "System banner / progname"
+# ── Firmware identity (fw.*) ──────────────────────────────────────────────
+# Immutable, compile-time. These define WHAT is running (not what it's running
+# ON — that's the mutable hostname below). Set from straddle.yaml's stub /
+# display_name / banner root keys (desugared to these by spangap-inside), and
+# exposed read-only to the browser as the fw.* subtree synthesized into the
+# storage dump — never persisted, never patchable, `set fw.* ...` errors.
+
+config SPANGAP_FW_STUB
+    string "Firmware stub name (lowercase id)"
+    default "spangap"
+    help
+        Short lowercase identity, e.g. "reticulous". Exposed as fw.stub.
+        Reserved as the future state-directory prefix so multiple firmwares'
+        state can coexist on one SD card. Set via straddle.yaml `stub:`.
+
+config SPANGAP_FW_NAME
+    string "Firmware proper name (menu title)"
+    default "spangap"
+    help
+        User-facing proper name shown in the leftmost menu, e.g. "Reticulous"
+        (usually the stub, capitalized). Exposed as fw.name. Immutable. Set via
+        straddle.yaml `display_name:`.
+
+config SPANGAP_FW_BANNER
+    string "Firmware banner / slogan"
     default "spangap device"
     help
-        Default value for the s.sys.banner config key, displayed by the
-        browser SPA in the menu bar and used by the device as its
-        identifying name. Editable at runtime via `set s.sys.banner ...`.
+        One-line description, slogan or motto, e.g. "Reticulum mesh networking
+        for the masses!". Exposed as fw.banner. Immutable. Set via
+        straddle.yaml `banner:`.
+
+config SPANGAP_FW_HOSTNAME
+    string "Default hostname"
+    default "spangap"
+    help
+        Compile-time DEFAULT for the MUTABLE s.net.hostname (seeded on first
+        boot, user-editable thereafter, and the base for the AP SSID). Unlike
+        the fw.* identity above this is what the device is running ON, so it is
+        settable. Set via straddle.yaml `default_hostname:`.
 
 config SPANGAP_SDCARD
     bool "Mount SD card on boot"

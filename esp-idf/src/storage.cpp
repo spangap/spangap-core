@@ -351,6 +351,14 @@ static bool isSecret(const char* key) {
   return strncmp(key, "secrets.", 8) == 0;
 }
 
+/* The fw.* subtree is immutable firmware identity (CONFIG_SPANGAP_FW_*),
+ * synthesized into the browser dump (dcSendFullDump) straight from ROM — it
+ * never lives in cfgRoot, is never persisted, and is read-only: inbound
+ * patches and `set fw.* ...` are rejected. */
+static bool isFw(const char* key) {
+  return strcmp(key, "fw") == 0 || strncmp(key, "fw.", 3) == 0;
+}
+
 /** Read entire file into malloc'd buffer (NUL-terminated). Uses fs API. */
 static char* readFileStr(const char* path) {
   struct stat st;
@@ -1319,6 +1327,7 @@ static void cmdSet(const char* a) {
     while (klen > 0 && a[klen - 1] == ' ') klen--;
     if (klen == 0 || klen >= sizeof(key)) { cliPrintf("err: key empty or too long\n"); return; }
     memcpy(key, a, klen); key[klen] = '\0';
+    if (isFw(key)) { cliPrintf("err: fw.* is read-only firmware identity (compile-time)\n"); return; }
     const char* val = eq + 1;
     while (*val == ' ') val++;
     storageSet(key, val);
@@ -1446,6 +1455,18 @@ static void dcSendFullDump(int handle) {
     cJSON* secrets = cJSON_DetachItemFromObject(clone, "secrets");
     if (secrets) cJSON_Delete(secrets);
 
+    /* Synthesize the read-only fw.* identity subtree straight from the ROM
+       string constants — never resident in cfgRoot, so it costs no steady-state
+       RAM and can never be persisted or patched. The browser receives it in the
+       initial dump alongside s.* and binds fw.name / fw.banner as plain text. */
+    cJSON* fw = cJSON_CreateObject();
+    if (fw) {
+        cJSON_AddStringToObject(fw, "stub",   CONFIG_SPANGAP_FW_STUB);
+        cJSON_AddStringToObject(fw, "name",   CONFIG_SPANGAP_FW_NAME);
+        cJSON_AddStringToObject(fw, "banner", CONFIG_SPANGAP_FW_BANNER);
+        cJSON_AddItemToObject(clone, "fw", fw);
+    }
+
     char* text = cJSON_PrintUnformatted(clone);
     cJSON_Delete(clone);
     if (!text) return;
@@ -1529,6 +1550,7 @@ static void mergeIncomingPatch(cJSON* obj, const std::string& prefix) {
   cJSON_ArrayForEach(item, obj) {
     std::string key = prefix.empty() ? item->string : prefix + "." + item->string;
     if (isSecret(key.c_str())) continue;
+    if (isFw(key.c_str())) continue;   /* read-only firmware identity */
     if (cJSON_IsNull(item)) {
       /* Silent delete (no subscription callbacks) */
       CFG_LOCK();

@@ -152,8 +152,9 @@ extern "C" void spangapInit(void) {
         }
     }
 
-    /* Spangap-side foundational defaults */
-    storageDefault("s.sys.banner", CONFIG_SPANGAP_BANNER);
+    /* The device identity (name / banner / stub) is immutable firmware
+     * identity now — exposed read-only as the fw.* storage subtree from
+     * CONFIG_SPANGAP_FW_*, not a mutable s.sys.banner setting. */
 
     /* Foundation tasks. Log timestamps start in UTC; once ntpInit() runs from
      * the dispatcher (it applies the persisted timezone at the end), they

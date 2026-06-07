@@ -24,7 +24,7 @@ Two things are required in the consuming buildable straddle:
 
 1. **`spangap/spangap-lcd` in `straddle.yaml`** — under `requires:` if the
    build is unconditionally LCD-based (the natural choice for a board with
-   a display), or `optional_requires:` to keep `--no-lcd` available.
+   a display), or `additional_installs:` to keep `--no-lcd` available.
    That's the on/off switch; `CONFIG_SPANGAP_LCD` is the short-form
    presence symbol `spangap-inside` emits when the straddle is staged.
 2. **A board HAL**, registered with `lcdSetBoard()` **before** `spangapInit()`
@@ -640,7 +640,7 @@ registry, the nav UI, the `lcdSetting*` helpers, and the gear program.
 - The whole `src/lcd_ui/` tree lives in the `spangap-lcd` straddle. Whether
   it compiles at all is determined by whether `spangap-lcd` is in the
   staged set — which `spangap-inside` controls via the buildable's
-  `requires:` / `optional_requires:` and the `--no-lcd` flag. When staged,
+  `requires:` / `additional_installs:` and the `--no-lcd` flag. When staged,
   `CONFIG_SPANGAP_LCD` is auto-emitted as a presence symbol; when not,
   the symbol is undefined and every consumer's `#if CONFIG_SPANGAP_LCD`
   block compiles away.
