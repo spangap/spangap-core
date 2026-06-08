@@ -1445,6 +1445,95 @@ void storageRegisterCmds() {
  * is authenticated. We carry the single client handle, coalesce changes
  * into one patch tree, and flush it as one packet per main-loop pass. */
 
+/* Streamed full dump. The saved-announce stores (rnsd, lxmf) push cfgRoot far
+ * past any single ITS packet, so the dump is split into multiple JSON messages,
+ * each under DC_DUMP_MAX. The browser deep-merges every message it receives, so
+ * each chunk need only carry its subtree at the right place — structure is
+ * mirrored as nested objects (NOT dotted paths: announce keys are opaque
+ * dest-hashes that may contain '.'). A {"__dump":"b"}/{"__dump":"e"} pair
+ * brackets the stream so the browser can defer its post-dump pending-set
+ * re-flush until full state has landed. */
+
+/* The server→client ITS buffer is 16K (fromSize at itsServerPortOpen below).
+ * Every packet is header(4)+body <= 16384. DC_DUMP_MAX is a conservative body
+ * budget for a streamed chunk: it leaves room for the header plus the path
+ * wrapper a deep subtree (e.g. s.<...>.<64-char-hash>) adds around its payload,
+ * since the per-unit size below is an estimate, not the exact printed length. */
+static constexpr size_t DC_DUMP_MAX   = 14000;
+static constexpr int    DC_DUMP_DEPTH = 32;     /* cfgRoot nests ~9 deep */
+
+/* Printed length of a node's value (0 on alloc failure). */
+static size_t dcNodePrintLen(cJSON* node) {
+    char* s = cJSON_PrintUnformatted(node);
+    if (!s) return 0;
+    size_t n = strlen(s);
+    cJSON_free(s);
+    return n;
+}
+
+static cJSON* dcGetOrCreateObject(cJSON* parent, const char* name) {
+    cJSON* o = cJSON_GetObjectItem(parent, name);
+    if (o && cJSON_IsObject(o)) return o;
+    o = cJSON_CreateObject();
+    cJSON_AddItemToObject(parent, name, o);
+    return o;
+}
+
+/* Print the accumulated batch as one packet, then reset *batch to empty. */
+static void dcDumpFlush(int handle, cJSON** batch, size_t* batchLen) {
+    if (*batch && (*batch)->child) {
+        char* text = cJSON_PrintUnformatted(*batch);
+        if (text) {
+            size_t len = strlen(text);
+            if (itsSend(handle, text, len, pdMS_TO_TICKS(500)) != len)
+                warn("storage: dump chunk %u send failed\n", (unsigned)len);
+            cJSON_free(text);
+        }
+        cJSON_Delete(*batch);
+        *batch = cJSON_CreateObject();
+    }
+    *batchLen = 0;
+}
+
+/* Place a copy of `node` into `batch` at stack[0..depth) + name, creating the
+ * mirror objects along the way. */
+static void dcBatchAdd(cJSON* batch, const char* const* stack, int depth,
+                       const char* name, cJSON* node) {
+    cJSON* cur = batch;
+    for (int i = 0; i < depth; i++) cur = dcGetOrCreateObject(cur, stack[i]);
+    cJSON_AddItemToObject(cur, name, cJSON_Duplicate(node, true));
+}
+
+/* Greedily pack subtrees into <=DC_DUMP_MAX chunks, recursing into objects too
+ * big to fit as a unit. */
+static void dcStreamNode(int handle, cJSON** batch, size_t* batchLen,
+                         const char** stack, int depth,
+                         const char* name, cJSON* node) {
+    size_t m   = dcNodePrintLen(node);
+    size_t est = m + strlen(name) + 8;          /* "name":{} + slack */
+
+    if (cJSON_IsObject(node) && node->child && est > DC_DUMP_MAX
+        && depth < DC_DUMP_DEPTH) {
+        stack[depth] = name;
+        for (cJSON* c = node->child; c; c = c->next)
+            dcStreamNode(handle, batch, batchLen, stack, depth + 1,
+                         c->string, c);
+        return;
+    }
+
+    if (*batchLen && *batchLen + est > DC_DUMP_MAX)
+        dcDumpFlush(handle, batch, batchLen);
+
+    dcBatchAdd(*batch, stack, depth, name, node);
+    *batchLen += est;
+
+    /* A single unit at/over budget can't share a chunk — ship it now so the
+     * next unit starts clean. Still bounded by the 16K buffer cap; itsSend
+     * warns via dcDumpFlush if a lone value genuinely won't fit. */
+    if (*batchLen >= DC_DUMP_MAX)
+        dcDumpFlush(handle, batch, batchLen);
+}
+
 static void dcSendFullDump(int handle) {
     CFG_LOCK();
     cJSON* clone = cJSON_Duplicate(cfgRoot, true);
@@ -1467,13 +1556,22 @@ static void dcSendFullDump(int handle) {
         cJSON_AddItemToObject(clone, "fw", fw);
     }
 
-    char* text = cJSON_PrintUnformatted(clone);
+    /* Bracket the stream; generous timeouts — the first dump must land even if
+       the router is momentarily backed up. */
+    static const char* DUMP_BEGIN = "{\"__dump\":\"b\"}";
+    static const char* DUMP_END   = "{\"__dump\":\"e\"}";
+    itsSend(handle, DUMP_BEGIN, strlen(DUMP_BEGIN), pdMS_TO_TICKS(500));
+
+    cJSON* batch = cJSON_CreateObject();
+    size_t batchLen = 0;
+    const char* stack[DC_DUMP_DEPTH];
+    for (cJSON* c = clone->child; c; c = c->next)
+        dcStreamNode(handle, &batch, &batchLen, stack, 0, c->string, c);
+    dcDumpFlush(handle, &batch, &batchLen);
+    cJSON_Delete(batch);
     cJSON_Delete(clone);
-    if (!text) return;
-    /* Generous timeout — first dump must land even if the router is
-       momentarily backed up. */
-    itsSend(handle, text, strlen(text), pdMS_TO_TICKS(500));
-    cJSON_free(text);
+
+    itsSend(handle, DUMP_END, strlen(DUMP_END), pdMS_TO_TICKS(500));
 }
 
 /** Accumulate a changed key into dcPendingPatch for coalesced output. */
@@ -1509,7 +1607,7 @@ static void dcAccumulateChange(const char* key, const char* val) {
 
 /** Flush accumulated changes to the browser as one DC packet. On back-
  *  pressure leave the patch intact and retry next pass — never drop. */
-static constexpr size_t DC_PATCH_MAX = 60000;  /* within SCTP 64KB max-message-size */
+static constexpr size_t DC_PATCH_MAX = 15500;  /* one 16K fromSize buffer, header(4)+slack */
 
 static void dcFlushPatch() {
     if (!dcPendingPatch || dcHandle < 0) return;
@@ -1649,10 +1747,12 @@ static void storageTaskFn(void* arg) {
     itsServerInit(0, 64);
     /* Packet-mode: each DC message is one JSON body (dump, patch, ping).
      * toSize=48K holds the largest browser-originated patch — the IANA
-     * timezone DB is ~40K when flattened. fromSize=64K accommodates full
-     * config dumps + coalesced multi-key patches. SCTP fragments both on
-     * the wire; the webrtc router reassembles inbound into one packet. */
-    itsServerPortOpen(STORAGE_CONFIG_PORT, /*packetBased=*/true, 1, 49152, 65536);
+     * timezone DB is ~40K when flattened. fromSize=16K: the full dump now
+     * STREAMS as multiple chunks (dcSendFullDump), so the server→client
+     * buffer no longer has to hold the whole config tree — the saved-announce
+     * stores (rnsd, lxmf) blow past any fixed cap. SCTP fragments both on the
+     * wire; the webrtc router reassembles inbound into one packet. */
+    itsServerPortOpen(STORAGE_CONFIG_PORT, /*packetBased=*/true, 1, 49152, 16384);
     itsServerOnConnect(STORAGE_CONFIG_PORT, storageItsConnect);
     itsServerOnDisconnect(STORAGE_CONFIG_PORT, storageItsDisconnect);
 
