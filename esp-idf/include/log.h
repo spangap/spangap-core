@@ -1,8 +1,8 @@
 /**
  * Log — logging macros, log task API, log levels.
  */
-#ifndef SECCAM_LOG_H
-#define SECCAM_LOG_H
+#ifndef SPANGAP_LOG_H
+#define SPANGAP_LOG_H
 
 #include <stdint.h>
 #include <esp_log.h>

@@ -102,6 +102,20 @@ void spangapInitStraddles(void);
  *  itself — no explicit vTaskDelete needed. */
 void spangapPostAppInit(void);
 
+/** Block the calling task until the platform clock is known-valid — the storage
+ *  key `sys.time.valid` flips to 1 when a time source syncs (SNTP in
+ *  spangap-net, GPS/RTC in hw-tdeck) — or until `timeout_s` elapses, whichever
+ *  comes first. Returns true if time became valid, false on timeout.
+ *
+ *  `timeout_s <= 0` uses the operator-tunable default `s.sys.time_wait_s`
+ *  (fallback 30 s); set that key to 0 on an offline node with no time source to
+ *  skip the wait entirely (it would never sync, so the delay buys nothing).
+ *  Holds a PM no-deep-sleep lock for the duration and is safe to call from any
+ *  task. Intended for the RNS startup paths (rnsd + the transports) so the
+ *  first announces and path-table entries aren't stamped with the pre-sync
+ *  1970 epoch. */
+bool waitForTime(int timeout_s);
+
 #ifdef __cplusplus
 }
 #endif

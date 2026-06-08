@@ -352,7 +352,7 @@ static bool isSecret(const char* key) {
 }
 
 /* The fw.* subtree is immutable firmware identity (CONFIG_SPANGAP_FW_*),
- * synthesized into the browser dump (dcSendFullDump) straight from ROM — it
+ * synthesized into the browser dump (dcBuildDump) straight from ROM — it
  * never lives in cfgRoot, is never persisted, and is read-only: inbound
  * patches and `set fw.* ...` are rejected. */
 static bool isFw(const char* key) {
@@ -1462,6 +1462,19 @@ void storageRegisterCmds() {
 static constexpr size_t DC_DUMP_MAX   = 14000;
 static constexpr int    DC_DUMP_DEPTH = 32;     /* cfgRoot nests ~9 deep */
 
+/* The full dump is pre-serialized into chunks (dcBuildDump) and streamed from
+ * the storage task loop (dcPumpDump), paced to DC buffer space. It must NOT run
+ * inside the connect callback or block on a send: the connect ack is withheld
+ * until storageItsConnect returns (its.cpp gives the ackSem only after
+ * onConnect), and the browser can't drain the stream until that ack lands — so
+ * a blocking in-callback dump deadlocks the ack (client gives up after 3 s) and
+ * freezes the inbox drain into a notify-drop storm. Streaming from the loop
+ * keeps the ack instant and the inbox draining while back-pressure paces the
+ * chunks. */
+static std::vector<std::string> dcDumpQueue;        /* pending dump chunks, in order */
+static size_t                   dcDumpPos     = 0;  /* next queue index to send */
+static bool                     dcDumpPending = false;  /* build queued on next pump */
+
 /* Printed length of a node's value (0 on alloc failure). */
 static size_t dcNodePrintLen(cJSON* node) {
     char* s = cJSON_PrintUnformatted(node);
@@ -1479,14 +1492,14 @@ static cJSON* dcGetOrCreateObject(cJSON* parent, const char* name) {
     return o;
 }
 
-/* Print the accumulated batch as one packet, then reset *batch to empty. */
-static void dcDumpFlush(int handle, cJSON** batch, size_t* batchLen) {
+/* Serialize the accumulated batch as one chunk, append it to dcDumpQueue, and
+ * reset *batch to empty. No network I/O — dcPumpDump streams the queue out from
+ * the task loop. */
+static void dcDumpEmit(cJSON** batch, size_t* batchLen) {
     if (*batch && (*batch)->child) {
         char* text = cJSON_PrintUnformatted(*batch);
         if (text) {
-            size_t len = strlen(text);
-            if (itsSend(handle, text, len, pdMS_TO_TICKS(500)) != len)
-                warn("storage: dump chunk %u send failed\n", (unsigned)len);
+            dcDumpQueue.emplace_back(text);
             cJSON_free(text);
         }
         cJSON_Delete(*batch);
@@ -1506,7 +1519,7 @@ static void dcBatchAdd(cJSON* batch, const char* const* stack, int depth,
 
 /* Greedily pack subtrees into <=DC_DUMP_MAX chunks, recursing into objects too
  * big to fit as a unit. */
-static void dcStreamNode(int handle, cJSON** batch, size_t* batchLen,
+static void dcStreamNode(cJSON** batch, size_t* batchLen,
                          const char** stack, int depth,
                          const char* name, cJSON* node) {
     size_t m   = dcNodePrintLen(node);
@@ -1516,25 +1529,30 @@ static void dcStreamNode(int handle, cJSON** batch, size_t* batchLen,
         && depth < DC_DUMP_DEPTH) {
         stack[depth] = name;
         for (cJSON* c = node->child; c; c = c->next)
-            dcStreamNode(handle, batch, batchLen, stack, depth + 1,
-                         c->string, c);
+            dcStreamNode(batch, batchLen, stack, depth + 1, c->string, c);
         return;
     }
 
     if (*batchLen && *batchLen + est > DC_DUMP_MAX)
-        dcDumpFlush(handle, batch, batchLen);
+        dcDumpEmit(batch, batchLen);
 
     dcBatchAdd(*batch, stack, depth, name, node);
     *batchLen += est;
 
-    /* A single unit at/over budget can't share a chunk — ship it now so the
-     * next unit starts clean. Still bounded by the 16K buffer cap; itsSend
-     * warns via dcDumpFlush if a lone value genuinely won't fit. */
+    /* A single unit at/over budget can't share a chunk — emit it now so the
+     * next unit starts clean. dcPumpDump skips (with a warn) any chunk that
+     * genuinely won't fit the DC buffer. */
     if (*batchLen >= DC_DUMP_MAX)
-        dcDumpFlush(handle, batch, batchLen);
+        dcDumpEmit(batch, batchLen);
 }
 
-static void dcSendFullDump(int handle) {
+/* Build the full dump into dcDumpQueue: a {"__dump":"b"} sentinel, the config
+ * tree packed into <=DC_DUMP_MAX chunks, then {"__dump":"e"}. Pure RAM/CPU (no
+ * network I/O); dcPumpDump streams the queue out paced to buffer space. */
+static void dcBuildDump() {
+    dcDumpQueue.clear();
+    dcDumpPos = 0;
+
     CFG_LOCK();
     cJSON* clone = cJSON_Duplicate(cfgRoot, true);
     CFG_UNLOCK();
@@ -1556,22 +1574,19 @@ static void dcSendFullDump(int handle) {
         cJSON_AddItemToObject(clone, "fw", fw);
     }
 
-    /* Bracket the stream; generous timeouts — the first dump must land even if
-       the router is momentarily backed up. */
-    static const char* DUMP_BEGIN = "{\"__dump\":\"b\"}";
-    static const char* DUMP_END   = "{\"__dump\":\"e\"}";
-    itsSend(handle, DUMP_BEGIN, strlen(DUMP_BEGIN), pdMS_TO_TICKS(500));
+    /* Bracket the stream so the browser knows when the snapshot is complete. */
+    dcDumpQueue.emplace_back("{\"__dump\":\"b\"}");
 
     cJSON* batch = cJSON_CreateObject();
     size_t batchLen = 0;
     const char* stack[DC_DUMP_DEPTH];
     for (cJSON* c = clone->child; c; c = c->next)
-        dcStreamNode(handle, &batch, &batchLen, stack, 0, c->string, c);
-    dcDumpFlush(handle, &batch, &batchLen);
+        dcStreamNode(&batch, &batchLen, stack, 0, c->string, c);
+    dcDumpEmit(&batch, &batchLen);
     cJSON_Delete(batch);
     cJSON_Delete(clone);
 
-    itsSend(handle, DUMP_END, strlen(DUMP_END), pdMS_TO_TICKS(500));
+    dcDumpQueue.emplace_back("{\"__dump\":\"e\"}");
 }
 
 /** Accumulate a changed key into dcPendingPatch for coalesced output. */
@@ -1642,6 +1657,46 @@ static void dcFlushPatch() {
     }
 }
 
+/** True while a full dump is queued or mid-stream. Patches are held until it
+ *  drains (see the task loop) so a post-snapshot change can't be overwritten by
+ *  an older dump chunk that lands after it. */
+static bool dcDumpInProgress() {
+    return dcDumpPending || dcDumpPos < dcDumpQueue.size();
+}
+
+/** Stream the pre-built dump from the task loop, paced to buffer space. Builds
+ *  the queue lazily on the first pump after a connect, then sends as many
+ *  chunks as fit right now and yields — the browser drains the buffer between
+ *  passes and the inbox keeps draining, so neither the dump nor the
+ *  notification fan-in starves the other. Never blocks. */
+static void dcPumpDump() {
+    if (dcHandle < 0) return;
+    if (dcDumpPending) { dcBuildDump(); dcDumpPending = false; }
+
+    size_t cap = itsSendBufSize(dcHandle);
+    while (dcDumpPos < dcDumpQueue.size()) {
+        const std::string& chunk = dcDumpQueue[dcDumpPos];
+        if (cap && chunk.size() + 4 > cap) {
+            /* Larger than the whole DC buffer — can never be enqueued (a single
+               leaf value > ~16 KB). Skip it rather than wedge the stream
+               forever; the subtree it carried is lost for this client. */
+            warn("storage: dump chunk %u exceeds DC buffer %u, skipping\n",
+                 (unsigned)chunk.size(), (unsigned)cap);
+            dcDumpPos++;
+            continue;
+        }
+        if (itsSpacesAvailable(dcHandle) < chunk.size()) break;   /* drain & retry next pass */
+        if (itsSend(dcHandle, chunk.data(), chunk.size(), 0) != chunk.size()) break;
+        dcDumpPos++;
+    }
+
+    if (dcDumpPos >= dcDumpQueue.size() && !dcDumpQueue.empty()) {
+        dcDumpQueue.clear();
+        dcDumpQueue.shrink_to_fit();   /* return the dump's RAM promptly */
+        dcDumpPos = 0;
+    }
+}
+
 /** Process incoming JSON from browser. Null = silent delete, values = storageSet. */
 static void mergeIncomingPatch(cJSON* obj, const std::string& prefix) {
   cJSON* item;
@@ -1708,13 +1763,21 @@ static int storageItsConnect(int handle, const void* data, size_t len) {
         return -1;
     }
     dcHandle = handle;
-    dcSendFullDump(handle);
+    /* Defer the dump to the task loop so we ack the connect immediately. The
+       ack is only sent once this callback returns (its.cpp), and the browser
+       can't drain the dump stream until it's acked — so building/streaming here
+       would blow the client's 3 s connect timeout and freeze the inbox drain. */
+    dcDumpPending = true;
     return 0;
 }
 
 static void storageItsDisconnect(int ref) {
     (void)ref;
     dcHandle = -1;
+    dcDumpPending = false;
+    dcDumpQueue.clear();
+    dcDumpQueue.shrink_to_fit();
+    dcDumpPos = 0;
     if (dcPendingPatch) {
         cJSON_Delete(dcPendingPatch);
         dcPendingPatch = nullptr;
@@ -1748,7 +1811,7 @@ static void storageTaskFn(void* arg) {
     /* Packet-mode: each DC message is one JSON body (dump, patch, ping).
      * toSize=48K holds the largest browser-originated patch — the IANA
      * timezone DB is ~40K when flattened. fromSize=16K: the full dump now
-     * STREAMS as multiple chunks (dcSendFullDump), so the server→client
+     * STREAMS as multiple chunks (dcBuildDump/dcPumpDump), so the server→client
      * buffer no longer has to hold the whole config tree — the saved-announce
      * stores (rnsd, lxmf) blow past any fixed cap. SCTP fragments both on the
      * wire; the webrtc router reassembles inbound into one packet. */
@@ -1767,7 +1830,11 @@ static void storageTaskFn(void* arg) {
         TickType_t timeout = (dcHandle >= 0) ? pdMS_TO_TICKS(10) : portMAX_DELAY;
         while (itsPoll(timeout)) { timeout = 0; }
         dcPollConfig();
-        dcFlushPatch();
+        dcPumpDump();
+        /* Hold patches until the dump drains: a chunk carries the snapshot
+           value, a patch the newer one, so the patch must land after its
+           chunk. dcAccumulateChange keeps coalescing meanwhile. */
+        if (!dcDumpInProgress()) dcFlushPatch();
     }
 }
 

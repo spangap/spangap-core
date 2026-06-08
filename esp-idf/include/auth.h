@@ -8,8 +8,8 @@
  * Config lives under secrets.auth.* (persisted, never sent to browser).
  * No in-memory caches — all reads/writes go through the storage API.
  */
-#ifndef SECCAM_AUTH_H
-#define SECCAM_AUTH_H
+#ifndef SPANGAP_AUTH_H
+#define SPANGAP_AUTH_H
 
 #include <string>
 

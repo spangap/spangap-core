@@ -1,8 +1,8 @@
 /**
  * CLI — command registry, line editor, CLI/serial tasks.
  */
-#ifndef SECCAM_CLI_H
-#define SECCAM_CLI_H
+#ifndef SPANGAP_CLI_H
+#define SPANGAP_CLI_H
 
 #include <stddef.h>
 #include <stdint.h>

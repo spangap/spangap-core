@@ -22,8 +22,8 @@
  *
  * File I/O: use fs.h (unified PSRAM-safe API).
  */
-#ifndef SECCAM_STORAGE_H
-#define SECCAM_STORAGE_H
+#ifndef SPANGAP_STORAGE_H
+#define SPANGAP_STORAGE_H
 
 #include <stdint.h>
 #include <stddef.h>

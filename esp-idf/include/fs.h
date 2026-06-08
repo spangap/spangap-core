@@ -6,8 +6,8 @@
  * a DRAM-stack worker task (SPI flash ops disable the PSRAM cache). SD card
  * paths and DRAM-stack callers use direct POSIX.
  */
-#ifndef SECCAM_FS_H
-#define SECCAM_FS_H
+#ifndef SPANGAP_FS_H
+#define SPANGAP_FS_H
 
 #include <sys/stat.h>
 #include <cstddef>

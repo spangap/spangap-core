@@ -1,8 +1,8 @@
 /**
  * PM — power management locks, USB management, deep sleep.
  */
-#ifndef SECCAM_PM_H
-#define SECCAM_PM_H
+#ifndef SPANGAP_PM_H
+#define SPANGAP_PM_H
 
 #include <stdint.h>
 #include "freertos/FreeRTOS.h"

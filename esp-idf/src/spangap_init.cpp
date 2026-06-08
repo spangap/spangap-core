@@ -198,3 +198,38 @@ extern "C" void spangapPostAppInit(void) {
      * may already have moved time forward through a scheduled minute). */
     cronPoll(true);
 }
+
+extern "C" bool waitForTime(int timeout_s) {
+    /* Fast path: clock already known-valid (warm boot carrying an RTC time, or
+     * an SNTP/GPS sync earlier this session). */
+    if (storageGetInt("sys.time.valid", 0)) return true;
+
+    /* timeout_s <= 0 → operator-tunable default. s.sys.time_wait_s = 0 on an
+     * offline node with no time source skips the wait outright. */
+    if (timeout_s <= 0) timeout_s = storageGetInt("s.sys.time_wait_s", 30);
+    if (timeout_s <= 0) return false;
+
+    /* Keep a power-managed device awake for the wait. One shared recursive lock
+     * across all callers — rnsd and the transports race here at boot, and the
+     * count aggregates so deep sleep stays blocked while any wait is live. */
+    static pm_lock_handle_t s_lock = nullptr;
+    if (!s_lock) pmLockCreate(PM_NO_DEEP_SLEEP, "waittime", &s_lock);
+    /* Capture locally: two boot tasks racing the lazy-create could each write
+     * s_lock, so acquire and release must name the same handle this call saw. */
+    pm_lock_handle_t lock = s_lock;
+    if (lock) pmLockAcquire(lock);
+
+    uint32_t start = millis();
+    bool valid = false;
+    while (!(valid = storageGetInt("sys.time.valid", 0) != 0)) {
+        if ((int)(millis() - start) >= timeout_s * 1000) break;
+        vTaskDelay(pdMS_TO_TICKS(200));
+    }
+
+    if (lock) pmLockRelease(lock);
+
+    /* Log line is tagged with the calling task name (rnsd, tcp, lora, …). */
+    if (valid) info("waitForTime: clock valid after %u ms\n", (unsigned)(millis() - start));
+    else       warn("waitForTime: no valid time after %d s — proceeding (clock may read ~1970)\n", timeout_s);
+    return valid;
+}

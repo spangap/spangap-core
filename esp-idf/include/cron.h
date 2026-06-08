@@ -9,8 +9,8 @@
  * until the next minute boundary (+1s).  cronWakeupHandler() checks on boot
  * whether there's cron work — stays awake if so, otherwise goes back to sleep.
  */
-#ifndef SECCAM_CRON_H
-#define SECCAM_CRON_H
+#ifndef SPANGAP_CRON_H
+#define SPANGAP_CRON_H
 
 /** Spawn cron task and create CLI command stream.
  *  Call from app_main() after fs_init(). */

@@ -263,6 +263,47 @@ static void authCliCmd(const char* args) {
     cliPrintf("unknown subcommand. try `auth -h`\n");
 }
 
+/* `passwd` — interactive password set for the "admin" realm. Prompts twice
+ * (echoed as stars) and only commits when both entries match. This is the
+ * convenient front door to `auth passwd admin <pw>`; the realm is fixed to
+ * "admin" by design (the realm every device ships with). */
+static void passwdCliCmd(const char* args) {
+    if (cliWantsHelp(args)) {
+        cliPrintf("%-*s set the admin password (prompts twice)\n", CLI_HELP_COL, "passwd");
+        return;
+    }
+    char pw1[128], pw2[128];
+    cliPrintf("New password: ");
+    int n1 = cliReadLine(pw1, sizeof(pw1), CLI_ECHO_STARS);
+    if (n1 < 0) { cliPrintf("passwd: cancelled\n"); return; }
+    if (n1 == 0) {
+        cliPrintf("passwd: empty password not allowed\n");
+        memset(pw1, 0, sizeof(pw1));
+        return;
+    }
+    cliPrintf("Retype new password: ");
+    int n2 = cliReadLine(pw2, sizeof(pw2), CLI_ECHO_STARS);
+    if (n2 < 0) {
+        cliPrintf("passwd: cancelled\n");
+        memset(pw1, 0, sizeof(pw1));
+        return;
+    }
+    if (strcmp(pw1, pw2) != 0) {
+        cliPrintf("passwd: passwords do not match\n");
+    } else {
+        auth_err_t e = authForceSetPassword("admin", pw1);
+        switch (e) {
+            case AUTH_OK:                  cliPrintf("password updated\n"); break;
+            case AUTH_NO_SUCH_REALM:       cliPrintf("passwd: no 'admin' realm\n"); break;
+            case AUTH_SAME_AS_OTHER_REALM: cliPrintf("passwd: matches another realm's password\n"); break;
+            case AUTH_WRONG_PASSWORD:      cliPrintf("passwd: empty password not allowed\n"); break;
+            default:                       cliPrintf("passwd: error %d\n", (int)e); break;
+        }
+    }
+    memset(pw1, 0, sizeof(pw1));
+    memset(pw2, 0, sizeof(pw2));
+}
+
 /* ---- Public API ---- */
 
 #define AUTH_VERSION 1
@@ -293,6 +334,7 @@ void authInit() {
     }
 
     cliRegisterCmd("auth", authCliCmd);
+    cliRegisterCmd("passwd", passwdCliCmd);
 }
 
 bool authEnabled() {
