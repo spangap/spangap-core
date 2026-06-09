@@ -6,9 +6,18 @@ message, an ISR like lora's DIO1, input) — a real event — and stays at the D
 floor for a wake that merely **timed out** (a routine housekeeping tick). The
 boost is held from the notify-wake until the task's next block. Plus a manual
 `pmBoost()`/`pmBoostEnd()` for sustained needs (heavy timeout-path work, or
-continuous non-notify loops like net/webrtc). All share one recursive
-`CPU_FREQ_MAX` lock named `"boost"`; the per-task "do I hold the auto count" bit
-lives in TLS slot 1 (`CONFIG_FREERTOS_THREAD_LOCAL_STORAGE_POINTERS=2`).
+continuous non-notify loops like net/webrtc).
+
+**Update (per-task locks):** rather than one shared `"boost"` lock, each task now
+owns a recursive `CPU_FREQ_MAX` lock named after the task, created lazily on its
+first boost (registry in `pm.cpp`, `BOOST_MAX_TASKS`). Its count is that task's
+auto count (0/1) plus its manual `pmBoost()` depth. This makes `pm` /
+`esp_pm_dump_locks` attribute boost time and total_count per task, and a stuck
+count names its own leaker — so the old `s_boostHolders` debug registry is gone.
+The per-task "do I hold the auto count" marker still lives in TLS slot 1
+(`CONFIG_FREERTOS_THREAD_LOCAL_STORAGE_POINTERS=2`), now holding the task's own
+lock handle. The single-shared-lock design below is the original plan, kept for
+context.
 
 This supersedes the original per-task `spawnTask(boost=)` flag: the notify is a
 better signal than a static per-task bool, because it boosts *exactly* when a

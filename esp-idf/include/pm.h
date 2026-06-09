@@ -46,9 +46,10 @@ bool deepSleepAllowed();
  * to max for the handling of a wake that came from a *notify* (an ITS message,
  * an ISR like lora's DIO1, input) — i.e. a real event — and stays at the floor
  * for a wake that merely *timed out* (a routine housekeeping tick). The boost is
- * held from the notify-wake until the task's next block. All boost tasks share
- * one recursive CPU_FREQ_MAX lock; the per-task "do I currently hold the auto
- * count" bit lives in TLS slot TLS_PM_BOOST (slot 0 is left for IDF). See
+ * held from the notify-wake until the task's next block. Each task owns a
+ * recursive CPU_FREQ_MAX lock named after itself (created lazily on first boost)
+ * so `pm` shows per-task boost time; the per-task "do I currently hold the auto
+ * count" marker lives in TLS slot TLS_PM_BOOST (slot 0 is left for IDF). See
  * docs/plans/pm-task-boost.md. */
 #define TLS_PM_BOOST 1
 

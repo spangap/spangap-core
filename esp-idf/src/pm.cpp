@@ -62,6 +62,10 @@ struct pm_lock {
 };
 
 static pm_lock* pmLockList = nullptr;
+/* Guards the pmLockList head only. Most locks are created single-threaded at
+ * init, but per-task boost locks (below) are created lazily from many tasks at
+ * once — two concurrent prepends would otherwise lose-update the list head. */
+static portMUX_TYPE pmListMux = portMUX_INITIALIZER_UNLOCKED;
 
 static const esp_pm_lock_type_t espLockTypes[] = {
   ESP_PM_CPU_FREQ_MAX, ESP_PM_APB_FREQ_MAX, ESP_PM_NO_LIGHT_SLEEP
@@ -73,8 +77,10 @@ void pmLockCreate(pm_lock_type_t type, const char* name, pm_lock_handle_t* out) 
   l->type = type;
   if (type != PM_NO_DEEP_SLEEP)
     esp_pm_lock_create(espLockTypes[type], 0, name, &l->esp_handle);
+  portENTER_CRITICAL(&pmListMux);   /* link last — esp_pm_lock_create must run outside the spinlock */
   l->next = pmLockList;
   pmLockList = l;
+  portEXIT_CRITICAL(&pmListMux);
   *out = l;
 }
 
@@ -104,37 +110,57 @@ void pmLockRelease(pm_lock_handle_t h) {
 #error "pm boost needs CONFIG_FREERTOS_THREAD_LOCAL_STORAGE_POINTERS > TLS_PM_BOOST (bump it in sdkconfig.defaults.spangap)"
 #endif
 
-/* One shared, recursive CPU_FREQ_MAX lock for the whole system. The count
- * aggregates every task's auto + manual boost: 240 MHz iff the count > 0.
- * Created lazily on first use. */
-static pm_lock_handle_t s_boostLock = nullptr;
+/* Each boosting task gets its OWN recursive CPU_FREQ_MAX lock, named after the
+ * task and created lazily on first boost. A lock's count aggregates only that
+ * task's auto count (0/1, tracked in TLS_PM_BOOST for idempotency) plus its
+ * manual pmBoost() depth — the task runs at 240 MHz iff its own count > 0.
+ * Per-task locks (vs one shared "boost" lock) mean `pm`/esp_pm_dump_locks list
+ * each task's boost time + total_count separately, and a stuck count names its
+ * own leaker. */
+#define BOOST_MAX_TASKS 24
+struct boost_task_t {
+  TaskHandle_t     task;
+  pm_lock_handle_t lock;
+  /* Private copy of the task name: pmLockCreate stores the name pointer by
+   * reference, and the TCB name can outlive the task (locks are never freed),
+   * so we own a stable string for the lock's lifetime. */
+  char             name[configMAX_TASK_NAME_LEN];
+};
+static boost_task_t s_boostTasks[BOOST_MAX_TASKS];
+/* Guards free-slot claiming only — two different tasks must not grab the same
+ * slot. Each claimed entry is thereafter private to its one (single-threaded)
+ * task, so lookups/acquires need no further locking. */
+static portMUX_TYPE s_boostMux = portMUX_INITIALIZER_UNLOCKED;
 
-static inline void boostEnsure() {
-  if (!s_boostLock) pmLockCreate(PM_CPU_FREQ_MAX, "boost", &s_boostLock);
+static pm_lock_handle_t boostLockFind(TaskHandle_t t) {
+  for (int i = 0; i < BOOST_MAX_TASKS; i++)
+    if (s_boostTasks[i].task == t) return s_boostTasks[i].lock;
+  return nullptr;
 }
 
-/* Debug attribution: which tasks currently hold a boost count, so `pm` can name
- * a leak. One entry per held count — an auto holder appears once (TLS-idempotent
- * acquire), a manual pmBoost() holder once per un-ended call; a task holding both
- * shows up twice. The registry mirrors s_boostLock->count exactly. */
-#define BOOST_MAX_HOLDERS 24
-static TaskHandle_t s_boostHolders[BOOST_MAX_HOLDERS];
-
-static void boostHolderAdd() {
+/* Get-or-create the current task's boost lock. Registry full → nullptr and the
+ * caller's boost no-ops (BOOST_MAX_TASKS covers every long-lived task with
+ * margin). The slot is claimed under the spinlock; the esp_pm lock is created
+ * outside it (pmLockCreate allocates + takes its own lock). */
+static pm_lock_handle_t boostLockEnsure() {
   TaskHandle_t t = xTaskGetCurrentTaskHandle();
-  for (int i = 0; i < BOOST_MAX_HOLDERS; i++)
-    if (!s_boostHolders[i]) { s_boostHolders[i] = t; return; }
-}
-static void boostHolderDel() {
-  TaskHandle_t t = xTaskGetCurrentTaskHandle();
-  for (int i = 0; i < BOOST_MAX_HOLDERS; i++)
-    if (s_boostHolders[i] == t) { s_boostHolders[i] = nullptr; return; }
+  pm_lock_handle_t l = boostLockFind(t);
+  if (l) return l;
+  int slot = -1;
+  portENTER_CRITICAL(&s_boostMux);
+  for (int i = 0; i < BOOST_MAX_TASKS; i++)
+    if (!s_boostTasks[i].task) { s_boostTasks[i].task = t; slot = i; break; }
+  portEXIT_CRITICAL(&s_boostMux);
+  if (slot < 0) return nullptr;
+  safeStrncpy(s_boostTasks[slot].name, pcTaskGetName(t), sizeof(s_boostTasks[slot].name));
+  pmLockCreate(PM_CPU_FREQ_MAX, s_boostTasks[slot].name, &s_boostTasks[slot].lock);
+  return s_boostTasks[slot].lock;
 }
 
 /* Lean release for the auto-boost hot path (runs on every itsPoll block): same
  * count/stats bookkeeping as pmLockRelease, but skips the deepSleepAllowed()
- * list-walk + going_down storageSet — the boost lock is CPU_FREQ_MAX and never
- * gates deep sleep. (Acquire has no such side effect, so we reuse pmLockAcquire.) */
+ * list-walk + going_down storageSet — boost locks are CPU_FREQ_MAX and never
+ * gate deep sleep. (Acquire has no such side effect, so we reuse pmLockAcquire.) */
 static void boostReleaseLean(pm_lock_handle_t h) {
   if (!h || h->count <= 0) return;
   h->count--;
@@ -144,35 +170,26 @@ static void boostReleaseLean(pm_lock_handle_t h) {
     esp_pm_lock_release(h->esp_handle);
 }
 
-/* Per-task auto boost. TLS slot holds s_boostLock when this task currently holds
- * its one auto count, else nullptr — so take/drop are idempotent and balanced
- * regardless of call order. Manual pmBoost() counts are NOT tracked here, so
- * they survive across blocks independently. */
+/* Per-task auto boost. TLS slot holds this task's boost lock while it holds its
+ * one auto count, else nullptr — so take/drop are idempotent and balanced
+ * regardless of call order. Manual pmBoost() counts share the same per-task lock
+ * but are NOT tracked in TLS, so they survive across blocks independently. */
 void pmBoostAuto(bool on) {
   void* held = pvTaskGetThreadLocalStoragePointer(NULL, TLS_PM_BOOST);
   if (on && !held) {
-    boostEnsure();
-    vTaskSetThreadLocalStoragePointer(NULL, TLS_PM_BOOST, s_boostLock);
-    pmLockAcquire(s_boostLock);
-    boostHolderAdd();
+    pm_lock_handle_t l = boostLockEnsure();
+    if (!l) return;
+    vTaskSetThreadLocalStoragePointer(NULL, TLS_PM_BOOST, l);
+    pmLockAcquire(l);
   } else if (!on && held) {
     vTaskSetThreadLocalStoragePointer(NULL, TLS_PM_BOOST, nullptr);
     boostReleaseLean((pm_lock_handle_t)held);
-    boostHolderDel();
   }
 }
 
-void pmBoost(void)    { boostEnsure(); pmLockAcquire(s_boostLock); boostHolderAdd(); }
-void pmBoostEnd(void) { if (s_boostLock && s_boostLock->count > 0) { pmLockRelease(s_boostLock); boostHolderDel(); } }
-
-/* Print the tasks currently pinning the boost lock — the `pm` leak readout. */
-static void pmBoostDumpHolders() {
-  cliPrintf("boost holders:");
-  bool none = true;
-  for (int i = 0; i < BOOST_MAX_HOLDERS; i++)
-    if (s_boostHolders[i]) { cliPrintf(" %s", pcTaskGetName(s_boostHolders[i])); none = false; }
-  cliPrintf(none ? " (none)\n" : "\n");
-}
+void pmBoost(void)    { pm_lock_handle_t l = boostLockEnsure(); if (l) pmLockAcquire(l); }
+void pmBoostEnd(void) { pm_lock_handle_t l = boostLockFind(xTaskGetCurrentTaskHandle());
+                        if (l && l->count > 0) pmLockRelease(l); }
 
 static pm_lock_handle_t usbLock = nullptr;
 RTC_DATA_ATTR static bool rtcUsbDisabled = false;
@@ -532,7 +549,6 @@ static void cmdPm(const char* args) {
     }
 #endif
     pmDumpLocks();
-    pmBoostDumpHolders();
 }
 
 static void cmdTop(const char* args) {
