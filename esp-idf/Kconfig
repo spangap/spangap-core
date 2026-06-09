@@ -152,6 +152,21 @@ config SPANGAP_SDCARD_SPI_FREQ_KHZ
         SPI mode; many cards happily run at 40 MHz with short wiring,
         but 20 MHz is a safe default on shared-bus boards.
 
+config SPANGAP_SDCARD_MAX_FILES
+    int "Max files open at once on the SD card"
+    depends on SPANGAP_SDCARD
+    range 1 20
+    default 6
+    help
+        Upper bound on simultaneously-open files on the FAT/SD volume.
+        FATFS pre-allocates one sector cache per slot at mount, so each
+        unit of this count costs FF_MAX_SS bytes of RAM up front (512 B
+        with CONFIG_WL_SECTOR_SIZE_512, which spangap-core sets by default
+        since it uses LittleFS — not FAT — on internal flash). 6 covers
+        the platform's own users (log stream, fs read/write streams, cron
+        logfile) with headroom; raise it if your app opens many SD files
+        concurrently, lower it to reclaim RAM.
+
 config SPANGAP_APP_PERCENT
     int "App share of available flash (%)"
     range 10 90

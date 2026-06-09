@@ -77,6 +77,26 @@ foreach(_n IN ITEMS spangap-net spangap__spangap-net)
     endif()
 endforeach()
 
+# SD-on-SPI: let sdmmc_cmd.c skip its per-write PSRAM bounce buffer.
+# sdmmc_cmd's sector read/write bounce every PSRAM-sourced transfer through a
+# fresh heap_caps_malloc(512, MALLOC_CAP_DMA) — guarded by the SDMMC
+# *peripheral's* SOC_SDMMC_PSRAM_DMA_CAPABLE (unset on the S3), which is
+# irrelevant to SDSPI. FatFs hands full sectors straight from the caller's
+# (PSRAM) buffer, so that per-write alloc runs constantly and fails with
+# ESP_ERR_NO_MEM (0x101) whenever the internal DMA pool is tight (WiFi + LCD).
+# The SDSPI host already bounces PSRAM sources through its own per-slot buffer,
+# allocated once and reused (esp_driver_sdspi get_block_buf), so sdmmc_cmd's
+# bounce is pure overhead here. Force the cap on for the sdmmc component ONLY
+# when the SD is on SPI — a real SDMMC-peripheral board (BUS_SDMMC) must keep
+# the bounce, as its dedicated DMA genuinely cannot reach PSRAM.
+if(CONFIG_SPANGAP_SDCARD_BUS_SPI)
+    idf_build_get_property(_all_comps BUILD_COMPONENTS)
+    if("sdmmc" IN_LIST _all_comps)
+        idf_component_get_property(_sdmmc_lib sdmmc COMPONENT_LIB)
+        target_compile_definitions(${_sdmmc_lib} PRIVATE SOC_SDMMC_PSRAM_DMA_CAPABLE=1)
+    endif()
+endif()
+
 # Refresh the build-epoch .c every ninja invocation. ALL+BYPRODUCTS forces
 # the script to run each build; the resulting .c is in SRCS so it relinks
 # into libspangap-core.a. Without this, app_build_unix would freeze at the

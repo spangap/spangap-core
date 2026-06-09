@@ -32,6 +32,14 @@ CONFIG_LWIP_PPP_SUPPORT=y
 # WiFi TX — larger BA window + more dynamic TX buffers for bursty video
 CONFIG_ESP_WIFI_TX_BA_WIN=32
 CONFIG_ESP_WIFI_DYNAMIC_TX_BUFFER_NUM=64
+# NOTE: do NOT enable CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP here as a blanket
+# default. On display boards (T-Deck) the LCD/LVGL already claim the internal
+# DMA pool, and moving WiFi/lwIP toward PSRAM tips the WiFi *static* RX buffers
+# (16 × ~1.6 KB, internal-DMA-only — cannot move to PSRAM) over the edge:
+# "malloc buffer fail / Expected to init 16 rx buffer, actual is 12" → WiFi
+# never inits. The display-less seeed board has the internal headroom and sets
+# it per-board. The SD-bounce 0x101 it would have papered over is fixed at the
+# source instead (SD-on-SPI skips the bounce — see spangap-core CMakeLists).
 
 # PSRAM — present on every target; malloc() prefers PSRAM for all allocations.
 # Mode (octal vs quad) is board hardware, so each board sets it in its own
@@ -67,6 +75,14 @@ CONFIG_FREERTOS_USE_TICKLESS_IDLE=y
 # FAT — long filenames (strftime patterns exceed 8.3).
 # exFAT was removed from ESP-IDF 5.4 menuconfig — SD cards must be FAT32.
 CONFIG_FATFS_LFN_HEAP=y
+# FATFS sector size = 512 B (down from IDF's 4096 default). FF_MAX_SS is
+# MAX(512, CONFIG_WL_SECTOR_SIZE), and every per-file cache + the volume window
+# is sized to it. The 4096 default exists only to serve wear-levelled FAT-on-
+# flash — which we don't use (flash is LittleFS; SD is the only FATFS volume and
+# is physically 512 B). Dropping to 512 shrinks each buffer 8× with no downside;
+# IDF's "breaking change" caveat (existing WL partitions become unreadable) does
+# not apply because there is no WL partition. See SPANGAP_SDCARD_MAX_FILES.
+CONFIG_WL_SECTOR_SIZE_512=y
 
 # C++ — no exceptions or RTTI (not used)
 CONFIG_COMPILER_CXX_EXCEPTIONS=n

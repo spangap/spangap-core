@@ -374,7 +374,15 @@ static void cmdDf(const char* a) {
     FATFS* fs;
     DWORD fre_clust;
     if (f_getfree("0:", &fre_clust, &fs) == FR_OK) {
-      uint64_t cs = (uint64_t)fs->csize * fs->ssize;
+      /* FATFS only carries a runtime `ssize` field in variable-sector mode
+       * (FF_MAX_SS != FF_MIN_SS); with a single configured sector size the
+       * size is the compile-time constant FF_MAX_SS. */
+#if FF_MAX_SS != FF_MIN_SS
+      uint32_t ssize = fs->ssize;
+#else
+      uint32_t ssize = FF_MAX_SS;
+#endif
+      uint64_t cs = (uint64_t)fs->csize * ssize;
       total = (uint64_t)(fs->n_fatent - 2) * cs;
       used = total - (uint64_t)fre_clust * cs;
       ok = true;

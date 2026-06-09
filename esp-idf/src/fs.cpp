@@ -46,6 +46,7 @@ static struct {
     FILE* fp;
     bool  active;
     bool  flash;      /* path was on a flash-backed filesystem at open time */
+    bool  sd;         /* path is on the SD card → sub-sector aligned write staging */
 } fileSlots[MAX_FILE_SLOTS];
 
 static struct {
@@ -175,6 +176,45 @@ struct fs_op_t {
 
 static SemaphoreHandle_t fsReady = nullptr;
 
+/* ---- SD write staging ----
+ * Writes to the SD card must reach FatFs's disk_write from a 4-byte-aligned,
+ * at-most-one-sector buffer. Otherwise sdmmc_cmd falls back to a per-write
+ * MALLOC_CAP_DMA bounce buffer, which fails with ESP_ERR_NO_MEM (0x101) when
+ * the internal DMA pool is tight (LCD framebuffers + WiFi). The bus-level fix
+ * (SOC_SDMMC_PSRAM_DMA_CAPABLE for SD-on-SPI, see CMakeLists) covers aligned
+ * PSRAM sources, but FatFs still hands an *unaligned* pointer to disk_write
+ * when a flush spans multiple sectors starting mid-sector (e.g. an append).
+ * Two parts close that gap, for SD files only — LittleFS (flash) writes never
+ * touch sdmmc:
+ *   - fsTuneSdFile(): pin the FILE to a one-sector fully-buffered stdio buffer,
+ *     so every flush is exactly one sector and never a multi-sector run whose
+ *     mid-buffer offset would be unaligned.
+ *   - fsSdFwrite(): write in sub-sector chunks so a single large fwrite can't
+ *     trip newlib's "bypass the buffer, write the caller's buffer straight
+ *     through" optimisation (which would re-introduce the unaligned PSRAM
+ *     source FatFs choked on). */
+#define FS_SD_SECTOR_BYTES 512
+static inline bool fsIsSdPath(const char* p) {
+    return p && strncmp(p, FS_SDCARD "/", sizeof(FS_SDCARD)) == 0;
+}
+static void fsTuneSdFile(FILE* fp, const char* path) {
+    if (fp && fsIsSdPath(path)) setvbuf(fp, nullptr, _IOFBF, FS_SD_SECTOR_BYTES);
+}
+static size_t fsSdFwrite(const void* buf, size_t size, size_t nmemb, FILE* fp, bool sd) {
+    if (!sd || size == 0) return fwrite(buf, size, nmemb, fp);
+    const size_t total = size * nmemb;
+    const uint8_t* p   = (const uint8_t*)buf;
+    size_t done = 0;
+    while (done < total) {
+        size_t n = total - done;
+        if (n >= FS_SD_SECTOR_BYTES) n = FS_SD_SECTOR_BYTES / 2;  /* stay < buffer */
+        size_t w = fwrite(p + done, 1, n, fp);
+        done += w;
+        if (w < n) break;                                        /* short write */
+    }
+    return done / size;
+}
+
 static void handleOp(fs_op_t* req) {
     /* No path rewriting: "/state" and "/sdcard/state" are both real, always-
      * mounted locations. Callers already pass whichever one is active. */
@@ -182,7 +222,9 @@ static void handleOp(fs_op_t* req) {
     case fs_op_t::OPEN: {
         FILE* fp = fopen(req->path, req->path2);
         if (!fp) { req->result = -1; break; }
+        fsTuneSdFile(fp, req->path);
         fileSlots[req->slot].fp = fp;
+        fileSlots[req->slot].sd = fsIsSdPath(req->path);
         req->result = req->slot;
         break;
     }
@@ -193,7 +235,7 @@ static void handleOp(fs_op_t* req) {
     }
     case fs_op_t::WRITE: {
         auto& s = fileSlots[req->slot];
-        req->result = (s.fp) ? (int)fwrite(req->buf, req->size, req->nmemb, s.fp) : 0;
+        req->result = (s.fp) ? (int)fsSdFwrite(req->buf, req->size, req->nmemb, s.fp, s.sd) : 0;
         break;
     }
     case fs_op_t::TELL: {
@@ -414,6 +456,7 @@ struct fs_stream_open_t {
 static struct {
     FILE* fp;
     int   handle;
+    bool  sd;
 } fsStreamSlots[FS_STREAM_MAX_HANDLES];
 
 static int fsStreamSlotFor(int handle) {
@@ -432,8 +475,10 @@ static int fsStreamOnConnect(int handle, const void* data, size_t len) {
     if (slot < 0) return -1;
     FILE* fp = fopen(req.path, req.mode);
     if (!fp) return -1;
+    fsTuneSdFile(fp, req.path);
     fsStreamSlots[slot].fp = fp;
     fsStreamSlots[slot].handle = handle;
+    fsStreamSlots[slot].sd = fsIsSdPath(req.path);
     if (req.triggerLevel > 1) itsSetTriggerLevel(handle, req.triggerLevel);
     return slot;
 }
@@ -441,11 +486,12 @@ static int fsStreamOnConnect(int handle, const void* data, size_t len) {
 static void fsStreamDrain(int slot) {
     FILE* fp = fsStreamSlots[slot].fp;
     int   h  = fsStreamSlots[slot].handle;
+    bool  sd = fsStreamSlots[slot].sd;
     static char drainBuf[2048];
     for (;;) {
         size_t n = itsRecv(h, drainBuf, sizeof(drainBuf), 0);
         if (n == 0) break;
-        fwrite(drainBuf, 1, n, fp);
+        fsSdFwrite(drainBuf, 1, n, fp, sd);
     }
 }
 
@@ -726,7 +772,7 @@ bool fs_mount_sd(void) {
 
     esp_vfs_fat_sdmmc_mount_config_t mount_config = {};
     mount_config.format_if_mount_failed = false;
-    mount_config.max_files = 10;
+    mount_config.max_files = CONFIG_SPANGAP_SDCARD_MAX_FILES;
     mount_config.allocation_unit_size = 16 * 1024;
 
     /* Silence IDF's sdmmc/vfs chatter — empty slot or slow first probe both

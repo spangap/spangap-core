@@ -95,6 +95,34 @@ platform-meta-repo root, not here:
 - `reallyclean.sh` — deep-clean a tree to source-only state; wired into
   `idf.py reallyclean` via `idf_ext.py` in consumer projects.
 
+## Configuration
+
+Most behaviour is driven by the board's pins and the app; a few Kconfig
+knobs are worth knowing (`idf.py menuconfig` → *spangap: spangap-core*):
+
+- **`CONFIG_SPANGAP_SDCARD`** + the bus choice (`…_BUS_SDMMC` /
+  `…_BUS_SPI`) and pins — enable and wire up the SD card.
+- **`CONFIG_SPANGAP_SDCARD_MAX_FILES`** (default **6**) — the cap on
+  files open at once on the SD volume. FATFS pre-allocates one sector
+  cache per slot at mount, so each slot costs `FF_MAX_SS` bytes
+  (512 B by default) of RAM up front. The default covers the platform's
+  own users (log stream, fs read/write streams, cron logfile) with
+  headroom — **raise it if your app opens many SD files concurrently**,
+  lower it to reclaim RAM.
+
+spangap-core's `sdkconfig.defaults.spangap` also pins
+`CONFIG_WL_SECTOR_SIZE_512=y` for all consumers: 512-byte FATFS sectors,
+since we use LittleFS (not FAT) on flash, so the 4 KB wear-levelling
+default would only waste RAM.
+
+On **SD-over-SPI** boards, spangap-core's CMakeLists defines
+`SOC_SDMMC_PSRAM_DMA_CAPABLE=1` for the `sdmmc` component so `sdmmc_cmd`
+skips its per-write PSRAM bounce buffer (a `MALLOC_CAP_DMA` alloc that
+fails with `0x101` when the internal DMA pool is tight) — the SDSPI host
+already bounces PSRAM through a buffer it allocates once. This is gated
+on `CONFIG_SPANGAP_SDCARD_BUS_SPI`; SDMMC-peripheral boards keep the
+bounce because their dedicated DMA genuinely cannot reach PSRAM.
+
 ## Read next
 
 - [INTERNALS.md](INTERNALS.md) — module-by-module deep dive and the

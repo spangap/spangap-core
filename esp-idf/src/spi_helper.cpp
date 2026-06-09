@@ -9,6 +9,7 @@
 #include "spi_helper.h"
 #include "log.h"
 
+#include "driver/gpio.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
@@ -33,5 +34,27 @@ esp_err_t spiHelperInitBus(spi_host_device_t host,
         return ESP_OK;
     }
     err("spiHelperInitBus(host=%d): %s", (int)host, esp_err_to_name(r));
+    return r;
+}
+
+esp_err_t spiHelperEnsureGpioIsr(int intr_flags) {
+    /* One-shot for the whole app. Boot init paths run sequentially, so a plain
+     * flag is enough; the INVALID_STATE handling below keeps even a racing
+     * second caller correct (and quiet). */
+    static bool s_installed = false;
+    if (s_installed) return ESP_OK;
+
+    /* Silence IDF gpio.c's ESP_LOGE("gpio", "GPIO isr service already
+     * installed") — a duplicate install is expected here, not an error. */
+    esp_log_level_t prev = esp_log_level_get("gpio");
+    esp_log_level_set("gpio", ESP_LOG_NONE);
+    esp_err_t r = gpio_install_isr_service(intr_flags);
+    esp_log_level_set("gpio", prev);
+
+    if (r == ESP_OK || r == ESP_ERR_INVALID_STATE /* someone beat us */) {
+        s_installed = true;
+        return ESP_OK;
+    }
+    err("spiHelperEnsureGpioIsr: %s", esp_err_to_name(r));
     return r;
 }

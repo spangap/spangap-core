@@ -55,6 +55,17 @@ esp_err_t spiHelperInitBus(spi_host_device_t host,
 void spiHelperBusLock(void);
 void spiHelperBusUnlock(void);
 
+/** Install the shared GPIO ISR service exactly once for the whole app.
+ *  The display's input INT lines (touch / button / trackball) and the LoRa
+ *  modem's DIO path both need gpio_install_isr_service(); whichever inits
+ *  second otherwise trips IDF gpio.c's ESP_LOGE("gpio", "GPIO isr service
+ *  already installed") even though the ESP_ERR_INVALID_STATE return is
+ *  harmless. Route every caller through here: the first installs, the rest
+ *  are no-ops, and IDF's log line is suppressed across the call. All callers
+ *  must pass the same ESP_INTR_FLAG_* — the first one wins. Returns ESP_OK
+ *  if the service is up (regardless of who installed it). */
+esp_err_t spiHelperEnsureGpioIsr(int intr_flags);
+
 #ifdef __cplusplus
 }
 #endif
