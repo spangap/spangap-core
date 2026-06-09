@@ -116,7 +116,11 @@ set(_SPANGAP_SDKCONFIG_DEFAULTS_LIST "${SDKCONFIG_DEFAULTS}" CACHE INTERNAL "")
 # symlink iff ota is in the build, and that's the authoritative signal. (Reading
 # CONFIG_SPANGAP_OTA from sdkconfig would lag: on first build sdkconfig doesn't
 # exist yet, and the symbol is auto-emitted later in the configure pass.)
-set(_FLASH_MB 8)        # matches spangap default in sdkconfig.defaults.spangap
+# Last-resort fallbacks for a raw `idf.py` build that bypasses spangap-inside.
+# A normal `spangap build` refuses to proceed unless some SDKCONFIG_DEFAULTS
+# layer below actually selects a flash size (see flash_size_configured in
+# spangap-inside), so the scan below overwrites _FLASH_MB with the real value.
+set(_FLASH_MB 8)
 set(_APP_PCT 75)        # matches Kconfig default
 
 set(_PARTGEN_FILES ${SDKCONFIG_DEFAULTS} "${_SDKCONFIG}")
