@@ -11,12 +11,14 @@
 #      and appends the spangap-inside-generated staging/sdkconfig.spangap-overrides
 #      (which carries CLI-driven values like --flash-size). Order: platform
 #      defaults → consumer's sdkconfig.defaults → CLI overrides. Later wins.
-#   2. Runs the sdkconfig.defaults staleness check: if defaults were edited
-#      after the last `idf.py reconfigure` and the user has no manual menuconfig
-#      edits, regenerate sdkconfig automatically. This works around IDF's
-#      one-shot defaults behavior (without it, edited defaults are silently
-#      ignored until you `rm sdkconfig`). The check covers the override file
-#      too, so changing --flash-size between builds takes effect.
+#   2. Runs the sdkconfig.defaults staleness check: if any SDKCONFIG_DEFAULTS
+#      file changed since sdkconfig was last seeded from it, delete sdkconfig so
+#      IDF reseeds from the new defaults. This works around IDF's one-shot
+#      defaults behavior (without it, edited defaults are silently ignored until
+#      you `rm sdkconfig`). The check covers the override file too, so changing
+#      --flash-size between builds takes effect. Suppressed by a
+#      `.spangap-manual-kconfig` marker in the workspace (`spangap menuconfig`
+#      sets it, `spangap autoconfig` clears it) for deliberate hand-tuning.
 #   3. Generates `${CMAKE_SOURCE_DIR}/partitions.csv` from CONFIG_SPANGAP_APP_PERCENT,
 #      CONFIG_ESPTOOLPY_FLASHSIZE_*MB, and whether `staging/components/ota/`
 #      exists (the post-Kconfig-cleanup signal for "OTA is in this build").
@@ -48,17 +50,29 @@ endforeach()
 # sdkconfig once, then sdkconfig is authoritative. Edits to defaults after
 # that point are silently ignored until you `rm sdkconfig`.
 #
-# We compare hashes of every file in SDKCONFIG_DEFAULTS (not mtimes, so
-# `git checkout` doesn't fool us). Two snapshots tracked in build/:
-#   sdkconfig.from_defaults   — sdkconfig right after last regen from defaults
-#   sdkconfig.defaults.hash   — combined hash of all defaults files at last regen
-# If defaults hash changed AND sdkconfig matches its snapshot (no manual
-# menuconfig edits), regenerate. If defaults changed AND user has manual
-# edits, warn and keep their sdkconfig.
+# We undo that: whenever any file in SDKCONFIG_DEFAULTS changes (tracked by a
+# combined content hash in build/sdkconfig.defaults.hash — hashes, not mtimes,
+# so `git checkout` doesn't fool us), we delete sdkconfig so IDF reseeds it from
+# the new defaults. No snapshots, no guessing whether the diff is a real
+# menuconfig edit or just IDF's own churn (new Kconfig symbols, re-evaluated
+# dependencies) — that guess produced false "manual edits" warnings on ordinary
+# builds, because IDF rewrites sdkconfig as a normal part of every build.
+#
+# Opt-out for deliberate hand-tuning: a `.spangap-manual-kconfig` marker in the
+# workspace (dropped by `spangap menuconfig`, removed by `spangap autoconfig`)
+# means "I'm managing sdkconfig by hand — don't clobber it." With the marker
+# present we keep the current sdkconfig and just note that the new defaults
+# aren't being applied. SPANGAP_WORKSPACE is exported by spangap-outside on
+# every docker exec; a raw `idf.py` build (no marker visible) just gets the
+# default auto-regen behavior.
 set(_SDKCONFIG "${CMAKE_SOURCE_DIR}/sdkconfig")
-set(_SDKSNAPSHOT "${CMAKE_BINARY_DIR}/sdkconfig.from_defaults")
 set(_DEFHASH_FILE "${CMAKE_BINARY_DIR}/sdkconfig.defaults.hash")
 set(_SDK_REGENERATED FALSE)
+
+set(_MANUAL_MARKER "")
+if(DEFINED ENV{SPANGAP_WORKSPACE})
+    set(_MANUAL_MARKER "$ENV{SPANGAP_WORKSPACE}/.spangap-manual-kconfig")
+endif()
 
 if(EXISTS "${_SDKCONFIG}" AND EXISTS "${_DEFHASH_FILE}" AND SDKCONFIG_DEFAULTS)
     # Combined hash of all defaults files in order
@@ -75,37 +89,25 @@ if(EXISTS "${_SDKCONFIG}" AND EXISTS "${_DEFHASH_FILE}" AND SDKCONFIG_DEFAULTS)
     string(STRIP "${_DEF_OLD_HASH}" _DEF_OLD_HASH)
 
     if(NOT "${_DEF_NOW_HASH}" STREQUAL "${_DEF_OLD_HASH}")
-        # Defaults changed since last regen.
-        set(_HAS_MANUAL_EDITS FALSE)
-        if(EXISTS "${_SDKSNAPSHOT}")
-            file(SHA256 "${_SDKCONFIG}" _SDK_NOW_HASH)
-            file(SHA256 "${_SDKSNAPSHOT}" _SDK_SNAP_HASH)
-            if(NOT "${_SDK_NOW_HASH}" STREQUAL "${_SDK_SNAP_HASH}")
-                set(_HAS_MANUAL_EDITS TRUE)
-            endif()
+        # Defaults changed since the sdkconfig was last seeded from them.
+        if(_MANUAL_MARKER AND EXISTS "${_MANUAL_MARKER}")
+            message(NOTICE
+                "─ sdkconfig.defaults changed, but manual kconfig mode is on — "
+                "keeping your sdkconfig.\n"
+                "  Run `spangap autoconfig` to drop the marker and reseed from defaults.")
         else()
-            set(_HAS_MANUAL_EDITS TRUE)
-        endif()
-        if(_HAS_MANUAL_EDITS)
-            message(WARNING
-                "  sdkconfig.defaults has changed since this sdkconfig was generated,\n"
-                "  AND sdkconfig has manual menuconfig edits — keeping the current\n"
-                "  sdkconfig and ignoring the new defaults. To accept defaults:\n"
-                "      rm sdkconfig && idf.py reconfigure")
-        else()
-            message(NOTICE "─ sdkconfig.defaults changed, no manual edits — regenerating sdkconfig")
+            message(NOTICE "─ sdkconfig.defaults changed — reseeding sdkconfig from defaults")
             file(REMOVE "${_SDKCONFIG}")
             set(_SDK_REGENERATED TRUE)
         endif()
     endif()
 endif()
 
-# Stash the values into the cache so project_include.cmake can finalize the
-# snapshot post-project (after IDF has read sdkconfig.defaults and possibly
+# Stash the values into the cache so project_include.cmake can record the
+# defaults hash post-project (after IDF has read sdkconfig.defaults and possibly
 # rewritten sdkconfig).
 set(_SPANGAP_SDK_REGENERATED ${_SDK_REGENERATED} CACHE INTERNAL "")
 set(_SPANGAP_SDKCONFIG "${_SDKCONFIG}" CACHE INTERNAL "")
-set(_SPANGAP_SDKSNAPSHOT "${_SDKSNAPSHOT}" CACHE INTERNAL "")
 set(_SPANGAP_DEFHASH_FILE "${_DEFHASH_FILE}" CACHE INTERNAL "")
 set(_SPANGAP_SDKCONFIG_DEFAULTS_LIST "${SDKCONFIG_DEFAULTS}" CACHE INTERNAL "")
 

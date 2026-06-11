@@ -458,6 +458,19 @@ static void cliRequestSessionEnd() {
     if (cliActiveSlot >= 0) cliSlots[cliActiveSlot].pendingClose = true;
 }
 
+/* Single source of truth for the serial CLI's "Returning to log" banner. Every
+ * serial path that hands the console back to the live log view routes through
+ * here — ^D, empty Enter, the `exit` command, and the trailing-';' run-then-
+ * resume. The blank line *after* the message is NOT emitted here: it's written
+ * by the serial task at the moment log output resumes (cliEmitLogResumeGap),
+ * because trailing newlines tacked onto the banner can land after the first
+ * resumed log line — the CLI ITS stream drains a beat late while the (separate)
+ * log task starts writing. */
+static void cliReturnToLog(cli_write_fn write) {
+    cliColorWrite(write, RESET, sizeof(RESET) - 1);
+    write("\r\n\r\nReturning to log\r\n", 22);
+}
+
 /** True if trimmed line ends with ';' — serial CLI's "run this and switch
  *  back to log output" signal. */
 static bool cliLineEndsWithSemicolon(const char* line) {
@@ -764,8 +777,7 @@ static void cliEditChar(cli_edit& e, char c, cli_write_fn write) {
    * usually wants to leave, not edit. */
   if (c == 0x04) {
     if (cliActiveSlot >= 0 && cliSlots[cliActiveSlot].usbSerial) {
-      cliColorWrite(write, RESET, sizeof(RESET) - 1);
-      write("\r\n\r\nReturning to log\r\n\r\n", 23);
+      cliReturnToLog(write);
     } else if (ansi) {
       write("\r\n", 2);
     }
@@ -825,10 +837,9 @@ static void cliEditChar(cli_edit& e, char c, cli_write_fn write) {
       }
       write("\r\n", 2);
       if (resumeLog) {
-        /* Trailing ';' on serial: brief overwrite-style "Returning to log"
-         * before the command runs, so the user knows the view switched. */
-        cliColorWrite(write, RESET, sizeof(RESET) - 1);
-        write("\rReturning to log\r\r", 17);
+        /* Trailing ';' on serial: announce the switch back to log before the
+         * command runs (its output follows the banner). */
+        cliReturnToLog(write);
         serialInCli = false;
       }
       cliOut = write;
@@ -859,8 +870,7 @@ static void cliEditChar(cli_edit& e, char c, cli_write_fn write) {
       if (cliActiveSlot >= 0 && cliSlots[cliActiveSlot].usbSerial) {
         /* Serial: announce the switch then kick back to log view. The main
          * loop disconnects once the banner has drained. */
-        cliColorWrite(write, RESET, sizeof(RESET) - 1);
-        write("\r\n\r\nReturning to log\r\n\r\n", 23);
+        cliReturnToLog(write);
         cliRequestSessionEnd();
       } else if (ansi) {
         /* WS/TCP ANSI: just re-prompt */
@@ -1054,7 +1064,7 @@ static void cliBuiltinInit() {
     cliRegisterCmd("exit", [](const char* a) {
         if (cliWantsHelp(a)) { cliPrintf("%-*s end this CLI session\n", CLI_HELP_COL, "exit"); return; }
         if (cliActiveSlot >= 0 && cliSlots[cliActiveSlot].usbSerial) {
-            cliPrintf("\r\n\r\nReturning to log\r\n\r\n");
+            cliReturnToLog(cliOut);
         }
         cliRequestSessionEnd();
     });
@@ -1305,6 +1315,19 @@ static void serialEmit(const char* p, size_t n) {
   fwrite(p, 1, n, stdout);
 }
 
+/* Emit the blank line that separates a "Returning to log" banner from the
+ * resumed log output, and flush it. Called on the serial task right before
+ * serialInCli is cleared, so it lands while the log task is still suppressed —
+ * the gap is therefore guaranteed to sit between the banner and the first
+ * resumed log line (a trailing newline on the banner itself can drain late and
+ * land after that line instead). A single '\n' is enough: the USB-Serial-JTAG
+ * VFS expands it to "\r\n" exactly as it does for log output. */
+static void cliEmitLogResumeGap() {
+  serialEmit("\n", 1);
+  fflush(stdout);
+  cliFlush();
+}
+
 /* Set true while in CLI mode so logVprintf suppresses its direct-stdout echo
  * (otherwise log lines would interleave with command output / prompts).
  * Declared extern in log.cpp; defined here without extern (definition-with-
@@ -1381,11 +1404,12 @@ static void serialTaskFn(void* arg) {
       }
       fflush(stdout);
       cliFlush();
-      /* Check if CLI kicked us. The CLI side already printed the handoff
-       * banner ("Resuming log" / "Press Ctrl-] to exit monitor") before
-       * disconnecting — stay silent here. */
+      /* Check if CLI kicked us. The CLI side already printed the "Returning to
+       * log" banner before disconnecting; emit the trailing blank line here so
+       * it can't drain late and land after the resumed log output. */
       if (!itsConnected(cliHandle)) {
         cliHandle = -1;
+        cliEmitLogResumeGap();
         serialInCli = false;
       }
     }
@@ -1407,6 +1431,7 @@ static void serialTaskFn(void* arg) {
         cliFlush();
         itsDisconnect(cliHandle);
         cliHandle = -1;
+        cliEmitLogResumeGap();
         serialInCli = false;
       }
     }

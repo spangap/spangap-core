@@ -5,22 +5,22 @@
 # ─── Finalize the sdkconfig.defaults staleness check ───
 # bootstrap.cmake (run pre-project by the consumer) staged the relevant paths
 # in cache vars. Now that IDF has processed sdkconfig.defaults and (re)written
-# sdkconfig, refresh the snapshot files used to detect future drift.
+# sdkconfig, record the combined hash of the defaults files so the next build
+# only reacts to a *further* change. Written unconditionally — first build,
+# auto-reseed, or manual-mode keep alike — so the "defaults changed" signal is
+# edge-triggered: it fires once per change, not on every build. (`spangap
+# autoconfig` reseeds independently by removing sdkconfig, so a hash recorded
+# during manual mode never strands stale defaults.)
 if(_SPANGAP_SDKCONFIG AND EXISTS "${_SPANGAP_SDKCONFIG}")
-    if(_SPANGAP_SDK_REGENERATED OR NOT EXISTS "${_SPANGAP_SDKSNAPSHOT}")
-        configure_file("${_SPANGAP_SDKCONFIG}" "${_SPANGAP_SDKSNAPSHOT}" COPYONLY)
-        # Combined hash of every file currently in SDKCONFIG_DEFAULTS — must match
-        # what bootstrap.cmake compares against on the next build.
-        set(_combined "")
-        foreach(_f IN LISTS _SPANGAP_SDKCONFIG_DEFAULTS_LIST)
-            if(EXISTS "${_f}")
-                file(SHA256 "${_f}" _one)
-                string(APPEND _combined "${_one}")
-            endif()
-        endforeach()
-        string(SHA256 _combined_hash "${_combined}")
-        file(WRITE "${_SPANGAP_DEFHASH_FILE}" "${_combined_hash}\n")
-    endif()
+    set(_combined "")
+    foreach(_f IN LISTS _SPANGAP_SDKCONFIG_DEFAULTS_LIST)
+        if(EXISTS "${_f}")
+            file(SHA256 "${_f}" _one)
+            string(APPEND _combined "${_one}")
+        endif()
+    endforeach()
+    string(SHA256 _combined_hash "${_combined}")
+    file(WRITE "${_SPANGAP_DEFHASH_FILE}" "${_combined_hash}\n")
 endif()
 
 # spangap_create_factory_image([PARTITION <name>] [DATA_DIR <dir>])
