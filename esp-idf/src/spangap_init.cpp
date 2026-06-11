@@ -25,6 +25,7 @@
 #include <ctime>
 #include "esp_littlefs.h"
 #include "esp_system.h"
+#include "hal/wdt_hal.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
@@ -178,6 +179,20 @@ extern "C" void spangapInit(void) {
 }
 
 extern "C" void spangapPostAppInit(void) {
+#if CONFIG_BOOTLOADER_WDT_DISABLE_IN_USER_CODE
+    /* Boot survived: every core foundation AND every straddle's hardware bring-up
+     * (LCD/touch/LoRa/SD, PSRAM, …) ran without wedging. Disable the RTC
+     * (bootloader) watchdog we kept armed across that whole window — IDF skips
+     * its own init_disable_rtc_wdt when we own the disable, so we replicate it
+     * here. Past this point the scheduler's int/task WDTs cover any hang. */
+    {
+        wdt_hal_context_t rwdt = RWDT_HAL_CONTEXT_DEFAULT();
+        wdt_hal_write_protect_disable(&rwdt);
+        wdt_hal_disable(&rwdt);
+        wdt_hal_write_protect_enable(&rwdt);
+    }
+#endif
+
     /* Mark RTC RAM valid so RTC vars survive deep-sleep wake correctly
      * (rtcRamValid() returns false after warm reboot, esp_restart, panic). */
     rtcRamSetValid();

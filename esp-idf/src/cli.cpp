@@ -1038,6 +1038,7 @@ static void cmdUnalias(const char* a) {
 /* ---- External CLI command init functions ---- */
 extern void cliCmdFsInit();
 extern void cliCmdSysInit();
+extern void cliCmdMountInit();
 extern void pmRegisterCmds();
 extern void logRegisterCmds();
 
@@ -1045,6 +1046,7 @@ static void cliBuiltinInit() {
     storageRegisterCmds();
     cliCmdFsInit();
     cliCmdSysInit();
+    cliCmdMountInit();
     pmRegisterCmds();
     logRegisterCmds();
     cliRegisterCmd("alias", cmdAlias);

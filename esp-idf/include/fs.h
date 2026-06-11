@@ -11,6 +11,7 @@
 
 #include <sys/stat.h>
 #include <cstddef>
+#include <cstdint>
 #include <string>
 #include "esp_err.h"
 
@@ -89,9 +90,10 @@ bool fsStateOnSd();
 void fsFormatFlash(void);
 
 /** Reformat the SD card in place (FAT); it stays mounted at /sdcard.
+ *  allocKb is the FAT cluster size in KB; <=0 uses CONFIG_SPANGAP_SDCARD_ALLOC_KB.
  *  Returns false if no card is mounted or SD support is compiled out.
- *  Run on a DRAM stack. Used by `format sd`. */
-bool fsFormatSd(void);
+ *  Run on a DRAM stack. Used by `format sd [KB]`. */
+bool fsFormatSd(int allocKb = 0);
 
 /** LittleFS usage for a partition `label` ("state", "webroot", "fixed_*").
  *  Proxied through the DRAM-stack fs worker — esp_littlefs_info walks
@@ -116,6 +118,10 @@ bool fs_mount_sd(void);
 /** True iff the SD card is mounted at /sdcard. Modules that may write to
  *  /sdcard/... should gate on this. False until fs_mount_sd() succeeds. */
 bool sdAvailable();
+
+/** SD card capacity / used bytes (FAT). Returns false if no card is mounted
+ *  or SD support is compiled out. Either pointer may be null. */
+bool fsSdInfo(uint64_t* totalBytes, uint64_t* usedBytes);
 
 /* ---- Handle-based file operations ---- */
 

@@ -773,7 +773,7 @@ bool fs_mount_sd(void) {
     esp_vfs_fat_sdmmc_mount_config_t mount_config = {};
     mount_config.format_if_mount_failed = false;
     mount_config.max_files = CONFIG_SPANGAP_SDCARD_MAX_FILES;
-    mount_config.allocation_unit_size = 16 * 1024;
+    mount_config.allocation_unit_size = CONFIG_SPANGAP_SDCARD_ALLOC_KB * 1024;
 
     /* Silence IDF's sdmmc/vfs chatter — empty slot or slow first probe both
      * splatter "send_op_cond" / "init failed" lines. We collapse to one warn
@@ -901,13 +901,35 @@ void fsFormatFlash(void) {
 
 /* Reformat the SD card in place (FAT). The card stays mounted at /sdcard.
  * Returns false if no card is mounted or SD support is compiled out. */
-bool fsFormatSd(void) {
+bool fsFormatSd(int allocKb) {
 #if !CONFIG_SPANGAP_SDCARD
+    (void)allocKb;
     return false;
 #else
     if (!sdReady || !sdCard) return false;
-    esp_err_t e = esp_vfs_fat_sdcard_format(FS_SDCARD, sdCard);
+    if (allocKb <= 0) allocKb = CONFIG_SPANGAP_SDCARD_ALLOC_KB;
+    /* Format with the chosen cluster size (small, to limit per-tile waste) —
+     * esp_vfs_fat_sdcard_format() alone uses an IDF default, so pass a cfg. */
+    esp_vfs_fat_mount_config_t fmt = {};
+    fmt.max_files = CONFIG_SPANGAP_SDCARD_MAX_FILES;
+    fmt.allocation_unit_size = (size_t)allocKb * 1024;
+    esp_err_t e = esp_vfs_fat_sdcard_format_cfg(FS_SDCARD, sdCard, &fmt);
     if (e != ESP_OK) { printf("SD format failed: %s\n", esp_err_to_name(e)); return false; }
+    return true;
+#endif
+}
+
+/* SD capacity / usage (FAT), for the `mount` status table. */
+bool fsSdInfo(uint64_t* totalBytes, uint64_t* usedBytes) {
+#if !CONFIG_SPANGAP_SDCARD
+    (void)totalBytes; (void)usedBytes;
+    return false;
+#else
+    if (!sdReady) return false;
+    uint64_t total = 0, freeBytes = 0;
+    if (esp_vfs_fat_info(FS_SDCARD, &total, &freeBytes) != ESP_OK) return false;
+    if (totalBytes) *totalBytes = total;
+    if (usedBytes)  *usedBytes  = total - freeBytes;
     return true;
 #endif
 }

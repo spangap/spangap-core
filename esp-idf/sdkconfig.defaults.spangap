@@ -48,8 +48,20 @@ CONFIG_ESP_WIFI_DYNAMIC_TX_BUFFER_NUM=64
 CONFIG_SPIRAM=y
 CONFIG_SPIRAM_SPEED_80M=y
 CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=0
-# Reserve 48KB of internal DRAM — SDMMC DMA bounce + WiFi/lwIP/mbedTLS need room
-CONFIG_SPIRAM_MALLOC_RESERVE_INTERNAL=49152
+# Reserve internal DRAM for DMA-capable allocations. Consumers that can ONLY
+# live in internal DMA RAM and all peak together at boot: WiFi static RX
+# (16 × ~1.6 KB), mbedTLS/lwIP, and — the one that bites — IDF's spi_master
+# bounce for SD-on-SPI *reads*. Every single-sector SDSPI read transfers
+# 512 B + 2 CRC = 514 B, which is not 4-byte aligned, so spi_master allocates a
+# fresh ~516 B internal-DMA temp buffer per read (esp_driver_spi
+# setup_dma_priv_buffer). At the boot peak (WiFi scan + LCD + LoRa + LXMF
+# opening an SD file) the 48 KB reserve was occasionally exhausted, that tiny
+# alloc returned NULL, and IDF's cleanup path NULL-derefs (memcpy from a
+# never-assigned buffer_to_rcv) → boot-loop. It was a race: most boots lost,
+# one eventually won. 64 KB gives the headroom so the read-bounce can't fail.
+# (This is a *read*-path sibling of the SD-write 0x101 fix; writes were staged
+# aligned, reads go through IDF's own block_buf and can't be pre-aligned here.)
+CONFIG_SPIRAM_MALLOC_RESERVE_INTERNAL=65536
 
 # Per-task heap ownership tracking (for heapDump on malloc failures)
 CONFIG_HEAP_TASK_TRACKING=y
@@ -75,13 +87,19 @@ CONFIG_FREERTOS_USE_TICKLESS_IDLE=y
 # FAT — long filenames (strftime patterns exceed 8.3).
 # exFAT was removed from ESP-IDF 5.4 menuconfig — SD cards must be FAT32.
 CONFIG_FATFS_LFN_HEAP=y
-# FATFS sector size = 512 B (down from IDF's 4096 default). FF_MAX_SS is
-# MAX(512, CONFIG_WL_SECTOR_SIZE), and every per-file cache + the volume window
-# is sized to it. The 4096 default exists only to serve wear-levelled FAT-on-
-# flash — which we don't use (flash is LittleFS; SD is the only FATFS volume and
-# is physically 512 B). Dropping to 512 shrinks each buffer 8× with no downside;
-# IDF's "breaking change" caveat (existing WL partitions become unreadable) does
-# not apply because there is no WL partition. See SPANGAP_SDCARD_MAX_FILES.
+# FATFS sector size = 512 B (down from IDF's 4096 default). FF_MAX_SS is set
+# from the FATFS_SECTOR_SIZE *choice* (NOT from CONFIG_WL_SECTOR_SIZE — that's
+# the wear-levelling layer, and we have no WL partition: flash is LittleFS).
+# Every per-file cache + the volume window is sized to FF_MAX_SS. IDF defaults
+# this choice to 4096, which exists only to serve 4K-sector media / wear-
+# levelled FAT-on-flash. Our SD card is physically 512 B and the allocation
+# unit (SPANGAP_SDCARD_ALLOC_KB, the FAT cluster size) is independent of the
+# sector size — 8 KB clusters are 16 × 512 B sectors, no 4096 sector needed.
+# Dropping to 512 shrinks each per-file cache + the window 8× (~25 KB across
+# max_files=6 + the volume) with no downside. See SPANGAP_SDCARD_MAX_FILES.
+CONFIG_FATFS_SECTOR_512=y
+# WL sector size is irrelevant here (no WL partition) but pin it to 512 too so
+# nothing silently inherits the 4096 default if a WL-backed FAT is ever added.
 CONFIG_WL_SECTOR_SIZE_512=y
 
 # C++ — no exceptions or RTTI (not used)
@@ -117,19 +135,25 @@ CONFIG_LOG_MAXIMUM_LEVEL_DEBUG=y
 # and most consumers).
 CONFIG_ESP_TASK_WDT_CHECK_IDLE_TASK_CPU1=n
 
-# Bootloader (RTC) watchdog — recover fast from an early-boot stall. Before the
-# scheduler exists the task/int WDTs aren't running, so the RTC_WDT (a hardware
-# timer in the RTC domain that fires regardless of CPU state) is the only thing
-# that can break a hang in early init. Motivating case: octal-PSRAM @80MHz
-# bring-up (esp_psram_impl_enable) intermittently spin-waits on a marginal MSPI
-# timing point on the T-Deck's S3R8 — but a short RTC_WDT is a cheap safety net
-# for ANY early stall (PSRAM/flash/cache) on any target. On timeout it resets
-# the chip; the reboot re-tunes/retries and almost always succeeds. The stock
-# 9s feels like a dead hang; 3s recovers quickly. Safe margin: a healthy boot
-# disables the RTC_WDT at init_disable_rtc_wdt (the last SECONDARY sysinit, ~1s
-# in) before any component/Wi-Fi startup, so the watched window never nears 3s.
+# Bootloader (RTC) watchdog — recover from a boot stall anywhere in init. Before
+# the scheduler exists the task/int WDTs aren't running, so the RTC_WDT (a
+# hardware timer in the RTC domain that fires regardless of CPU state) is the
+# only thing that can break a hang. IDF's default disables it at
+# init_disable_rtc_wdt (~1s in, the last SECONDARY sysinit) — which covers the
+# octal-PSRAM @80MHz bring-up spin (esp_psram_impl_enable, marginal MSPI timing
+# on the S3R8) but leaves the LATER window UNGUARDED: every straddle's hardware
+# bring-up (LCD/touch/LoRa/SD I2C+SPI probes) runs after that point, and a stall
+# there wedges forever (observed: sporadic dead hang, ~hourly during dev resets,
+# nothing recovers it). DISABLE_IN_USER_CODE keeps the RTC_WDT armed across the
+# WHOLE boot; spangapPostAppInit() disables it only once every init hook has run
+# (see spangap_init.cpp) — past there the scheduler's WDTs take over. Timeout
+# raised 3s→8s because the watched window now spans all synchronous init (SD
+# mount + storageLoad + EC keygen + hardware probes ≈ a few seconds; everything
+# network is async). Err generous: a too-short timeout would BOOT-LOOP a slow-
+# but-healthy boot, which is worse than ~8s auto-recovery from a real (rare) hang.
 CONFIG_BOOTLOADER_WDT_ENABLE=y
-CONFIG_BOOTLOADER_WDT_TIME_MS=3000
+CONFIG_BOOTLOADER_WDT_DISABLE_IN_USER_CODE=y
+CONFIG_BOOTLOADER_WDT_TIME_MS=8000
 
 # Console over USB Serial JTAG (most spangap targets have no UART pins exposed)
 CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y

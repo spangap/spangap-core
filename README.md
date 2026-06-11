@@ -109,6 +109,13 @@ knobs are worth knowing (`idf.py menuconfig` → *spangap: spangap-core*):
   own users (log stream, fs read/write streams, cron logfile) with
   headroom — **raise it if your app opens many SD files concurrently**,
   lower it to reclaim RAM.
+- **`CONFIG_SPANGAP_SDCARD_ALLOC_KB`** (default **8**) — FAT cluster size
+  used when the firmware *formats* the SD (`fsFormatSd`, format-on-mount-
+  fail). Only affects device-side formats; a card formatted on a computer
+  keeps its own cluster size. Each file rounds up to a whole cluster, so
+  big clusters waste space with many small files (a tree of ~7 KB map tiles
+  on a 64 KB-cluster card uses ~9× its real size). 8 KB ≈ one cluster per
+  tile while keeping the FAT small enough to mount large cards quickly.
 
 spangap-core's `sdkconfig.defaults.spangap` also pins
 `CONFIG_WL_SECTOR_SIZE_512=y` for all consumers: 512-byte FATFS sectors,

@@ -1805,9 +1805,12 @@ static void storageTaskFn(void* arg) {
     /* "" subscription for browser sync means every storageSet fires an aux
      * into our inbox — including changes we ourselves push when processing
      * browser-originated patches. UI bursts (page load, opening cli/log
-     * windows) generate many writes back-to-back; default depth 8 overflows.
-     * Drops show up as "[storage] notify drop" warns when too small. */
-    itsServerInit(0, 64);
+     * windows) AND the ~1 Hz multi-producer stats publish (rnsd + every iface
+     * + auto + tcp peers + lora + gps, >100 keys at once) generate many writes
+     * back-to-back; default depth 8 overflows. Drops show up as "[storage]
+     * notify drop … (inbox full)" warns. Depth is a PSRAM-backed Kconfig knob
+     * (~344 B/slot) so the worst-case burst fits in one drain window. */
+    itsServerInit(0, CONFIG_SPANGAP_STORAGE_NOTIFY_INBOX);
     /* Packet-mode: each DC message is one JSON body (dump, patch, ping).
      * toSize=48K holds the largest browser-originated patch — the IANA
      * timezone DB is ~40K when flattened. fromSize=16K: the full dump now

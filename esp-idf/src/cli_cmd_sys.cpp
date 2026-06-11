@@ -13,6 +13,13 @@
 #include "freertos/task.h"
 #include "freertos/semphr.h"
 
+/* `format sd` is registered unconditionally (it just reports "no SD card" when
+ * SD is compiled out), but this Kconfig only exists when SDCARD is enabled —
+ * give it a harmless fallback so the command compiles on non-SD boards too. */
+#ifndef CONFIG_SPANGAP_SDCARD_ALLOC_KB
+#define CONFIG_SPANGAP_SDCARD_ALLOC_KB 8
+#endif
+
 static void cmdReboot(const char* a) {
     if (cliWantsHelp(a)) { cliPrintf("%-*s restart device\n", CLI_HELP_COL, "reboot"); return; }
     storageSave();  /* flush pending settings before reboot */
@@ -52,7 +59,7 @@ static void cmdResetFactory(const char* a) {
  * `format sd; mkdir /sdcard/state; reboot` races the format. The worker
  * signals `done`, stores `ok`, then self-terminates (a task must not
  * return); the CLI takes the semaphore before continuing. */
-struct FmtCtx { SemaphoreHandle_t done; bool ok; };
+struct FmtCtx { SemaphoreHandle_t done; bool ok; int allocKb; };
 
 static void formatFlashWorker(void* arg) {
     auto* c = (FmtCtx*)arg;
@@ -64,13 +71,13 @@ static void formatFlashWorker(void* arg) {
 
 static void formatSdWorker(void* arg) {
     auto* c = (FmtCtx*)arg;
-    c->ok = fsFormatSd();
+    c->ok = fsFormatSd(c->allocKb);   /* 0 -> CONFIG_SPANGAP_SDCARD_ALLOC_KB */
     xSemaphoreGive(c->done);
     killSelf();
 }
 
-static bool runFmtWorker(TaskFunction_t fn, const char* name) {
-    FmtCtx c{ xSemaphoreCreateBinary(), false };
+static bool runFmtWorker(TaskFunction_t fn, const char* name, int allocKb = 0) {
+    FmtCtx c{ xSemaphoreCreateBinary(), false, allocKb };
     if (!c.done) { cliPrintf("(out of memory)\n"); return false; }
     spawnTask(fn, name, 3072, &c, 1, 0, STACK_DRAM);
     xSemaphoreTake(c.done, portMAX_DELAY);
@@ -87,11 +94,21 @@ static void cmdFormatFlash(const char* a) {
 }
 
 static void cmdFormatSd(const char* a) {
-    if (cliWantsHelp(a)) { cliPrintf("%-*s reformat the SD card (FAT), kept mounted at /sdcard\n", CLI_HELP_COL, "format sd"); return; }
+    if (cliWantsHelp(a)) {
+        cliPrintf("%-*s reformat the SD card (FAT), kept mounted at /sdcard;\n", CLI_HELP_COL, "format sd [KB]");
+        cliPrintf("%-*s optional FAT cluster size in KB (default %d, range 1-128)\n",
+                  CLI_HELP_COL, "", CONFIG_SPANGAP_SDCARD_ALLOC_KB);
+        return;
+    }
     if (!sdAvailable()) { cliPrintf("format sd: no SD card mounted\n"); return; }
-    cliPrintf("formatting SD card...\n");
+    int kb = CONFIG_SPANGAP_SDCARD_ALLOC_KB;
+    if (a && *a) {
+        kb = atoi(a);
+        if (kb < 1 || kb > 128) { cliPrintf("format sd: cluster size must be 1-128 KB (got '%s')\n", a); return; }
+    }
+    cliPrintf("formatting SD card (%d KB clusters)...\n", kb);
     fflush(stdout);
-    bool ok = runFmtWorker(formatSdWorker, "sdfmt");
+    bool ok = runFmtWorker(formatSdWorker, "sdfmt", kb);
     cliPrintf("format sd: %s\n", ok ? "done" : "failed");
 }
 

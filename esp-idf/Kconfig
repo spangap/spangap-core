@@ -167,6 +167,22 @@ config SPANGAP_SDCARD_MAX_FILES
         logfile) with headroom; raise it if your app opens many SD files
         concurrently, lower it to reclaim RAM.
 
+config SPANGAP_SDCARD_ALLOC_KB
+    int "SD format allocation unit (KB)"
+    depends on SPANGAP_SDCARD
+    range 1 128
+    default 8
+    help
+        FAT cluster size (KB) used whenever the firmware formats the SD card
+        (fsFormatSd, and the format-on-mount-fail path). Only affects formats
+        the device performs — a card formatted on a computer keeps its own
+        cluster size. Each file rounds up to a whole cluster, so large clusters
+        waste space with many small files: a tree of ~7 KB map tiles on a
+        64 KB-cluster card uses ~9x its real size. 8 KB ≈ one cluster per tile
+        (near-zero waste) while keeping the FAT small enough to mount quickly on
+        large cards; raise it for fewer/larger files, lower it to trim waste
+        further at the cost of a bigger FAT.
+
 config SPANGAP_APP_PERCENT
     int "App share of available flash (%)"
     range 10 90
@@ -182,6 +198,21 @@ config SPANGAP_APP_PERCENT
 
         Spangap regenerates partitions.csv from this value + flash size +
         OTA on/off at every reconfigure — never edit partitions.csv by hand.
+
+config SPANGAP_STORAGE_NOTIFY_INBOX
+    int "Storage change-notification inbox depth"
+    range 64 1024
+    default 256
+    help
+        Depth of the storage task's change-notification inbox (a PSRAM-backed
+        ITS aux queue). Every storageSet fires one message per matching
+        subscriber, and the storage task itself subscribes to "" for browser /
+        DC sync — so a single ~1 Hz stats publish from many producers (rnsd,
+        each RNS interface, auto, tcp peers, lora, gps) lands a burst of well
+        over a hundred notifications in one drain window. Too small and the
+        burst overflows, logged as "[storage] notify drop … (inbox full)";
+        the dropped write still lands in storage, but its DC republish waits
+        for the next change to that key. Costs ~344 B per slot in PSRAM.
 
 ## CONFIG_SPANGAP_LCD / _WEB / _OTA / _WG / _UPNP / _DUCKDNS / _ACME lived here
 ## until each became its own straddle. They are now auto-generated presence
