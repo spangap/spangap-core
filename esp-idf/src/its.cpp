@@ -6,6 +6,23 @@
 #include "esp_timer.h"
 #include "pm.h"
 #include <string.h>
+#include <atomic>
+#include "sdkconfig.h"
+
+/* Kconfig defaults (see esp-idf/Kconfig). The 0 cases of the per-task
+ * mailbox knobs resolve to these. */
+#ifndef CONFIG_SPANGAP_ITS_INBOX_DEPTH
+#define CONFIG_SPANGAP_ITS_INBOX_DEPTH   32
+#endif
+#ifndef CONFIG_SPANGAP_ITS_INBOX_MSG_MAX
+#define CONFIG_SPANGAP_ITS_INBOX_MSG_MAX 4096
+#endif
+#ifndef CONFIG_SPANGAP_ITS_PKT_DEPTH
+#define CONFIG_SPANGAP_ITS_PKT_DEPTH     16
+#endif
+#ifndef CONFIG_SPANGAP_ITS_MSG_MAX
+#define CONFIG_SPANGAP_ITS_MSG_MAX       65536
+#endif
 
 static const char* TAG = "its";
 
@@ -160,6 +177,186 @@ static StreamBufferHandle_t poolHandle(int idx) {
     return itsPool[idx].handle;
 }
 
+/* ---- Ownership counters (the leak detector) ----
+ * Tracked at the ownership boundary, not at malloc: payloads may be adopted
+ * from foreign allocators (itsSendAuxOwnedByTaskHandle / itsSendOwned) and the
+ * consumer frees with plain free(). Headers and payloads counted separately. */
+struct its_ctr_t {
+    std::atomic<size_t> liveBlocks{0};
+    std::atomic<size_t> liveBytes{0};
+    std::atomic<size_t> hwBlocks{0};
+    std::atomic<size_t> hwBytes{0};
+};
+static its_ctr_t hdrCtr;   /* its_msg headers */
+static its_ctr_t payCtr;   /* payload blocks (mailbox messages + packet-link payloads) */
+
+static inline void ctrAdd(its_ctr_t& c, size_t bytes) {
+    size_t lb = c.liveBlocks.fetch_add(1, std::memory_order_relaxed) + 1;
+    size_t by = c.liveBytes.fetch_add(bytes, std::memory_order_relaxed) + bytes;
+    /* Best-effort high-water (a stat, not a guard) — a racy lost update only
+     * undercounts the peak, never corrupts the live counters. */
+    if (lb > c.hwBlocks.load(std::memory_order_relaxed))
+        c.hwBlocks.store(lb, std::memory_order_relaxed);
+    if (by > c.hwBytes.load(std::memory_order_relaxed))
+        c.hwBytes.store(by, std::memory_order_relaxed);
+}
+static inline void ctrSub(its_ctr_t& c, size_t bytes) {
+    c.liveBlocks.fetch_sub(1, std::memory_order_relaxed);
+    c.liveBytes.fetch_sub(bytes, std::memory_order_relaxed);
+}
+
+/* Payload acquire/release wrappers (the only places payload memory crosses the
+ * ownership boundary). payAlloc allocates+adopts (copying sends); payAdopt
+ * adopts a foreign block (itsSendOwned); payDrop frees+uncounts; payHandoff
+ * uncounts WITHOUT freeing (itsRecvRef — the app now owns the block). */
+static void* payAlloc(size_t len) {
+    if (len == 0) return nullptr;
+    void* p = heap_caps_malloc(len, MALLOC_CAP_SPIRAM);
+    if (p) ctrAdd(payCtr, len);
+    return p;
+}
+static inline void payAdopt(size_t len) { ctrAdd(payCtr, len); }
+static inline void payDrop(void* p, size_t len) {
+    if (!p) return;
+    free(p);
+    ctrSub(payCtr, len);
+}
+static inline void payHandoff(size_t len) { ctrSub(payCtr, len); }
+
+/* ---- Packet-link descriptor rings (ITS_PACKET) ----
+ *
+ * A packet link is a per-connection, per-direction flow of whole messages.
+ * Each direction holds a small ring of 8-byte DESCRIPTORS; the payload bytes
+ * live in separate heap blocks (borrowed per message, freed on read), so idle
+ * cost is ~the ring (depth*8 B) and memory grows only under traffic. This is
+ * what reclaims seccam's 256 KB / storage's 48-16 KB permanent reservations.
+ *
+ * The descriptor ring itself is tiny and POOLED exactly like the stream-buffer
+ * pool above: reused/reset across same-depth connections, NEVER deleted. That
+ * sidesteps the no_pool deletion hazard entirely — a racing sender can never
+ * UAF a freed ring or sem, because nothing is freed. The reclaim comes from
+ * the payloads, not the ring. Single writer and single reader per direction
+ * (stated invariant — the ring and the byte counter rely on it). */
+struct its_desc { uint32_t len; void* ptr; };   /* 8 bytes; one queued message */
+
+struct its_link_t {
+    StreamBufferHandle_t ring;          /* descriptor ring: depth*8 bytes of its_desc */
+    size_t               depth;         /* descriptor slots (records) */
+    size_t               byteCap;       /* backpressure window (payload bytes) */
+    size_t               maxMsg;        /* per-message size guard */
+    std::atomic<size_t>  outstanding;   /* payload bytes currently queued (D9) */
+    volatile size_t      freeNotify;    /* sender's requested free bytes (one-shot) */
+    SemaphoreHandle_t    spaceFreedSem; /* wakes a blocked sender on slot-free/window-open */
+    volatile bool        inUse;
+};
+
+/* Two directions per packet connection, so size for every conn (ITS_MAX_CONNS
+ * = 128) being a packet link — a link is then always available whenever a conn
+ * slot is, matching the old per-conn stream-buffer pool's effective capacity.
+ * itsLinks lives in PSRAM (below), so this costs PSRAM (abundant), not the
+ * scarce internal DRAM. */
+#define ITS_MAX_LINKS 256
+/* PSRAM (task-context-only, like s_tasks): allocated lazily on the first
+ * packet-link connection so it costs nothing until a packet port is used. */
+static its_link_t*  itsLinks = nullptr;
+static int          itsLinkCount = 0;
+static portMUX_TYPE itsLinkMux = portMUX_INITIALIZER_UNLOCKED;
+
+/* Acquire a descriptor ring of `depth` records, with this direction's byte cap
+ * and per-message guard. Reuses a free same-depth slot (reset) or creates one.
+ * Returns an index into itsLinks[], or -1. */
+static int linkAcquire(size_t depth, size_t byteCap, size_t maxMsg) {
+    if (depth == 0) depth = 1;
+    portENTER_CRITICAL(&itsLinkMux);
+    for (int i = 0; i < itsLinkCount; i++) {
+        if (!itsLinks[i].inUse && itsLinks[i].ring && itsLinks[i].depth == depth) {
+            itsLinks[i].inUse = true;
+            itsLinks[i].byteCap = byteCap;
+            itsLinks[i].maxMsg = maxMsg;
+            itsLinks[i].freeNotify = 0;
+            itsLinks[i].outstanding.store(0, std::memory_order_relaxed);
+            portEXIT_CRITICAL(&itsLinkMux);
+            xStreamBufferReset(itsLinks[i].ring);
+            return i;
+        }
+    }
+    int idx = -1;
+    for (int i = 0; i < itsLinkCount; i++)
+        if (!itsLinks[i].inUse && itsLinks[i].ring == nullptr) { idx = i; break; }
+    if (idx < 0) {
+        if (itsLinkCount >= ITS_MAX_LINKS) {
+            portEXIT_CRITICAL(&itsLinkMux);
+            ITS_LOGE("link table full (%d), cannot add depth-%u ring (raise ITS_MAX_LINKS)",
+                     ITS_MAX_LINKS, (unsigned)depth);
+            return -1;
+        }
+        idx = itsLinkCount++;
+        itsLinks[idx].spaceFreedSem = nullptr;
+    }
+    its_link_t& L = itsLinks[idx];
+    L.depth = depth;
+    L.byteCap = byteCap;
+    L.maxMsg = maxMsg;
+    L.freeNotify = 0;
+    L.inUse = true;
+    L.ring = nullptr;
+    L.outstanding.store(0, std::memory_order_relaxed);
+    portEXIT_CRITICAL(&itsLinkMux);
+
+    /* (depth+1) records of headroom: a FreeRTOS stream buffer holds one byte
+     * short of its size, so size it so `depth` whole 8-byte descriptors always
+     * fit. The extra 8 bytes is negligible. */
+    L.ring = xStreamBufferCreateWithCaps((depth + 1) * sizeof(its_desc), sizeof(its_desc),
+                                         MALLOC_CAP_SPIRAM);
+    if (L.spaceFreedSem == nullptr) L.spaceFreedSem = xSemaphoreCreateBinary();
+    if (!L.ring || !L.spaceFreedSem) {
+        ITS_LOGE("link alloc failed for depth-%u ring", (unsigned)depth);
+        return -1;
+    }
+    return idx;
+}
+
+/* Release a link: DRAIN every queued descriptor freeing its payload (the
+ * teardown arm of the ownership rule), reset the ring for reuse, wake any
+ * blocked sender, and mark the slot free. The ring + sem are retained (never
+ * deleted) so a racing sender can't UAF them — it re-checks conn() and bails. */
+static void linkFree(int idx) {
+    if (idx < 0 || idx >= itsLinkCount) return;
+    its_link_t& L = itsLinks[idx];
+    if (L.ring) {
+        its_desc d;
+        while (xStreamBufferBytesAvailable(L.ring) >= sizeof(its_desc) &&
+               xStreamBufferReceive(L.ring, &d, sizeof(its_desc), 0) == sizeof(its_desc))
+            payDrop(d.ptr, d.len);
+        xStreamBufferReset(L.ring);
+    }
+    portENTER_CRITICAL(&itsLinkMux);
+    L.inUse = false;
+    L.freeNotify = 0;
+    L.outstanding.store(0, std::memory_order_relaxed);
+    portEXIT_CRITICAL(&itsLinkMux);
+    /* Wake a sender blocked waiting for space — conn is gone, so it aborts. */
+    if (L.spaceFreedSem) xSemaphoreGive(L.spaceFreedSem);
+}
+
+static inline its_link_t* linkAt(int idx) {
+    return (idx >= 0 && idx < itsLinkCount) ? &itsLinks[idx] : nullptr;
+}
+
+/* Drain a link's queued payloads and reset its ring WITHOUT releasing the slot
+ * (the conn stays active). Used by itsReset. */
+static void linkPurge(int idx) {
+    its_link_t* L = linkAt(idx);
+    if (!L || !L->ring) return;
+    its_desc d;
+    while (xStreamBufferBytesAvailable(L->ring) >= sizeof(its_desc) &&
+           xStreamBufferReceive(L->ring, &d, sizeof(its_desc), 0) == sizeof(its_desc))
+        payDrop(d.ptr, d.len);
+    xStreamBufferReset(L->ring);
+    L->outstanding.store(0, std::memory_order_relaxed);
+    if (L->spaceFreedSem) xSemaphoreGive(L->spaceFreedSem);
+}
+
 /* ---- Pickup semaphore: per-task (in its_task_t.pickupSem)
  * Each task has its own binary sem. ITS_WAIT_PICKUP callers wait on their
  * own sem; receivers give the sender's sem after processing. A task is
@@ -178,12 +375,15 @@ static StreamBufferHandle_t poolHandle(int idx) {
 
 struct its_conn_t {
     volatile bool       active;
-    bool                packetBased;
-    bool                noPool;       /* server opted out of the buffer pool */
+    bool                packetBased;  /* true for ITS_PACKET_LEGACY (framed-in-ring) */
+    uint8_t             kind;         /* its_port_kind_t: STREAM / PACKET_LEGACY / PACKET */
+    bool                noPool;       /* server opted out of the buffer pool (streams) */
     TaskHandle_t        clientTask;
     TaskHandle_t        serverTask;
-    int                 toPoolIdx;
-    int                 fromPoolIdx;
+    int                 toPoolIdx;    /* stream/legacy: client→server ring (pool idx) */
+    int                 fromPoolIdx;  /* stream/legacy: server→client ring (pool idx) */
+    int                 toLinkIdx;    /* ITS_PACKET: client→server descriptor ring */
+    int                 fromLinkIdx;  /* ITS_PACKET: server→client descriptor ring */
     uint16_t            itsPort;
     int8_t              clientRef;
     int8_t              serverRef;
@@ -207,6 +407,8 @@ static int connAlloc() {
             connTable[idx].active = true;
             connTable[idx].toPoolIdx = -1;
             connTable[idx].fromPoolIdx = -1;
+            connTable[idx].toLinkIdx = -1;
+            connTable[idx].fromLinkIdx = -1;
             connTable[idx].clientRef = -1;
             connTable[idx].serverRef = -1;
             connCounter = (idx + 1) % ITS_MAX_CONNS;
@@ -237,12 +439,20 @@ static void connFree(int handle) {
      * second reads -1 and the poolFree calls below no-op. */
     portENTER_CRITICAL(&connMux);
     int toIdx = c->toPoolIdx, fromIdx = c->fromPoolIdx;
+    int toLink = c->toLinkIdx, fromLink = c->fromLinkIdx;
     *c = {};
     c->toPoolIdx = -1;
     c->fromPoolIdx = -1;
+    c->toLinkIdx = -1;
+    c->fromLinkIdx = -1;
     portEXIT_CRITICAL(&connMux);
     poolFree(toIdx);
     poolFree(fromIdx);
+    /* Packet links: drain+free both descriptor rings (frees every in-flight
+     * payload), same race discipline as the pool (read+null under the lock,
+     * so a double close can't double-drain). */
+    linkFree(toLink);
+    linkFree(fromLink);
 }
 
 static its_conn_t* conn(int handle) {
@@ -250,25 +460,68 @@ static its_conn_t* conn(int handle) {
     return connTable[handle].active ? &connTable[handle] : nullptr;
 }
 
-/* ---- Signaling protocol ---- */
+/* ---- Mailbox message header + the one ownership rule ----
+ *
+ * THE OWNERSHIP RULE (this is the whole discipline; every send, receive and
+ * teardown path below is an instance of it):
+ *
+ *   The transport always frees the header. The payload is freed by whoever
+ *   holds it last: by default the transport, immediately after delivery —
+ *   unless the receiver takes it. Ownership transfers on SUCCESS only: a
+ *   backpressure/timeout return leaves an owned payload with the caller.
+ *   Every path that discards a queued message drains it and frees each
+ *   payload. Every ownership entry and exit goes through the counting
+ *   wrappers (msgAlloc/msgFree, payAlloc/payAdopt/payDrop) so a leak is a
+ *   number (see itsStatus), not a hunch.
+ *
+ * The inbox is a FreeRTOS queue of single `its_msg*` pointers. Each points at
+ * a fixed header the transport owns and never looks past; the header carries
+ * only what is needed to route, count and free a message. The payload (or
+ * none) is one separate heap block, freeable with a single free(); it never
+ * carries ownership of other allocations. */
 
-enum {
-    ITS_MSG_CONNECT,
-    ITS_MSG_DISCONNECT,
-    ITS_MSG_AUX,
-    ITS_MSG_FORWARD,
+enum its_kind_t : uint8_t {
+    ITS_K_CONNECT,            /* payload = handshake, or NULL          */
+    ITS_K_DISC_FROM_CLIENT,   /* metadata only (client closed)         */
+    ITS_K_DISC_FROM_SERVER,   /* metadata only; cb = client's disc cb  */
+    ITS_K_FORWARD,            /* payload = forward data                */
+    ITS_K_AUX,                /* payload = aux data                    */
 };
 
-typedef struct {
-    TaskHandle_t sender;
-    uint8_t      msg;
-    int8_t       pickupIdx;
-    uint16_t     itsPort;
-    uint16_t     len;
-    int16_t      handle;
-} its_header_t;
+#define ITS_F_PICKUP 0x01     /* give sender's pickupSem after dispatch */
 
-#define ITS_DEFAULT_INBOX_SIZE  (sizeof(its_header_t) + ITS_MAX_MSG_DATA + 4)
+struct its_msg {              /* one heap allocation; the mailbox slot points at it */
+    uint8_t             kind;
+    uint8_t             flags;
+    uint16_t            port;
+    int16_t             handle;   /* connection handle, or -1                       */
+    int8_t              ref;      /* disconnects: peer's ref for the callback; else -1 */
+    uint8_t             rsvd;
+    TaskHandle_t        sender;   /* for replies / accept-ack / pickup              */
+    its_disconnect_cb_t cb;       /* ITS_K_DISC_FROM_SERVER only; else NULL         */
+    uint32_t            len;      /* payload CONTENT length (not allocation size)   */
+    void*               payload;  /* separate heap block, or NULL                   */
+};
+
+/* Header acquire/release. msgAlloc returns a zeroed header with handle/ref
+ * defaulted to -1; msgFree frees the payload (if still owned) then the
+ * header — the blind teardown drain relies on this freeing ANY message from
+ * the header alone. */
+static its_msg* msgAlloc() {
+    its_msg* m = (its_msg*)heap_caps_malloc(sizeof(its_msg), MALLOC_CAP_SPIRAM);
+    if (!m) return nullptr;
+    *m = {};
+    m->handle = -1;
+    m->ref = -1;
+    ctrAdd(hdrCtr, sizeof(its_msg));
+    return m;
+}
+static void msgFree(its_msg* m) {
+    if (!m) return;
+    if (m->payload) payDrop(m->payload, m->len);
+    free(m);
+    ctrSub(hdrCtr, sizeof(its_msg));
+}
 
 /* ---- Per-task registry ---- */
 
@@ -282,11 +535,14 @@ struct its_aux_entry_t {
 
 struct its_server_port_t {
     bool                  active;
-    bool                  packetBased;
+    bool                  packetBased;  /* derived: kind == ITS_PACKET_LEGACY */
+    uint8_t               kind;         /* its_port_kind_t */
     uint16_t              port;
     int                   maxHandles;
-    size_t                toSize;
+    size_t                toSize;       /* stream/legacy: ring bytes; packet: byte window */
     size_t                fromSize;
+    size_t                depth;        /* ITS_PACKET: descriptor slots per direction */
+    size_t                maxMsg;       /* ITS_PACKET: per-message size guard */
     its_connect_cb_t      onConnect;
     its_busy_cb_t         onBusy;
     its_disconnect_cb_t   onDisconnect;
@@ -313,10 +569,14 @@ struct its_task_t {
     its_aux_entry_t       auxCallbacks[ITS_MAX_PORTS];
     int                   auxCount;
 
-    /* Inbox */
-    QueueHandle_t         inbox;
-    size_t                inboxItemSize;
-    int                   inboxDepth;
+    /* Inbox: a queue of its_msg* pointers. inboxMsgMax is the per-task
+     * payload size guard (floored at ITS_MAX_MSG_DATA). The in-flight payload
+     * bytes currently queued here live in the parallel s_pendingPay[] array
+     * (kept out of this memset-initialized struct so the struct stays
+     * trivially copyable). */
+    QueueHandle_t            inbox;
+    size_t                   inboxMsgMax;
+    int                      inboxDepth;
 
     bool                  isServer;
     bool                  isClient;
@@ -328,10 +588,27 @@ struct its_task_t {
     bool                  no_pool;
 };
 
-static its_task_t s_tasks[ITS_MAX_TASKS];
-static int        s_taskCount = 0;
+/* s_tasks is large (~23 KB: each entry holds serverPorts[8] + auxCallbacks[8]
+ * + inbox plumbing) and is task-context-only — never touched from an ISR or a
+ * cache-disabled window — so it lives in PSRAM, not internal DRAM, which is the
+ * scarce/DMA-capable pool on display+radio boards. Allocated lazily on the
+ * first task registration. */
+static its_task_t* s_tasks = nullptr;
+static int         s_taskCount = 0;
+
+/* In-flight payload bytes queued in each task's inbox, parallel to s_tasks[]
+ * (kept out of its_task_t so that struct stays memset-able). Senders increment
+ * on enqueue, the receiving task decrements on dispatch — multiple writers, so
+ * atomic. Slots are append-only (s_tasks never shrinks), so an index is stable
+ * for a task's lifetime. */
+static std::atomic<size_t> s_pendingPay[ITS_MAX_TASKS];
+
+static inline std::atomic<size_t>& pendingPayOf(its_task_t* t) {
+    return s_pendingPay[t - s_tasks];
+}
 
 static its_task_t* taskFind(TaskHandle_t task) {
+    if (!s_tasks) return nullptr;                 /* no task registered yet */
     for (int i = 0; i < s_taskCount; i++)
         if (s_tasks[i].task == task) return &s_tasks[i];
     return nullptr;
@@ -340,6 +617,18 @@ static its_task_t* taskFind(TaskHandle_t task) {
 static its_task_t* taskFindOrCreate(TaskHandle_t task, size_t inboxMaxMsgLen, size_t inboxDepth) {
     its_task_t* e = taskFind(task);
     if (e) return e;
+    if (!s_tasks) {
+        /* First registration: allocate the big task-context tables in PSRAM
+         * (zeroed). Done here — before any connection can exist — so packet
+         * connects find itsLinks ready without a concurrent lazy-alloc race
+         * (ITS registration is effectively serialized at boot, same assumption
+         * the lock-free s_taskCount already relies on). */
+        s_tasks = (its_task_t*)heap_caps_calloc(ITS_MAX_TASKS, sizeof(its_task_t),
+                                                MALLOC_CAP_SPIRAM);
+        itsLinks = (its_link_t*)heap_caps_calloc(ITS_MAX_LINKS, sizeof(its_link_t),
+                                                 MALLOC_CAP_SPIRAM);
+        if (!s_tasks || !itsLinks) { ITS_LOGE("ITS table alloc failed"); return nullptr; }
+    }
     if (s_taskCount >= ITS_MAX_TASKS) {
         ITS_LOGE("task table full (max %d)", ITS_MAX_TASKS);
         return nullptr;
@@ -350,19 +639,24 @@ static its_task_t* taskFindOrCreate(TaskHandle_t task, size_t inboxMaxMsgLen, si
     e->task = task;
     e->ackHandle = -1;
     e->pickupSem = xSemaphoreCreateBinary();
+    pendingPayOf(e).store(0, std::memory_order_relaxed);
 
-    size_t itemSize = inboxMaxMsgLen > 0 ? (sizeof(its_header_t) + inboxMaxMsgLen)
-                                         : ITS_DEFAULT_INBOX_SIZE;
-    int depth = inboxDepth > 0 ? (int)inboxDepth : 8;
-    e->inboxItemSize = itemSize;
+    /* inboxMaxMsgLen is now a per-task PAYLOAD size guard, floored at
+     * ITS_MAX_MSG_DATA so small-guard tasks never regress below today's cap
+     * (320). 0 = the Kconfig default. The queue item is always one pointer. */
+    size_t guard = inboxMaxMsgLen > 0 ? inboxMaxMsgLen
+                                      : (size_t)CONFIG_SPANGAP_ITS_INBOX_MSG_MAX;
+    if (guard < ITS_MAX_MSG_DATA) guard = ITS_MAX_MSG_DATA;
+    int depth = inboxDepth > 0 ? (int)inboxDepth : CONFIG_SPANGAP_ITS_INBOX_DEPTH;
+    e->inboxMsgMax = guard;
     e->inboxDepth = depth;
-    /* PSRAM-backed: ITS is task-context only — no ISR may call
-     * itsSend/itsSendAux. ISRs should set a heap flag + use
-     * vTaskNotifyGiveFromISR instead (PSRAM is unreachable from ISRs
-     * during cache-disabled windows; xQueueSendFromISR on a PSRAM
-     * queue would crash). See docs/its.md "ISR safety". The big win
-     * is storage's depth-64 inbox: ~22 KB reclaimed from DRAM. */
-    e->inbox = xQueueCreateWithCaps(depth, itemSize, MALLOC_CAP_SPIRAM);
+    /* PSRAM-backed queue of its_msg* pointers: ITS is task-context only — no
+     * ISR may call itsSend/itsSendAux. ISRs should set a heap flag + use
+     * vTaskNotifyGiveFromISR instead (PSRAM is unreachable from ISRs during
+     * cache-disabled windows; xQueueSendFromISR on a PSRAM queue would
+     * crash). See docs/its.md "ISR safety". Slots are pointers (~4 B), so the
+     * inbox storage is tiny and payloads are borrowed per-message on demand. */
+    e->inbox = xQueueCreateWithCaps(depth, sizeof(its_msg*), MALLOC_CAP_SPIRAM);
     return e;
 }
 
@@ -377,22 +671,68 @@ static its_server_port_t* portFind(its_task_t* t, uint16_t port) {
     return nullptr;
 }
 
-/* ---- Inbox helpers ---- */
-
-static bool inboxSend(its_task_t* target, const void* data, size_t len,
-                      TickType_t timeout) {
-    if (!target->inbox || len > target->inboxItemSize) return false;
-    /* xQueueSend reads exactly inboxItemSize bytes. Pad if needed. */
-    const void* item = data;
-    uint8_t* padBuf = nullptr;
-    if (len < target->inboxItemSize) {
-        padBuf = (uint8_t*)alloca(target->inboxItemSize);
-        memcpy(padBuf, data, len);
-        item = padBuf;
-    }
-    if (xQueueSend(target->inbox, item, timeout) != pdTRUE) return false;
+/* ---- Inbox helpers ----
+ *
+ * inboxEnqueue takes a fully-built its_msg* and posts the pointer. On SUCCESS
+ * ownership transfers to the receiver (do not touch the message after); on
+ * failure ownership stays with the caller (who frees it / returns it). The
+ * payload-byte accounting for itsTaskMem follows the same boundary: charged
+ * to the target on enqueue, credited back by the target on dispatch. */
+static bool inboxEnqueue(its_task_t* target, its_msg* m, TickType_t timeout) {
+    if (!target || !target->inbox) return false;
+    size_t plen = m->payload ? m->len : 0;
+    if (xQueueSend(target->inbox, &m, timeout) != pdTRUE) return false;
+    if (plen) pendingPayOf(target).fetch_add(plen, std::memory_order_relaxed);
     xTaskNotifyGive(target->task);
     return true;
+}
+
+/* Drain-and-free: the only thing allowed to discard mailbox contents. Frees
+ * every queued payload and header through the wrappers. Tasks never actually
+ * die today (s_tasks never shrinks), so this is future-proofing for task
+ * teardown — but it is the mailbox arm of the discipline at the top of the
+ * file, kept here so the rule reads the same for every transport. */
+[[maybe_unused]] static void inboxDrain(its_task_t* t) {
+    if (!t || !t->inbox) return;
+    its_msg* m = nullptr;
+    while (xQueueReceive(t->inbox, &m, 0) == pdTRUE) {
+        size_t plen = m->payload ? m->len : 0;
+        if (plen) pendingPayOf(t).fetch_sub(plen, std::memory_order_relaxed);
+        msgFree(m);
+    }
+}
+
+/* Build a COPYING message: allocate the header and, if data is present, copy
+ * it into a fresh payload block. Enforces the target's payload guard by
+ * REJECTING (returning nullptr) rather than silently truncating — the old
+ * clamp-and-deliver behavior was always a latent corruption. Caller owns the
+ * returned message until inboxEnqueue succeeds. */
+static its_msg* buildCopyMsg(uint8_t kind, uint16_t port, int handle,
+                             const void* data, size_t len, its_task_t* target,
+                             const char* what) {
+    if (len > target->inboxMsgMax) {
+        ITS_LOGE("%s payload %u exceeds [%s] mailbox guard %u (rejected)",
+                 what, (unsigned)len, pcTaskGetName(target->task),
+                 (unsigned)target->inboxMsgMax);
+        return nullptr;
+    }
+    its_msg* m = msgAlloc();
+    if (!m) { ITS_LOGE("%s: header alloc failed", what); return nullptr; }
+    m->kind = kind;
+    m->port = port;
+    m->handle = (int16_t)handle;
+    m->sender = xTaskGetCurrentTaskHandle();
+    m->len = (uint32_t)len;
+    if (data && len > 0) {
+        m->payload = payAlloc(len);
+        if (!m->payload) {
+            ITS_LOGE("%s: payload alloc failed (%u B)", what, (unsigned)len);
+            msgFree(m);
+            return nullptr;
+        }
+        memcpy(m->payload, data, len);
+    }
+    return m;
 }
 
 /* ---- Handle resolution ---- */
@@ -438,6 +778,115 @@ static TaskHandle_t remoteOf(int handle) {
     return nullptr;
 }
 
+/* Packet-link direction resolvers: the link this task SENDS into / RECVS from
+ * for `handle`. nullptr if not a packet link or not an endpoint of it. */
+static its_link_t* sendLink(int handle) {
+    its_conn_t* c = conn(handle);
+    if (!c || c->kind != ITS_PACKET) return nullptr;
+    TaskHandle_t me = xTaskGetCurrentTaskHandle();
+    if (me == c->clientTask) return linkAt(c->toLinkIdx);
+    if (me == c->serverTask) return linkAt(c->fromLinkIdx);
+    return nullptr;
+}
+static its_link_t* recvLink(int handle) {
+    its_conn_t* c = conn(handle);
+    if (!c || c->kind != ITS_PACKET) return nullptr;
+    TaskHandle_t me = xTaskGetCurrentTaskHandle();
+    if (me == c->clientTask) return linkAt(c->fromLinkIdx);
+    if (me == c->serverTask) return linkAt(c->toLinkIdx);
+    return nullptr;
+}
+
+/* Wake a packet-link sender blocked on backpressure: the receiver just freed a
+ * descriptor slot and dropped `outstanding`, so a send waiting for either may
+ * now proceed. One-shot freeNotify mirrors the stream path. */
+static inline void linkWakeSender(int handle, its_link_t* L) {
+    if (L->spaceFreedSem) xSemaphoreGive(L->spaceFreedSem);
+    TaskHandle_t sender = remoteOf(handle);
+    if (sender) xTaskNotifyGive(sender);
+}
+
+/* Bytes the send-direction link would accept from itsSend(timeout=0) right now:
+ * 0 if no descriptor slot is free (the slot clause check-then-send callers
+ * depend on), else the open window — and a full maxMsg when the link is idle so
+ * a single large message is always admissible. */
+static size_t linkSendSpace(its_link_t* L) {
+    if (xStreamBufferSpacesAvailable(L->ring) < sizeof(its_desc)) return 0;
+    size_t out = L->outstanding.load(std::memory_order_relaxed);
+    if (out == 0) return L->maxMsg;
+    return out < L->byteCap ? (L->byteCap - out) : 0;
+}
+
+/* True if a descriptor slot is free AND the byte window admits `len` (a single
+ * message is always admissible into an empty link, even if len > byteCap). */
+static bool linkCanSend(its_link_t* L, size_t len) {
+    if (xStreamBufferSpacesAvailable(L->ring) < sizeof(its_desc)) return false;
+    size_t out = L->outstanding.load(std::memory_order_relaxed);
+    return out == 0 || out + len <= L->byteCap;
+}
+
+/* Block until the send-direction link can admit `len`, the conn tears down, or
+ * timeout. Single writer per direction, so once linkCanSend is true nothing
+ * else shrinks the room before we enqueue. Returns false on timeout/teardown. */
+static bool linkWaitForSpace(int handle, its_link_t* L, size_t len, TickType_t timeout) {
+    if (linkCanSend(L, len)) return true;
+    if (timeout == 0) return false;
+    TickType_t start = xTaskGetTickCount();
+    TickType_t remaining = timeout;
+    for (;;) {
+        xSemaphoreTake(L->spaceFreedSem, 0);     /* clear stale signal */
+        L->freeNotify = len;
+        if (linkCanSend(L, len)) { L->freeNotify = 0; return true; }
+        BaseType_t got = xSemaphoreTake(L->spaceFreedSem, remaining);
+        if (!conn(handle)) { L->freeNotify = 0; return false; }  /* torn down */
+        if (got == pdTRUE && linkCanSend(L, len)) { L->freeNotify = 0; return true; }
+        if (timeout != portMAX_DELAY) {
+            TickType_t elapsed = xTaskGetTickCount() - start;
+            if (elapsed >= timeout) break;
+            remaining = timeout - elapsed;
+        } else if (got != pdTRUE) {
+            /* portMAX_DELAY take should not spuriously return without a give;
+             * loop and re-check. */
+        }
+    }
+    L->freeNotify = 0;
+    return false;
+}
+
+/* Enqueue one descriptor (payload already owned/counted). Single writer, and
+ * the caller has confirmed a slot via linkWaitForSpace, so the send is
+ * non-blocking and cannot fail. Charges the byte window, then notifies recv. */
+static void linkEnqueue(int handle, its_link_t* L, void* ptr, size_t len) {
+    its_desc d = { (uint32_t)len, ptr };
+    L->outstanding.fetch_add(len, std::memory_order_relaxed);
+    xStreamBufferSend(L->ring, &d, sizeof(its_desc), 0);
+    TaskHandle_t remote = remoteOf(handle);
+    if (remote) xTaskNotifyGive(remote);
+}
+
+/* Pop one descriptor (or return false if none within timeout). Decrements the
+ * byte window and wakes the sender. The payload is handed to the caller; the
+ * caller decides whether to copy+free (itsRecv) or hand off (itsRecvRef). */
+static bool linkDequeue(int handle, its_link_t* L, its_desc* out, TickType_t timeout) {
+    TickType_t start = xTaskGetTickCount();
+    TickType_t remaining = timeout;
+    while (xStreamBufferBytesAvailable(L->ring) < sizeof(its_desc)) {
+        if (remaining == 0) return false;
+        ulTaskNotifyTake(pdFALSE, remaining);
+        if (!conn(handle)) return false;
+        if (xStreamBufferBytesAvailable(L->ring) >= sizeof(its_desc)) break;
+        if (timeout != portMAX_DELAY) {
+            TickType_t elapsed = xTaskGetTickCount() - start;
+            remaining = (elapsed >= timeout) ? 0 : (timeout - elapsed);
+        }
+    }
+    if (xStreamBufferReceive(L->ring, out, sizeof(its_desc), 0) != sizeof(its_desc))
+        return false;
+    L->outstanding.fetch_sub(out->len, std::memory_order_relaxed);
+    linkWakeSender(handle, L);
+    return true;
+}
+
 static int serverPortActiveCount(its_task_t* t, uint16_t port) {
     int count = 0;
     for (int i = 0; i < ITS_MAX_CONNS; i++)
@@ -449,28 +898,26 @@ static int serverPortActiveCount(its_task_t* t, uint16_t port) {
 
 /* ---- Inbox message dispatch ---- */
 
-static void processInboxMsg(its_task_t* me, uint8_t* buf) {
-    auto* hdr = (its_header_t*)buf;
-    void* payload = buf + sizeof(its_header_t);
-    int pickupIdx = hdr->pickupIdx;
+static void processInboxMsg(its_task_t* me, its_msg* m) {
+    void* payload = m->payload;          /* borrowed for the dispatch; freed below */
 
-    if (hdr->msg == ITS_MSG_CONNECT && me->isServer) {
-        its_server_port_t* sp = portFind(me, hdr->itsPort);
+    if (m->kind == ITS_K_CONNECT && me->isServer) {
+        its_server_port_t* sp = portFind(me, m->port);
         if (!sp) {
             ITS_LOGE("connect to unopened port %u (from [%s])",
-                     hdr->itsPort, pcTaskGetName(hdr->sender));
-            its_task_t* cli = taskFind(hdr->sender);
+                     m->port, pcTaskGetName(m->sender));
+            its_task_t* cli = taskFind(m->sender);
             if (cli) { cli->ackHandle = -1; xSemaphoreGive(cli->ackSem); }
             goto done;
         }
 
-        bool full = serverPortActiveCount(me, hdr->itsPort) >= sp->maxHandles;
+        bool full = serverPortActiveCount(me, m->port) >= sp->maxHandles;
         if (full && sp->onBusy) {
-            if (!sp->onBusy(payload, hdr->len))
-                full = serverPortActiveCount(me, hdr->itsPort) >= sp->maxHandles;
+            if (!sp->onBusy(payload, m->len))
+                full = serverPortActiveCount(me, m->port) >= sp->maxHandles;
         }
 
-        its_task_t* cli = taskFind(hdr->sender);
+        its_task_t* cli = taskFind(m->sender);
 
         int handle = -1;
         if (!full && cli) handle = connAlloc();
@@ -478,30 +925,47 @@ static void processInboxMsg(its_task_t* me, uint8_t* buf) {
         bool accepted = false;
         if (handle >= 0) {
             its_conn_t* c = &connTable[handle];
-            c->clientTask = hdr->sender;
+            c->clientTask = m->sender;
             c->serverTask = me->task;
-            c->itsPort = hdr->itsPort;
+            c->itsPort = m->port;
+            c->kind = sp->kind;
             c->packetBased = sp->packetBased;
             c->noPool = me->no_pool;
             bool buffersOk = true;
-            if (sp->toSize > 0) {
-                c->toPoolIdx = poolGet(sp->toSize, me->no_pool);
-                if (c->toPoolIdx < 0) {
-                    ITS_LOGE("port %u rejected: no pool stream >= %u for to-buffer "
-                             "(client %s -> server %s)",
-                             hdr->itsPort, (unsigned)sp->toSize,
-                             pcTaskGetName(hdr->sender), pcTaskGetName(me->task));
-                    buffersOk = false;
+            if (sp->kind == ITS_PACKET) {
+                /* Packet link: a descriptor ring per non-zero direction. The
+                 * byte caps are lazy windows, not reservations. */
+                if (sp->toSize > 0) {
+                    c->toLinkIdx = linkAcquire(sp->depth, sp->toSize, sp->maxMsg);
+                    if (c->toLinkIdx < 0) buffersOk = false;
                 }
-            }
-            if (sp->fromSize > 0) {
-                c->fromPoolIdx = poolGet(sp->fromSize, me->no_pool);
-                if (c->fromPoolIdx < 0) {
-                    ITS_LOGE("port %u rejected: no pool stream >= %u for from-buffer "
-                             "(client %s -> server %s)",
-                             hdr->itsPort, (unsigned)sp->fromSize,
-                             pcTaskGetName(hdr->sender), pcTaskGetName(me->task));
-                    buffersOk = false;
+                if (buffersOk && sp->fromSize > 0) {
+                    c->fromLinkIdx = linkAcquire(sp->depth, sp->fromSize, sp->maxMsg);
+                    if (c->fromLinkIdx < 0) buffersOk = false;
+                }
+                if (!buffersOk)
+                    ITS_LOGE("port %u rejected: no link ring (client %s -> server %s)",
+                             m->port, pcTaskGetName(m->sender), pcTaskGetName(me->task));
+            } else {
+                if (sp->toSize > 0) {
+                    c->toPoolIdx = poolGet(sp->toSize, me->no_pool);
+                    if (c->toPoolIdx < 0) {
+                        ITS_LOGE("port %u rejected: no pool stream >= %u for to-buffer "
+                                 "(client %s -> server %s)",
+                                 m->port, (unsigned)sp->toSize,
+                                 pcTaskGetName(m->sender), pcTaskGetName(me->task));
+                        buffersOk = false;
+                    }
+                }
+                if (sp->fromSize > 0) {
+                    c->fromPoolIdx = poolGet(sp->fromSize, me->no_pool);
+                    if (c->fromPoolIdx < 0) {
+                        ITS_LOGE("port %u rejected: no pool stream >= %u for from-buffer "
+                                 "(client %s -> server %s)",
+                                 m->port, (unsigned)sp->fromSize,
+                                 pcTaskGetName(m->sender), pcTaskGetName(me->task));
+                        buffersOk = false;
+                    }
                 }
             }
 
@@ -509,7 +973,7 @@ static void processInboxMsg(its_task_t* me, uint8_t* buf) {
                 if (!sp->onConnect) {
                     accepted = true;
                 } else {
-                    int sRef = sp->onConnect(handle, payload, hdr->len);
+                    int sRef = sp->onConnect(handle, payload, m->len);
                     accepted = sRef >= 0;
                     if (accepted) c->serverRef = (int8_t)sRef;
                 }
@@ -522,84 +986,81 @@ static void processInboxMsg(its_task_t* me, uint8_t* buf) {
             xSemaphoreGive(cli->ackSem);
         }
 
-    } else if (hdr->msg == ITS_MSG_DISCONNECT && me->isServer &&
-               /* Payload form distinguishes the disconnect direction so dual
-                * server+client tasks (e.g. sshd) route both kinds correctly.
-                * Client-side close → len==1 (just serverRef). Server-side
-                * close → len==1+sizeof(cb) (clientRef + embedded callback).
-                * Without this check, sshd's me->isServer=true short-circuits
-                * the dispatch and the client-side cb path at line 540+
-                * never runs — silently dropping cli→sshd disconnects. */
-               hdr->len == 1) {
-        int handle = hdr->handle;
-        int8_t ref = -1;
-        uint16_t port = hdr->itsPort;
+    } else if (m->kind == ITS_K_DISC_FROM_CLIENT) {
+        /* A client closed a connection to me-as-server. The kind (D8) makes
+         * the direction unambiguous, so a dual server+client task (sshd)
+         * routes this to the server-role path regardless of its client role.
+         * ref/port are read from the live conn if it still exists, else from
+         * the metadata-only header (conn already freed). */
+        int handle = m->handle;
+        int8_t ref = m->ref;
+        uint16_t port = m->port;
         its_conn_t* c = conn(handle);
-        if (c && c->serverTask == me->task && c->clientTask == hdr->sender) {
+        if (c && c->serverTask == me->task && c->clientTask == m->sender) {
             ref = c->serverRef;
             port = c->itsPort;
             connFree(handle);
-        } else if (hdr->len >= 1) {
-            ref = (int8_t)((uint8_t*)payload)[0];
         }
         its_server_port_t* sp = portFind(me, port);
         if (sp && sp->onDisconnect && ref >= 0) sp->onDisconnect(ref);
 
-    } else if (hdr->msg == ITS_MSG_DISCONNECT && me->isClient) {
-        int handle = hdr->handle;
-        int8_t ref = -1;
-        its_disconnect_cb_t cb = nullptr;
+    } else if (m->kind == ITS_K_DISC_FROM_SERVER) {
+        /* A server closed my client connection. cb travels in the header so
+         * the conn can be freed before I wake (no payload allocation). */
+        int handle = m->handle;
+        int8_t ref = m->ref;
+        its_disconnect_cb_t cb = m->cb;
         its_conn_t* c = conn(handle);
-        if (c && c->clientTask == me->task && c->serverTask == hdr->sender) {
-            /* Conn still exists — read cb from connection table */
+        if (c && c->clientTask == me->task && c->serverTask == m->sender) {
             ref = c->clientRef;
             cb = c->cliDisconnectCb;
             connFree(handle);
-        } else if (hdr->len >= 1 + sizeof(cb)) {
-            /* Conn already freed (server disconnected) — cb embedded in payload */
-            ref = (int8_t)((uint8_t*)payload)[0];
-            memcpy(&cb, (uint8_t*)payload + 1, sizeof(cb));
-        } else if (hdr->len >= 1) {
-            ref = (int8_t)((uint8_t*)payload)[0];
         }
         if (ref >= 0 && cb) cb(ref);
 
-    } else if (hdr->msg == ITS_MSG_FORWARD && me->isServer) {
-        int handle = hdr->handle;
+    } else if (m->kind == ITS_K_FORWARD && me->isServer) {
+        int handle = m->handle;
         its_conn_t* c = conn(handle);
         if (c && c->serverTask == me->task) {
-            its_server_port_t* sp = portFind(me, hdr->itsPort);
+            its_server_port_t* sp = portFind(me, m->port);
             if (!sp) {
                 ITS_LOGE("forwarded conn arrived for unopened port %u (from [%s])",
-                         hdr->itsPort, pcTaskGetName(hdr->sender));
+                         m->port, pcTaskGetName(m->sender));
                 itsDisconnect(handle);
             } else {
+                c->kind = sp->kind;
                 c->packetBased = sp->packetBased;
-                if (sp->onConnect && sp->onConnect(handle, payload, hdr->len) < 0)
+                if (sp->onConnect && sp->onConnect(handle, payload, m->len) < 0)
                     itsDisconnect(handle);
             }
         }
 
-    } else if (hdr->msg == ITS_MSG_AUX) {
+    } else if (m->kind == ITS_K_AUX) {
         its_aux_cb_t cb = nullptr;
         for (int i = 0; i < me->auxCount; i++) {
-            if (me->auxCallbacks[i].active && me->auxCallbacks[i].port == hdr->itsPort) {
+            if (me->auxCallbacks[i].active && me->auxCallbacks[i].port == m->port) {
                 cb = me->auxCallbacks[i].cb;
                 break;
             }
         }
-        if (cb) cb(hdr->sender, payload, hdr->len);
+        if (cb) cb(m->sender, payload, m->len);
         else ITS_LOGE("aux to unregistered port %u (from [%s])",
-                      hdr->itsPort, pcTaskGetName(hdr->sender));
+                      m->port, pcTaskGetName(m->sender));
     }
 
 done:
-    if (pickupIdx > 0) {
-        /* Release sender's per-task pickup sem. No-op if sender isn't
-         * registered (shouldn't happen: ITS_WAIT_PICKUP forces registration). */
-        its_task_t* s = taskFind(hdr->sender);
+    if (m->flags & ITS_F_PICKUP) {
+        /* Release sender's per-task pickup sem after dispatch. No-op if the
+         * sender isn't registered (shouldn't happen: ITS_WAIT_PICKUP forces
+         * registration). */
+        its_task_t* s = taskFind(m->sender);
         if (s && s->pickupSem) xSemaphoreGive(s->pickupSem);
     }
+    /* Ownership exit: credit the in-flight bytes back to this task, then free
+     * the payload (the receiver never took it in step 1) and the header. */
+    size_t plen = m->payload ? m->len : 0;
+    if (plen) pendingPayOf(me).fetch_sub(plen, std::memory_order_relaxed);
+    msgFree(m);
 }
 
 /* ---- Receive callback dispatch ---- */
@@ -614,18 +1075,36 @@ static bool dispatchRecvCallbacks(its_task_t* me) {
         if (!isServer && !isClient) continue;
 
         its_recv_cb_t cb = nullptr;
-        StreamBufferHandle_t buf = nullptr;
         if (isServer) {
             its_server_port_t* sp = portFind(me, c->itsPort);
             if (sp) cb = sp->onRecv;
-            buf = poolHandle(c->toPoolIdx);
         } else {
             cb = c->cliRecvCb;
-            buf = poolHandle(c->fromPoolIdx);
         }
-        if (!cb || !buf) continue;
+        if (!cb) continue;
+
+        if (c->kind == ITS_PACKET) {
+            /* Packet link: pending = descriptor count > 0; "made progress" = a
+             * descriptor was popped (count decreased) or the conn went away —
+             * the same no-spin rule as below, restated on counts. A callback
+             * that backpressures without popping is NOT progress. */
+            its_link_t* L = linkAt(isServer ? c->toLinkIdx : c->fromLinkIdx);
+            if (!L || !L->ring) continue;
+            size_t cnt = xStreamBufferBytesAvailable(L->ring) / sizeof(its_desc);
+            if (cnt > 0) {
+                cb(i, L->outstanding.load(std::memory_order_relaxed));
+                if (!c->active ||
+                    xStreamBufferBytesAvailable(L->ring) / sizeof(its_desc) < cnt)
+                    any = true;
+            }
+            continue;
+        }
+
+        StreamBufferHandle_t buf = isServer ? poolHandle(c->toPoolIdx)
+                                            : poolHandle(c->fromPoolIdx);
+        if (!buf) continue;
         size_t avail = xStreamBufferBytesAvailable(buf);
-        /* Packet mode: avail <= 4 is either empty or a lone in-flight header. */
+        /* Legacy packet mode: avail <= 4 is either empty or a lone in-flight header. */
         size_t threshold = c->packetBased ? 4 : 0;
         if (avail > threshold) {
             cb(i, avail);
@@ -658,11 +1137,11 @@ bool itsPoll(TickType_t timeout) {
         return false;
     }
 
-    uint8_t* buf = (uint8_t*)alloca(me->inboxItemSize);
+    its_msg* m = nullptr;
     bool any = false;
 
-    if (xQueueReceive(me->inbox, buf, 0) == pdTRUE) {
-        processInboxMsg(me, buf);
+    if (xQueueReceive(me->inbox, &m, 0) == pdTRUE) {
+        processInboxMsg(me, m);   /* frees the message */
         any = true;
     }
 
@@ -677,8 +1156,8 @@ bool itsPoll(TickType_t timeout) {
     pmBoostAuto(false);
     if (ulTaskNotifyTake(pdTRUE, timeout)) pmBoostAuto(true);
 
-    if (xQueueReceive(me->inbox, buf, 0) == pdTRUE) {
-        processInboxMsg(me, buf);
+    if (xQueueReceive(me->inbox, &m, 0) == pdTRUE) {
+        processInboxMsg(me, m);
         any = true;
     }
     if (dispatchRecvCallbacks(me)) any = true;
@@ -696,36 +1175,50 @@ bool itsServerInit(size_t inboxMaxMsgLen, size_t inboxDepth, bool no_pool) {
     return true;
 }
 
-bool itsServerPortOpen(uint16_t port, bool packetBased, int maxHandles,
-                       size_t toSize, size_t fromSize) {
+bool itsServerPortOpen(uint16_t port, its_port_kind_t kind, int maxHandles,
+                       size_t toCap, size_t fromCap, size_t depth, size_t maxMsg) {
     its_task_t* e = myTask();
     if (!e || !e->isServer) {
         ITS_LOGE("PortOpen on non-server task");
         return false;
     }
-    its_server_port_t* sp = portFind(e, port);
-    if (sp) {
-        sp->packetBased = packetBased;
-        sp->maxHandles = maxHandles;
-        sp->toSize = toSize;
-        sp->fromSize = fromSize;
-        return true;
+    if (kind == ITS_PACKET) {
+        if (depth == 0)  depth  = CONFIG_SPANGAP_ITS_PKT_DEPTH;
+        if (maxMsg == 0) maxMsg = CONFIG_SPANGAP_ITS_MSG_MAX;
     }
-    for (int i = 0; i < ITS_MAX_PORTS; i++) {
-        if (!e->serverPorts[i].active) {
-            e->serverPorts[i] = {};
-            e->serverPorts[i].active = true;
-            e->serverPorts[i].packetBased = packetBased;
-            e->serverPorts[i].port = port;
-            e->serverPorts[i].maxHandles = maxHandles;
-            e->serverPorts[i].toSize = toSize;
-            e->serverPorts[i].fromSize = fromSize;
-            if (i + 1 > e->serverPortCount) e->serverPortCount = i + 1;
-            return true;
+    bool packetBased = (kind == ITS_PACKET_LEGACY);
+    its_server_port_t* sp = portFind(e, port);
+    if (!sp) {
+        for (int i = 0; i < ITS_MAX_PORTS && !sp; i++)
+            if (!e->serverPorts[i].active) {
+                e->serverPorts[i] = {};
+                e->serverPorts[i].active = true;
+                e->serverPorts[i].port = port;
+                if (i + 1 > e->serverPortCount) e->serverPortCount = i + 1;
+                sp = &e->serverPorts[i];
+            }
+        if (!sp) {
+            ITS_LOGE("PortOpen %u: no free port slot (max %d)", port, ITS_MAX_PORTS);
+            return false;
         }
     }
-    ITS_LOGE("PortOpen %u: no free port slot (max %d)", port, ITS_MAX_PORTS);
-    return false;
+    sp->kind = kind;
+    sp->packetBased = packetBased;
+    sp->maxHandles = maxHandles;
+    sp->toSize = toCap;
+    sp->fromSize = fromCap;
+    sp->depth = depth;
+    sp->maxMsg = maxMsg;
+    return true;
+}
+
+/* Transitional bool overload (D5): false→ITS_STREAM, true→ITS_PACKET_LEGACY.
+ * Deleted once every packet port has migrated to ITS_PACKET. */
+bool itsServerPortOpen(uint16_t port, bool packetBased, int maxHandles,
+                       size_t toSize, size_t fromSize) {
+    return itsServerPortOpen(port,
+                             packetBased ? ITS_PACKET_LEGACY : ITS_STREAM,
+                             maxHandles, toSize, fromSize, 0, 0);
 }
 
 void itsServerPortClose(uint16_t port) {
@@ -840,17 +1333,33 @@ its_mem_t itsTaskMem(TaskHandle_t task) {
      * attribute a connection's to+from buffers to its server — matches the
      * heap-task-tracking owner. Reflects current in-use, not pool high-water. */
     for (int i = 0; i < ITS_MAX_CONNS; i++) {
-        if (!connTable[i].active || connTable[i].serverTask != task) continue;
-        if (connTable[i].toPoolIdx >= 0) {
-            m.streamBytes += itsPool[connTable[i].toPoolIdx].size; m.streamBufs++;
+        its_conn_t& c = connTable[i];
+        if (!c.active) continue;
+        if (c.serverTask == task) {
+            if (c.toPoolIdx >= 0)   { m.streamBytes += itsPool[c.toPoolIdx].size;   m.streamBufs++; }
+            if (c.fromPoolIdx >= 0) { m.streamBytes += itsPool[c.fromPoolIdx].size; m.streamBufs++; }
+            /* Packet-link descriptor rings are tiny (depth*8); attribute them to
+             * the server, like stream buffers. */
+            if (its_link_t* L = linkAt(c.toLinkIdx))   { m.streamBytes += L->depth * sizeof(its_desc); m.streamBufs++; }
+            if (its_link_t* L = linkAt(c.fromLinkIdx)) { m.streamBytes += L->depth * sizeof(its_desc); m.streamBufs++; }
         }
-        if (connTable[i].fromPoolIdx >= 0) {
-            m.streamBytes += itsPool[connTable[i].fromPoolIdx].size; m.streamBufs++;
+        /* In-flight packet payloads on the RECV direction are borrowed memory
+         * the heap tracker bills to the sender; attribute them here to the
+         * receiving task as the corrective lens (mirrors the mailbox below). */
+        its_link_t* rl = nullptr;
+        if (c.kind == ITS_PACKET) {
+            if (c.serverTask == task)      rl = linkAt(c.toLinkIdx);
+            else if (c.clientTask == task) rl = linkAt(c.fromLinkIdx);
         }
+        if (rl) m.payloadBytes += rl->outstanding.load(std::memory_order_relaxed);
     }
-    /* The task's single inbox queue (PSRAM): depth * itemSize storage. */
+    /* The task's single inbox queue (PSRAM): depth * pointer-slot storage,
+     * plus the in-flight mailbox payload bytes currently queued for this task. */
     its_task_t* t = taskFind(task);
-    if (t && t->inbox) m.inboxBytes = (size_t)t->inboxDepth * t->inboxItemSize;
+    if (t && t->inbox) {
+        m.inboxBytes = (size_t)t->inboxDepth * sizeof(its_msg*);
+        m.payloadBytes += pendingPayOf(t).load(std::memory_order_relaxed);
+    }
     return m;
 }
 
@@ -860,13 +1369,34 @@ void itsStatus(int (*print)(const char*, ...)) {
         if (connTable[i].active) active++;
 
     print("ITS System Status Report\n");
+    /* Ownership counters — the leak detector. Idle outstanding should be ~0;
+     * non-zero residue at idle is an ownership bug, and the high-water marks
+     * say where to look. */
+    print("Messages: hdr %u live (%u B, hw %u/%u B)  payload %u live (%u B, hw %u/%u B)\n",
+          (unsigned)hdrCtr.liveBlocks.load(), (unsigned)hdrCtr.liveBytes.load(),
+          (unsigned)hdrCtr.hwBlocks.load(),  (unsigned)hdrCtr.hwBytes.load(),
+          (unsigned)payCtr.liveBlocks.load(), (unsigned)payCtr.liveBytes.load(),
+          (unsigned)payCtr.hwBlocks.load(),  (unsigned)payCtr.hwBytes.load());
     print("Connections (%d/%d in use)\n", active, ITS_MAX_CONNS);
     for (int i = 0; i < ITS_MAX_CONNS; i++) {
         its_conn_t* c = &connTable[i];
         if (!c->active) continue;
         const char* cn = c->clientTask ? pcTaskGetName(c->clientTask) : "?";
         const char* sn = c->serverTask ? pcTaskGetName(c->serverTask) : "?";
-        print("    [%s] -> [%s:%u]\n", cn, sn, c->itsPort);
+        const char* kn = c->kind == ITS_PACKET ? "pkt"
+                       : c->kind == ITS_PACKET_LEGACY ? "lpkt" : "strm";
+        if (c->kind == ITS_PACKET) {
+            its_link_t* tL = linkAt(c->toLinkIdx);
+            its_link_t* fL = linkAt(c->fromLinkIdx);
+            unsigned toB = tL ? (unsigned)tL->outstanding.load() : 0;
+            unsigned frB = fL ? (unsigned)fL->outstanding.load() : 0;
+            unsigned toC = tL ? (unsigned)(tL->byteCap) : 0;
+            unsigned frC = fL ? (unsigned)(fL->byteCap) : 0;
+            print("    [%s] -> [%s:%u] %s  to %u/%u B  from %u/%u B\n",
+                  cn, sn, c->itsPort, kn, toB, toC, frB, frC);
+        } else {
+            print("    [%s] -> [%s:%u] %s\n", cn, sn, c->itsPort, kn);
+        }
     }
 
     print("Streams\n");
@@ -904,6 +1434,10 @@ size_t itsInject(int handle, bool asServer, const void* data, size_t len,
                  TickType_t timeout) {
     its_conn_t* c = conn(handle);
     if (!c) return 0;
+    if (c->kind == ITS_PACKET) {
+        ITS_LOGE("itsInject unsupported on packet link (handle %d)", handle);
+        return 0;
+    }
     int idx = asServer ? c->fromPoolIdx : c->toPoolIdx;
     if (idx < 0 || idx >= itsPoolCount) return 0;
     auto* pe = &itsPool[idx];
@@ -946,28 +1480,16 @@ int itsServerForwardByTaskHandle(int handle, TaskHandle_t targetTask, uint16_t p
 
     c->serverTask = targetTask;
     c->itsPort = port;
+    c->kind = sp->kind;
     c->packetBased = sp->packetBased;
 
-    size_t maxPayload = te->inboxItemSize > sizeof(its_header_t)
-                      ? te->inboxItemSize - sizeof(its_header_t) : ITS_MAX_MSG_DATA;
-    if (dataLen > maxPayload) {
-        ITS_LOGE("forward data truncated: %u > %u",
-                 (unsigned)dataLen, (unsigned)maxPayload);
-        dataLen = maxPayload;
+    its_msg* m = buildCopyMsg(ITS_K_FORWARD, port, handle, data, dataLen, te, "forward");
+    if (!m) return -1;
+    if (!inboxEnqueue(te, m, pdMS_TO_TICKS(100))) {
+        ITS_LOGE("forward to [%s] inbox full", pcTaskGetName(targetTask));
+        msgFree(m);   /* ownership stayed with us on failure */
+        return -1;
     }
-    size_t totalLen = sizeof(its_header_t) + dataLen;
-    uint8_t* buf = (uint8_t*)alloca(totalLen);
-    auto* fhdr = (its_header_t*)buf;
-    *fhdr = {};
-    fhdr->sender = xTaskGetCurrentTaskHandle();
-    fhdr->msg = ITS_MSG_FORWARD;
-    fhdr->pickupIdx = -1;
-    fhdr->itsPort = port;
-    fhdr->len = (uint16_t)dataLen;
-    fhdr->handle = (int16_t)handle;
-    if (data && dataLen > 0)
-        memcpy(buf + sizeof(its_header_t), data, dataLen);
-    inboxSend(te, buf, totalLen, pdMS_TO_TICKS(100));
 
     return handle;
 }
@@ -1038,32 +1560,16 @@ int itsConnectByTaskHandle(TaskHandle_t serverTask, uint16_t port,
     xSemaphoreTake(me->ackSem, 0);
     me->ackHandle = -1;
 
-    /* Cap payload at what the target's inbox actually accepts, not a global
-     * compile-time default. Target may have been initialized with a larger
-     * inboxMaxMsgLen to carry bigger connect payloads (e.g. JSON args). */
-    size_t maxPayload = se->inboxItemSize > sizeof(its_header_t)
-                      ? se->inboxItemSize - sizeof(its_header_t) : ITS_MAX_MSG_DATA;
-    if (dataLen > maxPayload) {
-        ITS_LOGE("connect data truncated: %u > %u",
-                 (unsigned)dataLen, (unsigned)maxPayload);
-        dataLen = maxPayload;
-    }
-    size_t totalLen = sizeof(its_header_t) + dataLen;
-    uint8_t* buf = (uint8_t*)alloca(totalLen);
-    auto* hdr = (its_header_t*)buf;
-    *hdr = {};
-    hdr->sender = me->task;
-    hdr->msg = ITS_MSG_CONNECT;
-    hdr->pickupIdx = -1;
-    hdr->itsPort = port;
-    hdr->len = (uint16_t)dataLen;
-    hdr->handle = -1;
-    if (data && dataLen > 0)
-        memcpy(buf + sizeof(its_header_t), data, dataLen);
-
-    if (!inboxSend(se, buf, totalLen, timeout)) {
+    /* The handshake travels as a payload pointer (no copy of a big connect),
+     * bounded by the target's mailbox guard — a handshake too large to fit is
+     * rejected, never truncated (truncating a handshake would silently corrupt
+     * it). The old ~320-byte connect-arg cap is gone. */
+    its_msg* m = buildCopyMsg(ITS_K_CONNECT, port, -1, data, dataLen, se, "connect");
+    if (!m) return -1;
+    if (!inboxEnqueue(se, m, timeout)) {
         ITS_LOGE("itsConnect: target [%s] inbox full or send timed out",
                  pcTaskGetName(serverTask));
+        msgFree(m);   /* ownership stayed with us on failure */
         return -1;
     }
 
@@ -1124,13 +1630,19 @@ void itsDisconnect(int handle) {
      * its dispatch loop, when neither end is inside a buffer op. Pooled conns
      * keep the original free-now behavior. If the peer can't be notified, the
      * initiator retains the buffers (poolRetainOnFree) — never worse than pooled,
-     * no UAF, no leak. */
-    bool noPool = c->noPool;
+     * no UAF, no leak.
+     *
+     * Packet links are EXCLUDED from the deferral: their descriptor rings are
+     * pooled (never deleted, see linkFree), so connFree-now is safe — a racing
+     * peer re-checks conn() and bails, and the ring it might touch still exists.
+     * connFree drains both rings, freeing every in-flight payload. */
+    bool noPool = c->noPool && (c->kind != ITS_PACKET);
     int  toIdx = c->toPoolIdx, fromIdx = c->fromPoolIdx;
 
     if (c->serverTask == me) {
-        /* Server side closes — embed client cb pointer in the kick message
-         * since the conn entry will be freed before the client wakes. */
+        /* Server side closes — the client's disconnect cb travels in the
+         * header (ITS_K_DISC_FROM_SERVER, metadata only) since the conn entry
+         * is freed before the client wakes. */
         TaskHandle_t client = c->clientTask;
         int8_t clientRef = c->clientRef;
         uint16_t port = c->itsPort;
@@ -1139,33 +1651,30 @@ void itsDisconnect(int handle) {
         its_task_t* ce = taskFind(client);
         bool notified = false;
         if (ce) {
-            uint8_t buf[sizeof(its_header_t) + 1 + sizeof(cb)];
-            auto* hdr = (its_header_t*)buf;
-            *hdr = {};
-            hdr->sender = me;
-            hdr->msg = ITS_MSG_DISCONNECT;
-            hdr->handle = (int16_t)handle;
-            hdr->itsPort = port;
-            hdr->pickupIdx = -1;
-            hdr->len = 1 + sizeof(cb);
-            buf[sizeof(its_header_t)] = (uint8_t)clientRef;
-            memcpy(buf + sizeof(its_header_t) + 1, &cb, sizeof(cb));
-            /* 100ms blocking — matches the client-side branch below. Earlier
-             * timeout=0 here silently dropped the kick under inbox bursts
-             * (e.g. cli closing a busy SSH session: sshd's inbox briefly
-             * fills with channel-data events, the disconnect kick is the
-             * one that gets discarded, sshd never tears the session down,
-             * Mac SSH hangs on Ctrl-D forever). Disconnects are rare; a
-             * brief block here is the cheap correct fix. */
-            notified = inboxSend(ce, buf, sizeof(buf), pdMS_TO_TICKS(100));
+            its_msg* m = msgAlloc();
+            if (m) {
+                m->kind = ITS_K_DISC_FROM_SERVER;
+                m->sender = me;
+                m->handle = (int16_t)handle;
+                m->port = port;
+                m->ref = clientRef;
+                m->cb = cb;
+                /* 100ms blocking — disconnects are rare and the kick must not
+                 * be dropped under an inbox burst (cli closing a busy SSH
+                 * session: sshd's inbox briefly fills, the dropped kick left
+                 * Mac SSH hanging on Ctrl-D forever). */
+                notified = inboxEnqueue(ce, m, pdMS_TO_TICKS(100));
+                if (!notified) msgFree(m);
+            }
         }
         if (noPool && !notified) {
             poolRetainOnFree(toIdx); poolRetainOnFree(fromIdx);
             connFree(handle);
         }
     } else if (c->clientTask == me) {
-        /* Client side closes — server callback lives in the per-port
-         * table on the server task, no need to embed anything. */
+        /* Client side closes — the server's disconnect cb lives in the
+         * per-port table on the server task, so ITS_K_DISC_FROM_CLIENT carries
+         * only the server's ref (metadata only). */
         TaskHandle_t serverTask = c->serverTask;
         int8_t serverRef = c->serverRef;
         uint16_t port = c->itsPort;
@@ -1173,17 +1682,16 @@ void itsDisconnect(int handle) {
         its_task_t* se = taskFind(serverTask);
         bool notified = false;
         if (se) {
-            uint8_t buf[sizeof(its_header_t) + 1];
-            auto* hdr = (its_header_t*)buf;
-            *hdr = {};
-            hdr->sender = me;
-            hdr->msg = ITS_MSG_DISCONNECT;
-            hdr->pickupIdx = -1;
-            hdr->itsPort = port;
-            hdr->handle = (int16_t)handle;
-            hdr->len = 1;
-            buf[sizeof(its_header_t)] = (uint8_t)serverRef;
-            notified = inboxSend(se, buf, sizeof(buf), pdMS_TO_TICKS(100));
+            its_msg* m = msgAlloc();
+            if (m) {
+                m->kind = ITS_K_DISC_FROM_CLIENT;
+                m->sender = me;
+                m->port = port;
+                m->handle = (int16_t)handle;
+                m->ref = serverRef;
+                notified = inboxEnqueue(se, m, pdMS_TO_TICKS(100));
+                if (!notified) msgFree(m);
+            }
         }
         if (noPool && !notified) {
             poolRetainOnFree(toIdx); poolRetainOnFree(fromIdx);
@@ -1194,64 +1702,102 @@ void itsDisconnect(int handle) {
 
 /* ---- Aux messages ---- */
 
+static bool auxRegistered(its_task_t* te, uint16_t port) {
+    for (int i = 0; i < te->auxCount; i++)
+        if (te->auxCallbacks[i].active && te->auxCallbacks[i].port == port)
+            return true;
+    return false;
+}
+
+/* For ITS_WAIT_PICKUP, ensure the caller has an ITS task entry with its own
+ * pickupSem and drain any stale give. Returns the caller's task entry (or
+ * nullptr for ITS_WAIT_DELIVERY). On setup failure returns nullptr and sets
+ * *ok=false. */
+static its_task_t* pickupArm(its_wait_t wait, bool* ok) {
+    *ok = true;
+    if (wait != ITS_WAIT_PICKUP) return nullptr;
+    its_task_t* me = taskFindOrCreate(xTaskGetCurrentTaskHandle(), 0, 0);
+    if (!me || !me->pickupSem) { *ok = false; return nullptr; }
+    xSemaphoreTake(me->pickupSem, 0);
+    return me;
+}
+
 static bool itsSendAuxInternal(TaskHandle_t task, uint16_t port,
                                const void* data, size_t dataLen,
                                TickType_t timeout, its_wait_t wait) {
     its_task_t* te = taskFind(task);
     if (!te) return false;
-
-    /* Pre-flight: ensure the receiver has registered this aux port */
-    bool registered = false;
-    for (int i = 0; i < te->auxCount; i++) {
-        if (te->auxCallbacks[i].active && te->auxCallbacks[i].port == port) {
-            registered = true;
-            break;
-        }
-    }
-    if (!registered) {
+    if (!auxRegistered(te, port)) {
         ITS_LOGE("aux send to unregistered port %u on [%s]",
                  port, pcTaskGetName(task));
         return false;
     }
 
-    /* Max payload = target's inbox item size minus header */
-    size_t maxPayload = te->inboxItemSize > sizeof(its_header_t)
-                      ? te->inboxItemSize - sizeof(its_header_t) : ITS_MAX_MSG_DATA;
-    if (dataLen > maxPayload) {
-        ITS_LOGE("aux data truncated: %u > %u",
-                 (unsigned)dataLen, (unsigned)maxPayload);
-        dataLen = maxPayload;
-    }
+    bool ok;
+    its_task_t* me = pickupArm(wait, &ok);
+    if (!ok) return false;
 
-    /* For ITS_WAIT_PICKUP, ensure the caller has an ITS task entry with its
-     * own pickupSem, then drain any stale give on that sem. Receiver will
-     * give it after processing the aux. */
-    its_task_t* me = nullptr;
-    if (wait == ITS_WAIT_PICKUP) {
-        me = taskFindOrCreate(xTaskGetCurrentTaskHandle(), 0, 0);
-        if (!me || !me->pickupSem) return false;
-        xSemaphoreTake(me->pickupSem, 0);
-    }
+    its_msg* m = buildCopyMsg(ITS_K_AUX, port, -1, data, dataLen, te, "aux");
+    if (!m) return false;
+    if (wait == ITS_WAIT_PICKUP) m->flags |= ITS_F_PICKUP;
 
-    size_t totalLen = sizeof(its_header_t) + dataLen;
-    uint8_t* buf = (uint8_t*)alloca(totalLen);
-    auto* hdr = (its_header_t*)buf;
-    *hdr = {};
-    hdr->sender = xTaskGetCurrentTaskHandle();
-    hdr->msg = ITS_MSG_AUX;
-    hdr->pickupIdx = (wait == ITS_WAIT_PICKUP) ? 1 : -1;  /* flag only */
-    hdr->itsPort = port;
-    hdr->len = (uint16_t)dataLen;
-    hdr->handle = -1;
-    if (data && dataLen > 0)
-        memcpy(buf + sizeof(its_header_t), data, dataLen);
-
-    bool delivered = inboxSend(te, buf, totalLen, timeout);
-    if (!delivered) return false;
+    if (!inboxEnqueue(te, m, timeout)) { msgFree(m); return false; }
 
     if (me)
         return xSemaphoreTake(me->pickupSem, timeout) == pdTRUE;
+    return true;
+}
 
+bool itsSendAuxOwnedByTaskHandle(TaskHandle_t task, uint16_t port,
+                                 void* ptr, size_t len, TickType_t timeout,
+                                 its_wait_t wait) {
+    its_task_t* te = taskFind(task);
+    if (!te) return false;   /* caller still owns ptr */
+    if (!auxRegistered(te, port)) {
+        ITS_LOGE("owned aux send to unregistered port %u on [%s]",
+                 port, pcTaskGetName(task));
+        return false;
+    }
+    if (len > te->inboxMsgMax) {
+        ITS_LOGE("owned aux payload %u exceeds [%s] mailbox guard %u (rejected)",
+                 (unsigned)len, pcTaskGetName(task), (unsigned)te->inboxMsgMax);
+        return false;
+    }
+
+    bool ok;
+    its_task_t* me = pickupArm(wait, &ok);
+    if (!ok) return false;
+
+    its_msg* m = msgAlloc();
+    if (!m) return false;    /* caller still owns ptr */
+    m->kind = ITS_K_AUX;
+    m->port = port;
+    m->sender = xTaskGetCurrentTaskHandle();
+    m->len = (uint32_t)len;
+    m->payload = ptr;
+    if (wait == ITS_WAIT_PICKUP) m->flags |= ITS_F_PICKUP;
+    payAdopt(len);           /* ownership boundary: the adopted block is now counted */
+
+    if (!inboxEnqueue(te, m, timeout)) {
+        /* Failure → return ownership of ptr to the caller: detach it from the
+         * header so msgFree does not free the caller's block, and undo the
+         * adopt counter. */
+        m->payload = nullptr;
+        ctrSub(payCtr, len);
+        msgFree(m);
+        return false;
+    }
+
+    /* Ownership has now transferred to the receiver: the buffer lives in its
+     * inbox and will be freed exactly once when it dispatches. A pickup-wait
+     * timeout means the receiver is slow/stuck, NOT that the send failed — we
+     * must NOT report false here, or the caller (per the ownership contract:
+     * "false return → caller still owns ptr") would free a block ITS already
+     * owns, double-freeing it once the receiver finally drains the message.
+     * Surface the stall as a warning and still return success. */
+    if (me && xSemaphoreTake(me->pickupSem, timeout) != pdTRUE)
+        ITS_LOGW("owned aux to port %u on [%s] enqueued but not picked up within "
+                 "timeout (receiver stuck?)", port, pcTaskGetName(task));
     return true;
 }
 
@@ -1285,7 +1831,50 @@ static inline void wakeSenderIfReady(int handle, its_pool_entry_t* pe) {
     if (sender) xTaskNotifyGive(sender);
 }
 
+/* Packet-link send core, shared by itsSend (copy) and itsSendOwned (adopt).
+ * `owned`: ptr is the caller's heap block; on success ITS owns it, on any
+ * failure the caller keeps it. !owned: ITS copies `data` into a fresh block. */
+static size_t itsSendPacket(int handle, its_link_t* L, const void* data,
+                            size_t len, TickType_t timeout, bool owned) {
+    if (len == 0 || len > L->maxMsg) {
+        ITS_LOGE("packet len %u out of range (maxMsg %u)",
+                 (unsigned)len, (unsigned)L->maxMsg);
+        return 0;   /* owned: caller keeps ptr */
+    }
+    /* Wait for a descriptor slot AND byte window. Single writer per direction,
+     * so once admissible nothing else shrinks the room before we enqueue. */
+    if (!linkWaitForSpace(handle, L, len, timeout)) return 0;  /* owned: caller keeps */
+
+    void* ptr;
+    if (owned) {
+        ptr = (void*)data;
+        payAdopt(len);               /* ownership boundary: foreign block adopted */
+    } else {
+        ptr = payAlloc(len);
+        if (!ptr) return 0;          /* ITS's own OOM — caller retries (don't-drop) */
+        memcpy(ptr, data, len);
+    }
+    linkEnqueue(handle, L, ptr, len);
+    return len;
+}
+
+size_t itsSendOwned(int handle, void* ptr, size_t len, TickType_t timeout) {
+    its_link_t* L = sendLink(handle);
+    if (!L) {  /* packet links only */
+        ITS_LOGE("itsSendOwned on non-packet-link handle %d", handle);
+        return 0;
+    }
+    return itsSendPacket(handle, L, ptr, len, timeout, /*owned=*/true);
+}
+
 size_t itsSend(int handle, const void* data, size_t len, TickType_t timeout) {
+    its_conn_t* c0 = conn(handle);
+    if (c0 && c0->kind == ITS_PACKET) {
+        its_link_t* L = sendLink(handle);
+        if (!L) return 0;
+        return itsSendPacket(handle, L, data, len, timeout, /*owned=*/false);
+    }
+
     its_pool_entry_t* pe = nullptr;
     StreamBufferHandle_t buf = sendBufWithPool(handle, &pe);
     if (!buf || !pe) return 0;
@@ -1344,6 +1933,24 @@ size_t itsSend(int handle, const void* data, size_t len, TickType_t timeout) {
 }
 
 size_t itsRecv(int handle, void* buf, size_t maxLen, TickType_t timeout) {
+    its_conn_t* c0 = conn(handle);
+    if (c0 && c0->kind == ITS_PACKET) {
+        its_link_t* L = recvLink(handle);
+        if (!L) return 0;
+        its_desc d;
+        if (!linkDequeue(handle, L, &d, timeout)) return 0;
+        if (d.len > maxLen) {
+            /* Caller's buffer is undersized for this port's traffic — same
+             * drain-and-drop contract as legacy packet mode. */
+            ITS_LOGE("packet body %u > buf %u, dropping", (unsigned)d.len, (unsigned)maxLen);
+            payDrop(d.ptr, d.len);
+            return 0;
+        }
+        memcpy(buf, d.ptr, d.len);
+        payDrop(d.ptr, d.len);
+        return d.len;
+    }
+
     its_pool_entry_t* pe = nullptr;
     StreamBufferHandle_t sb = recvBufWithPool(handle, &pe);
     if (!sb || !pe) return 0;
@@ -1401,16 +2008,34 @@ size_t itsRecv(int handle, void* buf, size_t maxLen, TickType_t timeout) {
     return got;
 }
 
+bool itsRecvRef(int handle, void** out, size_t* len, TickType_t timeout) {
+    its_link_t* L = recvLink(handle);
+    if (!L) return false;   /* packet links only */
+    its_desc d;
+    if (!linkDequeue(handle, L, &d, timeout)) return false;
+    /* Ownership exits the transport: uncount WITHOUT freeing — the caller now
+     * owns the block and frees it with plain free(). The block is deliberately
+     * outside the backpressure window from here on (D9). */
+    payHandoff(d.len);
+    if (out) *out = d.ptr;
+    if (len) *len = d.len;
+    return true;
+}
+
 bool itsConnected(int handle) {
     return conn(handle) != nullptr;
 }
 
 size_t itsBytesAvailable(int handle) {
+    its_link_t* L = recvLink(handle);
+    if (L) return L->outstanding.load(std::memory_order_relaxed);  /* recv payload bytes */
     StreamBufferHandle_t buf = recvBuf(handle);
     return buf ? xStreamBufferBytesAvailable(buf) : 0;
 }
 
 size_t itsSpacesAvailable(int handle) {
+    its_link_t* L = sendLink(handle);
+    if (L) return linkSendSpace(L);   /* 0 if no slot free, else open window */
     StreamBufferHandle_t buf = sendBuf(handle);
     if (!buf) return 0;
     size_t spaces = xStreamBufferSpacesAvailable(buf);
@@ -1423,18 +2048,23 @@ size_t itsSpacesAvailable(int handle) {
 }
 
 size_t itsRecvBufSize(int handle) {
+    its_link_t* L = recvLink(handle);
+    if (L) return L->maxMsg;          /* packet link: the size guard (D7) */
     its_pool_entry_t* pe = nullptr;
     StreamBufferHandle_t buf = recvBufWithPool(handle, &pe);
     return (buf && pe) ? pe->size : 0;
 }
 
 size_t itsSendBufSize(int handle) {
+    its_link_t* L = sendLink(handle);
+    if (L) return L->maxMsg;          /* packet link: the size guard (D7) */
     its_pool_entry_t* pe = nullptr;
     StreamBufferHandle_t buf = sendBufWithPool(handle, &pe);
     return (buf && pe) ? pe->size : 0;
 }
 
 bool itsSetTriggerLevel(int handle, size_t triggerLevel) {
+    if (sendLink(handle) || recvLink(handle)) return false;  /* packet links wake per message */
     its_pool_entry_t* pe = nullptr;
     StreamBufferHandle_t buf = recvBufWithPool(handle, &pe);
     if (!buf || !pe) return false;
@@ -1444,6 +2074,17 @@ bool itsSetTriggerLevel(int handle, size_t triggerLevel) {
 }
 
 bool itsSetFreeNotify(int handle, size_t freeBytes) {
+    its_link_t* Lp = sendLink(handle);
+    if (Lp) {
+        xSemaphoreTake(Lp->spaceFreedSem, 0);
+        Lp->freeNotify = freeBytes;
+        if (freeBytes > 0 && linkSendSpace(Lp) >= freeBytes) {
+            Lp->freeNotify = 0;
+            xSemaphoreGive(Lp->spaceFreedSem);
+            xTaskNotifyGive(xTaskGetCurrentTaskHandle());
+        }
+        return true;
+    }
     its_pool_entry_t* pe = nullptr;
     StreamBufferHandle_t buf = sendBufWithPool(handle, &pe);
     if (!buf || !pe) return false;
@@ -1464,6 +2105,8 @@ bool itsSetFreeNotify(int handle, size_t freeBytes) {
 
 bool itsWaitForSpace(int handle, size_t freeBytes, TickType_t timeout) {
     if (freeBytes == 0) return true;
+    its_link_t* Lp = sendLink(handle);
+    if (Lp) return linkWaitForSpace(handle, Lp, freeBytes, timeout);
     its_pool_entry_t* pe = nullptr;
     StreamBufferHandle_t buf = sendBufWithPool(handle, &pe);
     if (!buf || !pe) return false;
@@ -1503,16 +2146,24 @@ bool itsWaitForSpace(int handle, size_t freeBytes, TickType_t timeout) {
 }
 
 bool itsIsEmpty(int handle) {
+    its_link_t* L = recvLink(handle);
+    if (L) return xStreamBufferBytesAvailable(L->ring) < sizeof(its_desc);
     StreamBufferHandle_t buf = recvBuf(handle);
     return buf ? xStreamBufferIsEmpty(buf) : true;
 }
 
 bool itsIsFull(int handle) {
+    its_link_t* L = sendLink(handle);
+    if (L) return linkSendSpace(L) == 0;   /* no slot or window full */
     StreamBufferHandle_t buf = sendBuf(handle);
     return buf ? xStreamBufferIsFull(buf) : true;
 }
 
 bool itsSendIsEmpty(int handle) {
+    its_link_t* L = sendLink(handle);
+    if (L)
+        return xStreamBufferBytesAvailable(L->ring) < sizeof(its_desc) &&
+               L->outstanding.load(std::memory_order_relaxed) == 0;
     StreamBufferHandle_t buf = sendBuf(handle);
     return buf ? xStreamBufferIsEmpty(buf) : true;
 }
@@ -1533,6 +2184,13 @@ TaskHandle_t itsRemoteTask(int handle) {
 }
 
 bool itsReset(int handle) {
+    its_conn_t* c = conn(handle);
+    if (c && c->kind == ITS_PACKET) {
+        /* Drain both directions (frees in-flight payloads), keep the links. */
+        linkPurge(c->toLinkIdx);
+        linkPurge(c->fromLinkIdx);
+        return true;
+    }
     StreamBufferHandle_t sb;
     sb = recvBuf(handle);
     if (sb) xStreamBufferReset(sb);

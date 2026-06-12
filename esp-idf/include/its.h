@@ -9,8 +9,12 @@
  * unopened/unregistered ports are rejected with an error log.
  *
  * Per-task inbox (FreeRTOS Queue) carries connect / disconnect / aux /
- * forward signaling. Per-connection FreeRTOS stream buffers (drawn from a
- * PSRAM pool that grows on demand and never shrinks) carry payload bytes.
+ * forward signaling. Each inbox slot is a single pointer to a heap-allocated
+ * message (a fixed `its_msg` header the transport owns plus an optional
+ * separate payload block); the transport frees the header on every path and
+ * frees the payload unless the receiver takes it. Per-connection FreeRTOS
+ * stream buffers (drawn from a PSRAM pool that grows on demand and never
+ * shrinks) carry continuous byte-stream payloads.
  *
  * itsPoll() is the universal blocking primitive: it drains one inbox
  * message AND dispatches per-connection recv callbacks for connections
@@ -54,6 +58,16 @@
 
 #define ITS_MAX_MSG_DATA  320
 #define ITS_MAX_PORTS      8     /* per task: server ports + aux ports */
+
+/** A port is declared once as one of these kinds (the "stream vs packet"
+ *  property lives in the PORT, never in a message). */
+enum its_port_kind_t : uint8_t {
+    ITS_STREAM = 0,        /* byte ring (unchanged): continuous byte streams      */
+    ITS_PACKET_LEGACY,     /* framed packets inside a byte ring — transitional,
+                            * deleted once every packet port has moved to ITS_PACKET */
+    ITS_PACKET,            /* packet link: per-connection descriptor ring + heap
+                            * payloads (borrowed per message, freed on read)       */
+};
 
 /** itsSendAux: wait for inbox delivery (default) or for receiver pickup. */
 enum its_wait_t {
@@ -114,6 +128,22 @@ bool itsServerInit(size_t inboxMaxMsgLen = 0, size_t inboxDepth = 0, bool no_poo
 bool itsServerPortOpen(uint16_t port, bool packetBased, int maxHandles,
                        size_t toSize, size_t fromSize);
 
+/** Open a server port, declaring its transport kind explicitly.
+ *  For ITS_STREAM / ITS_PACKET_LEGACY, `toCap`/`fromCap` are the reserved ring
+ *  bytes per connection (today's meaning). For ITS_PACKET they are the LAZY
+ *  per-direction byte windows (backpressure caps; idle cost ≈ 0):
+ *    toCap:   client→server outstanding-payload-byte window (0 = none/aux-only)
+ *    fromCap: server→client outstanding-payload-byte window (0 = none/aux-only)
+ *    depth:   descriptor slots per direction (0 = CONFIG_SPANGAP_ITS_PKT_DEPTH)
+ *    maxMsg:  largest single message in bytes — the size guard, NOT the window
+ *             (0 = CONFIG_SPANGAP_ITS_MSG_MAX). itsRecvBufSize/itsSendBufSize
+ *             report this on a packet link.
+ *  The bool overload above maps false→ITS_STREAM, true→ITS_PACKET_LEGACY and is
+ *  deleted once every packet port has migrated to ITS_PACKET. */
+bool itsServerPortOpen(uint16_t port, its_port_kind_t kind, int maxHandles,
+                       size_t toCap, size_t fromCap,
+                       size_t depth = 0, size_t maxMsg = 0);
+
 /** Close a server port (existing connections are disconnected). */
 void itsServerPortClose(uint16_t port);
 
@@ -137,8 +167,11 @@ void itsStatus(int (*print)(const char*, ...) = printf);
 
 /** PSRAM held by a task's ITS objects: stream buffers for connections it
  *  serves (attributed to the server, which allocates them at connect) plus
- *  its single inbox queue's storage. For per-task memory breakdowns. */
-typedef struct { size_t streamBytes; size_t inboxBytes; int streamBufs; } its_mem_t;
+ *  its single inbox queue's storage. `payloadBytes` is the in-flight message
+ *  payload bytes currently queued in this task's inbox (borrowed memory the
+ *  raw heap tracker attributes to the *sending* task; this is the corrective
+ *  lens for the receiver). For per-task memory breakdowns. */
+typedef struct { size_t streamBytes; size_t inboxBytes; int streamBufs; size_t payloadBytes; } its_mem_t;
 its_mem_t itsTaskMem(TaskHandle_t task);
 
 /** Inject bytes into one side of a connection's stream-buffer pair without
@@ -215,6 +248,19 @@ bool itsSendAuxByTaskHandle(TaskHandle_t task, uint16_t port,
                             const void* data, size_t dataLen, TickType_t timeout,
                             its_wait_t wait = ITS_WAIT_DELIVERY);
 
+/** Zero-copy aux send: adopt the caller's heap block `ptr` (any allocator —
+ *  it is freed with plain free() by the receiver after dispatch) instead of
+ *  copying it. Ownership transfers once the block is enqueued in the receiver's
+ *  inbox: on a false return it was NOT enqueued and the caller still owns `ptr`;
+ *  on a true return ITS owns it and frees it exactly once after dispatch. With
+ *  ITS_WAIT_PICKUP a slow/stuck receiver that misses the timeout still returns
+ *  true (the block is already enqueued and cannot be reclaimed) and logs a
+ *  warning — never free `ptr` on a true return. Used by storage to hand
+ *  pre-built op lists and CHANGED payloads to subscriber tasks without a copy. */
+bool itsSendAuxOwnedByTaskHandle(TaskHandle_t task, uint16_t port,
+                                 void* ptr, size_t len, TickType_t timeout,
+                                 its_wait_t wait = ITS_WAIT_DELIVERY);
+
 /* ---- Universal blocking primitive ---- */
 
 /** Drain one inbox message (if any) and dispatch per-connection recv
@@ -238,6 +284,21 @@ bool itsPoll(TickType_t timeout = portMAX_DELAY);
  *  Returns body length on success, 0 on failure. Body length must fit in 24
  *  bits and 4+len must fit in the connection's stream buffer capacity. */
 size_t itsSend(int handle, const void* data, size_t len, TickType_t timeout);
+
+/** Packet-link zero-copy producer: adopt the caller's heap block `ptr` instead
+ *  of copying it. ITS does NOT allocate; on backpressure/timeout it returns 0
+ *  and the caller STILL OWNS `ptr` (ownership transfers on success only). The
+ *  block may come from any allocator and is freed with plain free() by whoever
+ *  reads it (itsRecv) or by teardown. Packet links only — stream/legacy ports
+ *  return 0 and log. */
+size_t itsSendOwned(int handle, void* ptr, size_t len, TickType_t timeout);
+
+/** Packet-link zero-copy consumer: hand the next message's heap block straight
+ *  to the caller (no copy). On success sets out and len, returns true; the
+ *  caller then owns the block and frees it with plain free(). Returns false if
+ *  no message is available within the timeout. Packet links only — stream/
+ *  legacy ports return false. */
+bool   itsRecvRef(int handle, void** out, size_t* len, TickType_t timeout);
 
 /** Receive bytes (stream mode) or one packet body (packet mode).
  *

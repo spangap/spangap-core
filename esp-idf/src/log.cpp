@@ -722,7 +722,7 @@ static void logTaskFn(void* arg) {
   itsServerPortOpen(LOG_PORT_TCP, /*packetBased=*/false, 3, 2048, 2048);
   itsServerOnConnect(LOG_PORT_TCP, logTcpConnect);
   itsServerOnDisconnect(LOG_PORT_TCP, logOnDisconnect);
-  itsServerPortOpen(LOG_PORT_DC,  /*packetBased=*/true,  2, 2048, 2048);
+  itsServerPortOpen(LOG_PORT_DC,  ITS_PACKET,  2, 2048, 2048, /*depth=*/0, /*maxMsg=*/2048);
   itsServerOnConnect(LOG_PORT_DC, logDcConnect);
   itsServerOnDisconnect(LOG_PORT_DC, logOnDisconnect);
   /* Unblock logInit() — server is open for clients (e.g. serial task). */

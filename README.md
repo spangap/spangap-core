@@ -117,6 +117,36 @@ knobs are worth knowing (`idf.py menuconfig` → *spangap: spangap-core*):
   on a 64 KB-cluster card uses ~9× its real size). 8 KB ≈ one cluster per
   tile while keeping the FAT small enough to mount large cards quickly.
 
+ITS mailbox knobs (`idf.py menuconfig` → *spangap: spangap-core*):
+
+- **`CONFIG_SPANGAP_ITS_INBOX_DEPTH`** (default **32**) — default depth, in
+  messages, of each ITS task's mailbox. Slots are single pointers (~4 B) to
+  heap-allocated messages, so depth is nearly free. Tasks override with a
+  non-zero `inboxDepth` to `itsServerInit`/`itsClientInit`.
+- **`CONFIG_SPANGAP_ITS_INBOX_MSG_MAX`** (default **4096**) — default per-message
+  payload guard for mailboxes (connect handshake / aux / forward). Oversized
+  sends are rejected, not truncated; the guard is floored at `ITS_MAX_MSG_DATA`
+  (320). Per-task override: `itsServerInit`'s `inboxMaxMsgLen` (0 = this
+  default). Payload memory is borrowed per-message and freed on read, so a
+  generous guard costs nothing at idle.
+- **`CONFIG_SPANGAP_ITS_PKT_DEPTH`** (default **16**) — default in-flight
+  messages a packet-link direction queues (descriptor-ring depth). Slots are
+  8-byte descriptors; payloads are borrowed per message. Per-port override:
+  `itsServerPortOpen`'s `depth`.
+- **`CONFIG_SPANGAP_ITS_MSG_MAX`** (default **65536**) — default packet-link
+  per-message size guard (NOT the backpressure window). `itsRecvBufSize`/
+  `itsSendBufSize` report this. Per-port override: `itsServerPortOpen`'s `maxMsg`.
+
+Storage-actor knobs (`idf.py menuconfig` → *spangap: spangap-core*):
+
+- **`CONFIG_SPANGAP_STORAGE_OP_TIMEOUT_MS`** (default **5000**) — how long a
+  public storage write waits for the storage actor to apply its op message
+  before warning and giving up.
+- **`CONFIG_SPANGAP_STORAGE_NOTIFY_TIMEOUT_MS`** (default **10**) — how long the
+  actor blocks delivering one CHANGED message to a remote subscriber before
+  dropping it (bounded so a subscriber stuck in a sync write can't deadlock the
+  actor).
+
 spangap-core's `sdkconfig.defaults.spangap` also pins
 `CONFIG_WL_SECTOR_SIZE_512=y` for all consumers: 512-byte FATFS sectors,
 since we use LittleFS (not FAT) on flash, so the 4 KB wear-levelling

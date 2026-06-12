@@ -1,14 +1,17 @@
 /**
  * storage — config store.
  *
- * Config: cJSON tree in RAM, backed by JSON on /state.
- * All writes go through a patch tree (RFC 7396 merge-patch format).
- * commit() merges the patch into cfgRoot, fires subscriptions, coalesces
- * WS output, and triggers the save timer — atomically.
+ * Config: cJSON tree in RAM, backed by JSON on /state. Storage is an ACTOR:
+ * writes (storageSet and friends) are op-list messages applied by the storage
+ * task — build a patch tree, RFC 7396 deepMerge into cfgRoot, notify
+ * subscribers, trigger the save timer, all atomically per message. Writes are
+ * synchronous (read-your-writes holds); when the caller is the storage task or
+ * storage hasn't spawned yet, the write applies directly. Reads are direct
+ * under a recursive mutex (readers vs the single actor-writer).
  *
- * storageBegin()/storageEnd() bracket explicit transactions. Without them,
- * storageSet() is auto-commit (one patch per call). Reads within a
- * transaction see their own writes.
+ * storageBegin()/storageEnd() bracket a task-local op accumulator (one atomic
+ * message at the outer End). NOTE: reads INSIDE an open bracket see committed
+ * state, not the bracket's own pending writes — read before the bracket.
  *
  * Keys starting with "s." are persisted to <stateDir>/storage/root.json
  * (or a per-prefix blob under <stateDir>/storage/external/ if registered).
@@ -37,6 +40,7 @@
 static constexpr uint16_t STORAGE_CONFIG_PORT = 1;
 
 /** Storage task's ITS aux ports. */
+static constexpr uint16_t STORAGE_OP_PORT     = 44;  /* config write op lists → the actor */
 static constexpr uint16_t STORAGE_SAVE_PORT   = 43;  /* reserved (was save-now; saves now run on the storage_save worker) */
 static constexpr uint16_t STORAGE_CHANGE_PORT = 42;  /* change dispatch on subscriber tasks */
 

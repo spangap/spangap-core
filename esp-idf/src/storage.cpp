@@ -1,17 +1,23 @@
 /**
- * storage — config store.
+ * storage — config store (an ACTOR).
  *
  * Config: cJSON tree in RAM, backed by JSON on /state.
- * All writes go through a patch tree (RFC 7396 merge-patch). commit() merges
- * the patch into cfgRoot, fires subscriptions, coalesces WS output, and
- * triggers the save timer — atomically.
+ * WRITES are messages: storageSet and friends serialize the change into an op
+ * list and hand it to the storage task, which applies it (build patch tree →
+ * RFC 7396 deepMerge into cfgRoot → notify subscribers → save timer) — the
+ * message boundary is the transaction, so a list applies atomically. Writes are
+ * synchronous (the caller blocks until applied, so read-your-writes holds);
+ * when the caller IS the storage task, or storage hasn't spawned yet, the write
+ * applies directly (the fast path). READS stay direct under cfgMux.
  *
- * storageBegin()/storageEnd() bracket explicit transactions.
- * Without them, storageSet() is auto-commit (one patch per call).
+ * storageBegin()/storageEnd() bracket a task-local op accumulator: the writes
+ * between them ship as one atomic message. (Read-your-writes INSIDE an open
+ * bracket is gone — reads see committed state, not the bracket's pending ops.)
  *
- * Thread safety: a recursive mutex (cfgMux) protects cfgRoot, txPatch, and
- * txDepth.  storageBegin() acquires, storageEnd() releases.  All public
- * readers (storageGetInt, storageGetStr, …) lock around tree access.
+ * Thread safety: a recursive mutex (cfgMux) guards readers vs the single
+ * actor-writer on cfgRoot, plus the externals bookkeeping. The subscription
+ * table is storage-task-owned (mutated only via SUB/UNSUB ops), so it never
+ * races. There is no write lock and no transaction accumulator any more.
  *
  * Browser config DataChannel (`storage:1`, packet-mode over WebRTC):
  * - Device→browser: full dump on connect, then coalesced merge-patches.
@@ -60,16 +66,18 @@ static bool rootDirty = false;        /* root.json needs rewrite */
 /* ---- Config tree state ---- */
 
 static cJSON* cfgRoot = nullptr;        /* committed config (the truth) */
-static cJSON* txPatch = nullptr;        /* transaction write accumulator */
-static int txDepth = 0;                 /* transaction nesting depth */
-static int silentDepth = 0;             /* >0 suppresses change subscriptions */
-static SemaphoreHandle_t cfgMux = nullptr;  /* recursive mutex protecting cfgRoot + txPatch */
+static SemaphoreHandle_t cfgMux = nullptr;  /* recursive mutex: readers vs the single
+                                             * actor-writer on cfgRoot, plus externals */
 
 #define CFG_LOCK()   xSemaphoreTakeRecursive(cfgMux, portMAX_DELAY)
 #define CFG_UNLOCK() xSemaphoreGiveRecursive(cfgMux)
 
 static bool savePending = false;
 static esp_timer_handle_t saveTimer = nullptr;
+
+/* Save-now semaphores handed to the persist worker by the actor; the worker
+ * gives each after a flush completes (storageSave waits on its own). */
+static std::vector<SemaphoreHandle_t> pendingSaveSems;
 
 /* ---- Task state ---- */
 
@@ -177,13 +185,9 @@ static cJSON* navigateOrCreate(cJSON* root, const char* dotPath,
   return nullptr;
 }
 
-/** Resolve a key: check txPatch first (for read-your-writes in transactions),
- *  then cfgRoot. Returns NULL if deleted in patch or not found. */
+/** Resolve a key directly in the committed tree. Reads never consult a pending
+ *  patch now (writes are applied by the actor, not accumulated in a tx). */
 static cJSON* resolveKey(const char* key) {
-  if (txPatch) {
-    cJSON* node = navigatePath(txPatch, key);
-    if (node) return cJSON_IsNull(node) ? nullptr : node;
-  }
   return navigatePath(cfgRoot, key);
 }
 
@@ -197,6 +201,11 @@ static std::string stripDots(const char* s) {
 /* ---- Deep merge (RFC 7396, with array-element extension) ---- */
 
 static void deepMerge(cJSON* dst, const cJSON* src);
+static bool markExternalsDeletedUnder(const char* keyOrPrefix);  /* defined below */
+static void startSaveTimer();                                    /* defined below */
+static void routePatchDirty(const cJSON* node, char* path, size_t cap, size_t len);
+static bool isSecret(const char* key);
+static cfg_type_t inferType(const char* val);                    /* defined below */
 
 /** True if every (named) child of obj has an all-digits name. Empty objects
  *  return false — we don't want to interpret `{}` as "merge nothing into the
@@ -341,11 +350,6 @@ static void walkTreePrint(cJSON* node, const char* prefix, cli_write_fn write) {
 }
 
 /* ---- Settings file read/write ---- */
-
-static bool isSaved(const char* key) {
-  return (key[0] == 's' && key[1] == '.')
-      || strncmp(key, "secrets.", 8) == 0;
-}
 
 static bool isSecret(const char* key) {
   return strncmp(key, "secrets.", 8) == 0;
@@ -515,6 +519,12 @@ static void saveWorkerFn(void*) {
   for (;;) {
     ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
     writeSettingsFile();
+    /* Release any save-now semaphores queued by SAVE ops while we flushed. */
+    CFG_LOCK();
+    std::vector<SemaphoreHandle_t> sems = std::move(pendingSaveSems);
+    pendingSaveSems.clear();
+    CFG_UNLOCK();
+    for (auto s : sems) if (s) xSemaphoreGive(s);
   }
 }
 
@@ -548,80 +558,371 @@ static void startSaveTimer() {
 struct storage_sub_t {
   TaskHandle_t        task;
   storage_change_cb_t cb;
-  char                scope[40];
+  std::string         scope;   /* unbounded — lxmf's 64-hex segments fit now */
 };
 
+/* The subscription table is OWNED BY THE STORAGE ACTOR: it is only ever mutated
+ * on the storage task (via SUB/UNSUB ops) or at boot before the task spawns, so
+ * the old unguarded subCount++ race is gone by construction. */
 static storage_sub_t subs[STORAGE_MAX_SUBS];
 static int           subCount = 0;
 
-/* Payload for aux message on STORAGE_CHANGE_PORT. Sized to fit in
- * ITS_MAX_MSG_DATA with room for hierarchical keys (deep dotted paths)
- * and reasonably long values. */
-struct storage_change_msg_t {
-  storage_change_cb_t cb;
-  char                key[128];
-  char                val[128];
-};
-static_assert(sizeof(storage_change_msg_t) <= ITS_MAX_MSG_DATA,
-              "storage_change_msg_t exceeds ITS_MAX_MSG_DATA");
+/* ========================================================================
+ * The storage actor
+ *
+ * All config WRITES funnel through a serialized op list applied by
+ * storageApplyOps on the storage task; READS stay direct under cfgMux. A write
+ * either applies directly (FAST PATH, D1: the caller IS the storage task, or
+ * storage hasn't spawned yet) or is sent to the storage task as one aux message
+ * and the caller blocks until applied (sync write — read-your-writes holds).
+ * The message boundary is the transaction: a whole op list applies atomically.
+ *
+ * Op format (one heap block, freeable with a single free()):
+ *   [u8 flags][op]*          flags bit0 = SILENT (suppress subscriptions)
+ *   'S' SET     key\0 vtype value      vtype 'I': int32 LE
+ *   'D' DELETE  key\0                        'S': u32 len + bytes (string)
+ *   'd' DEFAULT key\0 vtype value            'J': u32 len + printed JSON (subtree)
+ *   '+' SUB     scope\0 cb(void*)
+ *   '-' UNSUB   scope\0 cb(void*)      cb NULL = all of sender's subs on scope
+ *   'W' SAVE    sem(SemaphoreHandle_t)
+ * Keys/scopes are NUL-terminated and unbounded. The whole list is validated
+ * before anything is applied; a malformed list is rejected whole.
+ * ===================================================================== */
 
-/* Aux handler installed on each subscribing task — unpacks and calls */
-static void storageChangeDispatch(TaskHandle_t sender, const void* data, size_t len) {
-  if (len < sizeof(storage_change_msg_t)) return;
-  auto* msg = (const storage_change_msg_t*)data;
-  if (msg->cb) msg->cb(msg->key, msg->val);
+#define STORAGE_OP_PORT 44    /* aux port on the storage task carrying op lists */
+#define OP_F_SILENT     0x01
+
+/* ---- op encoding (append to a std::string buffer) ---- */
+static inline void opPutStr(std::string& b, const char* s) { b.append(s ? s : ""); b.push_back('\0'); }
+static inline void opPutU32(std::string& b, uint32_t v) { b.append((const char*)&v, sizeof(v)); }
+static inline void opPutPtr(std::string& b, const void* p) { b.append((const char*)&p, sizeof(p)); }
+
+/* opcode is 'S' (SET) or 'd' (DEFAULT). */
+static void opAppendKV(std::string& b, char opcode, const char* key, const char* val) {
+  b.push_back(opcode); opPutStr(b, key);
+  if (inferType(val) == CFG_INT) {
+    b.push_back('I'); int32_t v = atoi(val); b.append((const char*)&v, 4);
+  } else {
+    uint32_t n = (uint32_t)strlen(val); b.push_back('S'); opPutU32(b, n); b.append(val, n);
+  }
+}
+static void opAppendKVInt(std::string& b, char opcode, const char* key, int val) {
+  b.push_back(opcode); opPutStr(b, key); b.push_back('I'); int32_t v = val; b.append((const char*)&v, 4);
+}
+static void opAppendKVJson(std::string& b, char opcode, const char* key, const char* json, size_t jlen) {
+  b.push_back(opcode); opPutStr(b, key); b.push_back('J'); opPutU32(b, (uint32_t)jlen); b.append(json, jlen);
+}
+static void opAppendDelete(std::string& b, const char* key) { b.push_back('D'); opPutStr(b, key); }
+
+/* ---- per-task bracket accumulator (storageBegin/End sugar, D4) ---- */
+struct op_accum_t { TaskHandle_t task; std::string ops; int depth; bool silent; volatile bool active; };
+#define STORAGE_MAX_ACCUM 24
+static op_accum_t   accums[STORAGE_MAX_ACCUM];
+static portMUX_TYPE accumMux = portMUX_INITIALIZER_UNLOCKED;
+
+static op_accum_t* accumFind(TaskHandle_t t) {
+  for (int i = 0; i < STORAGE_MAX_ACCUM; i++)
+    if (accums[i].active && accums[i].task == t) return &accums[i];
+  return nullptr;
+}
+static op_accum_t* accumFindOrCreate(TaskHandle_t t) {
+  op_accum_t* e = accumFind(t);
+  if (e) return e;
+  portENTER_CRITICAL(&accumMux);
+  e = accumFind(t);
+  if (!e) for (int i = 0; i < STORAGE_MAX_ACCUM; i++) {
+    if (!accums[i].active) { accums[i].task = t; accums[i].depth = 0; accums[i].silent = false;
+                             accums[i].active = true; e = &accums[i]; break; }
+  }
+  portEXIT_CRITICAL(&accumMux);
+  return e;
+}
+
+/* ---- subscription table mutation (storage-task-owned; under CFG_LOCK) ---- */
+static void subAdd(TaskHandle_t task, storage_change_cb_t cb, const char* scope) {
+  if (subCount >= STORAGE_MAX_SUBS) { warn("storage: subscription table full\n"); return; }
+  subs[subCount].task = task; subs[subCount].cb = cb; subs[subCount].scope = scope ? scope : "";
+  subCount++;
+}
+static void subRemove(TaskHandle_t task, storage_change_cb_t cb, const char* scope) {
+  for (int i = 0; i < subCount; ) {
+    bool match = subs[i].task == task &&
+                 (scope == nullptr || subs[i].scope == scope) &&
+                 (cb == nullptr || subs[i].cb == cb);
+    if (match) subs[i] = subs[--subCount];   /* swap-with-last; scope is a std::string move */
+    else i++;
+  }
+}
+
+/* Collect every changed leaf in the patch as {key, printed-value} (deletes →
+ * empty value), replacing the inline firePatchSubscriptions walk. */
+static void collectChanges(cJSON* node, char* path, size_t pathSize, size_t pathLen,
+                           std::vector<std::pair<std::string,std::string>>& out) {
+  int idx = 0;
+  cJSON* item;
+  cJSON_ArrayForEach(item, node) {
+    char idxBuf[12];
+    const char* name = item->string;
+    if (!name) { snprintf(idxBuf, sizeof(idxBuf), "%d", idx); name = idxBuf; }
+    idx++;
+    size_t nameLen = strlen(name);
+    size_t dotLen = pathLen > 0 ? 1 : 0;
+    size_t newLen = pathLen + dotLen + nameLen;
+    if (newLen >= pathSize) continue;
+    if (dotLen) path[pathLen] = '.';
+    memcpy(path + pathLen + dotLen, name, nameLen + 1);
+
+    if (cJSON_IsNull(item))        out.emplace_back(path, "");
+    else if (cJSON_IsObject(item)) collectChanges(item, path, pathSize, newLen, out);
+    else if (cJSON_IsArray(item))  out.emplace_back(path, "");
+    else if (cJSON_IsString(item)) out.emplace_back(path, item->valuestring);
+    else if (cJSON_IsNumber(item)) { char vb[32]; snprintf(vb, sizeof(vb), "%d", item->valueint); out.emplace_back(path, vb); }
+
+    path[pathLen] = '\0';
+  }
+}
+
+/* Sanitized, length-capped preview of a value for the serial log. Storage
+ * values can be arbitrary attacker-influenced bytes (e.g. a fetched NomadNet
+ * page in nomad.page.body) carrying raw control/escape sequences. Echoing
+ * those verbatim lets a remote page drive the operator's terminal — a query
+ * sequence (cursor/DSR) makes the terminal reply, and that reply lands on the
+ * CLI prompt. Fold C0 controls + DEL to '.' (matches nomad's logPage) and cap
+ * the length so a multi-KB page can't flood the log. UTF-8 (>=0x80) is kept. */
+static std::string logSafe(const char* s, size_t cap = 96) {
+  std::string r;
+  for (size_t i = 0; s[i] && i < cap; i++) {
+    uint8_t c = (uint8_t)s[i];
+    r += (c < 0x20 || c == 0x7f) ? '.' : (char)c;
+  }
+  if (s[r.size()]) r += "…";
+  return r;
+}
+
+/* Deliver one change to every matching subscriber. The storage task's own subs
+ * (the "" browser-sync) are invoked DIRECTLY — no self-send, and since the DC
+ * handler re-reads by key the value isn't copied (D6). Remote subscribers get a
+ * variable-length CHANGED message {cb, key\0, val\0}, bounded send (D2). */
+static void notifyChange(const char* key, const char* val) {
+  for (int i = 0; i < subCount; i++) {
+    size_t sl = subs[i].scope.size();
+    if (sl != 0 && strncmp(key, subs[i].scope.c_str(), sl) != 0) continue;
+    if (subs[i].task == storageHandle) {
+      if (subs[i].cb) subs[i].cb(key, val);
+      continue;
+    }
+    size_t klen = strlen(key), vlen = strlen(val);
+    size_t n = sizeof(void*) + klen + 1 + vlen + 1;
+    uint8_t* buf = (uint8_t*)malloc(n);
+    if (!buf) continue;
+    void* cb = (void*)subs[i].cb;
+    memcpy(buf, &cb, sizeof(cb));
+    memcpy(buf + sizeof(cb), key, klen + 1);
+    memcpy(buf + sizeof(cb) + klen + 1, val, vlen + 1);
+    if (!itsSendAuxOwnedByTaskHandle(subs[i].task, STORAGE_CHANGE_PORT, buf, n,
+                                     pdMS_TO_TICKS(CONFIG_SPANGAP_STORAGE_NOTIFY_TIMEOUT_MS))) {
+      free(buf);
+      const char* tn = pcTaskGetName(subs[i].task);
+      warn("notify drop: %s=%s → [%s]\n", logSafe(key).c_str(),
+           logSafe(val).c_str(), tn ? tn : "?");
+    }
+  }
+}
+
+/* The apply pipeline — runs on the storage task (aux handler) and on the D1
+ * fast path. `sender` owns any SUB/UNSUB registered by this message. */
+static void storageApplyOps(const uint8_t* p, size_t len, TaskHandle_t sender) {
+  if (len < 1) return;
+  bool silent = (p[0] & OP_F_SILENT);
+  size_t pos = 1;
+
+  struct ParsedOp { char op; std::string key; cJSON* val; void* ptr; };
+  std::vector<ParsedOp> ops;
+  std::vector<SemaphoreHandle_t> saves;
+  bool bad = false;
+
+  /* Pass 1: validate + parse, no side effects on cfgRoot/externals. */
+  while (pos < len && !bad) {
+    char op = (char)p[pos++];
+    if (op == 'S' || op == 'd' || op == 'D') {
+      const char* key = (const char*)(p + pos);
+      size_t klen = strnlen(key, len - pos);
+      if (klen >= len - pos) { bad = true; break; }   /* no NUL within bounds */
+      pos += klen + 1;
+      ParsedOp po{op, std::string(key, klen), nullptr, nullptr};
+      if (op != 'D') {
+        if (pos >= len) { bad = true; break; }
+        char vt = (char)p[pos++];
+        if (vt == 'I') {
+          if (pos + 4 > len) { bad = true; break; }
+          int32_t v; memcpy(&v, p + pos, 4); pos += 4;
+          po.val = cJSON_CreateNumber(v);
+        } else if (vt == 'S' || vt == 'J') {
+          if (pos + 4 > len) { bad = true; break; }
+          uint32_t vl; memcpy(&vl, p + pos, 4); pos += 4;
+          if (pos + vl > len) { bad = true; break; }
+          if (vt == 'S') po.val = cJSON_CreateString(std::string((const char*)(p + pos), vl).c_str());
+          else           po.val = cJSON_ParseWithLength((const char*)(p + pos), vl);
+          pos += vl;
+        } else { bad = true; break; }
+      }
+      ops.push_back(std::move(po));
+    } else if (op == '+' || op == '-') {
+      const char* sc = (const char*)(p + pos);
+      size_t scl = strnlen(sc, len - pos);
+      if (scl >= len - pos) { bad = true; break; }
+      pos += scl + 1;
+      if (pos + sizeof(void*) > len) { bad = true; break; }
+      void* cb; memcpy(&cb, p + pos, sizeof(void*)); pos += sizeof(void*);
+      ops.push_back(ParsedOp{op, std::string(sc, scl), nullptr, cb});
+    } else if (op == 'W') {
+      if (pos + sizeof(void*) > len) { bad = true; break; }
+      SemaphoreHandle_t sem; memcpy(&sem, p + pos, sizeof(sem)); pos += sizeof(sem);
+      saves.push_back(sem);
+    } else { bad = true; break; }
+  }
+
+  if (bad) {
+    warn("storage: malformed op list (rejected)\n");
+    for (auto& o : ops) if (o.val) cJSON_Delete(o.val);
+    for (auto s : saves) if (s) xSemaphoreGive(s);   /* don't hang storageSave callers */
+    return;
+  }
+
+  /* Pass 2: apply under the config mutex. */
+  cJSON* patch = cJSON_CreateObject();
+  std::vector<std::pair<std::string,std::string>> changes;
+
+  CFG_LOCK();
+  for (auto& o : ops) {
+    if (o.op == '+' || o.op == '-') continue;
+    char leaf[96];  /* see navigatePath */
+    if (o.op == 'D') {
+      cJSON* parent = navigateOrCreate(patch, o.key.c_str(), leaf, sizeof(leaf));
+      if (parent) { cJSON_DeleteItemFromObject(parent, leaf); cJSON_AddNullToObject(parent, leaf); }
+      markExternalsDeletedUnder(o.key.c_str());
+      continue;
+    }
+    if (!o.val) continue;   /* failed parse/alloc — skip this leaf */
+    if (o.op == 'd') {
+      cJSON* cur = navigatePath(cfgRoot, o.key.c_str());   /* DEFAULT: skip if present */
+      if (cur && !cJSON_IsObject(cur) && !cJSON_IsArray(cur)) continue;
+    } else {
+      cJSON* cur = navigatePath(cfgRoot, o.key.c_str());   /* SET dedup (load-bearing vs notify floods) */
+      if (cur) {
+        bool same = (cJSON_IsString(o.val) && cJSON_IsString(cur) && strcmp(cur->valuestring, o.val->valuestring) == 0)
+                 || (cJSON_IsNumber(o.val) && cJSON_IsNumber(cur) && cur->valueint == o.val->valueint);
+        if (same) continue;
+      }
+    }
+    cJSON* parent = navigateOrCreate(patch, o.key.c_str(), leaf, sizeof(leaf));
+    if (parent) {
+      cJSON_DeleteItemFromObject(parent, leaf);
+      cJSON_AddItemToObject(parent, leaf, o.val);
+      o.val = nullptr;   /* ownership moved into the patch */
+    }
+  }
+
+  deepMerge(cfgRoot, patch);
+  if (!silent) { char pb[128] = ""; collectChanges(patch, pb, sizeof(pb), 0, changes); }
+  if (cJSON_GetObjectItem(patch, "s") || cJSON_GetObjectItem(patch, "secrets")) {
+    char rb[128] = "";
+    routePatchDirty(patch, rb, sizeof(rb), 0);
+    startSaveTimer();
+  }
+  cJSON_Delete(patch);
+
+  /* SUB/UNSUB: mutate the actor-owned table under the lock (race-free). */
+  for (auto& o : ops) {
+    if (o.op == '+')      subAdd(sender, (storage_change_cb_t)o.ptr, o.key.c_str());
+    else if (o.op == '-') subRemove(sender, (storage_change_cb_t)o.ptr, o.key.c_str());
+  }
+  CFG_UNLOCK();
+
+  for (auto& o : ops) if (o.val) cJSON_Delete(o.val);   /* any skipped/leftover values */
+
+  /* Notify AFTER the unlock (deliberate ordering: callbacks see committed state
+   * and direct-called ones may re-lock the recursive mutex). */
+  for (auto& ch : changes) notifyChange(ch.first.c_str(), ch.second.c_str());
+
+  /* SAVE: queue the semaphores and poke the persist worker. */
+  if (!saves.empty()) {
+    CFG_LOCK();
+    for (auto s : saves) pendingSaveSems.push_back(s);
+    CFG_UNLOCK();
+    requestSave();
+  }
+}
+
+/* Aux handler on the storage task: one op message arrived. */
+static void onStorageOp(TaskHandle_t sender, const void* data, size_t len) {
+  storageApplyOps((const uint8_t*)data, len, sender);
+}
+
+/* Submit an op buffer (leading flags byte already present). Fast path applies
+ * directly; otherwise hand the buffer to the storage task and (for sync) block
+ * until applied. */
+static void storageSubmit(std::string&& ops, bool sync) {
+  TaskHandle_t me = xTaskGetCurrentTaskHandle();
+  if (storageHandle == nullptr || me == storageHandle) {
+    storageApplyOps((const uint8_t*)ops.data(), ops.size(), me);
+    return;
+  }
+  size_t n = ops.size();
+  void* buf = malloc(n);
+  if (!buf) { warn("storage: op alloc failed (%u B)\n", (unsigned)n); return; }
+  memcpy(buf, ops.data(), n);
+  if (!itsSendAuxOwnedByTaskHandle(storageHandle, STORAGE_OP_PORT, buf, n,
+                                   pdMS_TO_TICKS(CONFIG_SPANGAP_STORAGE_OP_TIMEOUT_MS),
+                                   sync ? ITS_WAIT_PICKUP : ITS_WAIT_DELIVERY)) {
+    free(buf);
+    warn("storage: op send timed out (storage task stuck?)\n");
+  }
+}
+
+/* Emit one already-built op: into the calling task's open bracket if it has
+ * one, else as a single auto-committed (sync) message. */
+static void storageEmitOp(const std::string& op, bool silentSingle) {
+  op_accum_t* a = accumFind(xTaskGetCurrentTaskHandle());
+  if (a && a->depth > 0) { a->ops.append(op); return; }
+  std::string buf;
+  buf.push_back(silentSingle ? OP_F_SILENT : 0);
+  buf.append(op);
+  storageSubmit(std::move(buf), /*sync=*/true);
+}
+
+/* Aux handler installed on each subscribing task — unpacks the variable-length
+ * CHANGED message {cb, key\0, val\0} and invokes the callback. */
+static void storageChangeDispatch(TaskHandle_t /*sender*/, const void* data, size_t len) {
+  if (len < sizeof(void*) + 2) return;
+  const uint8_t* r = (const uint8_t*)data;
+  void* cbp; memcpy(&cbp, r, sizeof(cbp));
+  storage_change_cb_t cb = (storage_change_cb_t)cbp;
+  const char* key = (const char*)(r + sizeof(cbp));
+  size_t rem = len - sizeof(cbp);
+  size_t klen = strnlen(key, rem);
+  if (klen + 1 >= rem) return;
+  const char* val = key + klen + 1;
+  if (cb) cb(key, val);
 }
 
 void storageSubscribeChanges(const char* scope, storage_change_cb_t cb) {
-  if (subCount >= STORAGE_MAX_SUBS) return;
-
-  TaskHandle_t me = xTaskGetCurrentTaskHandle();
-
-  /* Register aux handler on this task if first subscription */
-  bool needsHandler = true;
-  for (int i = 0; i < subCount; i++) {
-    if (subs[i].task == me) { needsHandler = false; break; }
-  }
-  if (needsHandler)
-    itsOnAux(STORAGE_CHANGE_PORT, storageChangeDispatch);
-
-  auto& s = subs[subCount++];
-  s.task = me;
-  s.cb = cb;
-  safeStrncpy(s.scope, scope, sizeof(s.scope));
+  /* Register the receive handler on THIS task, then send a SUB op so the actor
+   * adds us to its table. Sync, so the subscription is live on return (an
+   * immediate NOW_AND_ON_CHANGE read then sees consistent state). */
+  itsOnAux(STORAGE_CHANGE_PORT, storageChangeDispatch);
+  std::string buf;
+  buf.push_back(0);
+  buf.push_back('+'); opPutStr(buf, scope); opPutPtr(buf, (void*)cb);
+  storageSubmit(std::move(buf), /*sync=*/true);
 }
 
 void storageUnsubscribe(const char* scope) {
   if (!scope) return;
-  TaskHandle_t me = xTaskGetCurrentTaskHandle();
-  for (int i = 0; i < subCount; ) {
-    if (subs[i].task == me && strcmp(subs[i].scope, scope) == 0) {
-      subs[i] = subs[--subCount];  /* swap-with-last */
-    } else {
-      i++;
-    }
-  }
-  /* Aux handler stays installed for the task — itsOnAux has no off
-   * counterpart, and an idle dispatcher costs ~one strcmp per delivery. */
-}
-
-static void fireSubscriptions(const char* key, const char* val) {
-  storage_change_msg_t msg = {};
-  safeStrncpy(msg.key, key, sizeof(msg.key));
-  strncpy(msg.val, val, sizeof(msg.val) - 1);
-  msg.val[sizeof(msg.val) - 1] = '\0';
-
-  for (int i = 0; i < subCount; i++) {
-    size_t scopeLen = strlen(subs[i].scope);
-    if (scopeLen == 0 || strncmp(key, subs[i].scope, scopeLen) == 0) {
-      msg.cb = subs[i].cb;
-      if (!itsSendAuxByTaskHandle(subs[i].task, STORAGE_CHANGE_PORT, &msg, sizeof(msg),
-                                  pdMS_TO_TICKS(10))) {
-        const char* tn = pcTaskGetName(subs[i].task);
-        warn("notify drop: %s=%s → [%s] (inbox full)\n", key, val, tn ? tn : "?");
-      }
-    }
-  }
+  std::string buf;
+  buf.push_back(0);
+  buf.push_back('-'); opPutStr(buf, scope); opPutPtr(buf, nullptr);  /* cb NULL = all on scope */
+  storageSubmit(std::move(buf), /*sync=*/true);
 }
 
 /* ---- Type inference ---- */
@@ -638,47 +939,7 @@ static cfg_type_t inferType(const char* val) {
   return CFG_INT;
 }
 
-/* ---- Transactions ---- */
-
-/** Walk patch leaves firing subscriptions (null → val="").
- *  Uses a fixed char buffer to build dot-paths (no std::string on stack). */
-static void firePatchSubscriptions(cJSON* node, char* path, size_t pathSize, size_t pathLen) {
-  int idx = 0;
-  cJSON* item;
-  cJSON_ArrayForEach(item, node) {
-    char idxBuf[12];
-    const char* name = item->string;
-    if (!name) { snprintf(idxBuf, sizeof(idxBuf), "%d", idx); name = idxBuf; }
-    idx++;
-
-    /* Append ".name" to path (or just "name" if path is empty) */
-    size_t nameLen = strlen(name);
-    size_t dotLen = pathLen > 0 ? 1 : 0;
-    size_t newLen = pathLen + dotLen + nameLen;
-    if (newLen >= pathSize) continue;  /* path too long, skip */
-    if (dotLen) path[pathLen] = '.';
-    memcpy(path + pathLen + dotLen, name, nameLen + 1);
-
-    if (cJSON_IsNull(item)) {
-      fireSubscriptions(path, "");
-    } else if (cJSON_IsObject(item)) {
-      firePatchSubscriptions(item, path, pathSize, newLen);
-    } else if (cJSON_IsArray(item)) {
-      fireSubscriptions(path, "");
-    } else {
-      char valBuf[32];
-      const char* val;
-      if (cJSON_IsString(item)) val = item->valuestring;
-      else if (cJSON_IsNumber(item)) {
-        snprintf(valBuf, sizeof(valBuf), "%d", item->valueint);
-        val = valBuf;
-      } else { path[pathLen] = '\0'; continue; }
-      fireSubscriptions(path, val);
-    }
-
-    path[pathLen] = '\0';
-  }
-}
+/* ---- Patch routing (the apply pipeline lives in the actor, above) ---- */
 
 /** Walk a patch tree and route dirty flags. If a sub-tree's path equals an
  *  external prefix, mark that external dirty (don't descend further). Any
@@ -712,39 +973,34 @@ static void routePatchDirty(const cJSON* node, char* path, size_t cap, size_t le
     rootDirty = true;
 }
 
-static void commitPatch() {
-  /* Caller holds CFG_LOCK — protects cfgRoot, txPatch, txDepth from
-     concurrent access.  ITS aux sends (10ms timeout) are bounded. */
-  if (!txPatch) return;
-
-  deepMerge(cfgRoot, txPatch);
-
-  if (silentDepth == 0) {
-    char pathBuf[128] = "";
-    firePatchSubscriptions(txPatch, pathBuf, sizeof(pathBuf), 0);
-  }
-
-  if (cJSON_GetObjectItem(txPatch, "s") || cJSON_GetObjectItem(txPatch, "secrets")) {
-    char routeBuf[128] = "";
-    routePatchDirty(txPatch, routeBuf, sizeof(routeBuf), 0);
-    startSaveTimer();
-  }
-
-  cJSON_Delete(txPatch);
-  txPatch = nullptr;
-}
-
+/* storageBegin/End are sugar over the per-task op accumulator (D4): writes
+ * between them collect into one op list, submitted atomically at the outer
+ * storageEnd. NOTE: read-your-writes INSIDE an open bracket is gone — reads go
+ * straight to cfgRoot, which has not yet seen the bracket's pending writes.
+ * Audited callers restructure around this (read before the bracket). */
 void storageBegin() {
-  CFG_LOCK();
-  if (txDepth++ == 0)
-    txPatch = cJSON_CreateObject();
+  op_accum_t* a = accumFindOrCreate(xTaskGetCurrentTaskHandle());
+  if (a && a->depth++ == 0) { a->ops.clear(); a->silent = false; }
+  /* If the accumulator table is full, a is null: writes simply auto-commit
+   * individually (atomicity lost, never data lost). */
 }
 
 void storageEnd() {
-  if (txDepth <= 0) { CFG_UNLOCK(); return; }
-  if (--txDepth == 0)
-    commitPatch();
-  CFG_UNLOCK();
+  op_accum_t* a = accumFind(xTaskGetCurrentTaskHandle());
+  if (!a || a->depth <= 0) return;
+  if (--a->depth == 0 && !a->ops.empty()) {
+    std::string buf;
+    buf.push_back(a->silent ? OP_F_SILENT : 0);
+    buf.append(a->ops);
+    a->ops.clear();
+    storageSubmit(std::move(buf), /*sync=*/true);
+  }
+}
+
+/* Internal: open a SILENT bracket (storageDefaultTree / storageCopyNoNotify). */
+static void storageBeginSilent() {
+  op_accum_t* a = accumFindOrCreate(xTaskGetCurrentTaskHandle());
+  if (a && a->depth++ == 0) { a->ops.clear(); a->silent = true; }
 }
 
 /* ---- JSON deep merge (RFC 7396) ---- */
@@ -919,38 +1175,17 @@ std::string storageGetStr(const char* key, const char* def) {
 }
 
 void storageSet(const char* key, int val) {
-  char buf[16];
-  snprintf(buf, sizeof(buf), "%d", val);
-  storageSet(key, buf);
+  std::string op;
+  opAppendKVInt(op, 'S', key, val);
+  storageEmitOp(op, /*silentSingle=*/false);
 }
 
 void storageSet(const char* key, const char* val) {
-  CFG_LOCK();
-  /* Dedup: skip if current committed value equals new value. Saves notify
-   * floods when e.g. browser rapid-fires the same signal repeatedly. Compare
-   * against the cJSON string directly so we don't truncate long values. */
-  {
-    cJSON* node = resolveKey(key);
-    if (node && cJSON_IsString(node) && strcmp(node->valuestring, val) == 0) {
-      CFG_UNLOCK();
-      return;
-    }
-  }
-  bool autoCommit = (txDepth == 0);
-  if (autoCommit) storageBegin();
-
-  char leaf[96];  /* see navigatePath */
-  cJSON* parent = navigateOrCreate(txPatch, key, leaf, sizeof(leaf));
-  if (parent) {
-    cJSON_DeleteItemFromObject(parent, leaf);
-    if (inferType(val) == CFG_INT)
-      cJSON_AddNumberToObject(parent, leaf, atoi(val));
-    else
-      cJSON_AddStringToObject(parent, leaf, val);
-  }
-
-  if (autoCommit) storageEnd();
-  CFG_UNLOCK();
+  /* Dedup against the committed value now happens in the actor (load-bearing
+   * against notify floods, but moved so it sees the real committed state). */
+  std::string op;
+  opAppendKV(op, 'S', key, val);
+  storageEmitOp(op, /*silentSingle=*/false);
 }
 
 /* Default writes don't fire change subscriptions: by definition the value
@@ -958,15 +1193,15 @@ void storageSet(const char* key, const char* val) {
  * once (typically dozens at first boot), not real config changes. Without
  * this, broad subscriptions like net's "s." flood inboxes during install. */
 bool storageDefault(const char* key, const char* val) {
-  CFG_LOCK();
-  bool exists = storageExists(key);
-  if (!exists) {
-    silentDepth++;
-    storageSet(key, val);
-    silentDepth--;
-  }
-  CFG_UNLOCK();
-  return !exists;
+  /* DEFAULT op: the actor sets the key only if it is currently unset, and the
+   * SILENT flag suppresses notification (defaults are not real changes). The
+   * return value is a pre-check (benign TOCTOU on the return only; the
+   * conditional itself is resolved race-free inside the actor). */
+  bool wasUnset = !storageExists(key);
+  std::string op;
+  opAppendKV(op, 'd', key, val);
+  storageEmitOp(op, /*silentSingle=*/true);
+  return wasUnset;
 }
 
 bool storageDefault(const char* key, int val) {
@@ -1017,11 +1252,9 @@ static bool defaultTreeImpl(const char* fullKey, const cJSON* node, bool atRoot)
 bool storageDefaultTree(const char* prefix, const cJSON* json) {
   if (!json) return false;
   bool prefixEmpty = (!prefix || !*prefix);
-  silentDepth++;
-  storageBegin();
+  storageBeginSilent();
   bool wrote = defaultTreeImpl(prefixEmpty ? "" : prefix, json, prefixEmpty);
   storageEnd();
-  silentDepth--;
   return wrote;
 }
 
@@ -1035,56 +1268,24 @@ bool storageDefaultTree(const char* prefix, const char* jsonStr) {
 }
 
 void storageUnset(const char* key) {
-  CFG_LOCK();
-  bool autoCommit = (txDepth == 0);
-  if (autoCommit) storageBegin();
-
-  char leaf[96];  /* see navigatePath */
-  cJSON* parent = navigateOrCreate(txPatch, key, leaf, sizeof(leaf));
-  if (parent) {
-    cJSON_DeleteItemFromObject(parent, leaf);
-    cJSON_AddNullToObject(parent, leaf);
-  }
-
-  if (autoCommit) storageEnd();
-  CFG_UNLOCK();
+  /* Unified with storageDeleteTree (D12): one DELETE op, which the actor turns
+   * into a null-in-patch (whole subtree removed) plus markExternalsDeletedUnder. */
+  std::string op;
+  opAppendDelete(op, key);
+  storageEmitOp(op, /*silentSingle=*/false);
 }
 
 void storageSetTree(const char* key, cJSON* val) {
   if (!val) return;
-  CFG_LOCK();
-  bool autoCommit = (txDepth == 0);
-  if (autoCommit) storageBegin();
-
-  char leaf[96];  /* see navigatePath */
-  cJSON* parent = navigateOrCreate(txPatch, key, leaf, sizeof(leaf));
-  if (parent) {
-    cJSON_DeleteItemFromObject(parent, leaf);
-    cJSON_AddItemToObject(parent, leaf, val);
-  } else {
-    cJSON_Delete(val);  /* ownership was transferred, clean up on failure */
-  }
-
-  if (autoCommit) storageEnd();
-  CFG_UNLOCK();
-}
-
-/** Delete a node from a tree at the given dot-path. */
-static bool deleteFromTree(cJSON* root, const char* dotPath) {
-  const char* lastDot = strrchr(dotPath, '.');
-  if (!lastDot) {
-    cJSON* item = cJSON_DetachItemFromObject(root, dotPath);
-    if (!item) return false;
-    cJSON_Delete(item);
-    return true;
-  }
-  std::string parentPath(dotPath, lastDot - dotPath);
-  cJSON* parent = navigatePath(root, parentPath.c_str());
-  if (!parent) return false;
-  cJSON* item = cJSON_DetachItemFromObject(parent, lastDot + 1);
-  if (!item) return false;
-  cJSON_Delete(item);
-  return true;
+  /* Serialize the subtree into the op as a 'J' value, then delete the caller's
+   * tree (ownership contract unchanged for callers). */
+  char* json = cJSON_PrintUnformatted(val);
+  cJSON_Delete(val);
+  if (!json) return;
+  std::string op;
+  opAppendKVJson(op, 'S', key, json, strlen(json));
+  cJSON_free(json);
+  storageEmitOp(op, /*silentSingle=*/false);
 }
 
 /** Flag every external file at or below `keyOrPrefix` for deletion (the
@@ -1110,36 +1311,32 @@ static bool markExternalsDeletedUnder(const char* keyOrPrefix) {
 
 void storageDeleteTree(const char* keyOrPrefix) {
   if (!keyOrPrefix || !*keyOrPrefix) return;
-
-  /* Delete via the same null-in-txPatch → commit path as storageUnset
-     (RFC 7396: a null member removes the member, whole subtree included —
-     deepMerge() cJSON_DeleteItemFromObject). This routes the deletion
-     through firePatchSubscriptions + the coalesced, back-pressure-RETRIED
-     browser patch (dcFlushPatch), instead of a fire-and-forget
-     itsSend(...,0) whose drop under DC back-pressure left clients showing
-     deleted conversations until a reload. commitPatch handles
-     persistence (routePatchDirty + startSaveTimer) for s./secrets. */
-  CFG_LOCK();
-  /* If this key (or an ancestor) owns an external file, drop it on next flush
-     — otherwise the on-disk .json survives and resurrects on reboot. */
-  markExternalsDeletedUnder(keyOrPrefix);
-  bool autoCommit = (txDepth == 0);
-  if (autoCommit) storageBegin();
-
-  char leaf[96];  /* see navigatePath */
-  cJSON* parent = navigateOrCreate(txPatch, keyOrPrefix, leaf, sizeof(leaf));
-  if (parent) {
-    cJSON_DeleteItemFromObject(parent, leaf);
-    cJSON_AddNullToObject(parent, leaf);
-  }
-
-  if (autoCommit) storageEnd();
-  CFG_UNLOCK();
+  /* Unified with storageUnset on one DELETE op (D12): the actor adds a null to
+   * the patch (RFC 7396 whole-subtree removal via deepMerge) AND calls
+   * markExternalsDeletedUnder so an owning external file is dropped on the next
+   * flush. Routes through the coalesced, back-pressure-retried browser patch. */
+  std::string op;
+  opAppendDelete(op, keyOrPrefix);
+  storageEmitOp(op, /*silentSingle=*/false);
 }
 
 void storageSave() {
-  if (saveTimer) esp_timer_stop(saveTimer);
-  writeSettingsFile();
+  /* Force a flush now and block until it completes. A SAVE op carries a
+   * semaphore the persist worker gives once writeSettingsFile returns (D:
+   * never call from the storage task — it must not wait on its own actor). */
+  if (xTaskGetCurrentTaskHandle() == storageHandle) {
+    warn("storage: storageSave from the storage task is unsupported\n");
+    return;
+  }
+  SemaphoreHandle_t sem = xSemaphoreCreateBinary();
+  if (!sem) return;
+  std::string buf;
+  buf.push_back(0);
+  buf.push_back('W'); opPutPtr(buf, sem);
+  storageSubmit(std::move(buf), /*sync=*/false);  /* delivery only; we wait on sem */
+  if (xSemaphoreTake(sem, pdMS_TO_TICKS(30000)) != pdTRUE)
+    warn("storage: save timed out\n");
+  vSemaphoreDelete(sem);
 }
 
 void storageNewTreeFile(const char* prefix) {
@@ -1181,9 +1378,11 @@ cfg_type_t storageGetType(const char* key) {
 
 /* ---- Bulk operations ---- */
 
-/** Walk src subtree, storageSet each leaf at the corresponding dst path. */
-static void walkAndCopy(cJSON* node, const std::string& srcPre,
-                        const std::string& dstPre, bool onlyIfExists) {
+/** Walk src subtree, append a SET op for each leaf at the corresponding dst
+ *  path. Reads cfgRoot for the onlyIfExists guard, so the caller holds the
+ *  lock; the ops are submitted after the lock is released. */
+static void walkAndCopyOps(std::string& buf, cJSON* node, const std::string& srcPre,
+                           const std::string& dstPre, bool onlyIfExists) {
   int idx = 0;
   cJSON* item;
   cJSON_ArrayForEach(item, node) {
@@ -1194,70 +1393,59 @@ static void walkAndCopy(cJSON* node, const std::string& srcPre,
     std::string srcKey = srcPre + "." + name;
     std::string dstKey = dstPre + "." + name;
     if (cJSON_IsObject(item) || cJSON_IsArray(item)) {
-      walkAndCopy(item, srcKey, dstKey, onlyIfExists);
+      walkAndCopyOps(buf, item, srcKey, dstKey, onlyIfExists);
     } else {
       if (onlyIfExists && !navigatePath(cfgRoot, dstKey.c_str())) continue;
-      if (cJSON_IsNumber(item))
-        storageSet(dstKey.c_str(), item->valueint);
-      else if (cJSON_IsString(item))
-        storageSet(dstKey.c_str(), item->valuestring);
+      if (cJSON_IsNumber(item))      opAppendKVInt(buf, 'S', dstKey.c_str(), item->valueint);
+      else if (cJSON_IsString(item)) opAppendKV(buf, 'S', dstKey.c_str(), item->valuestring);
     }
   }
 }
 
+/* Read the source under the lock and compose SET ops into one message; submit
+ * after the lock is released (the actor would deadlock taking it again). Loses
+ * source-stability during the copy — callers are init-time, acceptable. */
 void storageCopy(const char* srcPrefix, const char* dstPrefix, bool onlyIfTargetKeyExists) {
   std::string src = stripDots(srcPrefix);
   std::string dst = stripDots(dstPrefix);
+  std::string buf;
+  buf.push_back(0);   /* notify */
 
   CFG_LOCK();
   cJSON* srcNode = navigatePath(cfgRoot, src.c_str());
-  if (!srcNode) { CFG_UNLOCK(); return; }
-
-  if (!cJSON_IsObject(srcNode) && !cJSON_IsArray(srcNode)) {
-    /* Single leaf copy */
-    if (onlyIfTargetKeyExists && !navigatePath(cfgRoot, dst.c_str())) { CFG_UNLOCK(); return; }
-    if (cJSON_IsNumber(srcNode))
-      storageSet(dst.c_str(), srcNode->valueint);
-    else if (cJSON_IsString(srcNode))
-      storageSet(dst.c_str(), srcNode->valuestring);
-    CFG_UNLOCK();
-    return;
+  if (srcNode) {
+    if (!cJSON_IsObject(srcNode) && !cJSON_IsArray(srcNode)) {
+      if (!(onlyIfTargetKeyExists && !navigatePath(cfgRoot, dst.c_str()))) {
+        if (cJSON_IsNumber(srcNode))      opAppendKVInt(buf, 'S', dst.c_str(), srcNode->valueint);
+        else if (cJSON_IsString(srcNode)) opAppendKV(buf, 'S', dst.c_str(), srcNode->valuestring);
+      }
+    } else {
+      walkAndCopyOps(buf, srcNode, src, dst, onlyIfTargetKeyExists);
+    }
   }
-
-  storageBegin();
-  walkAndCopy(srcNode, src, dst, onlyIfTargetKeyExists);
-  storageEnd();
   CFG_UNLOCK();
+
+  if (buf.size() > 1) storageSubmit(std::move(buf), /*sync=*/true);
 }
 
 void storageCopyNoNotify(const char* srcPrefix, const char* dstPrefix, bool onlyIfTargetKeyExists) {
   std::string src = stripDots(srcPrefix);
   std::string dst = stripDots(dstPrefix);
+  if (onlyIfTargetKeyExists) return;   /* unchanged: never copies in this mode */
 
+  /* Serialize the whole source subtree under the lock and emit it as one SILENT
+   * SET 'J' op — the actor's deepMerge places/merges it at dst exactly as the
+   * old direct merge did, but through the actor (no foreign-task write). */
   CFG_LOCK();
   cJSON* srcNode = navigatePath(cfgRoot, src.c_str());
-  if (!srcNode) { CFG_UNLOCK(); return; }
-
-  if (onlyIfTargetKeyExists) { CFG_UNLOCK(); return; }
-
-  /* Clone src subtree, deep-merge at dst */
-  cJSON* clone = cJSON_Duplicate(srcNode, true);
-  if (!clone) { CFG_UNLOCK(); return; }
-
-  /* Build a wrapper so deepMerge places the clone at the right path */
-  cJSON* wrapper = cJSON_CreateObject();
-  char leaf[96];  /* see navigatePath */
-  cJSON* parent = navigateOrCreate(wrapper, dst.c_str(), leaf, sizeof(leaf));
-  if (parent) {
-    cJSON_AddItemToObject(parent, leaf, clone);
-    deepMerge(cfgRoot, wrapper);
-  } else {
-    cJSON_Delete(clone);
-  }
+  char* json = srcNode ? cJSON_PrintUnformatted(srcNode) : nullptr;
   CFG_UNLOCK();
-  cJSON_Delete(wrapper);
-
-  if (isSaved(dst.c_str())) startSaveTimer();
+  if (!json) return;
+  std::string buf;
+  buf.push_back(OP_F_SILENT);
+  opAppendKVJson(buf, 'S', dst.c_str(), json, strlen(json));
+  cJSON_free(json);
+  storageSubmit(std::move(buf), /*sync=*/true);
 }
 
 int storageArrayCount(const char* prefix) {
@@ -1621,22 +1809,28 @@ static void dcAccumulateChange(const char* key, const char* val) {
 }
 
 /** Flush accumulated changes to the browser as one DC packet. On back-
- *  pressure leave the patch intact and retry next pass — never drop. */
-static constexpr size_t DC_PATCH_MAX = 15500;  /* one 16K fromSize buffer, header(4)+slack */
-
+ *  pressure leave the patch intact and retry next pass — never drop.
+ *
+ *  The per-patch ceiling now derives from the packet link's per-message size
+ *  guard (itsSendBufSize == the port's maxMsg, 64 KB), not a fixed 15.5 KB ring
+ *  budget — so a 15-32 KB Nomad page reaches the browser instead of being
+ *  silently dropped one layer below Nomad's own cap. The drop-and-warn arm
+ *  stays as a final backstop but should be unreachable below the guard. */
 static void dcFlushPatch() {
     if (!dcPendingPatch || dcHandle < 0) return;
     char* text = cJSON_PrintUnformatted(dcPendingPatch);
     if (!text) return;
     size_t len = strlen(text);
 
-    /* Patch outgrew what we'll send in one packet: drop and warn.
-       Incremental UI state may become stale until the next change forces
-       a fresh patch; full re-dumps from the storage task would blow the
+    size_t dcPatchMax = itsSendBufSize(dcHandle);   /* the port's maxMsg guard */
+
+    /* Patch outgrew the per-message guard: drop and warn (now unreachable in
+       practice). Incremental UI state may become stale until the next change
+       forces a fresh patch; full re-dumps from the storage task would blow the
        stack (cJSON_Duplicate of cfgRoot is deeply recursive). */
-    if (len > DC_PATCH_MAX) {
+    if (len > dcPatchMax) {
         warn("storage: patch %u > %u, dropping (clients may need reload)\n",
-             (unsigned)len, (unsigned)DC_PATCH_MAX);
+             (unsigned)len, (unsigned)dcPatchMax);
         cJSON_free(text);
         cJSON_Delete(dcPendingPatch);
         dcPendingPatch = nullptr;
@@ -1705,12 +1899,13 @@ static void mergeIncomingPatch(cJSON* obj, const std::string& prefix) {
     if (isSecret(key.c_str())) continue;
     if (isFw(key.c_str())) continue;   /* read-only firmware identity */
     if (cJSON_IsNull(item)) {
-      /* Silent delete (no subscription callbacks) */
-      CFG_LOCK();
-      markExternalsDeletedUnder(key.c_str());   /* drop external file if this is one */
-      deleteFromTree(cfgRoot, key.c_str());
-      CFG_UNLOCK();
-      if (strncmp(key.c_str(), "s.", 2) == 0) startSaveTimer();
+      /* Browser-initiated silent delete: a SILENT DELETE op (no subscription
+       * callbacks). Runs on the storage task, so this fast-paths straight into
+       * storageApplyOps — externals + null-merge + save-timer all handled there. */
+      std::string b;
+      b.push_back(OP_F_SILENT);
+      opAppendDelete(b, key.c_str());
+      storageSubmit(std::move(b), /*sync=*/true);
     } else if (cJSON_IsObject(item)) {
       mergeIncomingPatch(item, key);
     } else if (cJSON_IsArray(item)) {
@@ -1732,7 +1927,8 @@ static void dcHandleMessage(int handle, const char* text, size_t len) {
         requestSave();   /* off the storage task — never fs I/O on the poll loop */
         return;
     }
-    cJSON* root = cJSON_Parse(text);
+    /* The borrowed packet block carries no NUL terminator — parse by length. */
+    cJSON* root = cJSON_ParseWithLength(text, len);
     if (!root) return;
     mergeIncomingPatch(root, "");
     cJSON_Delete(root);
@@ -1740,14 +1936,14 @@ static void dcHandleMessage(int handle, const char* text, size_t len) {
 
 static void dcPollConfig() {
     if (dcHandle < 0) return;
-    /* Packet-mode itsRecv: one JSON body per call. Size to fit the
-       largest browser-originated patch we'd expect. */
-    static char buf[8192];
-    for (;;) {
-        size_t n = itsRecv(dcHandle, buf, sizeof(buf) - 1, 0);
-        if (n == 0) break;
-        buf[n] = '\0';
-        dcHandleMessage(dcHandle, buf, n);
+    /* Zero-copy receive: take ownership of each inbound JSON body (no copy, no
+       static buffer, no size cap — a >8 KB browser patch now applies), parse it
+       by length, then free. */
+    void* p = nullptr;
+    size_t n = 0;
+    while (itsRecvRef(dcHandle, &p, &n, 0)) {
+        dcHandleMessage(dcHandle, (const char*)p, n);
+        free(p);
     }
 }
 
@@ -1802,15 +1998,16 @@ static void storageTaskFn(void* arg) {
         if (old) cJSON_Delete(old);
     }
 
-    /* "" subscription for browser sync means every storageSet fires an aux
-     * into our inbox — including changes we ourselves push when processing
-     * browser-originated patches. UI bursts (page load, opening cli/log
-     * windows) AND the ~1 Hz multi-producer stats publish (rnsd + every iface
-     * + auto + tcp peers + lora + gps, >100 keys at once) generate many writes
-     * back-to-back; default depth 8 overflows. Drops show up as "[storage]
-     * notify drop … (inbox full)" warns. Depth is a PSRAM-backed Kconfig knob
-     * (~344 B/slot) so the worst-case burst fits in one drain window. */
-    itsServerInit(0, CONFIG_SPANGAP_STORAGE_NOTIFY_INBOX);
+    /* The storage actor's inbox carries op messages (STORAGE_OP_PORT) and the
+     * change self-sends from the "" browser-sync sub. Foreign writers block on
+     * sync delivery, so the inbox can't truly overflow, but a generous depth
+     * keeps a ~1 Hz multi-producer stats burst flowing without back-pressure.
+     * Slots are pointers now (~4 B). */
+    /* Inbox guard 64 KB: foreign-task op lists (a big storageSetTree/storageCopy
+     * subtree serialized as one message) must fit; browser patches never travel
+     * here (they run on this task and fast-path). */
+    itsServerInit(65536, CONFIG_SPANGAP_STORAGE_NOTIFY_INBOX);
+    itsOnAux(STORAGE_OP_PORT, onStorageOp);   /* receive config write op lists */
     /* Packet-mode: each DC message is one JSON body (dump, patch, ping).
      * toSize=48K holds the largest browser-originated patch — the IANA
      * timezone DB is ~40K when flattened. fromSize=16K: the full dump now
@@ -1818,7 +2015,16 @@ static void storageTaskFn(void* arg) {
      * buffer no longer has to hold the whole config tree — the saved-announce
      * stores (rnsd, lxmf) blow past any fixed cap. SCTP fragments both on the
      * wire; the webrtc router reassembles inbound into one packet. */
-    itsServerPortOpen(STORAGE_CONFIG_PORT, /*packetBased=*/true, 1, 49152, 16384);
+    /* Packet link (ITS_PACKET): each DC message is one heap-borrowed JSON body
+     * (dump chunk, patch, ping). toCap 64K = browser→device patch window;
+     * fromCap 256K = device→browser dump/patch window (lazy — idle ≈ 0, not a
+     * permanent reservation). maxMsg 256K is the per-message size guard, now at
+     * the lifted browser ceiling (SDP a=max-message-size:262144) so a single
+     * large config patch (e.g. a big Nomad page) rides one message; the router
+     * reassembles inbound SCTP fragments into one packet and sizes its recv
+     * buffer from this guard (D7). DC_PATCH_MAX derives from it below. */
+    itsServerPortOpen(STORAGE_CONFIG_PORT, ITS_PACKET, 1, 65536, 262144,
+                      /*depth=*/0, /*maxMsg=*/262144);
     itsServerOnConnect(STORAGE_CONFIG_PORT, storageItsConnect);
     itsServerOnDisconnect(STORAGE_CONFIG_PORT, storageItsDisconnect);
 

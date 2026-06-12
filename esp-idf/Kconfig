@@ -199,20 +199,87 @@ config SPANGAP_APP_PERCENT
         Spangap regenerates partitions.csv from this value + flash size +
         OTA on/off at every reconfigure — never edit partitions.csv by hand.
 
+config SPANGAP_ITS_INBOX_DEPTH
+    int "ITS mailbox depth (messages)"
+    range 8 1024
+    default 32
+    help
+        Default depth, in messages, of each ITS task's mailbox (the per-task
+        FreeRTOS queue carrying connect/disconnect/aux/forward signaling).
+        Slots are now single pointers (~4 B each) to heap-allocated messages,
+        so depth is nearly free — the default rises from the old 8. Per-task
+        overrides pass a non-zero inboxDepth to itsServerInit/itsClientInit.
+
+config SPANGAP_ITS_INBOX_MSG_MAX
+    int "ITS mailbox per-message payload guard (bytes)"
+    range 320 65536
+    default 4096
+    help
+        Default upper bound on a single mailbox message's payload (connect
+        handshake, aux message, forward data). Oversized sends are rejected,
+        never truncated. The effective guard is floored at ITS_MAX_MSG_DATA
+        (320) so small-guard tasks never regress. Per-task override:
+        itsServerInit's inboxMaxMsgLen argument (0 = this default). Payload
+        memory is borrowed per-message and freed on read, so a generous guard
+        costs nothing at idle.
+
+config SPANGAP_ITS_PKT_DEPTH
+    int "ITS packet-link descriptor depth (messages per direction)"
+    range 2 256
+    default 16
+    help
+        Default number of in-flight whole messages a packet-link direction can
+        queue (the descriptor ring depth). Each slot is an 8-byte descriptor;
+        the message payloads are separate heap blocks borrowed per message and
+        freed on read. Per-port override: the `depth` argument to
+        itsServerPortOpen (0 = this default).
+
+config SPANGAP_ITS_MSG_MAX
+    int "ITS packet-link per-message size guard (bytes)"
+    range 256 262144
+    default 65536
+    help
+        Default largest single message a packet link accepts — the size guard,
+        NOT the backpressure window (that is the per-direction byte cap passed
+        to itsServerPortOpen). itsRecvBufSize/itsSendBufSize report this on a
+        packet link, so routers size their shared receive buffer from it.
+        Per-port override: the `maxMsg` argument to itsServerPortOpen
+        (0 = this default).
+
+config SPANGAP_STORAGE_OP_TIMEOUT_MS
+    int "Storage sync-write wait bound (ms)"
+    range 500 60000
+    default 5000
+    help
+        How long a public storage write (storageSet and friends) waits for the
+        storage actor task to apply its op message before warning and giving up
+        (D1). Same "can't realistically happen" class as the old write mutex
+        never being released. Writes are synchronous so read-your-writes holds:
+        every storageSet(k,v); … storageGetInt(k) sequence keeps working. When
+        the caller IS the storage task, or storage hasn't spawned yet, the write
+        applies directly and this bound does not apply.
+
+config SPANGAP_STORAGE_NOTIFY_TIMEOUT_MS
+    int "Storage change-notification send bound (ms)"
+    range 1 1000
+    default 10
+    help
+        How long the storage actor blocks delivering one CHANGED message to a
+        remote subscriber's mailbox before warning and dropping it (D2). Bounded
+        so a subscriber stuck in a sync write can never deadlock the actor.
+        Pointer-slot mailboxes make depth nearly free, so the drop backstop is
+        unreachable in practice; the storage task's own subscriptions are
+        invoked directly (no message), avoiding self-send entirely.
+
 config SPANGAP_STORAGE_NOTIFY_INBOX
     int "Storage change-notification inbox depth"
     range 64 1024
     default 256
     help
-        Depth of the storage task's change-notification inbox (a PSRAM-backed
-        ITS aux queue). Every storageSet fires one message per matching
-        subscriber, and the storage task itself subscribes to "" for browser /
-        DC sync — so a single ~1 Hz stats publish from many producers (rnsd,
-        each RNS interface, auto, tcp peers, lora, gps) lands a burst of well
-        over a hundred notifications in one drain window. Too small and the
-        burst overflows, logged as "[storage] notify drop … (inbox full)";
-        the dropped write still lands in storage, but its DC republish waits
-        for the next change to that key. Costs ~344 B per slot in PSRAM.
+        Depth of the storage task's inbox (a PSRAM-backed ITS queue carrying op
+        messages and change self-sends). Slots are now single pointers (~4 B),
+        so depth is cheap. A ~1 Hz stats publish from many producers lands a
+        burst of writes; this sizes the actor's op backlog.
 
 ## CONFIG_SPANGAP_LCD / _WEB / _OTA / _WG / _UPNP / _DUCKDNS / _ACME lived here
 ## until each became its own straddle. They are now auto-generated presence

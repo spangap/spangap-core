@@ -1208,7 +1208,7 @@ static void cliTaskFn(void* arg) {
   itsServerPortOpen(CLI_PORT_TCP, /*packetBased=*/false, 6, 512, 2048);
   itsServerOnConnect(CLI_PORT_TCP, cliTcpConnect);
   itsServerOnDisconnect(CLI_PORT_TCP, cliOnDisconnect);
-  itsServerPortOpen(CLI_PORT_DC,  /*packetBased=*/true,  2, 512, 2048);
+  itsServerPortOpen(CLI_PORT_DC,  ITS_PACKET,  2, 512, 2048, /*depth=*/0, /*maxMsg=*/2048);
   itsServerOnConnect(CLI_PORT_DC, cliDcConnect);
   itsServerOnDisconnect(CLI_PORT_DC, cliOnDisconnect);
 

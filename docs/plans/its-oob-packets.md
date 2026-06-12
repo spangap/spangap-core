@@ -1,282 +1,764 @@
-# ITS — out-of-band packets (heap-backed payloads, unified)
+# ITS as a mailbox, and storage as an actor
 
-**Status:** plan. No code yet. Changes [ITS](../../esp-idf/include/its.h) (`its.cpp/h`).
-Motivated by, and a prerequisite for, the [Lua plan](lua.md) and the Nomad-page-render bug
-documented below.
+**Status:** plan. No code yet. Supersedes the earlier, narrower "out-of-band packets"
+framing — same motivation, bigger and cleaner idea. Changes [ITS](../../esp-idf/include/its.h)
+(`its.cpp/h`) and `storage.cpp`. Prerequisite for, and motivated by, the [Lua plan](lua.md)
+and the Nomad page-render bug below.
 
-## Problem
+**Revision 2:** the architecture below is unchanged; this revision adds the *implementation
+contract* — the decisions, API semantics, wire formats, caller anchors, and per-step
+acceptance criteria the first implementer needs. Where the contract pins something down,
+it wins over looser wording elsewhere in this document.
 
-ITS packet-mode layers discrete packets on top of a per-connection FreeRTOS **stream buffer** (a byte
-ring drawn from the PSRAM pool). A byte ring is the wrong substrate for packets, and it costs us twice:
+## The one idea
 
-1. **Ring capacity becomes a hard packet-size cap.** A packet body must fit `fromSize`/`toSize` minus
-   the header. The storage config DC runs a 16384-byte ring (`WEB_ITS_FROM_SIZE`), so a single live
-   merge-patch is capped — `DC_PATCH_MAX = 15500` in `storage.cpp`, **dropped with a warn above that**
-   (only the connect-time *dump* is chunked).
-2. **Every ring is permanently sized for its worst-case packet**, × `maxHandles`, reserved from the
-   pool whether or not that traffic ever flows. seccam's A/V ports reserve **256 KB** each; storage
-   reserves 48 KB / 16 KB. Mostly idle, always held.
+ITS today carries discrete messages — a config patch, a change notification, a video frame —
+inside fixed-size byte rings, one per connection, drawn from a memory pool. That makes the ring
+size both a hard cap on message size and a permanent worst-case reservation, and it is the root
+of three live problems: the Nomad page bug, dropped notifications, and large idle memory
+reservations. The fix is to stop pretending discrete messages are streams: ITS becomes a message
+system, where a task sends a self-contained message to an address and the receiver frees it, and
+byte rings stay only for traffic that is genuinely a stream of bytes. Each message is a plain heap
+block with its length carried beside the pointer, so memory is borrowed under load and returned on
+read instead of reserved forever. The same shape serves three transports — byte streams,
+per-connection packet links, and a per-task mailbox — differing only in where messages queue and
+how they are addressed. On top of this, storage becomes the single owner of its data: tasks change
+it by sending messages while reading stays direct under a mutex, which removes the shared write lock
+and the transaction machinery. We avoided allocating message memory before for fear of heap churn,
+but storage's existing JSON handling already churns the heap far harder and is fine, so that fear
+was unfounded.
 
-### The bug this fixes (concrete)
+## Why — the problems today
 
-Nomad publishes a fetched page body to the ephemeral config tree (`nomad.page.body`) so the SPA
-renders it over the storage DC. `nomad.cpp` caps the publish at `s.nomad.max_page_publish`
-(**default 32768**) — but 32768 is **more than double** the 15500 live-patch ceiling. So any Micron
-page roughly **15–32 KB renders empty**: it passes Nomad's own cap, then the merge-patch exceeds
-`DC_PATCH_MAX` and is dropped one layer down, visible only as a serial-log warn (with
-`nomad.page.truncated` still showing `0`, because Nomad believes it sent the body). That band is
-common — hence "Nomad so often doesn't return anything." It doesn't self-heal on reload either: the
-dump path skips any single leaf value larger than the ring (`storage.cpp` ~1680).
+Discrete messages (a config patch, a change notification, a video frame) currently ride
+inside a fixed-size byte ring, one ring per connection, drawn from a memory pool. That
+costs us three ways:
 
-## Core idea — one way: every packet is a heap block + a descriptor in the ring
+1. **The ring size is a hard cap on message size.** The browser config ring is 16 KB, so
+   a single live config patch is capped (`DC_PATCH_MAX = 15500`, dropped with a warning
+   above that). **The concrete bug:** Nomad publishes a fetched page (cap 32768) to the
+   config tree for the browser to render. Any page roughly **15–32 KB** passes Nomad's cap
+   but then exceeds the patch ceiling one layer down and is silently dropped — so the page
+   renders empty. It doesn't recover on reload either. This is "Nomad so often returns
+   nothing."
+2. **Notifications drop under load.** Change notifications ride a shared fixed-depth queue.
+   The ~1 Hz stats burst (>100 keys at once from many tasks) overflows it; the overflow is
+   dropped, and the browser shows stale values.
+3. **Memory is reserved for the worst case, forever.** Every ring is permanently sized for
+   its biggest possible message, times the number of connections, whether or not that
+   traffic ever flows — seccam reserves 256 KB per A/V port, storage 48 KB / 16 KB. Mostly
+   idle, always held.
 
-There is **no in-band path**. A packet-mode payload is always a plain heap block; the ring carries
-only a fixed **8-byte descriptor** — `{ uint32 len, void* ptr }`. The payload travels out-of-band in
-the same address space (ITS is **point-to-point, single-address-space** inter-task transport, so the
-pointer is valid and read exactly once).
+We avoided just allocating message memory on demand because we feared heap churn. That fear
+was wrong: storage's JSON handling already churns the heap far harder than this (hundreds of
+small allocations per second) and is fine. Uniform short-lived message blocks are noise next
+to that.
 
-Blocks are **plain `heap_caps_malloc` (PSRAM), freed with `free()`, always.** No size classes, no
-slab pool, no inline fast-path, no pool-vs-heap tag. The whole design reduces to one invariant:
+## Three kinds of transport
 
-> **Every payload is a malloc'd block, referenced by one descriptor, freed exactly once.**
+After the change there are three transports, and you pick by what the traffic actually is:
 
-This is deliberately the simplest possible scheme, and the justification is empirical: **storage
-already churns the heap far harder than this** — `cJSON_Create`/`Duplicate`/`Print` spray many tiny
-heterogeneous nodes and free them on every patch and every one of the >100 notifications/sec, and it
-works. Uniform, short-lived packet blocks are noise next to that, and on PSRAM they don't touch the
-DMA-critical internal pool. A small packet (even 20 bytes) becomes a heap block too; that micro-cost
-is the price of having exactly one path, and it's well within the existing budget. (If profiling ever
-shows real heap-lock contention or fragmentation, a block pool drops in *behind* the ITS boundary
-without touching a caller or the wire format — a reversible decision, so the simple choice wins now.
-See Rejected alternatives.)
+1. **Byte streams** — the existing byte ring, unchanged. For continuous byte flows with no
+   message boundaries: terminal sessions, raw socket-like traffic.
+2. **Packet links** — a per-connection flow of whole messages. The connection holds a small
+   queue of *records*, each a `{pointer, length}` to a heap block. For per-connection traffic
+   that needs its own ordering and its own backpressure: the browser data channels, camera
+   frames.
+3. **The mailbox** — one pointer per message in the task's shared inbox. For
+   connect / disconnect / handoff signaling, and for connectionless messages addressed to a
+   `(task, port)`. Notifications and storage operations travel here too.
 
-### The ring is the free-set
+Underneath, all three discrete transports are the same shape: a small record points at a heap
+block, and the receiver frees the block. The only differences are **where the records queue**
+(inside one connection, or in the task's shared mailbox) and **how routing is known**
+(implicit in the connection, or written in a small header).
 
-The descriptors in the ring *are* the set of in-flight blocks. `itsRecv` removes-and-frees as the
-reader consumes. There is no parallel list. **Teardown/reset/close drain-and-free:** walk the ring,
-`free()` every descriptor's `ptr`, then delete the ring. Because there is no inline branch, this is
-unconditional — every ring entry is a freeable block. The one discipline: **every path that discards
-ring contents must route through the drain-freeing helper, never a raw `xStreamBufferReset`/delete**
-(`itsReset`, the disconnect-side delete, `itsServerPortClose`). A raw reset would leak every block in
-flight. This is the same lifetime-sensitive area as the historical connect-timeout slot leak — be
-deliberate.
+## How the memory works
 
-## Two limits, cleanly separated
+- **Every payload is a plain heap block** (from PSRAM), allocated when sent and freed once —
+  on receipt, or on teardown. No pool, no size classes, no central registry of blocks.
+- **A payload must be freeable with a single `free()`.** It never carries ownership of other
+  allocations (no embedded cJSON trees, no pointer graphs). This is what lets the teardown
+  drain free *any* queued payload without knowing its type. Anything structured is serialized
+  into the block (it's one address space, so function pointers and task handles may travel as
+  plain values — they are not owned).
+- **All payload ownership passes through two ITS choke points** — an acquire wrapper
+  (`itsSend` allocating, `itsSendOwned` adopting) and a release wrapper (delivery-free,
+  `itsRecvRef` handoff, teardown drain). The wrappers maintain global live counters
+  (blocks, bytes, high-water) so a leak is a number, not a hunch. See *Observability*.
+  Note the counters track the **ownership boundary**, not malloc itself: `itsSendOwned`
+  must adopt blocks from any allocator (storage hands over `cJSON_PrintUnformatted` output),
+  and after `itsRecvRef` the consumer frees with plain `free()`.
+- **The length travels next to the pointer** — in the record, or in the message header.
+  `free()` does not need it: the allocator already stores each block's size just before the
+  block, so freeing only needs the pointer. We keep our own length anyway, because we need it
+  to copy the payload out and to count bytes in flight (and because a future pooled allocator
+  would round the real size up, so only our own length is trustworthy).
+- **Header vs payload is a firm boundary:**
+  - The **header** is fixed-size, owned by the transport, and never looks inside the payload.
+    It carries only what's needed to route, count, and free a message: a *kind*, some flags,
+    the addresses, and the `{payload pointer, length}`. The mailbox-drain loop can route and
+    free *any* message from the header alone.
+  - The **payload** is one separate block, or none. What's inside it is the application's
+    business; its own first byte can be an application-level type that the transport ignores.
+    So there are two type tags at two layers — the transport's *kind* in the header, the
+    application's op-type in the payload — and neither layer parses the other's.
+- **One rule governs lifetime:** the transport always frees the header; the payload is freed
+  by whoever holds it last. By default that's the transport, right after delivery — unless the
+  receiver asks to *take* it (a zero-copy handoff, e.g. receive a message and forward it on
+  without copying). Teardown walks the queue and frees both.
+- **Two limits per direction:** a *count* limit (how many messages may be outstanding — this
+  bounds the records) and a *byte* limit (how many payload bytes may be outstanding — this is
+  the backpressure window). Idle cost is near zero; memory grows only under traffic and is
+  returned the moment the receiver reads. So a limit can be generous and lazy — a 64 KB cap
+  that idles at nothing, instead of a 64 KB ring reserved forever.
 
-Each direction has two independent caps; a send needs room in both:
+## Connections live in the port, not in the message
 
-- **Descriptor ring → max in-flight packet *count*.** The ring holds fixed 8-byte descriptors, so its
-  capacity is purely "how many packets may be outstanding," a small knob (e.g. a 512-byte ring = 64
-  in-flight packets). Internal to ITS; callers don't size it.
-- **Logical byte counter → max in-flight *bytes*.** One `size_t` per direction: `+= len` on send,
-  `-= len` on receive. This is the backpressure window and the value the flow-control API reports.
+A port is declared once as either a byte stream or a packet link, with its limits. A connect
+message carries only **routing** (who is connecting, to which port) plus an optional
+**handshake** payload — which may be large and travels as a pointer, so a big connect is not
+copied. The transport looks up the port, sees its kind, and builds the matching machinery.
 
-Both gates are simple now because the descriptor is fixed-size — none of the variable-body
-reconciliation the inline design needed. A send blocks/fails if the ring is full (too many packets
-outstanding) *or* the byte counter would exceed the cap.
+Nothing about "stream vs packet" is ever written into a message — it is a property of the
+**port**. The connection itself is a real object the transport owns. That ownership is what
+lets later messages route straight to the right connection and feel that connection's own
+backpressure. (If connections were instead just an idea expressed in payloads, every flow on a
+port would fall back into one shared queue and we'd be back to head-of-line blocking and no
+per-connection backpressure — so connections stay transport-owned.)
 
-### "Feels endlessly large, capped by the bytes it may take"
+## Storage becomes an actor
 
-The byte counter makes a connection feel limitless: keep sending, blocks are allocated on demand, and
-the cap is "memory I'm willing to let it reach," not "memory I permanently donate." Idle cost is ≈ 0
-(no blocks allocated, only the tiny descriptor ring); cost materializes only under traffic and is
-freed the instant the receiver reads. So caps can be **generous and lazy** — a 64 KB cap that idles
-at near-zero, where today a 64 KB ring reserves 64 KB forever.
+- **Storage alone owns the config tree.** Other tasks change it by sending messages. *Reading*
+  stays direct and fast, guarded by a mutex so a reader never races the single writer. (Making
+  reads go through messages too would turn every config read into a round-trip — too slow; the
+  hot read path stays direct.)
+- **Writes are synchronous.** A public write call sends the op message and waits for storage to
+  apply it (the existing `ITS_WAIT_PICKUP` machinery), so **read-your-writes is preserved** —
+  every `storageSet(k,v); … storageGetInt(k)` sequence in the tree keeps working. When the
+  *caller is the storage task itself* (browser patches arrive there), or the storage task has
+  not been spawned yet (boot-time module inits), the call applies directly — mandatory, since a
+  task cannot wait on its own inbox. See decision **D1**.
+- **A write message is a list of leaf changes:** set key to value, or delete key (a null value
+  means delete). Applying the whole list is **atomic for free**, because storage handles one
+  message at a time — the message boundary *is* the transaction. So "set many keys at once" is
+  just one message carrying many leaves. This deletes the write-side lock role and the public
+  transaction *machinery* — but **not** the merge engine: the actor builds a patch tree from the
+  op list and reuses today's `deepMerge` / dirty-routing / subscription-walk pipeline (decision
+  **D3**), and `storageBegin/End` survive as thin sugar that batch ops locally (decision **D4**).
+- **No "merge" or "replace" operations are needed.** Merging is simply what applying a list of
+  leaves does. Replacing a subtree is "delete those keys and set the new ones" in the same
+  atomic message. An array is set as one opaque leaf. The only special write is **"set default
+  if unset"**, which stays because it is conditional.
+- **After applying a message, storage notifies.** Each change goes to each matching subscriber
+  as a message carrying `{key, value, that subscription's callback}`; the subscriber's one
+  generic handler just runs it. Notification sends are **bounded, never blocking forever**
+  (decision **D2**) — the warn-and-drop backstop stays, but pointer-slot mailboxes make depth
+  nearly free, so it becomes unreachable in practice. Because messages are cheap and arbitrarily
+  sized, the 128-byte key/value truncation disappears.
+- **The browser is unchanged at its edge.** It still speaks its existing JSON patches over its
+  data channel. Browser patches already arrive *on* the storage task, so with the D1 fast path
+  there is no translation layer at all — `mergeIncomingPatch` just calls the internal apply.
+- The config mutex **survives with a narrower job**: readers-vs-the-single-writer on `cfgRoot`,
+  plus the `externals` bookkeeping (which the save worker also touches). It stays recursive —
+  `cmdShow` and direct-called subscription callbacks re-enter it.
 
-The flip side: **the cap is the backpressure.** Uncapped means a producer faster than its consumer
-grows the heap without bound → OOM. On a few-hundred-KB-PSRAM device, default to a generous-but-finite
-cap (`CONFIG_SPANGAP_ITS_DEFAULT_LOGICAL_CAP`) so a runaway producer meets backpressure, not a crash.
-A per-packet `CONFIG_SPANGAP_ITS_MAX_BLOCK` guard keeps one pathological allocation from eating the
-whole window.
+## What this fixes
 
-### `itsSpacesAvailable` is purely logical
+- **The Nomad page renders.** A patch is a heap block, not bounded by a ring; the patch ceiling
+  rises to the port's message-size guard and Nomad's cap is corrected.
+- **Notifications stop dropping** under any realistic load, and the shared notify-queue depth
+  knob retires. (The bounded-timeout drop path remains as a backstop — see D2.)
+- **Reserved per-connection memory collapses** to near-zero idle. Payload memory is borrowed
+  under load and returned on read. The big reservations (seccam 256 KB, storage 48/16 KB) are
+  where the reclaim lands.
+- **Connect and handshake payloads stop being truncated** (today ~320 B / inbox item size,
+  `its.cpp` `maxPayload` clamps).
+- **The subscription table stops racing.** Today `storageSubscribeChanges` does an unguarded
+  `subCount++` from arbitrary tasks (storage.cpp:588). SUB/UNSUB as ops make the table
+  storage-task-owned — race-free by construction.
+- **The inbound-patch size cap disappears.** `dcPollConfig`'s static 8 KB receive buffer
+  (storage.cpp:1746) silently caps browser→device patches today; `itsRecvRef` removes the
+  buffer entirely.
 
-It returns the logical window (`cap − counter`) — nothing else. It must **not** try to report
-"largest body acceptable now," because that would depend on the largest contiguous PSRAM block:
-global, fragmentation-dependent, racy, useless per-connection. The ring-count limit and a transient
-malloc failure surface instead as `itsSend(timeout=0) → 0`, which the existing retry-don't-drop
-contract already absorbs (`dcFlushPatch` retries and only clears its pending patch when `sent == len`).
-So callers are unchanged, and `len` may rise to the logical cap. For the blocking path
-(`timeout > 0`), the free-notify wakes when the counter drops under the cap (or a descriptor slot
-frees); distinguish a transient ring-full/malloc-retry from a real cap-block.
+## Decisions locked
 
-## Send — copy (default) vs ownership transfer
+The architecture sections above leave several semantic questions open. They are decided here;
+don't relitigate them in the diff.
 
-- **`itsSend(handle, data, len, timeout)`** — copy/retain, unchanged signature. ITS `malloc`s a block
-  and copies into it; the caller keeps its buffer (stack, static, borrowed, anything). **The only path
-  where ITS allocates** and can hit its own OOM (→ `0`/retry). Every existing call site keeps working
-  with no edit — payloads simply travel OOB now.
-- **`itsSendOwned(handle, ptr, len, timeout)`** — ownership transfer, zero-copy: ITS takes the
-  caller's heap block as-is, writes the descriptor, and on success owns it (frees on the receiver's
-  read or on teardown drain). **Ownership transfers iff the call returns success;** on a back-pressure
-  `0` the caller still owns the block — exactly what retry-don't-drop wants. Requires a plain
-  `heap_caps`/`malloc` block ITS may `free()`. **No ITS malloc on this path → no in-ITS OOM there**:
-  the allocation already happened in the caller's buffer-build step, where failure is local.
+- **D1 — storage writes are synchronous, with a direct fast path.** Public write APIs send one
+  op message with `ITS_WAIT_PICKUP` and block until applied (timeout
+  `CONFIG_SPANGAP_STORAGE_OP_TIMEOUT_MS`, then warn + give up — same "can't realistically
+  happen" class as today's mutex never being released). Fast path: if
+  `xTaskGetCurrentTaskHandle() == storageHandle` **or** `storageHandle == nullptr` (boot, before
+  `storageInit` spawns the task), apply directly under the mutex. Without the fast path the
+  browser-patch path deadlocks (it runs on the storage task); without sync writes, hundreds of
+  existing set-then-get sequences break silently.
+- **D2 — notification sends are bounded.** CHANGED messages use a short timeout
+  (`CONFIG_SPANGAP_STORAGE_NOTIFY_TIMEOUT_MS`, default 10 ms as today) and keep the
+  `notify drop` warn as a backstop. Never block storage indefinitely on a subscriber: task A
+  blocked in a sync write while storage blocks on A's full mailbox is a permanent deadlock.
+  The real fix for drops is that a pointer-slot mailbox makes depth ~4 B/slot, so defaults rise
+  (D11) and the backstop becomes unreachable.
+- **D3 — the actor reuses the patch engine.** Applying an op list = build a cJSON patch tree
+  from the ops, then run the existing `deepMerge` + change-walk + `routePatchDirty` +
+  save-timer pipeline. That code is battle-tested (element-wise array merge, externals
+  routing) and gives all-or-nothing under OOM for free — the whole patch is built before
+  `cfgRoot` is touched. What dies: `txPatch`-under-global-lock, `txDepth`, `silentDepth`
+  (becomes a message flag), the notify queue knob. What survives: `deepMerge`,
+  `deepMergeIntoArray`, the subscription walk (now collecting into a list), `routePatchDirty`,
+  externals handling, the save timer.
+- **D4 — `storageBegin/End` survive as sugar.** They bracket a *task-local* op-list
+  accumulator (nestable depth counter, per-task slot); `storageEnd` at depth 0 sends the
+  accumulated list as one message. Callers keep their API (9 files use it: sshd, ssh_client,
+  net, auth, lxmf, gps, nomad, iface-tcp, rnsd). One behavior change: **read-your-writes
+  *inside* an open bracket is gone** (`resolveKey` no longer consults a patch). Audit each
+  bracket for a get-of-a-key-set-earlier-in-the-same-bracket; restructure any found (read
+  first, or split the bracket). Most brackets are pure write batches and need nothing.
+- **D5 — both packet implementations coexist during step 2.** The transport choice lives
+  inside `itsSend/itsRecv`, so "convert one port first" requires a per-port flag:
+  `ITS_PACKET_LEGACY` (today's framed-bytes-in-ring) vs `ITS_PACKET` (descriptor ring + heap
+  payloads). The legacy kind and the old `bool packetBased` overload are **deleted at the end
+  of step 2** — they are scaffolding, not a permanent mode.
+- **D6 — CHANGED is per-key, and storage's own subscriptions are direct calls.** One message
+  per (changed key × matching remote subscription) — simple and correct first; batching per
+  subscriber×callback is deferred until measured. Subscriptions registered *by the storage
+  task* (the `""` browser-sync sub) are invoked directly during the notify phase, no message:
+  this avoids self-sends entirely and, since `dcAccumulateChange` ignores `val` and re-reads
+  by key, avoids copying a 32 KB Nomad page into a payload just to throw it away.
+- **D7 — `itsRecvBufSize`/`itsSendBufSize` mean "largest single message" (the size guard)** on
+  packet links, not the byte cap. The webrtc router sizes its shared receive buffer from
+  `itsRecvBufSize` (webrtc_task.cpp:755, "grow to this port's largest packet"); if that
+  returned the logical cap, the router would permanently allocate the whole backpressure
+  window (256 KB for seccam) and silently un-do the headline reclaim.
+- **D8 — disconnect direction is explicit in the kind.** Today it's sniffed from the payload
+  length (`hdr->len == 1` vs `1+sizeof(cb)`, its.cpp:525–533 — a comment there documents the
+  sshd dual-role bug this once caused). The new header has `ITS_K_DISC_FROM_CLIENT` /
+  `ITS_K_DISC_FROM_SERVER` kinds and dedicated `ref`/`cb` header fields, so disconnects are
+  metadata-only messages (payload NULL, no tiny allocations) and never ambiguous.
+- **D9 — the byte counter is atomic and decrements on dequeue.** One `std::atomic<size_t>`
+  per direction (both ends touch it, dual-core). `+= len` on successful enqueue, `-= len` when
+  the receiver dequeues — for **both** `itsRecv` and `itsRecvRef`. A block held by the app
+  after `itsRecvRef` is deliberately outside the window: backpressure measures transport
+  occupancy, not application memory.
+- **D10 — the stream-buffer pool and `no_pool` remain for byte streams only.** Packet links
+  never touch the pool (payloads are per-message heap blocks). `no_pool`'s reason-to-exist
+  (attribution + reclaim of transient buffers) dissolves for packet links; rnsd is its only
+  user (`rnsd.cpp:4324`) and its ports go packet-link in step 2 — after which `no_pool` either
+  retires or stays as a streams-only nicety; decide when converting rnsd, don't pre-decide.
+- **D11 — knobs are Kconfig symbols** (project rule: no magic constants), defaults below under
+  *Settings*. `CONFIG_SPANGAP_STORAGE_NOTIFY_INBOX` (Kconfig:202) retires in step 3.
+- **D12 — `storageUnset` and `storageDeleteTree` unify** on one DELETE op with
+  `storageDeleteTree` semantics (null-in-patch + `markExternalsDeletedUnder`). Today the only
+  difference is the externals marking; unsetting a key that *is* an external prefix now drops
+  the file too, which is the less surprising behavior anyway.
 
-## Receive — transparent (default) vs by-reference
+## Optional later: lift the browser's 64 KB message limit
 
-- **`itsRecv(handle, buf, maxLen, timeout)`** — copies the block into the caller's buffer and frees it
-  internally. OOB is invisible to every existing reader.
-- **`itsRecvRef(handle, void** out, size_t* len, timeout)`** — hands the pointer and transfers
-  ownership; the caller frees. For forwarders (`webrtc_task`) that immediately re-emit, this avoids the
-  recv-side copy.
+Independent of everything above, the browser link still caps one message at 64 KB. A later,
+optional phase changes the retransmit bookkeeping to track a message's fragments *in place*
+(no copy) instead of copying each whole message into a pool, and raises the limit. Then the
+full config dump becomes a single message and the dump-chunking code retires. Cheap, separate,
+not required for the fixes above. **Until then, every packet-link port routed to the browser
+must keep its per-message size guard ≤ 64 KB.**
 
-### End-to-end zero-copy on the storage→browser patch path
+## Settings (the knobs)
 
-`dcFlushPatch` is the center of the Nomad fix and the ideal customer: it already
-`cJSON_PrintUnformatted`s into a throwaway `text`, null-checks it, and `cJSON_free`s it. With
-`itsSendOwned` it hands `text` straight over — **no memcpy, no `cJSON_free`** (ITS frees it on the
-receiver's read), the only "error" the `cJSON_Print → NULL` it already checks. Paired with
-`itsRecvRef` in `webrtc_task`, a patch goes producer → ring (8 bytes) → SCTP with **not a single
-payload copy**. `DC_PATCH_MAX` rises to the logical cap and the Nomad body flows.
+All new knobs are `Kconfig` symbols in `esp-idf/Kconfig` with a README row each (project
+convention):
 
-## Memory: the win
+- `CONFIG_SPANGAP_ITS_INBOX_DEPTH` (default 32) — default mailbox depth in messages. Slots are
+  pointers now (~4 B each), so the default rises from 8.
+- `CONFIG_SPANGAP_ITS_INBOX_MSG_MAX` (default 4096) — default per-message payload guard for
+  mailboxes. `itsServerInit`'s `inboxMaxMsgLen` argument becomes a per-task override of this
+  guard (it no longer sizes queue items).
+- `CONFIG_SPANGAP_ITS_PKT_DEPTH` (default 16) — default packet-link descriptor depth per
+  direction.
+- `CONFIG_SPANGAP_ITS_MSG_MAX` (default 65536) — default packet-link per-message size guard.
+- `CONFIG_SPANGAP_STORAGE_OP_TIMEOUT_MS` (default 5000) — sync-write wait bound (D1).
+- `CONFIG_SPANGAP_STORAGE_NOTIFY_TIMEOUT_MS` (default 10) — CHANGED send bound (D2).
+- **Retired:** `CONFIG_SPANGAP_STORAGE_NOTIFY_INBOX` (step 3). No version-gate migration —
+  zero users, per project policy.
 
-Per-connection rings collapse from "worst-case payload bytes" to "max-in-flight-count × 8 bytes" — a
-few hundred bytes instead of 16 KB / 48 KB / 256 KB. Payload memory is demand-allocated from the
-shared heap, bounded per connection by its logical cap, and freed on read. So **idle memory ≈ the sum
-of tiny descriptor rings**, and peak is demand-driven and bounded — versus today's permanently-reserved
-worst-case rings across every handle. The big reservations (seccam 256 KB, storage 48 KB/16 KB) are
-where the reclaim lands.
+Per-port byte caps, depths, and size guards are arguments to `itsServerPortOpen` (see the
+contract); the Kconfig symbols are only the defaults for the `0` cases.
 
-## Downstream cleanup this enables
+## Order of work
 
-- **The live-patch drop goes away.** `dcFlushPatch`'s `len > DC_PATCH_MAX → drop+warn` becomes a
-  non-event; `DC_PATCH_MAX` rises to the logical cap. The direct Nomad fix.
-- **Per-connection ring memory drops hard** (above).
-- **Dump chunking coarsens, then vanishes.** With OOB alone the dump is still bounded by SCTP's 64 KB
-  `max-message-size`, so `DC_DUMP_MAX` only relaxes from 14000 (sized for the 16 KB ring) to ~60 KB.
-  With the arbitrary-size SCTP send below, the 64 KB ceiling lifts and the dump becomes **one logical
-  packet** — `dcBuildDump` / `DC_DUMP_MAX` / the `{"__dump":"b/e"}` bracketing all retire. The full
-  "do away with storage chunking" outcome.
+1. **Mailbox = pointers.** Make each mailbox slot a pointer to a heap message with a fixed
+   header. Small and self-contained; immediately stops notify drops and removes the
+   connect/handshake size limits. Establish the header layout, the ownership rule, and the
+   live counters here.
+2. **Packet links.** Give packet connections their own small queue of `{pointer, length}`
+   records with heap payloads, a copy-receive and a take-ownership receive. Fixes the Nomad
+   patch and reclaims per-connection memory. De-risk by converting **one** port first (the
+   browser config port), proving it under load, then the rest; delete the legacy packet mode
+   at the end.
+3. **Storage actor.** Move writes to atomic leaf-list messages; keep reads direct under the
+   mutex; change-notify as messages. Delete the transaction internals, the write-lock role,
+   and the notify-queue knob.
+4. **(Optional) Lift the 64 KB browser limit** and collapse the config dump to one message.
 
-## Storage change-notify over packet streams (the bigger prize)
+Each step has explicit acceptance criteria in the contract below. Build with
+`spangap build reticulous/reticulous --with reticulous/hw-tdeck` from the workspace root and
+verify on hardware via `spangap log -f` and the `its` status CLI (cli_cmd_sys.cpp:129).
 
-Storage's change dispatch currently rides the shared per-task **aux inbox** (FreeRTOS queue, 320 B/msg
-cap, depth `CONFIG_SPANGAP_STORAGE_NOTIFY_INBOX = 256`). That is *the* structure that floods and drops
-under the >100/sec stats fan-in. Once payloads are cheap descriptors, move bulk notifications onto a
-per-subscriber **packet stream**: each subscriber drains a deep, cheap ring of 8-byte descriptors
-instead of contending for one shared 320 B-limited inbox. The flood-and-drop problem and its tuning
-knob largely dissolve. This is a follow-on refactor — rework subscribe/dispatch into per-subscriber
-streams; keep aux for connect/disconnect/forward signaling only — but it is arguably the headline win,
-more than the Nomad fix, and it is *enabled* by unified OOB.
+## The discipline that matters most
 
-## Arbitrary-sized packets (SCTP send-side)
+Every place that throws away queued messages — reset, disconnect, port close, task teardown —
+must **walk the queue and free each payload**, never just drop the records. Write the ownership
+rule once at the top of the file and make every send, receive, and teardown path an obvious
+instance of it. Most of ITS's past lifetime bugs were exactly this rule going unstated.
 
-OOB removes the *ITS* cap; the next ceiling is **SCTP's `max-message-size: 65536`** (advertised in
-`webrtc_task`, mirrored by the receive reassembly cap `MAX_MESSAGE`). 64 KB covers Nomad pages and
-most Lua output, so this is a **later, optional phase** — but it's cheap and it's what lets the dump
-collapse to a single packet.
+And make violations visible: the acquire/release wrappers keep live counters, and the
+acceptance criterion after every soak test is **outstanding ≈ 0 at idle**.
 
-### In-place fragment-bitmap retransmit
+## Rejected / deferred
 
-Today `sctpSend` copies each message into the rexmit pool as one slot and gates the *whole* message on
-`peerRwnd`, capping message size at the pool/window. Replace that with per-packet fragment accounting
-that never copies the payload:
+- **A memory pool or size classes.** No evidence we need it; plain allocation handles arbitrary
+  sizes and the heap already takes this load. A pool can drop in *behind* the message boundary
+  later without touching any caller — the acquire wrapper is the seam — so the simple choice
+  wins now.
+- **Inlining small payloads into the header, or a freelist of headers.** Real optimizations, but
+  premature. The flag bit and the pointer indirection leave the door open; don't build them yet.
+- **Connections as a payload-level idea.** Breaks per-connection routing and backpressure (every
+  flow on a port collapses into one queue), so the connection stays a transport-owned object.
+- **Carrying cJSON pointers as payloads.** Tempting for storage ops (no serialization), but a
+  cJSON tree is many blocks needing a type-specific destructor — it breaks the "any payload is
+  one `free()`" rule that makes blind teardown drains safe. Ops are serialized.
+- **A tagged allocator (prefix headers on payload blocks).** Would catch "took ownership and
+  forgot to free", but kills adoption of foreign blocks (cJSON print output) — the flagship
+  zero-copy path. The ownership-boundary counters catch everything else. A debug-only
+  registry (fixed table of `{ptr, len, owner, age}` dumpable from the CLI) may be added behind
+  a `#ifdef` if a leak hunt ever needs it.
+- **Batched CHANGED messages (per subscriber×callback per commit).** Deferred until per-key
+  messages are measured to matter (D6).
 
-- Per in-flight packet keep `{ptr, len, baseTSN, bitmap}`. Fragment size `F` is fixed, so bit *i* ↔
-  fragment *i* ↔ byte offset *i·F* ↔ TSN `baseTSN + i`. **The packet is never copied** — it stays in
-  place and is the retransmit source (read fragment *i* from `ptr + i·F`).
-- **2 bits per fragment** — `sent` and `acked`; outstanding = `sent & ~acked`. A 1 MB packet is ~840
-  fragments ≈ 210 bytes of bitmap. Negligible, and less memory than today's whole-message pool copy.
-- SACK gap-ack blocks are TSN ranges → set `acked` bits at `tsn − baseTSN`. Retransmit walks
-  `sent & ~acked` past the gaps. Windowing falls out: emit while outstanding < window, free the packet
-  when every `acked` bit sets.
+---
 
-Two invariants keep bit↔TSN exact:
-- **Reserve a contiguous TSN range per packet at fragmentation time** (`nFrags = ceil(len/F)`, claim
-  `[myTsn, myTsn+nFrags)`, advance). Interleaving other packets/streams for windowing is then fine.
-- **Fixed `F` ⇒ stable PMTU.** Pin `F` to a conservative DTLS/UDP-safe size; never make it dynamic.
+# Implementation contract (the nitty-gritty)
 
-### The block makes one journey, never copied, freed once
+The concrete shapes, written down so the first implementer doesn't re-derive them. File/line
+anchors are as of this writing; re-locate with grep if drifted.
+
+## The message header (mailbox) and the descriptor (packet link)
+
+The mailbox becomes a FreeRTOS queue of single pointers; each points at a fixed header the
+transport owns and never looks past:
+
+```c
+enum its_kind_t : uint8_t {
+    ITS_K_CONNECT,            /* payload = handshake, or NULL          */
+    ITS_K_DISC_FROM_CLIENT,   /* metadata only (D8)                    */
+    ITS_K_DISC_FROM_SERVER,   /* metadata only; cb = client's disc cb  */
+    ITS_K_FORWARD,            /* payload = forward data                */
+    ITS_K_AUX,                /* payload = aux data                    */
+};
+
+#define ITS_F_PICKUP 0x01     /* give sender's pickupSem after dispatch (replaces pickupIdx) */
+
+struct its_msg {              /* one heap allocation; the mailbox slot points at it */
+    uint8_t             kind;
+    uint8_t             flags;
+    uint16_t            port;
+    int16_t             handle;   /* connection handle, or -1                       */
+    int8_t              ref;      /* disconnects: peer's ref for the callback; else -1 */
+    uint8_t             rsvd;
+    TaskHandle_t        sender;   /* for replies / accept-ack / pickup              */
+    its_disconnect_cb_t cb;       /* ITS_K_DISC_FROM_SERVER only; else NULL         */
+    uint32_t            len;      /* payload CONTENT length (not allocation size)   */
+    void*               payload;  /* separate heap block, or NULL                   */
+};
+```
+
+Notes against today's code:
+
+- `processInboxMsg` (its.cpp:452) dispatches on `kind` — the `hdr->len == 1` direction
+  sniffing at its.cpp:525–533 dies (D8).
+- Disconnect kicks carry `ref` + `cb` in the header — no payload allocation for the common
+  teardown message.
+- The `alloca(inboxItemSize)` pads die (`inboxSend` its.cpp:389, `itsPoll` its.cpp:661,
+  connect/aux/forward builders). `inboxSend` allocates the header (and copies the payload into
+  a fresh block, for the copying variants) and enqueues one pointer.
+- `ITS_MAX_MSG_DATA` (its.h:55) stops being a hard transport limit and becomes the *default
+  mailbox size-guard floor*; rnsd's `static_assert(sizeof(...) <= ITS_MAX_MSG_DATA)` walls
+  (rns/include/ports.h) stay true and unmodified. rnsd.cpp:2555's explicit size check keeps
+  working; lifting it is rnsd's business, later.
+- web.cpp:853 (`itsServerInit(sizeof(web_file_req_t*), …)`) already passes a pointer *as* the
+  aux payload; it keeps working unchanged (its 4-byte payload now rides in a tiny heap block).
+
+A packet link doesn't need routing fields — the connection knows them — so its queue element
+is just the descriptor:
+
+```c
+struct its_desc {           /* 8 bytes; lives inside the per-connection descriptor ring */
+    uint32_t len;           /* CONTENT length */
+    void*    ptr;           /* heap block     */
+};
+```
+
+The per-connection descriptor ring is a FreeRTOS stream buffer carrying these 8-byte records
+(reusing its locking and notify; always sent/received in exact 8-byte units, single writer and
+single reader per direction — state this invariant in a comment). Ring size = depth × 8.
+Each direction also carries `{atomic outstanding-bytes counter, byte cap, maxMsg guard}`.
+
+Payloads are `heap_caps_malloc(MALLOC_CAP_SPIRAM)`, freed with `free()`. The allocation may be
+larger than `len`; `len` is authoritative for copying and accounting.
+
+## The ownership rule — write this first, in one place
+
+> The transport always frees the header. The payload is freed by whoever holds it last: by
+> default the transport, immediately after delivery — unless the receiver takes it. Ownership
+> transfers on **success only**: a backpressure/timeout return of 0 leaves an owned payload
+> with the caller. Every path that discards a queue drains it and frees each payload. Every
+> ownership entry and exit goes through the counting wrappers.
+
+## Send / receive variants
+
+```c
+size_t itsSend     (int h, const void* data, size_t len, TickType_t to); // copy: ITS mallocs + copies in
+size_t itsSendOwned(int h, void* ptr,        size_t len, TickType_t to); // adopt the caller's block
+size_t itsRecv     (int h, void* buf, size_t maxLen,     TickType_t to); // copy out, then free
+bool   itsRecvRef  (int h, void** out, size_t* len,      TickType_t to); // hand the pointer over, caller frees
+
+/* mailbox equivalent of itsSendOwned, for storage's pre-built op lists and CHANGED payloads: */
+bool   itsSendAuxOwnedByTaskHandle(TaskHandle_t task, uint16_t port, void* ptr, size_t len,
+                                   TickType_t timeout, its_wait_t wait = ITS_WAIT_DELIVERY);
+```
+
+- `itsSend` is the only path where ITS allocates, so the only one that can hit its own
+  out-of-memory → returns 0, caller retries (don't-drop). Signature unchanged; every existing
+  caller keeps working.
+- `itsSendOwned` does no allocation; on a `0` return the caller still owns `ptr`. This is the
+  zero-copy producer — storage hands its printed JSON straight over. Adoption enters the
+  counters. Packet links only (streams return 0 and log).
+- `itsRecv` unchanged for callers; packet mode: pops one descriptor, copies, frees. If
+  `len > maxLen`: log error, free, return 0 (same contract as today's drain-and-drop).
+- `itsRecvRef` is the zero-copy consumer; packet links and **nothing else** (streams return
+  false). Exits the counters; the consumer uses plain `free()`.
+
+## Flow control, re-expressed on the counter
+
+- One atomic `size_t` per direction: `+= len` on enqueue, `-= len` on dequeue (D9).
+- A send blocks (or returns 0 at timeout) if the descriptor ring is full (count) **or** the
+  counter would exceed the cap (bytes). The blocking wait must wake on either a descriptor
+  slot freeing or the counter dropping — reuse the `spaceFreedSem` + `freeNotify` pattern
+  (its.cpp:1279, `wakeSenderIfReady`), re-pointed at "slot freed OR window opened".
+- A transient full/OOM surfaces as `itsSend(timeout=0) → 0`, which the existing
+  retry-don't-drop contract already absorbs (`dcFlushPatch` clears its pending patch only when
+  `sent == len`).
+
+## What every ITS query means after the change
+
+`itsSend/itsRecv` semantics are preserved; the *query* functions are where callers silently
+depend on ring behavior. Sweep every caller against this table during step 2 (anchors are the
+known-sensitive ones):
+
+| API | byte stream | packet link (`ITS_PACKET`) |
+|---|---|---|
+| `itsBytesAvailable` | ring bytes (unchanged) | payload bytes outstanding, recv side. **webrtc_task.cpp:273 checks `> 4`** (legacy whole-packet heuristic) → becomes `> 0`. iface drain loops (auto.cpp:435, lora.cpp:593/750, espnow.cpp:302) read `> 0` / `== 0` — fine as-is. |
+| `itsSpacesAvailable` | ring free (unchanged) | **0 if no descriptor slot free**, else `cap − outstanding`. The slot clause matters: callers do check-then-send(0) (play.cpp:484, `dcFlushPatch`, `dcPumpDump`) and must not see "space" they can't use. |
+| `itsRecvBufSize` / `itsSendBufSize` | ring capacity (unchanged) | the **maxMsg size guard** (D7). Anchor: webrtc_task.cpp:755 router buffer sizing. |
+| `itsIsEmpty` | unchanged | no descriptors queued |
+| `itsIsFull` | unchanged | a `timeout=0` send would fail (slot or window) |
+| `itsSendIsEmpty` / `itsSendDrain` | unchanged | peer has dequeued everything (count 0 ∧ outstanding 0) |
+| `itsSetTriggerLevel` | unchanged (only fs.cpp:482/638 uses it) | no-op, return false — packet links wake per message |
+| `itsSetFreeNotify` / `itsWaitForSpace` | unchanged | wait until a slot is free ∧ window ≥ freeBytes |
+| `itsInject` | unchanged (all callers are web.cpp streams: 721/1189/1203/2009) | unsupported: log + return 0 |
+| `itsReset` | reset rings (unchanged) | drain-and-free both directions via the teardown helper |
+| `itsRecv` cb arg `bytesAvail` | bytes (unchanged) | outstanding payload bytes — callers must not parse it as a message count (most loop `itsRecv` until 0 and ignore it; verify the few that don't) |
+
+`dispatchRecvCallbacks` (its.cpp:607): pending = descriptor count > 0 (replaces the
+`avail > 4` packet heuristic); "made progress" = **a descriptor was popped** (count decreased)
+or the conn went inactive — the existing no-spin rule, restated on counts.
+
+## Port declaration and the migration flag
+
+```c
+enum its_port_kind_t : uint8_t {
+    ITS_STREAM = 0,        /* byte ring, unchanged                                  */
+    ITS_PACKET_LEGACY,     /* today's framed packets in a ring — DELETED end of step 2 */
+    ITS_PACKET,            /* packet link: descriptor ring + heap payloads          */
+};
+
+bool itsServerPortOpen(uint16_t port, its_port_kind_t kind, int maxHandles,
+                       size_t toCap, size_t fromCap,
+                       size_t depth = 0,    /* 0 = CONFIG_SPANGAP_ITS_PKT_DEPTH  */
+                       size_t maxMsg = 0);  /* 0 = CONFIG_SPANGAP_ITS_MSG_MAX    */
+```
+
+For `ITS_STREAM`, `toCap/fromCap` keep today's meaning (reserved ring bytes). For
+`ITS_PACKET` they are the lazy per-direction byte windows (idle ≈ 0). The existing
+`bool packetBased` overload stays during step 2 mapping `false→ITS_STREAM`,
+`true→ITS_PACKET_LEGACY`, and is deleted with the legacy kind once the last port converts —
+end state is one signature, all ~20 call sites migrated.
+
+`itsServerInit(inboxMaxMsgLen, …)`: `inboxMaxMsgLen` becomes the per-task mailbox payload
+guard (0 = `CONFIG_SPANGAP_ITS_INBOX_MSG_MAX`); `inboxDepth` 0 =
+`CONFIG_SPANGAP_ITS_INBOX_DEPTH`. The queue item is always `sizeof(its_msg*)`.
+
+## Teardown — one drain-and-free helper
+
+A single helper walks a descriptor ring or mailbox, frees every payload (through the release
+wrapper) and header, then deletes the structure. It is the only thing allowed to discard
+packet-link or mailbox contents, and every path routes through it: `itsReset`, both arms of
+`itsDisconnect`, `itsServerPortClose`, task teardown. Never a raw
+`xStreamBufferReset`/delete on a packet link — that leaks every block in flight. Keep the
+concurrency care already in `connFree` (its.cpp:221): read-and-null the ring/queue handles
+under the conn spinlock before freeing, so two racing closes can't double-free. (Tasks never
+actually die today — `s_tasks` never shrinks — so mailbox-teardown drain is future-proofing;
+the live paths are all connection-level.)
+
+## Connect path
+
+The port is declared stream or packet at `itsServerPortOpen`, with its limits. A CONNECT
+message carries routing in the header and the handshake as a payload pointer, so a large
+connect — JSON args, an initial request — is not copied. The transport reads the port's kind,
+builds the matching machinery, runs accept/reject, assigns the handle, then hands the
+handshake to `onConnect` by reference; it is freed when `onConnect` returns, or taken. The
+current ~320-byte connect-arg truncation disappears.
+
+**Known adjacent bug — decide explicitly:** a client whose `itsConnect` times out leaks a
+server slot when the busy server later processes the stale CONNECT and allocates anyway
+(see repo memory; the rnsd boot trigger was fixed, the nonce/cancel fix deferred). The
+connect/ack path is being rewritten in step 1 — fold the fix in: the client stamps a
+per-attempt nonce into the CONNECT header (use `rsvd`/a widened field), the server's
+ack-give checks the client is still waiting on *that* nonce, and on a stale ack the server
+side tears the just-built conn down. If it turns out to be more than ~30 lines, punt — but
+then write "preserved as-is, still leaks on timeout" into the commit message so it isn't
+half-fixed by accident.
+
+## Observability
+
+- Acquire/release wrappers maintain `{live blocks, live bytes, high-water blocks/bytes}`
+  atomics for headers and payloads (separately). All entry/exit goes through them.
+- `itsStatus` (printed by the CLI, cli_cmd_sys.cpp:129) adds: the global counters; per
+  connection — kind, per-direction outstanding count/bytes, caps, high-water.
+- `itsTaskMem` (its.cpp:837) adds outstanding payload bytes attributed to the *receiving*
+  task (its mailbox + recv-direction links), so `top` stays honest. Note the raw heap-task
+  tracker will attribute in-flight blocks to the sender that allocated them — accepted;
+  `itsTaskMem` is the corrective lens.
+- **The acceptance criterion everywhere: idle outstanding ≈ 0.** After any soak or
+  reconnect-storm test, non-zero residue = an ownership bug; the high-water marks tell you
+  where to look.
+
+## Storage actor — concrete protocol
+
+Ops travel as one mailbox message to the storage task on a new aux port
+`STORAGE_OP_PORT = 44` (43 is reserved, 42 is CHANGE, 1 is the DC). Payload:
 
 ```
-producer mallocs (PSRAM)
-  → itsSendOwned    ITS owns (descriptor in ring)
-  → itsRecvRef      webrtc_task owns (block dequeued; ITS no longer references it)
-  → sctpSendOwned   SCTP rexmit owns; block IS the in-place retransmit source
-  → last SACK       SCTP frees it. Once.
+[u8 flags][op]*          flags: bit0 SILENT (suppress subscriptions — replaces silentDepth)
+
+op:
+  'S' SET      key\0  vtype value          vtype 'I': int32 LE
+  'D' DELETE   key\0                             'S': u32 len + bytes (string)
+  'd' DEFAULT  key\0  vtype value                'J': u32 len + printed JSON
+  '+' SUB      scope\0  cb(void*)                     (array/object subtree — storageSetTree)
+  '-' UNSUB    scope\0  cb(void*)          cb NULL = all of sender's subs on scope
+  'W' SAVE     sem(SemaphoreHandle_t)      sem may be NULL
 ```
 
-The no-copy property is coupled to this phase: it needs a `sctpSendOwned` mirroring `itsSendOwned`.
-With today's pool-copying `sctpSend` the copy doesn't vanish, it moves from the ITS boundary to the
-pool (and `webrtc_task` frees the block right after the call). Contract details mirror the ITS rules:
-**reject → caller retains** (feeds the existing stash/`pendingBuf`, now a pointer-hold = another copy
-gone); **teardown/stream-reset → drain-and-free** the un-ACKed blocks. The wire is *not* copy-free —
-each fragment is DTLS-encrypted into a transient buffer per (re)transmit, re-run from the in-place
-plaintext on retransmit — but that's not a preservation copy, which is the property that matters.
+Keys and scopes are NUL-terminated, **unbounded** — the 128-byte key cap, the `scope[40]`
+field (storage.cpp:551), and the `storage_change_msg_t` 128/128 truncation (storage.cpp:560)
+all die. Validate the whole list (bounds-check every field against `len`) **before** applying
+anything; a malformed list is rejected whole. Sender identity for SUB/UNSUB ownership comes
+from `its_msg.sender`.
 
-### Memory: the ESP32 is the only ledger
+### Disposition of every public storage.h function
 
-The browser has gigabytes; a few hundred KB of dump in Chrome's reassembly buffer is nothing, and a
-config dump has no useful partial state, so "progressive delivery" buys nothing. The only constrained
-party is the device, asymmetrically:
-- **Outbound (device→browser):** send arbitrary. Set the SDP `a=max-message-size` to `0` (unlimited,
-  RFC 8841 — usrsctp/Chrome honor it). Bound **total outstanding outbound bytes** so a stalled browser
-  can't pin device RAM — the same cap-as-backpressure idea, one layer down.
-- **Inbound (→device):** **keep a reassembly cap** (`CONFIG_SPANGAP_SCTP_INBOUND_MAX_MSG`, replacing
-  the hard-coded 64 KB `MAX_MESSAGE`). This is the only place "arbitrary size" is dangerous — a peer
-  could make the *ESP32* malloc unboundedly.
+| Function | Becomes |
+|---|---|
+| `storageExists/GetInt/GetStr/GetType/ArrayCount/ForEach/List` | direct read under mutex (unchanged; `resolveKey` loses its txPatch arm) |
+| `storageSet` (all overloads) | one SET op, sync (D1) |
+| `storageUnset` / `storageDeleteTree` | one DELETE op (unified, D12) |
+| `storageSetTree` | SET op with 'J' value (serialize, then `cJSON_Delete` the caller's tree — ownership contract unchanged for callers) |
+| `storageDefault` (both) | DEFAULT op. Return value = a *pre-check* `!storageExists(key)` — benign TOCTOU on the return only; the conditional itself is resolved race-free in the actor. (Only `storageDefaultTree` consumes the return today.) |
+| `storageDefaultTree` | sugar: one message of DEFAULT (+ 'J' DEFAULT for absent arrays) ops, SILENT flag set (as today via silentDepth) |
+| `storageBegin/End` | sugar: task-local op-list accumulator (D4) |
+| `storageCopy` | read source under mutex → compose SET ops → one message. (Loses today's source-stability during the copy; callers are init-time, acceptable — note it at the definition.) |
+| `storageCopyNoNotify` | same, with SILENT flag (it is a write and must go through the actor — today it merges into `cfgRoot` from arbitrary tasks) |
+| `storageSubscribeChanges` / `storageUnsubscribe` | SUB / UNSUB ops, sync — so the subscription is live on return (NOW_AND_ON_CHANGE immediately reads; order must hold) |
+| `storageSave` | SAVE op carrying a semaphore; see below |
+| `storageNewTreeFile` | stays a direct mutex-guarded call — `externals` has multiple writers across tasks regardless (save worker erases entries), so the mutex keeps that job |
+| `storageLoad` | unchanged (boot, pre-task) |
 
-## Rejected alternatives
+### The apply pipeline (runs on the storage task; also the D1 direct path)
 
-- **Keep an inline fast-path for small packets.** We worried the hot small-packet path — RNS, capped
-  at the 500 B protocol MTU (`rns .../ports.h`), one packet per ITS packet per hop — shouldn't pay a
-  malloc, which argued for an inline path with a threshold above 500 B. Rejected: storage's cJSON
-  churn is the existence proof the heap handles this rate, so the inline path bought complexity (a
-  threshold, a dual-gate physical/logical reconciliation, two wire formats) against no measured
-  problem. One way is simpler and the cost is in budget.
-- **Slab/block pool with size classes.** Solves fragmentation and heap-lock contention — neither of
-  which we have evidence for (cJSON again). Size classes plus the unavoidable big-packet exception is
-  two mechanisms where plain `malloc` is one and handles arbitrary sizes. And it's reversible: a pool
-  can drop in behind the ITS boundary later without touching callers or the wire format, so there's no
-  reason to pay for it now.
-- **DataChannel reassembly shim (vs in-place SCTP bitmap).** Splitting large packets into N ≤64 KB
-  SCTP messages with a browser-side reassembly shim avoids touching the SCTP core and an SDP bump, but
-  the in-place bitmap is *cheaper* on the device (no copy, less state), needs no framing on either
-  end, and uses native one-message-one-`onmessage` delivery. The shim would only win for progressive
-  delivery, which — browser memory being a non-issue — we don't need.
+One function, `storageApplyOps(payload, len)`, used by the aux handler and by the fast path:
 
-## Kconfig
+1. Validate the op list fully.
+2. Take the mutex. Build a patch tree from SET/DELETE/DEFAULT: DEFAULT resolves against
+   `cfgRoot` *now* (skip if present); SET dedups against the committed value (the skip at
+   storage.cpp:931 moves here — it is load-bearing against notify floods); DELETE adds null
+   **and** calls `markExternalsDeletedUnder`.
+3. `deepMerge(cfgRoot, patch)` — unchanged engine, element-wise array merges included.
+4. Walk the patch collecting `{key, printed value}` changes (today's
+   `firePatchSubscriptions` walk, collecting instead of sending); run `routePatchDirty` +
+   `startSaveTimer` as today.
+5. Release the mutex.
+6. Notify (unless SILENT): for each change × matching sub — storage-task subs are called
+   directly (D6); remote subs get one CHANGED message, bounded timeout, warn backstop (D2).
+7. Process SUB/UNSUB (table is storage-task-owned now — delete the `subs` race) and SAVE.
 
-- `CONFIG_SPANGAP_ITS_DEFAULT_LOGICAL_CAP` — per-direction byte cap when a port doesn't specify one
-  (generous-but-finite OOM backstop).
-- `CONFIG_SPANGAP_ITS_MAX_BLOCK` — per-packet allocation guard.
-- Descriptor-ring default depth (max in-flight packet count) — internal, not caller-facing.
+Notifying *after* the unlock is a deliberate ordering change (today fires under the lock);
+callbacks describe committed state and direct-called ones may re-lock — keep the mutex
+recursive.
 
-SCTP arbitrary-size phase (webrtc):
-- `CONFIG_SPANGAP_SCTP_OUTSTANDING_CAP` — max total outstanding (unACKed) outbound bytes.
-- `CONFIG_SPANGAP_SCTP_INBOUND_MAX_MSG` — inbound reassembly cap (replaces hard-coded `MAX_MESSAGE`).
-- SDP `a=max-message-size` → `0` (unlimited) outbound.
+CHANGED payload: `{cb (void*), key\0, val\0}` packed, heap, arbitrary length;
+`storageChangeDispatch` adapts to the variable-length form. The `(key, val)` pointers passed
+to subscriber callbacks are valid for the duration of the callback only — same contract as
+today.
 
-## API changes (its.h)
+SAVE: the actor appends the op's semaphore (if any) to a pending list (under the mutex) and
+pokes the save worker; the worker gives every pending semaphore after `writeSettingsFile`
+completes. `storageSave()` blocks on its semaphore (generous timeout, ~30 s — FAT can be
+slow). It must not be called from the storage task (nothing does today; assert it).
 
-- `itsSend(handle, data, len, timeout)` — **unchanged signature**; now copies into a heap block (not
-  the ring). No existing call site changes.
-- `itsSendOwned(handle, ptr, len, timeout)` — new: ownership-transfer send (zero-copy); transfers on
-  success only, caller retains on `0`. Plain heap blocks ITS may `free()` only.
-- `itsRecvRef(handle, void** out, size_t* len, timeout)` — new: zero-copy receive; caller frees.
-- `itsServerPortOpen(... toSize, fromSize)` — **meaning shifts** from "bytes reserved" to "max logical
-  bytes in flight" (the per-direction cap). Argument list unchanged; the descriptor ring is internal.
-- `itsSpacesAvailable` — returns the logical window. `itsBytesAvailable`, `itsSetTriggerLevel`,
-  `itsSetFreeNotify`, `itsWaitForSpace` operate on the logical counter.
-- SCTP phase: `sctpSend` reworked to in-place fragment-bitmap (above); add `sctpSendOwned`.
+### Boot ordering and the browser boundary
 
-## Phased rollout
+- Fast path triggers when `storageHandle == nullptr` (module inits before `storageInit`) or
+  the caller *is* the storage task. After `storageInit` spawns the task, all foreign writes
+  are messages. Sweep for writers in esp_timer/event-loop contexts (none known —
+  `saveTimerCb` only pokes) since they would now block up to the op timeout.
+- `mergeIncomingPatch` / `dcHandleMessage` run on the storage task → their `storageSet`/null
+  deletes hit the fast path automatically. Express the browser's silent null-deletes as
+  SILENT DELETE ops so the whole inbound path is ops + direct apply — no second delete
+  mechanism.
+- Convert `dcPollConfig` (storage.cpp:1741) to `itsRecvRef` in step 2: the static 8 KB
+  buffer and its silent cap die; parse with `cJSON_ParseWithLength(text, len)` (no NUL
+  guarantee), then `free()`.
+- `dcFlushPatch`: `DC_PATCH_MAX` (storage.cpp:1625) stops being a constant — derive it from
+  the port's `maxMsg`. The drop-oversized-patch arm stays as the final backstop but should
+  now be unreachable below the guard.
 
-1. **Descriptor transport + plain blocks.** Convert packet-mode `itsSend` to malloc-block +
-   8-byte-descriptor-in-ring; `itsRecv` copies-and-frees; logical byte counter + count-limited
-   descriptor ring; drain-and-free teardown routed through `itsReset`/disconnect/port-close. Behavior-
-   preserving for callers; the risk is concentrated in teardown lifetime. **De-risk by converting one
-   port first (storage DC), validating under load, then the rest** — per-port, not a temporary hybrid
-   format.
-2. **Zero-copy.** Add `itsSendOwned` + `itsRecvRef`; convert `dcFlushPatch` and `webrtc_task`. Raise
-   `DC_PATCH_MAX` to the logical cap; correct `s.nomad.max_page_publish`. Verify a 15–32 KB Nomad page
-   renders.
-3. **Sweep caps.** Audit `itsServerPortOpen` call sites; set per-direction logical caps + descriptor
-   depths; confirm the PSRAM pool / heap high-water drops (seccam 256 KB, storage 48/16 KB).
-4. **(Optional) SCTP arbitrary-size.** In-place fragment-bitmap retransmit; SDP `max-message-size: 0`
-   outbound; outstanding-bytes cap; inbound reassembly cap. Then collapse the storage dump to a single
-   packet — retire `dcBuildDump` / `DC_DUMP_MAX` / `__dump` bracketing.
-5. **(Optional) Storage notify over packet streams.** Move change-dispatch off the shared aux inbox
-   onto per-subscriber descriptor streams; retire the notify-inbox pressure and its Kconfig knob.
+## Step by step, with anchors and acceptance
+
+### 1. Mailbox = pointers
+
+Replace the fixed inbox slot with a pointer to `its_msg` (queue item = one pointer; PSRAM
+queue stays, ISR rule unchanged). `inboxSend` (its.cpp:382) mallocs header + payload copy and
+enqueues the pointer; `processInboxMsg` (its.cpp:452) dispatches on `kind`, frees both via the
+wrappers. Split DISCONNECT into the two kinds (D8). Replace `pickupIdx` with `ITS_F_PICKUP`.
+Drop every `alloca` pad. Connect/aux/forward payloads become arbitrary-size heap blocks
+(remove the `maxPayload` truncation clamps at its.cpp:951/1044/1218). Add
+`itsSendAuxOwnedByTaskHandle`. Add the counters + `itsStatus`/`itsTaskMem` extensions. Add the
+drain-and-free helper and route `itsServerPortClose`/teardown through it. Optional: the
+connect-nonce fix (see *Connect path*). Kconfig: the two INBOX knobs.
+
+Acceptance:
+- [x] tdeck image builds and boots; `its` CLI shows the new counters (`Messages: hdr … payload …`).
+- [x] No `notify drop` warns through boot + network bring-up burst (verified; live blocks/bytes
+      idle ≈ the in-flight message only).
+- [ ] SSH session under heavy output closes promptly on Ctrl-D (the disconnect-kick path,
+      both directions — sshd is the dual-role task that bit us before). *(user spot-check pending)*
+- [ ] Browser connect/disconnect storm (rapid reloads ×20): connection table returns to
+      baseline, live blocks/bytes return to ~0. *(user spot-check pending)*
+- [x] Web/browser works (web UI loads).
+
+### 2. Packet links
+
+Add `its_port_kind_t` + the new `itsServerPortOpen`; implement the descriptor ring,
+counters, `itsSendOwned`/`itsRecvRef`, blocking sends, and the query-API table above.
+Convert in this order, soaking each:
+
+1. **storage:1** (storage.cpp:1821): `toCap` 49152, `fromCap` 65536, `maxMsg` ≤ 64 KB
+   (browser SCTP pool limit until step 4). Convert `dcPollConfig` to `itsRecvRef`; derive
+   `DC_PATCH_MAX` from `maxMsg`; raise/verify `s.nomad.max_page_publish` ≤ the new ceiling
+   (nomad.cpp:217/777).
+2. **log DC** (log.cpp:725) and **cli DC** (cli.cpp:1211) — small, low-risk.
+3. **rnsd ×5** (rnsd.cpp:4257/4335/4346/4360/4374) and **lxmf** (lxmf.cpp:3202) — exercises
+   the iface drain loops and the connect-leak scenario; decide `no_pool`'s fate here (D10).
+4. **seccam live/play ×6** (live.cpp:227–229, play.cpp:696–698) — the big reclaim; set
+   `maxMsg` to the real largest frame, which also shrinks the router's shared recv buffer
+   via D7.
+
+All packet ports converted to `ITS_PACKET`; the webrtc router `> 4` → `> 0` (:273) and
+recv-buffer sizing (:755 → `maxMsg`) are done. **Deferred (dead-code cleanup):** removing
+`ITS_PACKET_LEGACY`, the bool overload, and the now-unreachable packet-framing code in
+`itsSend`/`itsRecv` — no port uses legacy mode any more (all stream ports still use the bool
+overload → `ITS_STREAM`, so deleting it also means migrating those ~10 call sites). Left as a
+separate, behavior-neutral follow-up to avoid destabilizing a verified-working build. The
+router `pendingBuf` → `itsRecvRef` micro-opt is also deferred (one extra copy, not a bug).
+
+Acceptance:
+- [x] **A 15–32 KB Nomad page renders** — verified on hardware ("EVERYTHING LOADS").
+- [x] PSRAM reclaim measured: rnsd stream-pool buffers `4 kB (18/18)` → `(7/9)` (~44 KB freed);
+      device internal-DRAM low-water also went 4.75 KB → 21 KB and DMA-pool 26 B → 13.8 KB after
+      moving ITS metadata tables to PSRAM.
+- [ ] Seccam live view + playback — N/A (seccam is not in the reticulous build; ports converted
+      in source only).
+- [ ] rnsd/lxmf soak over lora/tcp/espnow ifaces; repeated link setup/teardown. *(boots + runs
+      clean; extended soak is user spot-check)*
+- [ ] DC reconnect storm on storage:1: dump streams, patches resume. *(user spot-check pending)*
+- [x] Browser→device patch > 8 KB applies (`dcPollConfig` → `itsRecvRef`, no buffer cap).
+
+### 3. Storage actor
+
+Implement `storageApplyOps` + the op port + the sugar per the disposition table. Move dedup
+and DEFAULT into the actor; SILENT flag replaces `silentDepth`; subs table becomes
+actor-owned; CHANGED becomes variable-length heap messages; SAVE gains the semaphore reply.
+Delete: `txPatch`/`txDepth` globals, the write-lock role (mutex keeps readers + externals),
+`storage_change_msg_t`, `CONFIG_SPANGAP_STORAGE_NOTIFY_INBOX` (Kconfig:202). Audit the 9
+`storageBegin/End` files for in-bracket read-your-writes (D4). Cross-check the
+[Lua plan](lua.md): it needs begin/end batching and prefix subscriptions — both survive.
+
+**Implemented.** `storageApplyOps` + `STORAGE_OP_PORT=44` + the sugar; dedup/DEFAULT moved
+into the actor; SILENT flag replaces `silentDepth`; subs table actor-owned; CHANGED is a
+variable-length heap message; SAVE carries a semaphore. Deleted: `txPatch`/`txDepth`/
+`silentDepth`, `commitPatch`, the write-lock role, `storage_change_msg_t`. **D4 audit
+result:** all 5 flagged `storageBegin/End` brackets are actually SAFE — the array shifts read
+*higher* (not-yet-written) indices and net:679 reads a different key than it writes, so no
+in-bracket read-your-write dependency exists; no restructuring needed. (`NOTIFY_INBOX` kept as
+the actor's inbox-depth knob rather than retired — it still sizes the op/notify backlog.)
+
+Acceptance (implemented; flashed — user hardware verification pending):
+- [ ] set-then-get round-trips from the CLI task and from inside a subscriber callback.
+- [ ] Keys/scopes > 128 chars subscribe and notify untruncated (lxmf's 64-hex segments).
+- [ ] Stats burst: no drops, no truncation, browser values live.
+- [ ] `save` CLI returns only after the flush; set + save + immediate reboot retains.
+- [ ] Browser dump + patches + deletions echo exactly as before (single-session UI diff).
+- [ ] Boot is clean: module-init `storageDefault` storms work; first browser connect dumps.
+
+### 4. (Optional) Browser 64 KB
+
+**Implemented (conservative variant).** The rexmit pool is already 1 MB / 256 slots, so
+outbound messages up to ~1 MB are supported without the in-place rewrite. Lifted the actual
+ceiling: SDP `a=max-message-size` 65536 → **262144** (webrtc_task.cpp), inbound reassembly
+`MAX_MESSAGE` 65536 → 262144 (webrtc_sctp.cpp), and storage:1 `maxMsg` → 262144 (`DC_PATCH_MAX`
+follows via `itsSendBufSize`). **Deferred:** the in-place fragment-bitmap retransmit (a memory
+optimization — the pool already holds large messages, and PSRAM is abundant) and collapsing
+the dump to one message (it streams fine in ≤14 KB chunks; one big message is riskier for no
+functional gain).
+
+## Gotchas we already named
+
+- `dispatchRecvCallbacks`: "made progress" must mean "a descriptor was popped," not
+  "descriptors are present" — a callback that backpressures without popping isn't activity,
+  or `itsPoll` spins (the existing no-spin comment at its.cpp:628 explains the WDT history).
+- `itsSpacesAvailable` on a packet link must return 0 when no descriptor slot is free, even
+  if the byte window is open — check-then-send(0) callers depend on it.
+- Ownership-on-success matches retry-don't-drop: an `itsSendOwned → 0` feeds today's stash
+  paths (`dcFlushPatch`'s pending patch, the router's `pendingBuf`) — now a pointer hold.
+- ISR rule unchanged: no task may send from an ISR (PSRAM is unreachable during
+  cache-disabled windows); the mailbox stays PSRAM-backed and task-context only.
+- Roomy allocations are fine and expected: the counter and the copy use `len`; the block may
+  be larger.
+- Single writer per direction stays an invariant on packet links (it's what makes the
+  descriptor ring and the counter race-free); assert it in debug builds if cheap.
+- Don't break the D1 deadlock triangle: storage must never *block indefinitely* sending to a
+  subscriber (D2), and no public write API may be called in a way that waits on the storage
+  task *from* the storage task (the fast path covers every known case; assert otherwise).
+- Heap-task attribution: in-flight payloads show under the sending task until freed —
+  `itsTaskMem`'s new outstanding-bytes field is the corrective lens for `top`.
+
+## Docs to update with the code
+
+- `its.h` banner comment (it describes rings-for-everything today) and `docs/its.md`
+  (including the ISR-safety section it anchors).
+- `docs/storage.md` + the `storage.h` banner (transactions, locking story, subscription
+  contract).
+- `esp-idf/Kconfig` + the README knob rows (project convention) for every symbol in
+  *Settings*; remove the retired one.
+- This plan: tick the acceptance boxes per step as they land; strike decisions that get
+  revised, with one line saying why.
