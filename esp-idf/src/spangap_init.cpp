@@ -248,3 +248,32 @@ extern "C" bool waitForTime(int timeout_s) {
     else       warn("waitForTime: no valid time after %d s — proceeding (clock may read ~1970)\n", timeout_s);
     return valid;
 }
+
+extern "C" bool waitForFlag(const char* key, int timeout_s) {
+    /* Block until an ephemeral readiness flag (storage int, non-zero) is set, or
+     * `timeout_s` elapses. The boot-barrier primitive: rns publishes rns.ready,
+     * net publishes net.up, …; ifaces/clients gate on them. timeout_s <= 0 means
+     * "check once, don't wait". Returns true iff the flag was set. Holds one
+     * shared PM no-deep-sleep lock for the wait (aggregated across the several
+     * boot tasks that wait in parallel) so deep sleep can't latch mid-barrier.
+     * Polls storage — a direct locked read, not an ITS round-trip — so a waiter
+     * is NOT registered as an ITS task merely by waiting. */
+    if (storageGetInt(key, 0)) return true;
+    if (timeout_s <= 0) return false;
+
+    static pm_lock_handle_t s_lock = nullptr;
+    if (!s_lock) pmLockCreate(PM_NO_DEEP_SLEEP, "waitflag", &s_lock);
+    pm_lock_handle_t lock = s_lock;
+    if (lock) pmLockAcquire(lock);
+
+    uint32_t start = millis();
+    bool set = false;
+    while (!(set = storageGetInt(key, 0) != 0)) {
+        if ((int)(millis() - start) >= timeout_s * 1000) break;
+        vTaskDelay(pdMS_TO_TICKS(200));
+    }
+
+    if (lock) pmLockRelease(lock);
+    if (!set) warn("waitForFlag: '%s' not set after %d s — proceeding\n", key, timeout_s);
+    return set;
+}

@@ -116,6 +116,14 @@ void spangapPostAppInit(void);
  *  1970 epoch. */
 bool waitForTime(int timeout_s);
 
+/** Block until an ephemeral readiness flag `key` (a storage int) is non-zero,
+ *  or `timeout_s` elapses (<= 0 = check once, don't wait). Returns true iff set.
+ *  The boot-barrier primitive: e.g. waitForFlag("rns.ready", 120) at the top of
+ *  an iface/client task body holds it quiet until the RNS universe has settled
+ *  (clock valid, network up if configured, minimum settle elapsed). Safe from
+ *  any task; holds a shared PM no-deep-sleep lock for the wait. */
+bool waitForFlag(const char* key, int timeout_s);
+
 #ifdef __cplusplus
 }
 #endif

@@ -608,7 +608,10 @@ static inline std::atomic<size_t>& pendingPayOf(its_task_t* t) {
 }
 
 static its_task_t* taskFind(TaskHandle_t task) {
-    if (!s_tasks) return nullptr;                 /* no task registered yet */
+    if (!s_tasks || !task) return nullptr;        /* no table yet, or a NULL'd
+                                                   * (dead-task) slot — never
+                                                   * match those. See
+                                                   * vPortCleanUpTCB below. */
     for (int i = 0; i < s_taskCount; i++)
         if (s_tasks[i].task == task) return &s_tasks[i];
     return nullptr;
@@ -658,6 +661,41 @@ static its_task_t* taskFindOrCreate(TaskHandle_t task, size_t inboxMaxMsgLen, si
      * inbox storage is tiny and payloads are borrowed per-message on demand. */
     e->inbox = xQueueCreateWithCaps(depth, sizeof(its_msg*), MALLOC_CAP_SPIRAM);
     return e;
+}
+
+/* Task-death hook: the Xtensa FreeRTOS port calls this for every deleted task,
+ * inside a scheduler critical section (see port.c prvDeleteTCB). pxTCB IS the
+ * TaskHandle_t.
+ *
+ * Why ITS needs it: taskFindOrCreate appends a permanent s_tasks slot the first
+ * time a task touches ITS — including a transient task that registers only to
+ * use the connectionless fs/storage pickup proxy (pickupArm), then dies. The
+ * canonical case is main_task: it drives proxyOp during boot (tlsInit →
+ * fs_stat → itsSendAux) and self-deletes when app_main returns. The table is
+ * append-only and never shrinks, so its slot survives with a now-dangling
+ * TaskHandle. A later send routed to that slot does xTaskNotifyGive(slot->task)
+ * (inboxEnqueue) — writing a notification (ucNotifyState = 2) into the FREED
+ * TCB: a use-after-free that corrupts whatever has since reused that internal
+ * DRAM (observed downstream as a NULL-owner xTaskRemoveFromEventList assert
+ * from the USB-Serial-JTAG RX ISR).
+ *
+ * Fix: NULL the slot's handle so taskFind() can never match the dead task
+ * again. The slot, its pickupSem/ackSem and inbox stay allocated (honoring the
+ * append-only invariant — they're never freed, just inert); a cached
+ * its_task_t* whose ->task is now NULL degrades to xTaskNotifyGive(NULL), which
+ * prvGetTCBFromHandle maps to the *current* task — a harmless spurious notify,
+ * not a UAF. Single aligned pointer write: no lock needed, and none allowed
+ * here (critical-section context — no FreeRTOS calls, no logging, no malloc).
+ *
+ * NOTE: this covers connectionless / pickup registrants. A task that dies while
+ * still owning live conns leaves stale clientTask/serverTask handles that the
+ * link-backpressure notifies (remoteOf) use directly — out of scope here; no
+ * such task self-deletes today. */
+extern "C" void vPortCleanUpTCB(void* pxTCB) {
+    if (!s_tasks) return;
+    TaskHandle_t dead = (TaskHandle_t)pxTCB;
+    for (int i = 0; i < s_taskCount; i++)
+        if (s_tasks[i].task == dead) { s_tasks[i].task = nullptr; break; }
 }
 
 static its_task_t* myTask() {
@@ -1521,6 +1559,15 @@ void itsClientInit(int maxConns,
     entry->ackHandle = -1;
 }
 
+/* Cadence at which itsConnect re-checks for the server task / its open port
+ * while waiting for it to come up. Pure internal granularity — the caller's
+ * `timeout` is the real budget; this only bounds re-check latency. Self-defined
+ * so ITS builds standalone outside any particular project; override with -D if
+ * an embedder ever wants a different cadence. */
+#ifndef ITS_CONNECT_RECHECK_MS
+#define ITS_CONNECT_RECHECK_MS 10
+#endif
+
 int itsConnectByTaskHandle(TaskHandle_t serverTask, uint16_t port,
                            const void* data, size_t dataLen, TickType_t timeout,
                            int ref,
@@ -1543,18 +1590,35 @@ int itsConnectByTaskHandle(TaskHandle_t serverTask, uint16_t port,
         return -1;
     }
 
+    /* Wait — within the caller's `timeout` — for the target to come up as a
+     * server with this port open, rather than failing the instant it isn't
+     * ready. A client that races the server's boot then connects as soon as the
+     * server is ready, with no retry loop of its own. The single `timeout` is
+     * the whole budget; the handshake below gets whatever remains. timeout==0
+     * keeps the old fail-fast behaviour; portMAX_DELAY waits indefinitely. */
+    const bool forever = (timeout == portMAX_DELAY);
+    const TickType_t start = xTaskGetTickCount();
     its_task_t* se = taskFind(serverTask);
-    if (!se || !se->isServer) {
-        ITS_LOGE("itsConnect: target task [%s] not initialised as a server",
-                 pcTaskGetName(serverTask));
-        return -1;
+    while (!se || !se->isServer || !portFind(se, port)) {
+        if (!forever && (timeout == 0 || (xTaskGetTickCount() - start) >= timeout)) {
+            if (!se || !se->isServer)
+                ITS_LOGE("itsConnect: target task [%s] not initialised as a server",
+                         pcTaskGetName(serverTask));
+            else
+                ITS_LOGE("connect to unopened port %u on [%s]",
+                         port, pcTaskGetName(serverTask));
+            return -1;
+        }
+        vTaskDelay(pdMS_TO_TICKS(ITS_CONNECT_RECHECK_MS));
+        se = taskFind(serverTask);
     }
 
-    /* Pre-flight: ensure the server has actually opened this port. */
-    if (!portFind(se, port)) {
-        ITS_LOGE("connect to unopened port %u on [%s]",
-                 port, pcTaskGetName(serverTask));
-        return -1;
+    /* Budget the remainder of `timeout` for the handshake so the whole connect
+     * stays bounded by the caller's timeout, not up to 2×. */
+    TickType_t remaining = portMAX_DELAY;
+    if (!forever) {
+        TickType_t elapsed = xTaskGetTickCount() - start;
+        remaining = elapsed < timeout ? timeout - elapsed : 0;
     }
 
     xSemaphoreTake(me->ackSem, 0);
@@ -1566,14 +1630,14 @@ int itsConnectByTaskHandle(TaskHandle_t serverTask, uint16_t port,
      * it). The old ~320-byte connect-arg cap is gone. */
     its_msg* m = buildCopyMsg(ITS_K_CONNECT, port, -1, data, dataLen, se, "connect");
     if (!m) return -1;
-    if (!inboxEnqueue(se, m, timeout)) {
+    if (!inboxEnqueue(se, m, remaining)) {
         ITS_LOGE("itsConnect: target [%s] inbox full or send timed out",
                  pcTaskGetName(serverTask));
         msgFree(m);   /* ownership stayed with us on failure */
         return -1;
     }
 
-    if (xSemaphoreTake(me->ackSem, timeout) != pdTRUE) {
+    if (xSemaphoreTake(me->ackSem, remaining) != pdTRUE) {
         ITS_LOGE("itsConnect: target [%s] did not ack within %u ms",
                  pcTaskGetName(serverTask),
                  (unsigned)(timeout * portTICK_PERIOD_MS));
@@ -1596,12 +1660,27 @@ int itsConnectByTaskHandle(TaskHandle_t serverTask, uint16_t port,
 int itsConnect(const char* serverName, uint16_t port,
                const void* data, size_t dataLen, TickType_t timeout, int ref,
                its_recv_cb_t onRecv, its_disconnect_cb_t onDisconnect) {
+    /* Wait — within `timeout` — for the server task to even be created, then
+     * hand the remaining budget to the by-handle path (which further waits for
+     * it to become a server with the port open). One caller `timeout` thus
+     * spans task-creation + ITS init + handshake. timeout==0 = fail-fast. */
+    const bool forever = (timeout == portMAX_DELAY);
+    const TickType_t start = xTaskGetTickCount();
     TaskHandle_t task = xTaskGetHandle(serverName);
-    if (!task) {
-        ITS_LOGE("itsConnect: server task [%s] not found (not running?)", serverName);
-        return -1;
+    while (!task) {
+        if (!forever && (timeout == 0 || (xTaskGetTickCount() - start) >= timeout)) {
+            ITS_LOGE("itsConnect: server task [%s] not found (not running?)", serverName);
+            return -1;
+        }
+        vTaskDelay(pdMS_TO_TICKS(ITS_CONNECT_RECHECK_MS));
+        task = xTaskGetHandle(serverName);
     }
-    return itsConnectByTaskHandle(task, port, data, dataLen, timeout, ref,
+    TickType_t remaining = timeout;
+    if (!forever) {
+        TickType_t elapsed = xTaskGetTickCount() - start;
+        remaining = elapsed < timeout ? timeout - elapsed : 0;
+    }
+    return itsConnectByTaskHandle(task, port, data, dataLen, remaining, ref,
                                   onRecv, onDisconnect);
 }
 
