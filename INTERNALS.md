@@ -57,10 +57,16 @@ spangap-web is present). Prefixes: `s.*` (persisted + synced),
 `storageDefault*` writes are silent — they don't fire change
 subscriptions. Use `storageSet` when subscribers need to react.
 
-`storage_change_msg_t` is `cb(4) + key[128] + val[128]`. Hierarchical
-keys like `lxmf.directory.<32hex>.<field>` fit without subscriber-
-notify truncation. `ITS_MAX_MSG_DATA` is `320` (lifted from 96) to
-carry the widened struct.
+Change notifications to remote subscribers are variable-length heap
+messages (`{cb, key\0, val\0}`): keys travel at full length
+(hierarchical keys like `lxmf.directory.<32hex>.<field>` fit without
+truncation), but the carried *value* is truncated at
+`STORAGE_NOTIFY_VAL_MAX` (512 B). Notifies are change signals, not
+value transport — a handler that needs the full value re-reads storage
+by key. Same-task subscribers (invoked directly) see the full value.
+The storage task's inbox accepts ops up to
+`CONFIG_SPANGAP_STORAGE_OP_MSG_MAX` (default 192 KB) so the largest
+published value (a Nomad page body, 128 KB) fits.
 
 `storageSubscribeChanges(scope, cb)` plus the matching
 `storageUnsubscribe(scope)` — pair them in lifecycle code that creates
@@ -141,8 +147,11 @@ landed but documentation may lag.
 - **ITS inbox queues are PSRAM-backed.** ITS is no longer ISR-safe;
   ISRs use a heap flag + `vTaskNotifyGiveFromISR`, picked up by the
   target task's `itsPoll`.
-- **`storage_change_msg_t`** widened to `cb(4) + key[128] + val[128]`
-  (was `48`/`44`). Required the `ITS_MAX_MSG_DATA` bump.
+- **Change notifications are variable-length** (`{cb, key\0, val\0}`
+  heap messages — the fixed `storage_change_msg_t` is gone). Keys are
+  carried whole; values truncate at `STORAGE_NOTIFY_VAL_MAX` (512 B):
+  notifies are signals, not value transport — re-read by key for the
+  full value.
 - **`storageUnsubscribe(scope)`** added — pairs with
   `storageSubscribeChanges`. Removes the calling task's subscription
   matching `scope` exactly.

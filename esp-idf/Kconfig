@@ -281,6 +281,20 @@ config SPANGAP_STORAGE_NOTIFY_INBOX
         so depth is cheap. A ~1 Hz stats publish from many producers lands a
         burst of writes; this sizes the actor's op backlog.
 
+config SPANGAP_STORAGE_OP_MSG_MAX
+    int "Storage op message size guard (bytes)"
+    range 65536 524288
+    default 196608
+    help
+        Per-message payload guard on the storage task's inbox: the largest
+        single op a foreign task can send (a big storageSet value, or a
+        storageSetTree/storageCopy subtree serialized as one message). Owned
+        ops hand over a heap pointer, so a large guard costs nothing when
+        idle — it only bounds what producers may send. Must comfortably
+        exceed the largest single value any producer publishes; today that
+        is a Nomad page body (NOMAD_MAX_PAGE_PUBLISH, 128 KB) plus op
+        overhead.
+
 ## CONFIG_SPANGAP_LCD / _WEB / _OTA / _WG / _UPNP / _DUCKDNS / _ACME lived here
 ## until each became its own straddle. They are now auto-generated presence
 ## symbols emitted by spangap-inside into the synthetic `_spangap_present`

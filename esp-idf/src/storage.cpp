@@ -111,8 +111,9 @@ static bool isAllDigits(const char* s, size_t len) {
  *  rejected writes with longer segments — storageSet returned without
  *  setting anything, and inbound LXMs never persisted. Outbound keys (mids
  *  like `o_<ts>_<id>`) escaped notice because they're short. Subscriber
- *  notification keys are already 128 bytes (see spangap-core CLAUDE.md);
- *  this aligns the path parser with that. */
+ *  change notifications carry keys at full length (variable-size
+ *  messages, see notifyChange); this keeps the path parser from being
+ *  the binding constraint. */
 static cJSON* navigatePath(cJSON* root, const char* dotPath) {
   if (!root || !dotPath || !*dotPath) return nullptr;
   cJSON* node = root;
@@ -703,6 +704,16 @@ static std::string logSafe(const char* s, size_t cap = 96) {
  * (the "" browser-sync) are invoked DIRECTLY — no self-send, and since the DC
  * handler re-reads by key the value isn't copied (D6). Remote subscribers get a
  * variable-length CHANGED message {cb, key\0, val\0}, bounded send (D2). */
+/* Cross-task notifies carry at most this much of the VALUE. Notifications
+ * are change SIGNALS, not value transport: a handler that needs the full
+ * value re-reads storage by key (they all do for large values). Without the
+ * cap, a big write (a Nomad page body) made the notify exceed subscriber
+ * inbox guards and got dropped ("notify drop ... → [lcd]") — and copying
+ * kilobytes per subscriber per write is waste even when it fits. Same-task
+ * subscribers (the storage task's own, called directly) still see the full
+ * value. */
+#define STORAGE_NOTIFY_VAL_MAX 512
+
 static void notifyChange(const char* key, const char* val) {
   for (int i = 0; i < subCount; i++) {
     size_t sl = subs[i].scope.size();
@@ -712,13 +723,15 @@ static void notifyChange(const char* key, const char* val) {
       continue;
     }
     size_t klen = strlen(key), vlen = strlen(val);
+    if (vlen > STORAGE_NOTIFY_VAL_MAX) vlen = STORAGE_NOTIFY_VAL_MAX;
     size_t n = sizeof(void*) + klen + 1 + vlen + 1;
     uint8_t* buf = (uint8_t*)malloc(n);
     if (!buf) continue;
     void* cb = (void*)subs[i].cb;
     memcpy(buf, &cb, sizeof(cb));
     memcpy(buf + sizeof(cb), key, klen + 1);
-    memcpy(buf + sizeof(cb) + klen + 1, val, vlen + 1);
+    memcpy(buf + sizeof(cb) + klen + 1, val, vlen);   /* may be truncated */
+    buf[sizeof(cb) + klen + 1 + vlen] = '\0';
     if (!itsSendAuxOwnedByTaskHandle(subs[i].task, STORAGE_CHANGE_PORT, buf, n,
                                      pdMS_TO_TICKS(CONFIG_SPANGAP_STORAGE_NOTIFY_TIMEOUT_MS))) {
       free(buf);
@@ -1507,7 +1520,7 @@ static void cmdSet(const char* a) {
     if (cliWantsHelp(a)) { cliPrintf("%-*s set config variable\n", CLI_HELP_COL, "set <key>=<value>"); return; }
     const char* eq = strchr(a, '=');
     if (!eq || eq == a) { cliPrintf("usage: set <key>=<value>\n"); return; }
-    /* Match storage's full-key capacity (storage_change_msg_t::key is 128B).
+    /* Generous full-key buffer (change notifies carry keys at any length).
      * Used to be 48 — small enough that `set s.lxmf.id.0.msgs.<64-hex>.<field>=…`
      * was rejected at the CLI before storageSet ever ran. */
     char key[128];
@@ -2003,10 +2016,12 @@ static void storageTaskFn(void* arg) {
      * sync delivery, so the inbox can't truly overflow, but a generous depth
      * keeps a ~1 Hz multi-producer stats burst flowing without back-pressure.
      * Slots are pointers now (~4 B). */
-    /* Inbox guard 64 KB: foreign-task op lists (a big storageSetTree/storageCopy
-     * subtree serialized as one message) must fit; browser patches never travel
-     * here (they run on this task and fast-path). */
-    itsServerInit(65536, CONFIG_SPANGAP_STORAGE_NOTIFY_INBOX);
+    /* Inbox guard (Kconfig, default 192 KB): foreign-task op lists (a big
+     * storageSetTree/storageCopy subtree serialized as one message) AND the
+     * largest single published value must fit — Nomad page bodies run up to
+     * NOMAD_MAX_PAGE_PUBLISH (128 KB). Browser patches never travel here
+     * (they run on this task and fast-path). */
+    itsServerInit(CONFIG_SPANGAP_STORAGE_OP_MSG_MAX, CONFIG_SPANGAP_STORAGE_NOTIFY_INBOX);
     itsOnAux(STORAGE_OP_PORT, onStorageOp);   /* receive config write op lists */
     /* Packet-mode: each DC message is one JSON body (dump, patch, ping).
      * toSize=48K holds the largest browser-originated patch — the IANA

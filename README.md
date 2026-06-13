@@ -146,6 +146,22 @@ Storage-actor knobs (`idf.py menuconfig` → *spangap: spangap-core*):
   actor blocks delivering one CHANGED message to a remote subscriber before
   dropping it (bounded so a subscriber stuck in a sync write can't deadlock the
   actor).
+- **`CONFIG_SPANGAP_STORAGE_NOTIFY_INBOX`** (default **256**) — depth of the
+  storage task's inbox (PSRAM-backed pointer-slot queue carrying op messages
+  and change self-sends); sizes the actor's op backlog under multi-producer
+  write bursts.
+- **`CONFIG_SPANGAP_STORAGE_OP_MSG_MAX`** (default **192 KB**) — per-message
+  payload guard on the storage task's inbox: the largest single op a foreign
+  task can send (a big `storageSet` value, or a `storageSetTree`/`storageCopy`
+  subtree serialized as one message). Must comfortably exceed the largest
+  single value any producer publishes — today a Nomad page body
+  (`NOMAD_MAX_PAGE_PUBLISH`, 128 KB) plus op overhead. Owned ops hand over a
+  heap pointer, so a generous guard costs nothing at idle.
+
+Cross-task change notifications truncate the carried value at
+`STORAGE_NOTIFY_VAL_MAX` (**512 B**): notifies are change *signals*, not
+value transport — a subscriber that needs the full value re-reads storage by
+key. Same-task subscribers (invoked directly) still see the full value.
 
 spangap-core's `sdkconfig.defaults.spangap` also pins
 `CONFIG_WL_SECTOR_SIZE_512=y` for all consumers: 512-byte FATFS sectors,
