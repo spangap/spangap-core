@@ -1343,8 +1343,19 @@ static void serialTaskFn(void* arg) {
    * even with bytes in the hardware FIFO. Installing the driver attaches an
    * ISR that drains LL → ringbuffer, and the VFS then reads from the ring. */
   usb_serial_jtag_driver_config_t cfg = USB_SERIAL_JTAG_DRIVER_CONFIG_DEFAULT();
+  /* Force the driver's TX/RX ring buffers into INTERNAL RAM. The driver builds
+   * them with plain xRingbufferCreate (no caps), so with SPIRAM_MALLOC_ALWAYSINTERNAL=0
+   * they land in PSRAM — but the ring buffer is touched by the driver's ISR, and
+   * its struct holds a function pointer (vCopyItem) + spinlock. An IRAM ISR
+   * mauling a PSRAM ring during a flash-op cache-disable window corrupts that
+   * pointer → a later xRingbufferSend on the serial task calls a garbage PSRAM
+   * address → InstructionFetchError (deterministic, reproduced via `cat` of a state file).
+   * Buffers are tiny (256 B TX + 256 B RX default), so internal cost is ~1 KB.
+   * extmem_enable sets the runtime alwaysinternal threshold; restore it after. */
+  heap_caps_malloc_extmem_enable(32 * 1024);
   usb_serial_jtag_driver_install(&cfg);
   usb_serial_jtag_vfs_use_driver();
+  heap_caps_malloc_extmem_enable(CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL);
 #endif
 
   /* Set stdin non-blocking */

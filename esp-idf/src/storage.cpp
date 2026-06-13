@@ -1101,6 +1101,22 @@ static void loadExternals() {
 
 void storageLoad() {
   if (!cfgMux) cfgMux = xSemaphoreCreateRecursiveMutex();
+
+  /* The config tree (cfgRoot) belongs in PSRAM — it's large config DATA, not
+   * ISR/lock-touched, so PSRAM is correct for it. Make that EXPLICIT via cJSON's
+   * global allocator hooks so it survives the malloc-default flip to
+   * internal-preferred (SPIRAM_MALLOC_ALWAYSINTERNAL): without hooks cJSON uses
+   * plain malloc/free and would crowd into scarce internal DRAM. Set once. */
+  static bool cjsonHooked = false;
+  if (!cjsonHooked) {
+    cJSON_Hooks h = {
+      [](size_t n) -> void* { return heap_caps_malloc(n, MALLOC_CAP_SPIRAM); },
+      free,
+    };
+    cJSON_InitHooks(&h);
+    cjsonHooked = true;
+  }
+
   if (cfgRoot) cJSON_Delete(cfgRoot);
 
   /* Ensure <stateDir>/storage/ (and storage/external/) exist before any

@@ -2,6 +2,7 @@
 #include "esp_log.h"
 #include "freertos/queue.h"
 #include "freertos/semphr.h"
+#include "freertos/stream_buffer.h"
 #include "esp_heap_caps.h"
 #include "esp_timer.h"
 #include "pm.h"
@@ -43,6 +44,13 @@ static inline uint32_t millis() { return (uint32_t)(esp_timer_get_time() / 1000)
 
 struct its_pool_entry_t {
     StreamBufferHandle_t handle;
+    /* Split allocation (see poolGet): the stream buffer's control block embeds
+     * an SMP spinlock that MUST live in internal RAM (its S32C1I atomic is
+     * unreliable on PSRAM, and critical sections run during flash cache-disable
+     * windows); the ring storage is large and is memcpy'd outside the lock, so
+     * it stays in PSRAM. Both freed together in the no_pool path of poolFree. */
+    StaticStreamBuffer_t* sbCtrl;    /* control block — internal RAM */
+    uint8_t*             sbStore;    /* ring storage — PSRAM */
     size_t               size;
     /* false = a no_pool server's buffer: created fresh on connect, never
      * reused/shared, and deleted (vStreamBufferDeleteWithCaps) when the
@@ -117,9 +125,25 @@ static int poolGet(size_t size, bool noPool = false) {
     e.triggerLevel = 1;
     e.freeNotify = 0;
     e.handle = nullptr;
+    e.sbCtrl = nullptr;
+    e.sbStore = nullptr;
     portEXIT_CRITICAL(&itsPoolMux);
 
-    e.handle = xStreamBufferCreateWithCaps(size, 1, MALLOC_CAP_SPIRAM);
+    /* Control block internal (spinlock), ring storage PSRAM — see its_pool_entry_t.
+     * Storage area must be xBufferSizeBytes + 1 (FreeRTOS static requirement). */
+    StaticStreamBuffer_t* ctrl  = (StaticStreamBuffer_t*)heap_caps_malloc(
+                                      sizeof(StaticStreamBuffer_t),
+                                      MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    uint8_t*              store = (uint8_t*)heap_caps_malloc(size + 1, MALLOC_CAP_SPIRAM);
+    if (ctrl && store) {
+        e.sbCtrl  = ctrl;
+        e.sbStore = store;
+        e.handle  = xStreamBufferCreateStatic(size, 1, store, ctrl);
+    } else {
+        heap_caps_free(ctrl);
+        heap_caps_free(store);
+        e.handle = nullptr;
+    }
     if (e.spaceFreedSem == nullptr) e.spaceFreedSem = xSemaphoreCreateBinary();
     if (!e.handle || !e.spaceFreedSem) {
         ITS_LOGE("alloc failed for %u-byte stream entry", (unsigned)size);
@@ -154,14 +178,22 @@ static void poolFree(int idx) {
          * of the same slot can't both reach vStreamBufferDeleteWithCaps with
          * the same pointer — the second reads nullptr and skips the delete. */
         portENTER_CRITICAL(&itsPoolMux);
-        StreamBufferHandle_t h = e.handle;
-        e.handle = nullptr;
+        StreamBufferHandle_t  h     = e.handle;
+        StaticStreamBuffer_t* ctrl  = e.sbCtrl;
+        uint8_t*              store = e.sbStore;
+        e.handle  = nullptr;
+        e.sbCtrl  = nullptr;
+        e.sbStore = nullptr;
         e.size = 0;
         e.inUse = false;
         e.triggerLevel = 1;
         e.freeNotify = 0;
         portEXIT_CRITICAL(&itsPoolMux);
-        if (h) vStreamBufferDeleteWithCaps(h);
+        if (h) {
+            vStreamBufferDelete(h);    /* static buffer: tears down, frees nothing itself */
+            heap_caps_free(ctrl);      /* control block (internal RAM) */
+            heap_caps_free(store);     /* ring storage (PSRAM) */
+        }
     }
 }
 
@@ -306,8 +338,13 @@ static int linkAcquire(size_t depth, size_t byteCap, size_t maxMsg) {
     /* (depth+1) records of headroom: a FreeRTOS stream buffer holds one byte
      * short of its size, so size it so `depth` whole 8-byte descriptors always
      * fit. The extra 8 bytes is negligible. */
+    /* Internal RAM, not PSRAM: the stream buffer's control block embeds an SMP
+     * spinlock (taskENTER_CRITICAL in every send/recv) whose S32C1I atomic is
+     * unreliable on PSRAM and is touched during flash cache-disable windows.
+     * The ring is small ((depth+1)*8 B of descriptors), so the whole buffer can
+     * live internally rather than splitting control/storage like the pool. */
     L.ring = xStreamBufferCreateWithCaps((depth + 1) * sizeof(its_desc), sizeof(its_desc),
-                                         MALLOC_CAP_SPIRAM);
+                                         MALLOC_CAP_INTERNAL);
     if (L.spaceFreedSem == nullptr) L.spaceFreedSem = xSemaphoreCreateBinary();
     if (!L.ring || !L.spaceFreedSem) {
         ITS_LOGE("link alloc failed for depth-%u ring", (unsigned)depth);
@@ -653,13 +690,19 @@ static its_task_t* taskFindOrCreate(TaskHandle_t task, size_t inboxMaxMsgLen, si
     int depth = inboxDepth > 0 ? (int)inboxDepth : CONFIG_SPANGAP_ITS_INBOX_DEPTH;
     e->inboxMsgMax = guard;
     e->inboxDepth = depth;
-    /* PSRAM-backed queue of its_msg* pointers: ITS is task-context only — no
-     * ISR may call itsSend/itsSendAux. ISRs should set a heap flag + use
-     * vTaskNotifyGiveFromISR instead (PSRAM is unreachable from ISRs during
-     * cache-disabled windows; xQueueSendFromISR on a PSRAM queue would
-     * crash). See docs/its.md "ISR safety". Slots are pointers (~4 B), so the
-     * inbox storage is tiny and payloads are borrowed per-message on demand. */
-    e->inbox = xQueueCreateWithCaps(depth, sizeof(its_msg*), MALLOC_CAP_SPIRAM);
+    /* Internal RAM, NOT PSRAM: a FreeRTOS queue's control block embeds an SMP
+     * spinlock taken by taskENTER_CRITICAL inside xQueueSend/xQueueReceive. Two
+     * reasons that spinlock can't sit in PSRAM, even though ITS is task-context
+     * only (no ISR may call itsSend/itsSendAux — ISRs should set a heap flag +
+     * vTaskNotifyGiveFromISR; see docs/its.md "ISR safety"):
+     *   1. the spinlock acquire uses an S32C1I atomic, which is unreliable on
+     *      external PSRAM → owner/count desync → `spinlock_acquire ... count==0`
+     *      assert (observed: cli task in itsPoll→xQueueReceive).
+     *   2. a flash op on the OTHER core disables the cache, making the PSRAM
+     *      queue struct unreadable while this core is in the critical section.
+     * Slots are pointers (~4 B), so the whole queue is tiny in internal RAM;
+     * payloads stay borrowed per-message in PSRAM (read outside the lock). */
+    e->inbox = xQueueCreateWithCaps(depth, sizeof(its_msg*), MALLOC_CAP_INTERNAL);
     return e;
 }
 

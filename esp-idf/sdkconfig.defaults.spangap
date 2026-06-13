@@ -41,12 +41,21 @@ CONFIG_ESP_WIFI_DYNAMIC_TX_BUFFER_NUM=64
 # it per-board. The SD-bounce 0x101 it would have papered over is fixed at the
 # source instead (SD-on-SPI skips the bounce — see spangap-core CMakeLists).
 
-# PSRAM — present on every target; malloc() prefers PSRAM for all allocations.
+# PSRAM — present on every target.
 # Mode (octal vs quad) is board hardware, so each board sets it in its own
 # sdkconfig.defaults (T-Deck S3R8 = octal, Heltec V4 S3R2 = quad) — NOT here.
 # 80 MHz is a sane default both current boards use; a board may override.
 CONFIG_SPIRAM=y
 CONFIG_SPIRAM_SPEED_80M=y
+# Malloc placement: 0 = every untagged allocation goes to PSRAM. Internal DRAM
+# is the scarce resource here (~73 KB free, and WiFi's static RX wants ~25 KB of
+# DMA-capable internal RAM), so we keep the default at PSRAM and pin ONLY the few
+# things that MUST be internal — ISR/critical-section control structures (driver
+# ring buffers, queues) — with explicit MALLOC_CAP_INTERNAL at their call sites
+# (ITS inbox/streams, USB-JTAG ring). Tested the inverse (=16384, internal-pref):
+# it pulled ~28 KB into DRAM — almost all of it PSRAM-safe UI/buffer data (LVGL,
+# CLI) — and dropped DMA-lowest to 19 KB *with WiFi off*, which won't survive WiFi
+# on. So: PSRAM-default + surgical internal pins, not internal-default.
 CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=0
 # Reserve internal DRAM for DMA-capable allocations. Consumers that can ONLY
 # live in internal DMA RAM and all peak together at boot: WiFi static RX
