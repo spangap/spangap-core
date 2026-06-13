@@ -174,6 +174,36 @@ struct fs_op_t {
     int     result;
 };
 
+/* Human-readable fs_op_t::Op for the worker timing logs. */
+static const char* fsOpName(int op) {
+    switch (op) {
+        case fs_op_t::OPEN:      return "open";
+        case fs_op_t::READ:      return "read";
+        case fs_op_t::WRITE:     return "write";
+        case fs_op_t::TELL:      return "tell";
+        case fs_op_t::SEEK:      return "seek";
+        case fs_op_t::FLUSH:     return "flush";
+        case fs_op_t::SYNC:      return "sync";
+        case fs_op_t::TRUNCATE:  return "truncate";
+        case fs_op_t::CLOSE:     return "close";
+        case fs_op_t::STAT:      return "stat";
+        case fs_op_t::RENAME:    return "rename";
+        case fs_op_t::REMOVE:    return "remove";
+        case fs_op_t::MKDIR:     return "mkdir";
+        case fs_op_t::OPENDIR:   return "opendir";
+        case fs_op_t::READDIR:   return "readdir";
+        case fs_op_t::CLOSEDIR:  return "closedir";
+        case fs_op_t::LISTDIR:   return "listdir";
+        case fs_op_t::FILE_INFO: return "file_info";
+        case fs_op_t::LFS_INFO:  return "lfs_info";
+        default: {
+            static char b[24];
+            snprintf(b, sizeof(b), "unknown(%d)", op);
+            return b;
+        }
+    }
+}
+
 static SemaphoreHandle_t fsReady = nullptr;
 
 /* ---- SD write staging ----
@@ -412,7 +442,8 @@ static void onFsOp(TaskHandle_t, const void* data, size_t len) {
      * starved between picking up messages. */
     uint32_t idleMs = lastOpExitUs ? (t0 - lastOpExitUs) / 1000 : 0;
     if (idleMs > 200) {
-        verb("fs worker: idle %ums before op=%d\n", (unsigned)idleMs, (int)op->op);
+        verb("fs worker: idle %ums before op=%s\n",
+             (unsigned)idleMs, fsOpName((int)op->op));
     }
     fsCurrentOp = (int)op->op;
     fsCurrentSlot = op->slot;
@@ -423,7 +454,8 @@ static void onFsOp(TaskHandle_t, const void* data, size_t len) {
     uint32_t t1 = (uint32_t)esp_timer_get_time();
     uint32_t took = (t1 - t0) / 1000;
     if (took > 200) {
-        ESP_LOGD("fs", "op=%d slot=%d took %ums", (int)op->op, op->slot, (unsigned)took);
+        ESP_LOGD("fs", "op=%s slot=%d took %ums",
+                 fsOpName((int)op->op), op->slot, (unsigned)took);
     }
     lastOpExitUs = t1;
 }
@@ -435,8 +467,8 @@ static int proxyOp(fs_op_t& req) {
                            portMAX_DELAY, ITS_WAIT_PICKUP);
     uint32_t took = ((uint32_t)esp_timer_get_time() - t0) / 1000;
     if (took > 200) {
-        verb("fs proxy: op=%d slot=%d wait %ums\n",
-             (int)req.op, req.slot, (unsigned)took);
+        verb("fs proxy: op=%s slot=%d wait %ums\n",
+             fsOpName((int)req.op), req.slot, (unsigned)took);
     }
     return req.result;
 }
@@ -651,8 +683,8 @@ static void fsWorkerFn(void*) {
         if (now - lastPulseMs >= 1000) {
             uint32_t delta = fsOpCount - lastOpCount;
             if (fsCurrentOp >= 0) {
-                ESP_LOGD("fs", "pulse: ops/s=%u in-op=%d slot=%d",
-                         (unsigned)delta, fsCurrentOp, fsCurrentSlot);
+                ESP_LOGD("fs", "pulse: ops/s=%u in-op=%s slot=%d",
+                         (unsigned)delta, fsOpName(fsCurrentOp), fsCurrentSlot);
             } else if (delta > 0) {
                 ESP_LOGD("fs", "pulse: ops/s=%u idle", (unsigned)delta);
             }
