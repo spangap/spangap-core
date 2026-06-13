@@ -66,6 +66,30 @@ CONFIG_SPIRAM_MALLOC_RESERVE_INTERNAL=65536
 # Per-task heap ownership tracking (for heapDump on malloc failures)
 CONFIG_HEAP_TASK_TRACKING=y
 
+# ─── DEBUG — internal-DRAM corruption hunt (TEMPORARY; revert before shipping) ───
+# Chasing a silent stray write into internal RAM: it clobbers a FreeRTOS
+# list / ringbuffer recv-semaphore and only surfaces much later as an
+# `xTaskRemoveFromEventList ... (pxUnblockedTCB)` assert from the USB-Serial-JTAG
+# RX ISR. These trip the fault at (or near) the bad write instead.
+#   * COMPREHENSIVE poisoning adds head/tail canaries + free-fill so an overrun
+#     into a neighbouring block is detectable; pair with the runtime
+#     SPANGAP_HEAP_INTEGRITY_POLL (off by default) which scans for tripped
+#     canaries once per second on the log task.
+#   * PTRVAL stack-overflow check (mode 2) is stricter than the default
+#     context-switch canary — it validates the stack pointer on every switch.
+# Both carry a runtime/throughput cost; remove this block (reverting to the
+# implicit HEAP_POISONING_DISABLED / CHECK_STACKOVERFLOW_CANARY) once the
+# offending writer is found.
+CONFIG_HEAP_POISONING_COMPREHENSIVE=y
+CONFIG_FREERTOS_CHECK_STACKOVERFLOW_PTRVAL=y
+# Runtime scan enabled for this hunt (the whole block reverts together).
+CONFIG_SPANGAP_HEAP_INTEGRITY_POLL=y
+# HW store-watchpoint (0 = off). It confirmed the victim was main_task's freed
+# TCB but can't sit on a live TCB during boot (that address is reused), so it's
+# parked off; the integrity poll above verifies the fix (no more CORRUPT HEAP).
+CONFIG_SPANGAP_WATCH_ADDR=0x0
+# ─────────────────────────────────────────────────────────────────────────────
+
 # IPC task stack — IDF default 1280 B is enough for the bare IPC service but not
 # for cross-core init callbacks: the LittleFS init path that runs on ipc0 during
 # spangap_init has been seen to overflow 1280 B. 4 KiB gives comfortable room.

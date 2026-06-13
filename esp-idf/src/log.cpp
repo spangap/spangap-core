@@ -14,6 +14,10 @@
 #include <esp_heap_caps.h>
 #include <string>
 #include <esp_timer.h>
+#if CONFIG_SPANGAP_WATCH_ADDR
+#include <esp_cpu.h>
+#include <esp_ipc.h>
+#endif
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include <cstdio>
@@ -768,9 +772,43 @@ static void logTaskFn(void* arg) {
    * no TCP listener; serial and the browser DataChannel reach the log over
    * ITS regardless. */
 
+#if CONFIG_SPANGAP_WATCH_ADDR
+  /* Debug: arm a HW STORE watchpoint over a 16-byte window around the UAF
+   * address (from SPANGAP_HEAP_INTEGRITY_POLL's CORRUPT HEAP line) on BOTH
+   * cores, so the corrupting write faults with the writer's backtrace.
+   * esp_cpu_set_watchpoint programs the calling core's debug regs, so we run
+   * it on each core via IPC. Slot 1 (slot 0 left for IDF/panic). */
+  {
+    auto armWp = [](void*) {
+      uintptr_t a = (uintptr_t)CONFIG_SPANGAP_WATCH_ADDR & ~(uintptr_t)0xF;
+      esp_cpu_set_watchpoint(1, (void*)a, 16, ESP_CPU_WATCHPOINT_STORE);
+    };
+    esp_ipc_call_blocking(0, armWp, nullptr);
+    esp_ipc_call_blocking(1, armWp, nullptr);
+    info("watch: armed STORE watchpoint @ 0x%08x (16B, slot 1) on both cores",
+         (unsigned)((uintptr_t)CONFIG_SPANGAP_WATCH_ADDR & ~(uintptr_t)0xF));
+  }
+#endif
+
   char buf[512];
   for (;;) {
     pmPollUsb();
+#if CONFIG_SPANGAP_HEAP_INTEGRITY_POLL
+    /* Debug: trip on internal-DRAM corruption near its source. A stray write
+     * into internal RAM (e.g. one that clobbers a ringbuffer's recv-semaphore
+     * wait list) is otherwise silent until an unrelated ISR walks the damaged
+     * structure and asserts much later — heap_caps_check_integrity aborts at
+     * the first corrupted block instead. Gated + off by default; pairs with
+     * HEAP_POISONING_COMPREHENSIVE. See SPANGAP_HEAP_INTEGRITY_POLL. */
+    {
+      static int64_t lastHeapCheckUs = 0;
+      int64_t nowUs = esp_timer_get_time();
+      if (nowUs - lastHeapCheckUs >= (int64_t)CONFIG_SPANGAP_HEAP_INTEGRITY_POLL_MS * 1000) {
+        lastHeapCheckUs = nowUs;
+        heap_caps_check_integrity(MALLOC_CAP_INTERNAL, true);
+      }
+    }
+#endif
     while (itsPoll(pdMS_TO_TICKS(200))) {}
 
     /* Deferred paste-back: a DC connect was just accepted (logDcConnect) and

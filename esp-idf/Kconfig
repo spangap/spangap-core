@@ -295,6 +295,52 @@ config SPANGAP_STORAGE_OP_MSG_MAX
         is a Nomad page body (NOMAD_MAX_PAGE_PUBLISH, 128 KB) plus op
         overhead.
 
+config SPANGAP_HEAP_INTEGRITY_POLL
+    bool "Periodically check internal-heap integrity (debug)"
+    default n
+    help
+        Diagnostic only — leave OFF for shipping builds. When set, the log
+        task calls heap_caps_check_integrity(MALLOC_CAP_INTERNAL, true) once
+        per SPANGAP_HEAP_INTEGRITY_POLL_MS. The check aborts at the first
+        corrupted block, naming the offending region — so a silent stray
+        write into internal DRAM (e.g. the kind that clobbers a FreeRTOS
+        list / ringbuffer semaphore and later trips an xTaskRemoveFromEventList
+        assert from an ISR) faults at, or near, the moment of the bad write
+        instead of much later in unrelated code. Most effective paired with
+        HEAP_POISONING_COMPREHENSIVE (see sdkconfig.defaults.spangap), which
+        adds the canaries the check inspects. Has a runtime cost proportional
+        to live internal allocations; that is why it is gated and off by
+        default rather than always-on.
+
+config SPANGAP_HEAP_INTEGRITY_POLL_MS
+    int "Internal-heap integrity check interval (ms)"
+    depends on SPANGAP_HEAP_INTEGRITY_POLL
+    range 200 60000
+    default 1000
+    help
+        How often the log task runs the internal-heap integrity check. Lower
+        narrows the window between the corrupting write and the abort (better
+        backtrace locality) at higher CPU cost; the default 1 Hz matches the
+        log task's existing pmPollUsb cadence.
+
+config SPANGAP_WATCH_ADDR
+    hex "Arm a HW store-watchpoint at this address (debug; 0 = off)"
+    default 0x0
+    help
+        Diagnostic only. When non-zero, the log task arms a hardware STORE
+        watchpoint covering a 16-byte window around this address, on BOTH
+        cores, early at boot. The next instruction that writes anywhere in
+        that window faults immediately — so a use-after-free writer (located
+        via SPANGAP_HEAP_INTEGRITY_POLL's `CORRUPT HEAP: ... at 0xADDR` line)
+        panics with its own backtrace instead of corrupting silently.
+
+        Workflow: read the address from a CORRUPT HEAP log line, set it here,
+        reflash. The window is aligned down to 16 bytes, so two corrupted
+        words a few bytes apart are both covered by one watchpoint. Assumes
+        the address is stable across boots (boot-time allocation order is
+        deterministic; confirm by checking the address survives a reboot).
+        Uses watchpoint slot 1 (slot 0 left for IDF/panic/gdbstub).
+
 ## CONFIG_SPANGAP_LCD / _WEB / _OTA / _WG / _UPNP / _DUCKDNS / _ACME lived here
 ## until each became its own straddle. They are now auto-generated presence
 ## symbols emitted by spangap-inside into the synthetic `_spangap_present`
