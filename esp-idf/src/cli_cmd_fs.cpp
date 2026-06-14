@@ -1,5 +1,6 @@
 /** CLI commands: ls, cd, mkdir, rm, cat, df — filesystem operations (per-session cwd). */
 #include "cli.h"
+#include "mem.h"
 #include "fs.h"
 #include "compat.h"
 #include <cstring>
@@ -193,7 +194,7 @@ static void rmRecursive(const char* filepath, bool opt_f) {
     int dir;
     char path[RM_PATH];
   };
-  auto* stack = (rm_frame*)malloc(RM_DEPTH * sizeof(rm_frame));
+  auto* stack = (rm_frame*)gp_alloc(RM_DEPTH * sizeof(rm_frame));
   if (!stack) {
     cliPrintf("rm: out of memory\n");
     return;

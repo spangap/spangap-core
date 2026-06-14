@@ -299,18 +299,23 @@ config SPANGAP_HEAP_INTEGRITY_POLL
     bool "Periodically check internal-heap integrity (debug)"
     default n
     help
-        Diagnostic only — leave OFF for shipping builds. When set, the log
-        task calls heap_caps_check_integrity(MALLOC_CAP_INTERNAL, true) once
-        per SPANGAP_HEAP_INTEGRITY_POLL_MS. The check aborts at the first
-        corrupted block, naming the offending region — so a silent stray
-        write into internal DRAM (e.g. the kind that clobbers a FreeRTOS
-        list / ringbuffer semaphore and later trips an xTaskRemoveFromEventList
-        assert from an ISR) faults at, or near, the moment of the bad write
-        instead of much later in unrelated code. Most effective paired with
-        HEAP_POISONING_COMPREHENSIVE (see sdkconfig.defaults.spangap), which
-        adds the canaries the check inspects. Has a runtime cost proportional
-        to live internal allocations; that is why it is gated and off by
-        default rather than always-on.
+        Diagnostic only — leave OFF for shipping builds (real CPU/throughput
+        cost). The log task calls heap_caps_check_integrity(MALLOC_CAP_INTERNAL,
+        true) once per SPANGAP_HEAP_INTEGRITY_POLL_MS, aborting at the first
+        corrupted block and naming the region — so a silent stray write /
+        use-after-free into internal DRAM (e.g. clobbering a FreeRTOS list /
+        ringbuffer semaphore, or a notify into a freed TCB) faults at, or near,
+        the bad write instead of much later in unrelated code.
+
+        For the full hunt also enable, via menuconfig (kconfiglib can't `select`
+        a choice option, so these can't be bundled here):
+          * Component config → Heap memory debugging → Heap corruption detection
+            → "Comprehensive"  (HEAP_POISONING_COMPREHENSIVE) — adds the head/tail
+            canaries + free-fill this poll inspects.
+          * Component config → FreeRTOS → Check for stack overflow → "Check using
+            canary + PTRVAL"  (FREERTOS_CHECK_STACKOVERFLOW_PTRVAL).
+        Pair with SPANGAP_WATCH_ADDR to catch the writer's backtrace once the poll
+        reports an address.
 
 config SPANGAP_HEAP_INTEGRITY_POLL_MS
     int "Internal-heap integrity check interval (ms)"

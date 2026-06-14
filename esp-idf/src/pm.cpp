@@ -3,6 +3,7 @@
  * CLI commands: pm, top, usb.
  */
 #include "pm.h"
+#include "mem.h"
 #include "log.h"
 #include "cli.h"
 #include "storage.h"
@@ -72,7 +73,7 @@ static const esp_pm_lock_type_t espLockTypes[] = {
 };
 
 void pmLockCreate(pm_lock_type_t type, const char* name, pm_lock_handle_t* out) {
-  auto* l = (pm_lock*)calloc(1, sizeof(pm_lock));
+  auto* l = (pm_lock*)gp_calloc(1, sizeof(pm_lock));
   l->name = name;
   l->type = type;
   if (type != PM_NO_DEEP_SLEEP)
@@ -228,7 +229,7 @@ static int pmBufWrite(void* cookie, const char* data, int len) {
  *  output also carries Mode + Sleep stats — we keep both; Sleep stats' light-
  *  sleep reject count is the "why no light sleep" signal. */
 static void pmDumpLocks() {
-  char* buf = (char*)malloc(4096);
+  char* buf = (char*)gp_alloc(4096);
   if (buf) {
     pm_buf_t st = { buf, 0, 4096 };
     FILE* f = funopen(&st, nullptr, pmBufWrite, nullptr, nullptr);
@@ -581,14 +582,14 @@ static void cmdTop(const char* args) {
         size_t dram, psram; uint16_t dblk, pblk;
         uint32_t delta;
     };
-    auto* s1 = (snap*)malloc(maxSnap * sizeof(snap));
-    auto* s2 = (snap*)malloc(maxSnap * sizeof(snap));
+    auto* s1 = (snap*)gp_alloc(maxSnap * sizeof(snap));
+    auto* s2 = (snap*)gp_alloc(maxSnap * sizeof(snap));
     if (!s1 || !s2) { free(s1); free(s2); cliPrintf("top: out of memory\n"); return; }
     memset(s1, 0, maxSnap * sizeof(snap));
     memset(s2, 0, maxSnap * sizeof(snap));
     auto takeSnap = [](snap* out, int max, uint32_t& total) -> int {
         UBaseType_t n = uxTaskGetNumberOfTasks();
-        auto* raw = (TaskStatus_t*)malloc(n * sizeof(TaskStatus_t));
+        auto* raw = (TaskStatus_t*)gp_alloc(n * sizeof(TaskStatus_t));
         if (!raw) return 0;
         n = uxTaskGetSystemState(raw, n, &total);
         int cnt = n < (UBaseType_t)max ? (int)n : max;

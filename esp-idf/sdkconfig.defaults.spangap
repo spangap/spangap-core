@@ -17,11 +17,13 @@ CONFIG_ESP_WIFI_NVS_ENABLED=n
 # for the spangap web stack; raise if a consumer adds many more listeners.
 CONFIG_LWIP_MAX_SOCKETS=24
 
-# lwIP — TCP send/recv windows + reuse + oversize MSS for high-throughput TCP
-# (RTSP, WebDAV, log/cli streaming). Defaults are too small for anything
-# beyond config bytes.
-CONFIG_LWIP_TCP_SND_BUF_DEFAULT=16384
-CONFIG_LWIP_TCP_WND_DEFAULT=16384
+# lwIP — TCP send/recv windows + reuse + oversize MSS. 8 KB each (down from 16 KB)
+# is a balance: ample for the spangap web/cli/log streaming, but half the memory —
+# these are per active TCP connection and the larger size was eating scarce
+# internal DRAM. A consumer needing high-throughput TCP (e.g. video) overrides
+# these back up in its own sdkconfig.defaults (see seccam).
+CONFIG_LWIP_TCP_SND_BUF_DEFAULT=8192
+CONFIG_LWIP_TCP_WND_DEFAULT=8192
 CONFIG_LWIP_SO_REUSE=y
 CONFIG_LWIP_TCP_OVERSIZE_MSS=y
 CONFIG_LWIP_IRAM_OPTIMIZATION=y
@@ -29,9 +31,12 @@ CONFIG_LWIP_IRAM_OPTIMIZATION=y
 # lwIP — PPP support (workaround for ESP-IDF 5.x netif->state conflict with WireGuard)
 CONFIG_LWIP_PPP_SUPPORT=y
 
-# WiFi TX — larger BA window + more dynamic TX buffers for bursty video
+# WiFi TX — larger BA window for aggregation. Dynamic TX buffers kept modest (16,
+# down from 64): each is ~1.6 KB of internal DMA RAM, and 64 was sized for this-
+# project bursty video. Lowered for the non-video reticulous build; a video
+# consumer overrides DYNAMIC_TX_BUFFER_NUM back up in its own defaults (see seccam).
 CONFIG_ESP_WIFI_TX_BA_WIN=32
-CONFIG_ESP_WIFI_DYNAMIC_TX_BUFFER_NUM=64
+CONFIG_ESP_WIFI_DYNAMIC_TX_BUFFER_NUM=16
 # NOTE: do NOT enable CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP here as a blanket
 # default. On display boards (T-Deck) the LCD/LVGL already claim the internal
 # DMA pool, and moving WiFi/lwIP toward PSRAM tips the WiFi *static* RX buffers
@@ -75,29 +80,13 @@ CONFIG_SPIRAM_MALLOC_RESERVE_INTERNAL=65536
 # Per-task heap ownership tracking (for heapDump on malloc failures)
 CONFIG_HEAP_TASK_TRACKING=y
 
-# ─── DEBUG — internal-DRAM corruption hunt (TEMPORARY; revert before shipping) ───
-# Chasing a silent stray write into internal RAM: it clobbers a FreeRTOS
-# list / ringbuffer recv-semaphore and only surfaces much later as an
-# `xTaskRemoveFromEventList ... (pxUnblockedTCB)` assert from the USB-Serial-JTAG
-# RX ISR. These trip the fault at (or near) the bad write instead.
-#   * COMPREHENSIVE poisoning adds head/tail canaries + free-fill so an overrun
-#     into a neighbouring block is detectable; pair with the runtime
-#     SPANGAP_HEAP_INTEGRITY_POLL (off by default) which scans for tripped
-#     canaries once per second on the log task.
-#   * PTRVAL stack-overflow check (mode 2) is stricter than the default
-#     context-switch canary — it validates the stack pointer on every switch.
-# Both carry a runtime/throughput cost; remove this block (reverting to the
-# implicit HEAP_POISONING_DISABLED / CHECK_STACKOVERFLOW_CANARY) once the
-# offending writer is found.
-CONFIG_HEAP_POISONING_COMPREHENSIVE=y
-CONFIG_FREERTOS_CHECK_STACKOVERFLOW_PTRVAL=y
-# Runtime scan enabled for this hunt (the whole block reverts together).
-CONFIG_SPANGAP_HEAP_INTEGRITY_POLL=y
-# HW store-watchpoint (0 = off). It confirmed the victim was main_task's freed
-# TCB but can't sit on a live TCB during boot (that address is reused), so it's
-# parked off; the integrity poll above verifies the fix (no more CORRUPT HEAP).
-CONFIG_SPANGAP_WATCH_ADDR=0x0
-# ─────────────────────────────────────────────────────────────────────────────
+# Heap-corruption diagnostics are opt-in via Kconfig now (OFF by default — the
+# stray-write/UAF hunt they were installed for is fixed: the main_task-TCB UAF
+# was an orphaned cleanup hook, fixed by CONFIG_FREERTOS_TASK_PRE_DELETION_HOOK
+# wiring its.cpp's vTaskPreDeletionHook). To re-arm the kit, enable
+# CONFIG_SPANGAP_HEAP_INTEGRITY_POLL (Component config → spangap-core) — one
+# switch that also pulls in comprehensive poisoning + the strict PTRVAL stack
+# check. Set CONFIG_SPANGAP_WATCH_ADDR=<addr> to catch a UAF writer's backtrace.
 
 # IPC task stack — IDF default 1280 B is enough for the bare IPC service but not
 # for cross-core init callbacks: the LittleFS init path that runs on ipc0 during
@@ -153,6 +142,16 @@ CONFIG_SPANGAP_APP_PERCENT=75
 CONFIG_FREERTOS_USE_TRACE_FACILITY=y
 CONFIG_FREERTOS_GENERATE_RUN_TIME_STATS=y
 CONFIG_FREERTOS_VTASKLIST_INCLUDE_COREID=y
+
+# Task pre-deletion hook — REQUIRED so its.cpp's vTaskPreDeletionHook fires when a
+# task is deleted, nulling its stale s_tasks slot. Without this, a self-deleting
+# task that touched ITS (canonically main_task, which drives boot proxy ops then
+# returns from app_main) leaves a dangling TaskHandle; a later notify routed to
+# that slot writes into the freed TCB — a use-after-free that the heap-poisoning
+# poll catches as CORRUPT HEAP. IDF 5.5's live hook is vTaskPreDeletionHook; the
+# legacy vPortCleanUpTCB path (CONFIG_FREERTOS_ENABLE_STATIC_TASK_CLEAN_UP) is
+# deprecated, so we must use this one or the cleanup never runs.
+CONFIG_FREERTOS_TASK_PRE_DELETION_HOOK=y
 
 # Per-task CPU boost (pm.cpp): slot 0 left for IDF, slot 1 (TLS_PM_BOOST) holds
 # each boosted task's CPU_FREQ_MAX handle. Must be > TLS_PM_BOOST or pm.cpp #errors.

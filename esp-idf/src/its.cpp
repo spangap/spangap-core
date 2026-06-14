@@ -706,9 +706,17 @@ static its_task_t* taskFindOrCreate(TaskHandle_t task, size_t inboxMaxMsgLen, si
     return e;
 }
 
-/* Task-death hook: the Xtensa FreeRTOS port calls this for every deleted task,
- * inside a scheduler critical section (see port.c prvDeleteTCB). pxTCB IS the
- * TaskHandle_t.
+/* Task-death hook: IDF's Xtensa port calls vTaskPreDeletionHook(pxTCB) for every
+ * deleted task from prvDeleteTCB, inside a scheduler critical section, IFF
+ * CONFIG_FREERTOS_TASK_PRE_DELETION_HOOK is set (we set it in
+ * sdkconfig.defaults.spangap). pxTCB IS the TaskHandle_t.
+ *
+ * HISTORY / why this leaked: this was named vPortCleanUpTCB, the legacy hook that
+ * IDF only calls under CONFIG_FREERTOS_ENABLE_STATIC_TASK_CLEAN_UP — which we
+ * never set. IDF 5.5 renamed the live hook to vTaskPreDeletionHook (port.c:644
+ * vPortTCBPreDeleteHook), so the old function was orphaned: never called, the
+ * slot never nulled, the main_task UAF below never actually fixed (confirmed via
+ * a HW watchpoint that caught main_task's TCB as the victim).
  *
  * Why ITS needs it: taskFindOrCreate appends a permanent s_tasks slot the first
  * time a task touches ITS — including a transient task that registers only to
@@ -734,7 +742,14 @@ static its_task_t* taskFindOrCreate(TaskHandle_t task, size_t inboxMaxMsgLen, si
  * still owning live conns leaves stale clientTask/serverTask handles that the
  * link-backpressure notifies (remoteOf) use directly — out of scope here; no
  * such task self-deletes today. */
-extern "C" void vPortCleanUpTCB(void* pxTCB) {
+/* Storage's subscription table needs the same dead-task cleanup. It provides a
+ * strong storageOnTaskDeath() (weak no-op here if storage isn't linked) so the
+ * one global task-deletion hook drives both tables — same critical-section rules
+ * (its impl only nulls handle pointers: no locks/alloc/logging). */
+extern "C" void __attribute__((weak)) storageOnTaskDeath(void* tcb) { (void)tcb; }
+
+extern "C" void vTaskPreDeletionHook(void* pxTCB) {
+    storageOnTaskDeath(pxTCB);
     if (!s_tasks) return;
     TaskHandle_t dead = (TaskHandle_t)pxTCB;
     for (int i = 0; i < s_taskCount; i++)

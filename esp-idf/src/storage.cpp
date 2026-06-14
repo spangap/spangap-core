@@ -33,6 +33,7 @@
 #include "cli.h"
 #include "its.h"
 #include "compat.h"
+#include "mem.h"
 
 #include <string>
 #include <vector>
@@ -370,7 +371,7 @@ static char* readFileStr(const char* path) {
   if (fs_stat(path, &st) != 0 || st.st_size <= 0) return nullptr;
   int f = fs_open(path, "rb");
   if (f < 0) return nullptr;
-  char* buf = (char*)malloc(st.st_size + 1);
+  char* buf = (char*)gp_alloc(st.st_size + 1);
   if (!buf) { fs_close(f); return nullptr; }
   fs_read(buf, 1, st.st_size, f);
   buf[st.st_size] = '\0';
@@ -655,6 +656,22 @@ static void subRemove(TaskHandle_t task, storage_change_cb_t cb, const char* sco
   }
 }
 
+/* Task-death cleanup. Called from ITS's vTaskPreDeletionHook (the one global
+ * task-deletion hook) in a scheduler critical section — so NO locks/alloc/
+ * logging, and no concurrent subAdd/subRemove (scheduler suspended). Null the
+ * owner handle of any subscription on the dead task so notifyChange stops trying
+ * to deliver to a freed TCB: a notify into a dead handle is a UAF, and reading
+ * its name for the warn() reads freed memory ("notify drop → [garbage]"). The
+ * slot + its scope string stay allocated but inert (compacted by a later matching
+ * subRemove), mirroring the ITS s_tasks table's append-only discipline. Canonical
+ * case: a module that subscribed from main_task during init, which then
+ * self-deletes when app_main returns. */
+extern "C" void storageOnTaskDeath(void* tcb) {
+  TaskHandle_t dead = (TaskHandle_t)tcb;
+  for (int i = 0; i < subCount; i++)
+    if (subs[i].task == dead) subs[i].task = nullptr;
+}
+
 /* Collect every changed leaf in the patch as {key, printed-value} (deletes →
  * empty value), replacing the inline firePatchSubscriptions walk. */
 static void collectChanges(cJSON* node, char* path, size_t pathSize, size_t pathLen,
@@ -716,6 +733,7 @@ static std::string logSafe(const char* s, size_t cap = 96) {
 
 static void notifyChange(const char* key, const char* val) {
   for (int i = 0; i < subCount; i++) {
+    if (!subs[i].task) continue;   /* owner died — nulled by storageOnTaskDeath */
     size_t sl = subs[i].scope.size();
     if (sl != 0 && strncmp(key, subs[i].scope.c_str(), sl) != 0) continue;
     if (subs[i].task == storageHandle) {
@@ -725,7 +743,7 @@ static void notifyChange(const char* key, const char* val) {
     size_t klen = strlen(key), vlen = strlen(val);
     if (vlen > STORAGE_NOTIFY_VAL_MAX) vlen = STORAGE_NOTIFY_VAL_MAX;
     size_t n = sizeof(void*) + klen + 1 + vlen + 1;
-    uint8_t* buf = (uint8_t*)malloc(n);
+    uint8_t* buf = (uint8_t*)gp_alloc(n);
     if (!buf) continue;
     void* cb = (void*)subs[i].cb;
     memcpy(buf, &cb, sizeof(cb));
@@ -882,7 +900,7 @@ static void storageSubmit(std::string&& ops, bool sync) {
     return;
   }
   size_t n = ops.size();
-  void* buf = malloc(n);
+  void* buf = gp_alloc(n);
   if (!buf) { warn("storage: op alloc failed (%u B)\n", (unsigned)n); return; }
   memcpy(buf, ops.data(), n);
   if (!itsSendAuxOwnedByTaskHandle(storageHandle, STORAGE_OP_PORT, buf, n,
@@ -1102,17 +1120,12 @@ static void loadExternals() {
 void storageLoad() {
   if (!cfgMux) cfgMux = xSemaphoreCreateRecursiveMutex();
 
-  /* The config tree (cfgRoot) belongs in PSRAM — it's large config DATA, not
-   * ISR/lock-touched, so PSRAM is correct for it. Make that EXPLICIT via cJSON's
-   * global allocator hooks so it survives the malloc-default flip to
-   * internal-preferred (SPIRAM_MALLOC_ALWAYSINTERNAL): without hooks cJSON uses
-   * plain malloc/free and would crowd into scarce internal DRAM. Set once. */
+  /* The config tree (cfgRoot) is large config DATA (not ISR/lock-touched), so it
+   * follows the default allocation policy — route cJSON through gp_alloc (mem.h):
+   * PSRAM on PSRAM targets, internal on no-PSRAM ones, in one place. Set once. */
   static bool cjsonHooked = false;
   if (!cjsonHooked) {
-    cJSON_Hooks h = {
-      [](size_t n) -> void* { return heap_caps_malloc(n, MALLOC_CAP_SPIRAM); },
-      free,
-    };
+    cJSON_Hooks h = { gp_alloc, free };
     cJSON_InitHooks(&h);
     cjsonHooked = true;
   }

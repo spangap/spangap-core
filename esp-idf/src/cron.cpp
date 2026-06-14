@@ -6,6 +6,7 @@
  * Enabled/disabled via s.cron.enable config. Subscribes via storageSubscribeChanges.
  */
 #include "cron.h"
+#include "mem.h"
 #include "fs.h"
 #include "log.h"
 #include "storage.h"
@@ -220,7 +221,7 @@ bool cronPoll(bool execute) {
     struct stat st;
     std::string cronFile = fsStatePath("/crontab");
     if (fs_stat(cronFile.c_str(), &st) != 0 || st.st_size <= 0) return false;
-    char* buf = (char*)malloc(st.st_size + 1);
+    char* buf = (char*)gp_alloc(st.st_size + 1);
     if (!buf) return false;
     int fh = fs_open(cronFile.c_str(), "r");
     if (fh < 0) { free(buf); return false; }
@@ -368,7 +369,7 @@ bool cronDefault(const char* schedule, const char* command) {
         fileExists = true;
         struct stat st;
         if (fs_stat(cronFile.c_str(), &st) == 0 && st.st_size > 0) {
-            char* buf = (char*)malloc(st.st_size + 1);
+            char* buf = (char*)gp_alloc(st.st_size + 1);
             if (!buf) { fs_close(fh); return false; }
             size_t nr = fs_read(buf, 1, st.st_size, fh);
             buf[nr] = '\0';

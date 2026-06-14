@@ -1,4 +1,5 @@
 #pragma once
+#include "sdkconfig.h"
 #include "esp_timer.h"
 #include "esp_sleep.h"
 #include "esp_log.h"
@@ -61,7 +62,12 @@ static inline TaskHandle_t spawnTask(TaskFunction_t fn, const char* name,
                                       UBaseType_t prio, BaseType_t core,
                                       stack_caps_t stackMem = STACK_PSRAM) {
     TaskHandle_t h = nullptr;
+#if CONFIG_SPIRAM
     uint32_t caps = (stackMem == STACK_DRAM) ? MALLOC_CAP_INTERNAL : MALLOC_CAP_SPIRAM;
+#else
+    uint32_t caps = MALLOC_CAP_INTERNAL;   /* no PSRAM: every task stack is internal */
+    (void)stackMem;
+#endif
     BaseType_t r = xTaskCreatePinnedToCoreWithCaps(fn, name, stackBytes, arg,
                                                    prio, &h, core, caps);
     return (r == pdPASS) ? h : nullptr;
