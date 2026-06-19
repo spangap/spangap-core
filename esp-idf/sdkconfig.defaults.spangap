@@ -128,15 +128,17 @@ CONFIG_WL_SECTOR_SIZE_512=y
 CONFIG_COMPILER_CXX_EXCEPTIONS=n
 CONFIG_COMPILER_CXX_RTTI=n
 
-# Partition table — spangap generates partitions.csv at configure time from
-# the OTA / app-percent / flash-size knobs (see scripts/gen-partitions.py).
+# Partition table — spangap generates partitions.csv at configure time and
+# shrink-wraps it post-build (see scripts/gen-partitions.py). It's a size-
+# agnostic FLOOR image: `state` is absent and created at runtime in fs.cpp.
 CONFIG_PARTITION_TABLE_CUSTOM=y
 CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
 
-# Default app-percent split (75% app / 25% fixed). Consumer can override in
-# its own sdkconfig.defaults. OTA on/off is no longer a Kconfig knob — it's
-# derived from whether spangap/ota is in the staged set (see bootstrap.cmake).
-CONFIG_SPANGAP_APP_PERCENT=75
+# Flash size = the floor: default 4 MB so one image boots on any chip >= 4 MB and
+# the firmware self-grows to the real size at first boot. A board that wants to
+# PIN a size (no self-grow) overrides this in its own sdkconfig.defaults / kconfig.
+# (Updater on/off is derived from whether spangap/updater is staged — bootstrap.cmake.)
+CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
 
 # FreeRTOS — task stats for 'top' command
 CONFIG_FREERTOS_USE_TRACE_FACILITY=y

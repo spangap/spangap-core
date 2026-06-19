@@ -83,6 +83,13 @@ function(spangap_create_factory_image)
             --partition-name ${partition_name}
         VERBATIM)
 
+    # Full partition layout (name/offset/size) on every build — not just the
+    # configure-time print in bootstrap.cmake (which caches away on rebuilds).
+    add_custom_command(TARGET littlefs_${partition_name}_bin POST_BUILD
+        COMMAND python3 "${_spangap_core_dir}/scripts/report-partitions.py"
+            --partitions "${CMAKE_SOURCE_DIR}/partitions.csv"
+        VERBATIM)
+
     # If the consumer also called spangap_browser_build(), wire its target as
     # a prerequisite so the SPA lands in data_merged before the merge runs.
     if(TARGET spangap_browser_build_target)

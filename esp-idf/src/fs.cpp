@@ -13,6 +13,7 @@
 #include <cstdio>
 #include <cstring>
 #include <cstdlib>
+#include <cinttypes>
 #include <string>
 #include <dirent.h>
 #include <errno.h>
@@ -27,6 +28,8 @@
 #include "nvs_flash.h"
 #include "esp_ota_ops.h"
 #include "esp_partition.h"
+#include "esp_flash.h"
+#include "esp_rom_spiflash.h"
 #include "esp_vfs_fat.h"
 #include "ff.h"
 #include "sdmmc_cmd.h"
@@ -1002,6 +1005,75 @@ void fsSelectStateStore(void) {
     }
 }
 
+/* Grow flash to the real chip size and register the `state` partition.
+ *
+ * The flashed image is a size-agnostic FLOOR image (default 4 MB): its on-flash
+ * partition table holds only nvs/otadata/updater/app/fixed and `state` is absent.
+ * The flash driver clamped its idea of the chip to the floor (header) size at
+ * boot, so we (1) read the REAL physical size via SFDP, (2) raise the driver's
+ * size to it (g_rom_flashchip + esp_flash_default_chip), and (3) register `state`
+ * in the upper part of flash with esp_partition_register_external — purely
+ * in-memory, recreated identically every boot, so the LittleFS data persists on
+ * flash while the table never has to be rewritten.
+ *
+ * state's share is CONFIG_SPANGAP_STATE_PERCENT of the real flash (default 50%,
+ * i.e. starts at the half-flash mark). If the shipped firmware (fixed partition
+ * end) would extend past that, fall back to half the share (state starts higher);
+ * if it STILL won't fit, clamp state to whatever's above fixed and warn. state's
+ * start is stable for a given chip size, so app/fixed upgrades never move it. */
+#ifndef CONFIG_SPANGAP_STATE_PERCENT
+#define CONFIG_SPANGAP_STATE_PERCENT 50
+#endif
+static void statePartitionEnsure() {
+    /* Already present (a board could pin `state` in its table)? Then do nothing. */
+    if (esp_partition_find_first(ESP_PARTITION_TYPE_DATA,
+                                 ESP_PARTITION_SUBTYPE_ANY, "state"))
+        return;
+
+    uint32_t phys = 0;
+    if (esp_flash_get_physical_size(nullptr, &phys) != ESP_OK || phys == 0)
+        phys = esp_flash_default_chip->size;     /* fall back to configured size */
+
+    /* Unlock the upper region for the partition/flash layer. */
+    esp_flash_default_chip->size = phys;
+    g_rom_flashchip.chip_size = phys;
+
+    const uint32_t ALIGN = 0x1000;               /* LittleFS 4K */
+    uint32_t pct = CONFIG_SPANGAP_STATE_PERCENT;
+    uint32_t start = (uint32_t)(((uint64_t)phys * (100 - pct)) / 100);
+
+    /* Underwater check against the shipped firmware (fixed partition end). */
+    uint32_t fixedEnd = 0;
+    const esp_partition_t* fx = esp_partition_find_first(
+        ESP_PARTITION_TYPE_DATA, ESP_PARTITION_SUBTYPE_ANY, "fixed");
+    if (fx) fixedEnd = fx->address + fx->size;
+
+    if (fixedEnd > start) {                       /* fall back to half the share */
+        start = (uint32_t)(((uint64_t)phys * (100 - pct / 2)) / 100);
+        if (fixedEnd > start) {                   /* still won't fit — clamp + warn */
+            warn("state: firmware (%#" PRIx32 ") past %u%% mark; state shrunk\n",
+                 fixedEnd, pct);
+            start = fixedEnd;
+        }
+    }
+    start = (start + ALIGN - 1) & ~(ALIGN - 1);   /* round up to 4K */
+    if (start >= phys) {
+        err("state: no room for a state partition (flash %#" PRIx32 ")\n", phys);
+        return;
+    }
+    uint32_t size = phys - start;
+
+    const esp_partition_t* out = nullptr;
+    esp_err_t e = esp_partition_register_external(
+        esp_flash_default_chip, start, size, "state",
+        ESP_PARTITION_TYPE_DATA, ESP_PARTITION_SUBTYPE_DATA_SPIFFS, &out);
+    if (e != ESP_OK)
+        err("state: register_external failed: %s\n", esp_err_to_name(e));
+    else
+        info("state: flash %#" PRIx32 ", /state at %#" PRIx32 " size %#" PRIx32 "\n",
+             phys, start, size);
+}
+
 void fs_init() {
     /* NVS flash — ESP-IDF internals only (WiFi cal, PHY data) */
     esp_err_t err = nvs_flash_init();
@@ -1010,22 +1082,11 @@ void fs_init() {
         nvs_flash_init();
     }
 
-    /* Resolve "fixed" partition based on running app slot.
-     * OTA on:  app0 → fixed_a, app1 → fixed_b. OTA writes the inactive pair
-     *          together and otadata flips both atomically by association.
-     * OTA off: a single "fixed" partition (no suffix) — the running app is
-     *          the factory app and neither _OTA_0 nor _OTA_1 matches. */
-    {
-        const esp_partition_t* run = esp_ota_get_running_partition();
-        const char* lbl;
-        if (run && run->subtype == ESP_PARTITION_SUBTYPE_APP_OTA_1)
-            lbl = "fixed_b";
-        else if (run && run->subtype == ESP_PARTITION_SUBTYPE_APP_OTA_0)
-            lbl = "fixed_a";
-        else
-            lbl = "fixed";
-        safeStrncpy(fixedLabel, lbl, sizeof(fixedLabel));
-    }
+    /* Single read-only `fixed` partition now (no A/B). Then grow flash to the
+     * real chip size and register the runtime `state` partition — both must
+     * happen before the mount loop below brings `state` up. */
+    safeStrncpy(fixedLabel, "fixed", sizeof(fixedLabel));
+    statePartitionEnsure();
 
     /* Mount all LittleFS partitions from the table, INCLUDING `state`.
      * /state is the on-flash partition and is always mounted, regardless of

@@ -1,90 +1,100 @@
 #!/usr/bin/env python3
-"""Generate spangap's partitions.csv from flash size + OTA + app-percent.
+"""Generate spangap's partitions.csv — size-agnostic, state-less layout.
 
-Layout (8 MB OTA example, app=75%):
+The flashed image is a **floor-sized** image (default 4 MB) that boots on any
+chip >= that size; the firmware grows flash to the real size at first boot and
+registers the `state` LittleFS partition itself (esp_partition_register_external,
+no on-flash table entry). So the partition table here contains ONLY the things
+that ship in the image, shrink-wrapped to their actual sizes:
 
-    nvs       0x09000   0x05000     20K  IDF internal (WiFi cal, PHY)
-    otadata   0x0E000   0x02000      8K  OTA bootloader pointer (only if OTA)
-    app0      0x10000   ...              firmware A     ─┐
-    app1                                 firmware B      │ paired A/B if OTA;
-    fixed_a                              LittleFS RO A   │ single partitions
-    fixed_b                              LittleFS RO B  ─┘ if OTA off
-    state                  0x40000    256K /state LittleFS R/W
+    nvs        0x09000   0x05000     IDF internal (WiFi PHY cal)
+    otadata    0x0E000   0x02000     (only with updater — selects app vs updater)
+    updater    0x10000   <wrapped>   (only with updater) tiny serial-updated flasher (ota_1)
+    app        ...        <wrapped>   firmware (factory, or ota_0 when updater present)
+    fixed      ...        <wrapped>   read-only LittleFS (SPA + factory defaults)
 
-`available = flash_total - 0x10000 - state_size` is split: app gets
-app_percent%, fixed gets the rest. With OTA on, both are paired A/B (each
-slot = half the share). With OTA off, each gets the full share.
+`state` is deliberately absent — it lives in the upper half of flash and is
+created at runtime (see statePartitionEnsure() in fs.cpp). Flash order keeps the
+updater BELOW app/fixed so their shrink-wrap growth never moves the updater slot.
 
-App partitions must be 64K-aligned; LittleFS partitions are 4K-aligned. Any
-rounding leftover is absorbed into fixed_b (or fixed, if OTA off) so the
-layout fills the available range perfectly.
+Two modes:
+  * provisional (--app-bytes 0 --fixed-bytes 0): generous sizes filling the floor
+    so the first configure can link + pack the littlefs image.
+  * final (real --app-bytes/--fixed-bytes from the post-build measure): shrink-wrap
+    app to 64 K and fixed to 4 K. Everything must fit the floor or it errors.
+
+App partitions are 64 K-aligned; LittleFS partitions 4 K-aligned.
 """
 import argparse
 import sys
 from pathlib import Path
 
-APP_START = 0x10000     # first app partition (64K-aligned by spec)
-APP_ALIGN = 0x10000     # OTA app slots must be 64K-aligned
-DATA_ALIGN = 0x1000     # LittleFS partitions: 4K alignment
-STATE_SIZE = 0x40000    # /state LittleFS R/W (256 KB)
-NVS_START = 0x9000
-NVS_SIZE = 0x5000
+APP_START   = 0x10000   # first app/updater partition (64K-aligned by spec)
+APP_ALIGN   = 0x10000   # app slots must be 64K-aligned
+DATA_ALIGN  = 0x1000    # LittleFS partitions: 4K alignment
+NVS_START   = 0x9000
+NVS_SIZE    = 0x5000
 OTADATA_START = 0xE000
-OTADATA_SIZE = 0x2000
+OTADATA_SIZE  = 0x2000
+# Provisional reserve for the updater slot when its real size isn't known yet.
+UPDATER_PROVISIONAL = 0x80000   # 512 KB — generous; shrunk in the final pass
+# Provisional fixed reserve = this fraction of the floor (scales with flash so
+# the first littlefs pack has room; the post-build pass shrinks it to actual).
+FIXED_PROVISIONAL_DIV = 5        # 1/5 = 20% of the floor
 
 
-def align_down(x: int, a: int) -> int:
-    return (x // a) * a
+def align_up(x: int, a: int) -> int:
+    return ((x + a - 1) // a) * a
 
 
-def render(flash_mb: int, ota: bool, app_pct: int) -> str:
-    flash_total = flash_mb * 1024 * 1024
-    available = flash_total - APP_START - STATE_SIZE
+def render(flash_mb: int, updater: bool,
+           app_bytes: int, fixed_bytes: int, updater_bytes: int) -> str:
+    floor = flash_mb * 1024 * 1024
+    provisional = (app_bytes == 0 and fixed_bytes == 0)
 
     rows: list[tuple[str, str, str, int, int, str]] = []
     rows.append(("nvs", "data", "nvs", NVS_START, NVS_SIZE, ""))
 
-    if ota:
+    offset = APP_START
+    if updater:
         rows.append(("otadata", "data", "ota", OTADATA_START, OTADATA_SIZE, ""))
-        # App: half of (available * pct/100), 64K-aligned
-        app_slot = align_down(available * app_pct // 200, APP_ALIGN)
-        if app_slot < APP_ALIGN:
-            sys.exit(f"spangap gen-partitions: app slot too small ({app_slot} bytes)")
-        # Remaining after 2 app slots → 2 fixed slots
-        rest = available - 2 * app_slot
-        fixed_a = align_down(rest // 2, DATA_ALIGN)
-        # fixed_b absorbs any rounding leftover (still DATA_ALIGN-aligned).
-        fixed_b = rest - fixed_a
-        if fixed_a < DATA_ALIGN or fixed_b < DATA_ALIGN:
-            sys.exit(f"spangap gen-partitions: fixed slots too small "
-                     f"({fixed_a}/{fixed_b} bytes) — try a lower app-percent")
-
-        offset = APP_START
-        rows.append(("app0", "app", "ota_0", offset, app_slot, ""));    offset += app_slot
-        rows.append(("app1", "app", "ota_1", offset, app_slot, ""));    offset += app_slot
-        rows.append(("fixed_a", "data", "spiffs", offset, fixed_a, "readonly")); offset += fixed_a
-        rows.append(("fixed_b", "data", "spiffs", offset, fixed_b, "readonly")); offset += fixed_b
-        rows.append(("state", "data", "spiffs", offset, STATE_SIZE, ""))
+        # Updater slot first (low, stable) — ota_1.
+        if provisional:
+            usz = UPDATER_PROVISIONAL
+        else:
+            usz = align_up(updater_bytes, APP_ALIGN) if updater_bytes else UPDATER_PROVISIONAL
+        rows.append(("updater", "app", "ota_1", offset, usz, ""))
+        offset += usz
+        app_sub = "ota_0"
     else:
-        # No OTA → no otadata, single factory app, single fixed.
-        app_size = align_down(available * app_pct // 100, APP_ALIGN)
-        fixed_size = available - app_size
-        if app_size < APP_ALIGN or fixed_size < DATA_ALIGN:
-            sys.exit(f"spangap gen-partitions: app/fixed too small "
-                     f"({app_size}/{fixed_size} bytes)")
+        app_sub = "factory"
 
-        offset = APP_START
-        rows.append(("factory", "app", "factory", offset, app_size, ""));   offset += app_size
-        rows.append(("fixed", "data", "spiffs", offset, fixed_size, "readonly")); offset += fixed_size
-        rows.append(("state", "data", "spiffs", offset, STATE_SIZE, ""))
+    if provisional:
+        # Reserve a floor-scaled slice for fixed; app gets the rest. Generous on
+        # both so the first link + littlefs pack succeed; shrunk post-build.
+        fixed_sz = align_up(floor // FIXED_PROVISIONAL_DIV, DATA_ALIGN)
+        app_sz = ((floor - offset - fixed_sz) // APP_ALIGN) * APP_ALIGN
+        if app_sz < APP_ALIGN:
+            sys.exit(f"gen-partitions: floor {flash_mb}MB too small for a provisional app")
+    else:
+        app_sz = align_up(app_bytes, APP_ALIGN)
+        fixed_sz = align_up(fixed_bytes, DATA_ALIGN)
+    rows.append(("app", "app", app_sub, offset, app_sz, ""))
+    offset += app_sz
+
+    end = offset + fixed_sz
+    if end > floor:
+        sys.exit(f"gen-partitions: layout ({end:#x}) exceeds {flash_mb}MB floor "
+                 f"({floor:#x}) — raise CONFIG_ESPTOOLPY_FLASHSIZE or trim app/fixed")
+    if fixed_sz < DATA_ALIGN:
+        sys.exit("gen-partitions: fixed partition too small")
+    rows.append(("fixed", "data", "spiffs", offset, fixed_sz, "readonly"))
 
     out = [
-        "# Generated by spangap — do not edit. Tune via:",
-        "#   OTA on/off          — staging set (include/exclude spangap/ota)",
-        "#   Flash size           — `spangap build --flash-size <MB>`",
-        "#                          or `idf.py menuconfig` → Serial flasher config",
-        "#   App share %          — `idf.py menuconfig` → Spangap → App share %",
-        f"# Flash {flash_mb}MB, OTA={'on' if ota else 'off'}, app={app_pct}%",
+        "# Generated by spangap — do not edit. Size-agnostic floor image;",
+        "# `state` is created at runtime (fs.cpp), not listed here.",
+        f"# Floor {flash_mb}MB, updater={'on' if updater else 'off'}, "
+        f"{'provisional' if provisional else 'shrink-wrapped'}",
         "#",
         "# Name,    Type, SubType, Offset,    Size,      Flags",
     ]
@@ -96,20 +106,20 @@ def render(flash_mb: int, ota: bool, app_pct: int) -> str:
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--flash-mb", type=int, required=True, choices=[4, 8, 16, 32, 64, 128])
-    ap.add_argument("--ota", choices=["y", "n"], required=True)
-    ap.add_argument("--app-percent", type=int, required=True)
-    ap.add_argument("--out", required=True, help="Output partitions.csv path")
+    ap.add_argument("--flash-mb", type=int, required=True, choices=[4, 8, 16, 32, 64, 128],
+                    help="Floor size = configured CONFIG_ESPTOOLPY_FLASHSIZE (default 4)")
+    ap.add_argument("--updater", choices=["y", "n"], required=True)
+    ap.add_argument("--app-bytes", type=int, default=0, help="Actual app .bin size (0 = provisional)")
+    ap.add_argument("--fixed-bytes", type=int, default=0, help="Actual fixed data size (0 = provisional)")
+    ap.add_argument("--updater-bytes", type=int, default=0, help="Actual updater .bin size (0 = provisional)")
+    ap.add_argument("--out", required=True)
     args = ap.parse_args()
 
-    if not (10 <= args.app_percent <= 90):
-        sys.exit(f"spangap gen-partitions: app-percent {args.app_percent} out of range (10..90)")
-
-    content = render(args.flash_mb, args.ota == "y", args.app_percent)
+    content = render(args.flash_mb, args.updater == "y",
+                     args.app_bytes, args.fixed_bytes, args.updater_bytes)
 
     out = Path(args.out)
-    # Avoid touching mtime if content unchanged — keeps CMake from triggering
-    # a needless reconfigure cascade on plain rebuilds.
+    # Skip the write when unchanged — keeps CMake from a needless reconfigure cascade.
     if out.exists() and out.read_text() == content:
         return 0
     out.write_text(content)

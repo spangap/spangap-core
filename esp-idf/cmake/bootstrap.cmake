@@ -111,19 +111,17 @@ set(_SPANGAP_SDKCONFIG "${_SDKCONFIG}" CACHE INTERNAL "")
 set(_SPANGAP_DEFHASH_FILE "${_DEFHASH_FILE}" CACHE INTERNAL "")
 set(_SPANGAP_SDKCONFIG_DEFAULTS_LIST "${SDKCONFIG_DEFAULTS}" CACHE INTERNAL "")
 
-# ─── 3. Generate partitions.csv ───
-# Flash size and app-percent come from sdkconfig / SDKCONFIG_DEFAULTS (so they
-# can be tuned via menuconfig or the spangap-inside override file). OTA on/off
-# comes from the staged set — spangap-inside drops a `staging/components/ota/`
-# symlink iff ota is in the build, and that's the authoritative signal. (Reading
-# CONFIG_SPANGAP_OTA from sdkconfig would lag: on first build sdkconfig doesn't
-# exist yet, and the symbol is auto-emitted later in the configure pass.)
-# Last-resort fallbacks for a raw `idf.py` build that bypasses spangap-inside.
-# A normal `spangap build` refuses to proceed unless some SDKCONFIG_DEFAULTS
-# layer below actually selects a flash size (see flash_size_configured in
-# spangap-inside), so the scan below overwrites _FLASH_MB with the real value.
-set(_FLASH_MB 8)
-set(_APP_PCT 75)        # matches Kconfig default
+# ─── 3. Generate partitions.csv (provisional / configure-time) ───
+# This is a size-agnostic FLOOR image: the table is sized to the configured
+# CONFIG_ESPTOOLPY_FLASHSIZE (default 4 MB via sdkconfig.defaults.spangap), and
+# `state` is NOT in it — the firmware grows flash to the real chip size at first
+# boot and registers `state` itself (statePartitionEnsure() in fs.cpp). So a
+# single image boots on any chip >= the floor. The updater on/off signal comes
+# from the staged set — spangap-inside drops a `staging/components/updater/`
+# symlink iff the updater straddle is in the build (mirrors the old ota signal).
+# This provisional pass writes generous app/fixed so the first configure can link
+# + pack littlefs; project_include.cmake re-runs it shrink-wrapped post-build.
+set(_FLASH_MB 4)        # floor; overwritten by the configured flash size below
 
 set(_PARTGEN_FILES ${SDKCONFIG_DEFAULTS} "${_SDKCONFIG}")
 foreach(_f IN LISTS _PARTGEN_FILES)
@@ -134,33 +132,53 @@ foreach(_f IN LISTS _PARTGEN_FILES)
     foreach(_line IN LISTS _lines)
         if(_line MATCHES "^CONFIG_ESPTOOLPY_FLASHSIZE_([0-9]+)MB=y$")
             set(_FLASH_MB "${CMAKE_MATCH_1}")
-        elseif(_line MATCHES "^CONFIG_SPANGAP_APP_PERCENT=([0-9]+)$")
-            set(_APP_PCT "${CMAKE_MATCH_1}")
         endif()
     endforeach()
 endforeach()
 
-if(EXISTS "${CMAKE_SOURCE_DIR}/staging/components/ota")
-    set(_OTA y)
-    set(_SPANGAP_FIXED_PARTITION "fixed_a")
+if(EXISTS "${CMAKE_SOURCE_DIR}/staging/components/updater")
+    set(_UPDATER y)
 else()
-    set(_OTA n)
-    set(_SPANGAP_FIXED_PARTITION "fixed")
+    set(_UPDATER n)
 endif()
-# Exposed so the factory-image / lcd-icons helpers can default to the
-# correct partition name without the consumer having to know the layout.
-set(SPANGAP_FIXED_PARTITION "${_SPANGAP_FIXED_PARTITION}" CACHE INTERNAL "")
+# Single fixed partition now (no A/B) — exposed so the factory-image / lcd-icons
+# helpers default to the right name without the consumer knowing the layout.
+set(SPANGAP_FIXED_PARTITION "fixed" CACHE INTERNAL "")
+
+# Shrink-wrap inputs: spangap-inside measures the real app .bin + fixed data
+# after a build and writes build/.spangap-sizes; reading it here sizes app/fixed
+# to actual (no cap on fixed). Absent (first build) → 0 → generous provisional.
+set(_APP_BYTES 0)
+set(_FIXED_BYTES 0)
+set(_SIZES_FILE "${CMAKE_BINARY_DIR}/.spangap-sizes")
+# Reconfigure when the measured sizes change, so spangap-inside's second pass
+# (which writes this file) re-runs gen-partitions with the real sizes.
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${_SIZES_FILE}")
+if(EXISTS "${_SIZES_FILE}")
+    file(STRINGS "${_SIZES_FILE}" _szlines)
+    foreach(_l IN LISTS _szlines)
+        if(_l MATCHES "^app=([0-9]+)$")
+            set(_APP_BYTES "${CMAKE_MATCH_1}")
+        elseif(_l MATCHES "^fixed=([0-9]+)$")
+            set(_FIXED_BYTES "${CMAKE_MATCH_1}")
+        endif()
+    endforeach()
+endif()
 
 execute_process(
     COMMAND python3 "${_SPANGAP_CORE_DIR}/scripts/gen-partitions.py"
         --flash-mb ${_FLASH_MB}
-        --ota ${_OTA}
-        --app-percent ${_APP_PCT}
+        --updater ${_UPDATER}
+        --app-bytes ${_APP_BYTES}
+        --fixed-bytes ${_FIXED_BYTES}
         --out "${CMAKE_SOURCE_DIR}/partitions.csv"
     COMMAND_ERROR_IS_FATAL ANY)
 
-# Stash for post-project so we can report `fixed` utilization against the
-# partition we just generated.
+# Print the layout so `spangap build` shows how flash is carved up.
+execute_process(
+    COMMAND python3 "${_SPANGAP_CORE_DIR}/scripts/report-partitions.py"
+        --partitions "${CMAKE_SOURCE_DIR}/partitions.csv")
+
+# Stash for post-project (shrink-wrap re-gen + `fixed` utilization report).
 set(_SPANGAP_PART_FLASH_MB ${_FLASH_MB} CACHE INTERNAL "")
-set(_SPANGAP_PART_OTA ${_OTA} CACHE INTERNAL "")
-set(_SPANGAP_PART_APP_PCT ${_APP_PCT} CACHE INTERNAL "")
+set(_SPANGAP_PART_UPDATER ${_UPDATER} CACHE INTERNAL "")

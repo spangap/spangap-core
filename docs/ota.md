@@ -1,5 +1,10 @@
 # OTA — over-the-air updates
 
+> **Superseded.** The paired-A/B partition layout and the `ota` straddle described
+> here are replaced by the floor-image + single-slot `updater` model — see
+> [flash-partitions.md](flash-partitions.md). Kept for the manifest / signing
+> background until the `updater` flasher lands.
+
 Signed manifest, paired firmware + files update, manual rollback. ECDSA P-256 signatures, no flash encryption, no Secure Boot lockdown — verification is purely application-level for now (see [Future hardening](#future-hardening)).
 
 The **mechanics** below (manifest format, update flow, rollback, storage keys, partition shape spangap-core expects) live in spangap-core. The **distribution side** (signing keys, build scripts, manifest URL, About-panel UI) lives in the consuming app.

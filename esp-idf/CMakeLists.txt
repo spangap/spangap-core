@@ -49,6 +49,8 @@ set(_REQ
     esp_rom
     esp_app_format
     app_update
+    spi_flash
+    esp_partition
     lwip
     mbedtls)
 

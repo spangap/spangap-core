@@ -183,21 +183,21 @@ config SPANGAP_SDCARD_ALLOC_KB
         large cards; raise it for fewer/larger files, lower it to trim waste
         further at the cost of a bigger FAT.
 
-config SPANGAP_APP_PERCENT
-    int "App share of available flash (%)"
-    range 10 90
-    default 75
+config SPANGAP_STATE_PERCENT
+    int "State partition share of real flash (%)"
+    range 10 75
+    default 50
     help
-        After NVS, otadata, and the /state partition are reserved, the
-        remaining flash is split between app (firmware code) and fixed
-        (read-only LittleFS for the SPA + factory defaults). This knob
-        is the percentage that goes to app; the rest goes to fixed.
-
-        With OTA on, both app and fixed are paired A/B (so each individual
-        slot is half the share). With OTA off, each gets the full share.
-
-        Spangap regenerates partitions.csv from this value + flash size +
-        OTA on/off at every reconfigure — never edit partitions.csv by hand.
+        The flashed image is a size-agnostic floor (default 4 MB) holding only
+        nvs/otadata/updater/app/fixed. At first boot the firmware grows flash to
+        the real chip size and creates the read-write /state LittleFS partition
+        in the upper part of flash, registered at runtime (not in the on-flash
+        partition table). This knob is state's target share of the real flash —
+        default 50% (state starts at the half-flash mark). If the shipped image
+        (app + fixed) would extend past that mark ("underwater"), the firmware
+        falls back to half this value (state starts higher up) so the firmware
+        fits below it. State's start offset is stable for a given chip size, so
+        firmware/data upgrades never move it. See statePartitionEnsure() in fs.cpp.
 
 config SPANGAP_ITS_INBOX_DEPTH
     int "ITS mailbox depth (messages)"
