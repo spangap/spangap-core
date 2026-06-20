@@ -19,6 +19,8 @@
 #include <cstdio>
 #include <cstring>
 #include <vector>
+#include <string>
+#include <deque>
 #include <dirent.h>
 #include <sys/stat.h>
 #include <freertos/FreeRTOS.h>
@@ -112,30 +114,25 @@ void cliWrite(const char* data, size_t len) {
 
 /* ---- Command history (shared across serial + network) ---- */
 static constexpr int HIST_SIZE = 20;
-static char (*histBuf)[128];       /* allocated in PSRAM */
-static int histCount = 0;          /* total entries stored */
-static int histHead = 0;           /* next write slot (circular) */
+/* Command history, newest at front — dynamically sized std::strings, so no fixed
+ * per-line cap and no clients×history static waste. */
+static std::deque<std::string> histDq;
 
 static void histAdd(const char* cmd) {
-  /* skip if same as last entry */
-  int last = (histHead + HIST_SIZE - 1) % HIST_SIZE;
-  if (histCount > 0 && strcmp(histBuf[last], cmd) == 0) return;
-  safeStrncpy(histBuf[histHead], cmd, sizeof(histBuf[0]));
-  histHead = (histHead + 1) % HIST_SIZE;
-  if (histCount < HIST_SIZE) histCount++;
+  if (!histDq.empty() && histDq.front() == cmd) return;   /* skip dup of last */
+  histDq.emplace_front(cmd);
+  if ((int)histDq.size() > HIST_SIZE) histDq.pop_back();
 }
 
-/* Map browse index (0 = newest) to circular buffer index */
+/* Browse index 0 = newest; nullptr past the end. */
 static const char* histGet(int browseIdx) {
-  if (browseIdx < 0 || browseIdx >= histCount) return nullptr;
-  int idx = (histHead - 1 - browseIdx + HIST_SIZE * 2) % HIST_SIZE;
-  return histBuf[idx];
+  if (browseIdx < 0 || browseIdx >= (int)histDq.size()) return nullptr;
+  return histDq[browseIdx].c_str();
 }
 
 struct cli_edit {
-    char buf[128];
-    char saved[128];    /* saved current line when browsing history */
-    int len = 0;
+    std::string buf;            /* current line (dynamic, no fixed cap) */
+    std::string saved;          /* saved current line when browsing history */
     int cursor = 0;
     int escState = 0;
     int histIdx = -1;   /* -1 = not browsing, 0 = newest, 1 = next older... */
@@ -151,8 +148,7 @@ static struct cli_slot_t {
     bool usbSerial;
     bool color;        /* emit ANSI color escapes (CLI_ANSI input echo) */
     bool noPrompt;     /* suppress connect-time prompt (one-shot exec clients) */
-    char lineBuf[128];
-    int lineLen;
+    std::string lineBuf;   /* LINE-mode accumulation (dynamic) */
     int cols, rows;    /* client terminal size (0 = unknown → 80x24); for ssh pty-req */
     char cwd[256];
     /* True when the slot wants to disconnect once its outgoing stream is
@@ -291,12 +287,24 @@ static int cliAllocSlot(int itsHandle) {
     return -1;
 }
 
+/* Write the whole buffer, applying BACKPRESSURE: when the channel is full,
+ * block and retry rather than drop. This throttles a producer (e.g. `cat` of a
+ * big file) to the channel's drain rate instead of flooding the CLI→DataChannel
+ * path — an unthrottled flood backed the WebRTC/SCTP send up until it wedged.
+ * Guards keep it from hanging: stop if the peer disconnects, and give up after a
+ * long stall (no drain) so a dead-but-not-closed channel can't block forever. */
 static void itsSendAll(int h, const char* data, size_t len) {
+    int stalls = 0;
     while (len > 0) {
-        size_t sent = itsSend(h, data, len, pdMS_TO_TICKS(100));
-        if (sent == 0) break;
+        size_t sent = itsSend(h, data, len, pdMS_TO_TICKS(200));
+        if (sent == 0) {
+            if (!itsConnected(h)) break;       /* peer gone — drop the rest */
+            if (++stalls > 150) break;         /* ~30 s with no drain — give up */
+            continue;                          /* full: wait, then retry (backpressure) */
+        }
+        stalls = 0;
         data += sent;
-        len -= sent;
+        len  -= sent;
     }
 }
 
@@ -480,19 +488,41 @@ static bool cliLineEndsWithSemicolon(const char* line) {
   return n > 0 && p[n - 1] == ';';
 }
 
-/* Redraw buffer from position 'from' to end, clear rest, restore cursor */
+/* ---- wrap-aware cursor math ----
+ * A line can wrap across terminal rows (prompt + text > width), so cursor moves
+ * and clears must reckon in rows, not just columns — otherwise a multi-row
+ * history entry doesn't clear and the cursor walks downward. Width comes from the
+ * client's connect payload (colsxrows); the LCD and xterm both report it. */
+static int cliPromptLen();   /* defined below */
+
+static int cliTermWidth() {
+  if (cliActiveSlot >= 0 && cliSlots[cliActiveSlot].cols > 0) return cliSlots[cliActiveSlot].cols;
+  return 80;
+}
+
+/* Move the terminal cursor from input position `fromPos` to `toPos` (offsets
+ * into the line; 0 = first char), crossing wrapped rows as needed. */
+static void cliMoveCursor(int fromPos, int toPos, cli_write_fn write) {
+  if (fromPos == toPos) return;
+  int w = cliTermWidth(); if (w < 1) w = 80;
+  int p = cliPromptLen();
+  int frRow = (p + fromPos) / w, toRow = (p + toPos) / w;
+  int toCol = (p + toPos) % w;
+  char buf[24]; int n = 0;
+  if (toRow < frRow)      n += snprintf(buf + n, sizeof(buf) - n, "\033[%dA", frRow - toRow);
+  else if (toRow > frRow) n += snprintf(buf + n, sizeof(buf) - n, "\033[%dB", toRow - frRow);
+  n += snprintf(buf + n, sizeof(buf) - n, "\033[%dG", toCol + 1);   /* absolute column (1-based) */
+  if (n > 0) write(buf, n);
+}
+
+/* Redraw the whole line (wrap-aware) and leave the cursor at e.cursor. `from` is
+ * the input position the terminal cursor is currently at. Clears with \033[J so
+ * any wrapped continuation rows of the previous content are removed. */
 static void cliEditRefresh(cli_edit& e, int from, cli_write_fn write) {
-  char tmp[192];
-  int n = 0;
-  int count = e.len - from;
-  if (count > 0 && count <= (int)sizeof(tmp) - 20) {
-    memcpy(tmp, e.buf + from, count);
-    n += count;
-  }
-  n += snprintf(tmp + n, sizeof(tmp) - n, "\033[K");
-  int back = e.len - e.cursor;
-  if (back > 0) n += snprintf(tmp + n, sizeof(tmp) - n, "\033[%dD", back);
-  write(tmp, n);
+  cliMoveCursor(from, 0, write);            /* to start of input */
+  write("\033[J", 3);                        /* clear to end of screen */
+  if (!e.buf.empty()) write(e.buf.data(), e.buf.size());
+  cliMoveCursor((int)e.buf.size(), e.cursor, write);   /* end -> cursor */
 }
 
 void cliRunFile(const char* path) {
@@ -593,21 +623,14 @@ static int cliPromptLen() {
 /* Replace entire edit buffer, redraw line */
 static void cliEditReplace(cli_edit& e, const char* text, cli_write_fn write) {
   bool ansi = cliIsAnsi();
-  /* Move cursor to start of input (after prompt), clear line */
-  if (e.cursor > 0) {
-    char tmp[16]; int n = snprintf(tmp, sizeof(tmp), "\033[%dD", e.cursor);
-    write(tmp, n);
-  }
-  write("\033[K", 3);
-  int newLen = strlen(text);
-  if (newLen > (int)sizeof(e.buf) - 1) newLen = sizeof(e.buf) - 1;
-  memcpy(e.buf, text, newLen);
-  e.buf[newLen] = '\0';
-  e.len = newLen;
-  e.cursor = newLen;
-  if (newLen > 0) {
+  /* Move to start of input (wrap-aware) and clear all wrapped rows below. */
+  cliMoveCursor(e.cursor, 0, write);
+  write("\033[J", 3);
+  e.buf = text;
+  e.cursor = (int)e.buf.size();
+  if (!e.buf.empty()) {
     if (ansi) cliColorWrite(write, CYAN, sizeof(CYAN) - 1);
-    write(e.buf, newLen);
+    write(e.buf.data(), e.buf.size());
   } else {
     if (ansi) cliColorWrite(write, RESET, sizeof(RESET) - 1);
   }
@@ -643,24 +666,24 @@ static int cliLongestCmdMatch(const char* line, int* matchedLen) {
 
 /* Tab completion: files when past a path-taking command; dirname via cwd / resolved path */
 static void cliTabComplete(cli_edit& e, cli_write_fn write) {
-  e.buf[e.len] = '\0';
-  const char* wordStart = e.buf;
+  const char* base = e.buf.c_str();
+  const char* wordStart = base;
   for (int i = e.cursor - 1; i >= 0; i--) {
-    if (e.buf[i] == ' ') {
-      wordStart = e.buf + i + 1;
+    if (base[i] == ' ') {
+      wordStart = base + i + 1;
       break;
     }
   }
-  int wordLen = (int)(e.buf + e.cursor - wordStart);
+  int wordLen = (int)(base + e.cursor - wordStart);
   if (wordLen < 0) return;
 
-  const char* line0 = e.buf;
+  const char* line0 = base;
   while (*line0 == ' ') line0++;
 
   int cmdLen = 0;
   int cmdIdx = cliLongestCmdMatch(line0, &cmdLen);
   if (!cliCmdWantsFileArgs(cmdIdx)) return;
-  int cmdEndIdx = (int)(line0 - e.buf) + cmdLen;
+  int cmdEndIdx = (int)(line0 - base) + cmdLen;
   if (e.cursor <= cmdEndIdx) return;
   /* Option token (e.g. rm -rf, ls -la, mkdir -p) */
   if (wordLen > 0 && wordStart[0] == '-') return;
@@ -714,11 +737,9 @@ static void cliTabComplete(cli_edit& e, cli_write_fn write) {
 
   const char* suffix = match + prefixLen;
   int suffixLen = (int)strlen(suffix);
-  if (e.len + suffixLen >= (int)sizeof(e.buf) - 1) return;
+  if (suffixLen <= 0) return;
 
-  memmove(e.buf + e.cursor + suffixLen, e.buf + e.cursor, e.len - e.cursor);
-  memcpy(e.buf + e.cursor, suffix, (size_t)suffixLen);
-  e.len += suffixLen;
+  e.buf.insert((size_t)e.cursor, suffix, (size_t)suffixLen);
   e.cursor += suffixLen;
   cliEditRefresh(e, e.cursor - suffixLen, write);
 }
@@ -736,21 +757,19 @@ static void cliEditChar(cli_edit& e, char c, cli_write_fn write) {
   if (e.escState == 2) {
     e.escState = 0;
     if (c == 'D' && e.cursor > 0) {
+      cliMoveCursor(e.cursor, e.cursor - 1, write);
       e.cursor--;
-      write("\033[D\033[2 q", 8);
-    } else if (c == 'C' && e.cursor < e.len) {
+      write("\033[2 q", 5);
+    } else if (c == 'C' && e.cursor < (int)e.buf.size()) {
+      cliMoveCursor(e.cursor, e.cursor + 1, write);
       e.cursor++;
-      if (e.cursor == e.len)
-        write("\033[C\033[0 q", 8);
-      else
-        write("\033[C", 3);
+      if (e.cursor == (int)e.buf.size()) write("\033[0 q", 5);
     } else if (c == 'A') {
       int next = e.histIdx + 1;
       const char* h = histGet(next);
       if (h) {
         if (e.histIdx < 0) {
-          memcpy(e.saved, e.buf, e.len);
-          e.saved[e.len] = '\0';
+          e.saved = e.buf;
           e.savedValid = true;
         }
         e.histIdx = next;
@@ -763,7 +782,7 @@ static void cliEditChar(cli_edit& e, char c, cli_write_fn write) {
         if (h) cliEditReplace(e, h, write);
       } else if (e.histIdx == 0) {
         e.histIdx = -1;
-        cliEditReplace(e, e.savedValid ? e.saved : "", write);
+        cliEditReplace(e, e.savedValid ? e.saved.c_str() : "", write);
         e.savedValid = false;
       }
     }
@@ -788,20 +807,17 @@ static void cliEditChar(cli_edit& e, char c, cli_write_fn write) {
   /* ^A / ^E — beginning / end of line (readline) */
   if (c == 0x01) {
     if (e.cursor > 0) {
-      char tmp[16];
-      int n = snprintf(tmp, sizeof(tmp), "\033[%dD", e.cursor);
-      write(tmp, n);
+      cliMoveCursor(e.cursor, 0, write);
       e.cursor = 0;
       write("\033[0 q", 5);
     }
     return;
   }
   if (c == 0x05) {
-    if (e.cursor < e.len) {
-      char tmp[16];
-      int n = snprintf(tmp, sizeof(tmp), "\033[%dC", e.len - e.cursor);
-      write(tmp, n);
-      e.cursor = e.len;
+    int len = (int)e.buf.size();
+    if (e.cursor < len) {
+      cliMoveCursor(e.cursor, len, write);
+      e.cursor = len;
       write("\033[0 q", 5);
     }
     return;
@@ -813,14 +829,11 @@ static void cliEditChar(cli_edit& e, char c, cli_write_fn write) {
   }
 
   if (c == '\n' || c == '\r') {
-    if (e.len > 0) {
-      e.buf[e.len] = '\0';
-      histAdd(e.buf);
-      char lineCopy[128];
-      safeStrncpy(lineCopy, e.buf, sizeof(lineCopy));
-      e.len = 0;
+    if (!e.buf.empty()) {
+      histAdd(e.buf.c_str());
+      std::string lineCopy = e.buf;
+      e.buf.clear();
       e.cursor = 0;
-      e.buf[0] = '\0';
       e.histIdx = -1;
       e.savedValid = false;
       /* Trailing ';' is the "run this and disconnect" signal:
@@ -830,7 +843,7 @@ static void cliEditChar(cli_edit& e, char c, cli_write_fn write) {
       bool stayCli = true;
       bool resumeLog = false;
       bool itsHangup = false;
-      if (cliActiveSlot >= 0 && cliLineEndsWithSemicolon(lineCopy)) {
+      if (cliActiveSlot >= 0 && cliLineEndsWithSemicolon(lineCopy.c_str())) {
         stayCli = false;
         if (cliSlots[cliActiveSlot].usbSerial) resumeLog = true;
         else                                    itsHangup = true;
@@ -843,7 +856,7 @@ static void cliEditChar(cli_edit& e, char c, cli_write_fn write) {
         serialInCli = false;
       }
       cliOut = write;
-      cliProcess(lineCopy);
+      cliProcess(lineCopy.c_str());
       /* If the just-run command (e.g. `exit`) requested session end, treat
        * it like a hangup — skip the prompt redraw. */
       if (stayCli && cliActiveSlot >= 0 && cliSlots[cliActiveSlot].pendingClose)
@@ -881,26 +894,22 @@ static void cliEditChar(cli_edit& e, char c, cli_write_fn write) {
     }
   } else if (c == 0x7F || c == 0x08) {
     if (e.cursor > 0) {
-      memmove(e.buf + e.cursor - 1, e.buf + e.cursor, e.len - e.cursor);
-      e.len--;
+      e.buf.erase((size_t)(e.cursor - 1), 1);
       e.cursor--;
-      if (e.len == 0 && ansi) {
-        char tmp[16];
-        int n = snprintf(tmp, sizeof(tmp), "\033[%dG\033[K", cliPromptLen() + 1);
+      if (e.buf.empty() && ansi) {
+        cliMoveCursor(e.cursor + 1, 0, write);   /* old pos -> input start */
         cliColorWrite(write, RESET, sizeof(RESET) - 1);
-        write(tmp, n);
+        write("\033[J", 3);
         write("\033[0 q", 5);
       } else {
-        write("\033[D", 3);
-        cliEditRefresh(e, e.cursor, write);
+        /* terminal cursor is one right of the new cursor; full wrap-aware redraw */
+        cliEditRefresh(e, e.cursor + 1, write);
       }
     }
-  } else if (c >= 0x20 && e.len < (int)sizeof(e.buf) - 1) {
-    if (e.len == 0 && ansi)
+  } else if (c >= 0x20 && e.buf.size() < 4096) {   /* sane upper bound */
+    if (e.buf.empty() && ansi)
       cliColorWrite(write, CYAN, sizeof(CYAN) - 1);
-    memmove(e.buf + e.cursor + 1, e.buf + e.cursor, e.len - e.cursor);
-    e.buf[e.cursor] = c;
-    e.len++;
+    e.buf.insert(e.buf.begin() + e.cursor, c);
     e.cursor++;
     cliEditRefresh(e, e.cursor - 1, write);
   }
@@ -909,24 +918,18 @@ static void cliEditChar(cli_edit& e, char c, cli_write_fn write) {
 /* ---- CLI command dispatcher ---- */
 
 void cliProcess(const char* line) {
-  char trimmed[128];
   while (*line == ' ') line++;
-  safeStrncpy(trimmed, line, sizeof(trimmed));
-  size_t tl = strlen(trimmed);
-  while (tl > 0 && (trimmed[tl - 1] == '\r' || trimmed[tl - 1] == '\n' || trimmed[tl - 1] == ' ' ||
-                    trimmed[tl - 1] == '\t'))
-    trimmed[--tl] = '\0';
-  line = trimmed;
+  std::string trimmed(line);
+  while (!trimmed.empty() && (trimmed.back() == '\r' || trimmed.back() == '\n' ||
+                              trimmed.back() == ' '  || trimmed.back() == '\t'))
+    trimmed.pop_back();
+  line = trimmed.c_str();          /* points into `trimmed` for the rest of the fn */
   if (*line == '#' || *line == '\0') return;
   /* Semicolon: split and execute each part */
   const char* semi = strchr(line, ';');
   if (semi) {
-    char part[128];
-    size_t plen = semi - line;
-    if (plen >= sizeof(part)) plen = sizeof(part) - 1;
-    memcpy(part, line, plen);
-    part[plen] = '\0';
-    cliProcess(part);
+    std::string part(line, (size_t)(semi - line));
+    cliProcess(part.c_str());
     cliProcess(semi + 1);
     return;
   }
@@ -1125,7 +1128,7 @@ static int cliTcpConnect(int handle, const void* data, size_t len) {
   if (slot < 0) return -1;
   auto& cl = cliSlots[slot];
   cl.edit = {};
-  cl.lineLen = 0;
+  cl.lineBuf.clear();
   cl.usbSerial = false;
   cl.color = true;          /* default on; a cli_connect_t may opt out */
   cl.noPrompt = false;      /* default: send the connect-time prompt */
@@ -1155,7 +1158,7 @@ static int cliDcConnect(int handle, const void* data, size_t len) {
   if (slot < 0) return -1;
   auto& cl = cliSlots[slot];
   cl.edit = {};
-  cl.lineLen = 0;
+  cl.lineBuf.clear();
   /* Optional connect payload "colsxrows" (e.g. "64x26") reports the client's
    * terminal size, used for the ssh pty-req. Defaults to 80x24 if absent. */
   cl.cols = 80; cl.rows = 24;
@@ -1191,7 +1194,7 @@ static TaskHandle_t cliTaskHandle = NULL;
 static void cliTaskFn(void* arg) {
   /* History buffer in PSRAM, allocated in task context so heap tracking
      attributes it to cli, not the main task that spawned us. */
-  histBuf = (char(*)[128])heap_caps_calloc(HIST_SIZE, 128, MALLOC_CAP_SPIRAM);
+  /* history is a std::deque now — no preallocation needed */
   for (int i = 0; i < CLI_MAX_CLIENTS; i++) cliSlots[i].itsHandle = -1;
   itsServerInit();
   /* CLI commands sometimes need to itsConnect outwards (e.g. rnprobe → rnsd
@@ -1254,17 +1257,16 @@ static void cliTaskFn(void* arg) {
             break;
           }
           if (c == '\n' || c == '\r') {
-            cl.lineBuf[cl.lineLen] = '\0';
-            hangup = cliLineEndsWithSemicolon(cl.lineBuf);
-            if (cl.lineLen > 0) {
+            hangup = cliLineEndsWithSemicolon(cl.lineBuf.c_str());
+            if (!cl.lineBuf.empty()) {
               cliOut = itsCliWrite;
-              cliProcess(cl.lineBuf);
+              cliProcess(cl.lineBuf.c_str());
             }
-            cl.lineLen = 0;
+            cl.lineBuf.clear();
             if (hangup) break;
             cliWritePrompt(itsCliWrite);
-          } else if (cl.lineLen < (int)sizeof(cl.lineBuf) - 1) {
-            cl.lineBuf[cl.lineLen++] = c;
+          } else if (cl.lineBuf.size() < 4096) {
+            cl.lineBuf.push_back(c);
           }
         }
         if (hangup) {
