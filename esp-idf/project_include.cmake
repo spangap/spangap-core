@@ -57,17 +57,36 @@ function(spangap_create_factory_image)
     set(_spangap_data "${_spangap_core_dir}/data")
     set(_data_merged "${CMAKE_BINARY_DIR}/data_merged")
 
+    # Staged straddles that ship read-only /fixed files (e.g. viewer's webroot
+    # help docs) opt in by appending their data/ dir to this global property from
+    # their own project_include.cmake. Merged after the core defaults and before
+    # the consumer, so the buildable still wins on collision.
+    get_property(_extra_data_dirs GLOBAL PROPERTY SPANGAP_EXTRA_DATA_DIRS)
+
     add_custom_target(spangap_data_merge ALL
         COMMAND ${CMAKE_COMMAND} -E rm -rf "${_data_merged}"
         COMMAND ${CMAKE_COMMAND} -E make_directory "${_data_merged}"
         # 1. Spangap static defaults (factory_state/{boot,crontab,net_up,
         #    storage/external/s.time.zones.json, ...})
         COMMAND ${CMAKE_COMMAND} -E copy_directory "${_spangap_data}" "${_data_merged}"
-        # 2. Consumer overrides (whole-file replacement on collision)
+        COMMENT "Merging spangap defaults + straddle data/ + ${PROJECT_NAME} data/ (consumer wins)"
+        VERBATIM)
+
+    # 2. Opt-in straddle data/ dirs (POST_BUILD commands run after the target's
+    #    own, in registration order — so: core, then each straddle, then below).
+    foreach(_ed IN LISTS _extra_data_dirs)
+        if(EXISTS "${_ed}")
+            add_custom_command(TARGET spangap_data_merge POST_BUILD
+                COMMAND ${CMAKE_COMMAND} -E copy_directory "${_ed}" "${_data_merged}"
+                VERBATIM)
+        endif()
+    endforeach()
+
+    # 3. Consumer overrides (whole-file replacement on collision), then strip the
+    #    macOS .DS_Store droppings that must never reach flash.
+    add_custom_command(TARGET spangap_data_merge POST_BUILD
         COMMAND ${CMAKE_COMMAND} -E copy_directory "${_consumer_data}" "${_data_merged}"
-        # macOS sprinkles .DS_Store everywhere; never want them in flash.
         COMMAND find "${_data_merged}" -name .DS_Store -delete
-        COMMENT "Merging spangap defaults + ${PROJECT_NAME} data/ (consumer wins)"
         VERBATIM)
 
     littlefs_create_partition_image(${partition_name} "${_data_merged}" FLASH_IN_PROJECT)
