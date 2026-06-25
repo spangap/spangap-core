@@ -554,7 +554,7 @@ static void startSaveTimer() {
 
 /* ---- Config change subscriptions ---- */
 
-#define STORAGE_MAX_SUBS     96
+#define STORAGE_MAX_SUBS     128
 /* STORAGE_CHANGE_PORT in storage.h */
 
 struct storage_sub_t {
@@ -642,8 +642,19 @@ static op_accum_t* accumFindOrCreate(TaskHandle_t t) {
 
 /* ---- subscription table mutation (storage-task-owned; under CFG_LOCK) ---- */
 static void subAdd(TaskHandle_t task, storage_change_cb_t cb, const char* scope) {
+  const char* sc = scope ? scope : "";
+  /* Idempotent: re-subscribing the same (task, scope, cb) is a no-op, not a new
+   * row. A captureless ON_CHANGE lambda has a stable function pointer per site,
+   * so this triple identifies one subscription exactly. Without this, any caller
+   * that re-runs a subscribe on a repeating event — a program layer rebuilt
+   * after eviction, a handler re-entered on wake — appends a duplicate every
+   * time until the table fills and real subscriptions are silently dropped
+   * ("subscription table full"). Generalises the hand-rolled !have guard in
+   * lcd_settings.cpp so no caller has to remember it. */
+  for (int i = 0; i < subCount; i++)
+    if (subs[i].task == task && subs[i].cb == cb && subs[i].scope == sc) return;
   if (subCount >= STORAGE_MAX_SUBS) { warn("storage: subscription table full\n"); return; }
-  subs[subCount].task = task; subs[subCount].cb = cb; subs[subCount].scope = scope ? scope : "";
+  subs[subCount].task = task; subs[subCount].cb = cb; subs[subCount].scope = sc;
   subCount++;
 }
 static void subRemove(TaskHandle_t task, storage_change_cb_t cb, const char* scope) {

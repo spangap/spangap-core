@@ -8,6 +8,7 @@
 #include "storage.h"
 #include "cron.h"
 #include "compat.h"
+#include "mem.h"
 #if CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG
 #include <driver/usb_serial_jtag.h>
 #include <driver/usb_serial_jtag_vfs.h>
@@ -141,7 +142,7 @@ struct cli_edit {
 
 /* CLI ITS server: per-slot state */
 #define CLI_MAX_CLIENTS 8    /* up to 6 TCP + 2 DC (browser session + on-device CLI) */
-static struct cli_slot_t {
+PSRAM_BSS static struct cli_slot_t {
     int itsHandle;
     cli_edit edit;
     cli_mode_t mode;
@@ -1314,7 +1315,38 @@ static void cliTaskFn(void* arg) {
  * \r\r\n per line, which terminals render as a duplicated/overwritten
  * output region (looked like CLI output "reappearing"). */
 static void serialEmit(const char* p, size_t n) {
+#if CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG
+  /* The USB-Serial-JTAG VFS write() returns -1 and discards the whole chunk
+   * whenever usb_serial_jtag_is_connected() momentarily reads false. That flag
+   * is SOF-based and noisy — it blips false for a single tick (the IDF
+   * disconnect tolerance ALLOWED_NO_SOF_TICKS is pdMS_TO_TICKS(3) == 0 at
+   * CONFIG_FREERTOS_HZ=100, i.e. zero tolerance). A fire-and-forget fwrite then
+   * silently drops any output that lands in a blip. It shows up most clearly as
+   * the *front* of a burst that follows an idle gap (e.g. `top`'s 2 s sampling
+   * delay lets DFS quiet the bus, so a blip lands right as the table starts) —
+   * the header and first rows vanish while the tail survives. Everything
+   * upstream of here (the ITS link, the per-slot buffer) is lossless via
+   * backpressure, so retry the unwritten tail rather than drop it. Bound the
+   * retry so a genuinely absent host (real unplug) can't wedge the serial task:
+   * a blip is ~10-30 ms, a real disconnect is sustained. */
+  size_t off = 0;
+  TickType_t deadline = xTaskGetTickCount() + pdMS_TO_TICKS(250);
+  while (off < n) {
+    size_t w = fwrite(p + off, 1, n - off, stdout);
+    if (w > 0) {
+      off += w;
+      deadline = xTaskGetTickCount() + pdMS_TO_TICKS(250);
+      continue;
+    }
+    clearerr(stdout);
+    if (xTaskGetTickCount() > deadline) break;   /* sustained refusal: real disconnect */
+    fflush(stdout);                              /* push what's buffered, let a SOF land */
+    usb_serial_jtag_ll_txfifo_flush();
+    vTaskDelay(1);
+  }
+#else
   fwrite(p, 1, n, stdout);
+#endif
 }
 
 /* Emit the blank line that separates a "Returning to log" banner from the
@@ -1403,8 +1435,14 @@ static void serialTaskFn(void* arg) {
           serialInCli = false;
         }
       }
-      if (cliHandle >= 0)
-        itsSend(cliHandle, &c, 1, 0);
+      if (cliHandle >= 0) {
+        /* Block briefly rather than timeout-0: the cli task's input stream can
+         * be momentarily full while it finishes a command, and a 0-timeout send
+         * would silently drop the keystroke — the serial console "going deaf"
+         * for that key. A short wait rides out the transient without stalling
+         * the output-drain below for long. */
+        itsSend(cliHandle, &c, 1, pdMS_TO_TICKS(50));
+      }
     }
 
     /* Drain CLI → serial */

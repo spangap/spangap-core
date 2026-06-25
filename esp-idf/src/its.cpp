@@ -424,6 +424,9 @@ struct its_conn_t {
     uint16_t            itsPort;
     int8_t              clientRef;
     int8_t              serverRef;
+    uint32_t            connectNonce; /* client's connect nonce; a CONNECT_CANCEL with
+                                       * this value reaps a conn whose client timed out
+                                       * waiting for the ack but which we committed anyway */
     /* Per-connection client-side callbacks. Set by itsConnect, used by
      * the client task only. The server side uses per-port callbacks. */
     its_recv_cb_t       cliRecvCb;
@@ -523,6 +526,7 @@ enum its_kind_t : uint8_t {
     ITS_K_DISC_FROM_SERVER,   /* metadata only; cb = client's disc cb  */
     ITS_K_FORWARD,            /* payload = forward data                */
     ITS_K_AUX,                /* payload = aux data                    */
+    ITS_K_CONNECT_CANCEL,     /* metadata only; nonce names the abandoned connect to reap */
 };
 
 #define ITS_F_PICKUP 0x01     /* give sender's pickupSem after dispatch */
@@ -534,6 +538,7 @@ struct its_msg {              /* one heap allocation; the mailbox slot points at
     int16_t             handle;   /* connection handle, or -1                       */
     int8_t              ref;      /* disconnects: peer's ref for the callback; else -1 */
     uint8_t             rsvd;
+    uint32_t            nonce;    /* CONNECT / CONNECT_CANCEL: client's per-connect id */
     TaskHandle_t        sender;   /* for replies / accept-ack / pickup              */
     its_disconnect_cb_t cb;       /* ITS_K_DISC_FROM_SERVER only; else NULL         */
     uint32_t            len;      /* payload CONTENT length (not allocation size)   */
@@ -597,6 +602,10 @@ struct its_task_t {
     int                   maxConns;
     SemaphoreHandle_t     ackSem;
     int                   ackHandle;
+    uint32_t              ackNonce;     /* server echoes the connect's nonce with the ack,
+                                         * so the client recognises ITS ack on the shared
+                                         * binary ackSem and discards a late stray one */
+    uint32_t              connectGen;   /* monotonic per-connect id this client hands out */
 
     /* ITS_WAIT_PICKUP — sender waits on its own pickupSem; receiver gives
      * this sem after processing the aux. Created on first registration. */
@@ -1003,7 +1012,7 @@ static void processInboxMsg(its_task_t* me, its_msg* m) {
             ITS_LOGE("connect to unopened port %u (from [%s])",
                      m->port, pcTaskGetName(m->sender));
             its_task_t* cli = taskFind(m->sender);
-            if (cli) { cli->ackHandle = -1; xSemaphoreGive(cli->ackSem); }
+            if (cli) { cli->ackHandle = -1; cli->ackNonce = m->nonce; xSemaphoreGive(cli->ackSem); }
             goto done;
         }
 
@@ -1024,6 +1033,7 @@ static void processInboxMsg(its_task_t* me, its_msg* m) {
             c->clientTask = m->sender;
             c->serverTask = me->task;
             c->itsPort = m->port;
+            c->connectNonce = m->nonce;
             c->kind = sp->kind;
             c->packetBased = sp->packetBased;
             c->noPool = me->no_pool;
@@ -1079,7 +1089,28 @@ static void processInboxMsg(its_task_t* me, its_msg* m) {
 
         if (cli) {
             cli->ackHandle = accepted ? handle : -1;
+            cli->ackNonce = m->nonce;
             xSemaphoreGive(cli->ackSem);
+        }
+
+    } else if (m->kind == ITS_K_CONNECT_CANCEL && me->isServer) {
+        /* The client abandoned this connect (its ack wait timed out), but we may
+         * already have committed the conn and run onConnect. FIFO from the same
+         * sender guarantees this CANCEL is dispatched after the CONNECT it
+         * cancels, so reap the orphan now — otherwise the conn, and anything
+         * onConnect allocated for it (e.g. a CLI session slot), leaks until
+         * reboot, and a busy server eventually refuses every new connect. */
+        for (int h = 0; h < ITS_MAX_CONNS; h++) {
+            its_conn_t* c = &connTable[h];
+            if (c->active && c->serverTask == me->task &&
+                c->clientTask == m->sender && c->connectNonce == m->nonce &&
+                m->nonce != 0) {
+                its_server_port_t* sp = portFind(me, c->itsPort);
+                int8_t ref = c->serverRef;
+                connFree(h);
+                if (sp && sp->onDisconnect && ref >= 0) sp->onDisconnect(ref);
+                break;
+            }
         }
 
     } else if (m->kind == ITS_K_DISC_FROM_CLIENT) {
@@ -1682,12 +1713,20 @@ int itsConnectByTaskHandle(TaskHandle_t serverTask, uint16_t port,
     xSemaphoreTake(me->ackSem, 0);
     me->ackHandle = -1;
 
+    /* Tag this connect with a per-client nonce. It lets us (a) recognise OUR ack
+     * on the shared binary ackSem and discard a late one from an earlier connect
+     * we abandoned, and (b) name the connect in a CONNECT_CANCEL if we give up.
+     * Skip 0 — it is the "no nonce" sentinel a freshly-allocated conn carries. */
+    uint32_t myNonce = ++me->connectGen;
+    if (myNonce == 0) myNonce = ++me->connectGen;
+
     /* The handshake travels as a payload pointer (no copy of a big connect),
      * bounded by the target's mailbox guard — a handshake too large to fit is
      * rejected, never truncated (truncating a handshake would silently corrupt
      * it). The old ~320-byte connect-arg cap is gone. */
     its_msg* m = buildCopyMsg(ITS_K_CONNECT, port, -1, data, dataLen, se, "connect");
     if (!m) return -1;
+    m->nonce = myNonce;
     if (!inboxEnqueue(se, m, remaining)) {
         ITS_LOGE("itsConnect: target [%s] inbox full or send timed out",
                  pcTaskGetName(serverTask));
@@ -1695,14 +1734,32 @@ int itsConnectByTaskHandle(TaskHandle_t serverTask, uint16_t port,
         return -1;
     }
 
-    if (xSemaphoreTake(me->ackSem, remaining) != pdTRUE) {
-        ITS_LOGE("itsConnect: target [%s] did not ack within %u ms",
-                 pcTaskGetName(serverTask),
-                 (unsigned)(timeout * portTICK_PERIOD_MS));
-        return -1;
+    /* Wait for THIS connect's ack, matched by nonce. On timeout the server may
+     * still commit the conn after we leave, so send a CONNECT_CANCEL naming our
+     * nonce: FIFO from us guarantees it is dispatched after the CONNECT, so the
+     * server reaps the orphan. Without this, a slow/busy server leaks a conn —
+     * and any slot its onConnect took — on every connect that times out, and
+     * eventually refuses all new connects (the "out of CLI sessions" wedge). */
+    int handle = -1;
+    for (;;) {
+        TickType_t budget = remaining;
+        if (!forever) {
+            TickType_t el = xTaskGetTickCount() - start;
+            budget = el < timeout ? timeout - el : 0;
+        }
+        if (xSemaphoreTake(me->ackSem, budget) != pdTRUE) {
+            its_msg* cm = buildCopyMsg(ITS_K_CONNECT_CANCEL, port, -1, nullptr, 0, se,
+                                       "connect-cancel");
+            if (cm) { cm->nonce = myNonce; if (!inboxEnqueue(se, cm, pdMS_TO_TICKS(50))) msgFree(cm); }
+            ITS_LOGE("itsConnect: target [%s] did not ack within %u ms",
+                     pcTaskGetName(serverTask),
+                     (unsigned)(timeout * portTICK_PERIOD_MS));
+            return -1;
+        }
+        if (me->ackNonce == myNonce) { handle = me->ackHandle; break; }
+        /* A late ack for an earlier connect we abandoned — its conn is reaped by
+         * the CANCEL we already sent for it; ignore it and keep waiting for ours. */
     }
-
-    int handle = me->ackHandle;
     if (handle < 0) {
         ITS_LOGE("itsConnect: target [%s] rejected connection on port %u",
                  pcTaskGetName(serverTask), port);

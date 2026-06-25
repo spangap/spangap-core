@@ -1,4 +1,4 @@
-/** CLI commands: reboot, reset, format, sleep, run, its. */
+/** CLI commands: reboot, reset, format, sleep, run, its, bat. */
 #include "cli.h"
 #include "storage.h"
 #include "pm.h"
@@ -129,6 +129,17 @@ static void cmdIts(const char* a) {
     itsStatus(cliPrintf);
 }
 
+/* Reports the battery.* ephemerals a board's battery monitor publishes (e.g. the
+ * T-Deck). Generic: boards without a battery sense never set the keys, so this
+ * just says so rather than printing zeroes. */
+static void cmdBat(const char* a) {
+    if (cliWantsHelp(a)) { cliPrintf("%-*s battery voltage + percent\n", CLI_HELP_COL, "bat"); return; }
+    if (!storageExists("battery.percent")) { cliPrintf("No battery information\n"); return; }
+    int mv = storageGetInt("battery.millivolt", 0);
+    cliPrintf("voltage:  %d.%03d V\n", mv / 1000, mv % 1000);
+    cliPrintf("percent:  %d%%\n", storageGetInt("battery.percent", 0));
+}
+
 /* help is special — declared here but needs access to the cmd registry.
  * We call cliProcess("help") which handles it in the dispatcher. */
 
@@ -140,4 +151,5 @@ void cliCmdSysInit() {
     cliRegisterCmd("sleep", cmdSleep);
     cliRegisterCmd("run", cmdRun);
     cliRegisterCmd("its", cmdIts);
+    cliRegisterCmd("bat", cmdBat);
 }

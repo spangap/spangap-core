@@ -20,6 +20,22 @@
 #include <stddef.h>
 #include "sdkconfig.h"
 #include "esp_heap_caps.h"
+#include "esp_attr.h"
+
+/* Static-storage counterpart to gp_alloc. The heap wrappers (operator new /
+ * gp_alloc) route dynamic allocations to PSRAM, but a `static T x[N];` is .bss
+ * reserved by the linker — no allocator runs, so it always lands in internal
+ * DRAM. PSRAM_BSS places such an array in external RAM instead, the .bss
+ * equivalent of the "could be PSRAM" intent. Same constraint as gp_alloc's
+ * opposite (dram_alloc): NEVER use on data touched from an ISR, under a
+ * spinlock, or during a flash cache-disable window — that must stay internal.
+ * Requires CONFIG_SPIRAM_ALLOW_BSS_SEG_EXTERNAL_MEMORY (sdkconfig.defaults.spangap);
+ * degrades to internal .bss when PSRAM (or that option) is absent. */
+#if CONFIG_SPIRAM && CONFIG_SPIRAM_ALLOW_BSS_SEG_EXTERNAL_MEMORY
+#define PSRAM_BSS EXT_RAM_BSS_ATTR
+#else
+#define PSRAM_BSS
+#endif
 
 #ifdef __cplusplus
 extern "C" {

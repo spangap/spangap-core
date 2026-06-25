@@ -62,6 +62,13 @@ CONFIG_SPIRAM_SPEED_80M=y
 # CLI) — and dropped DMA-lowest to 19 KB *with WiFi off*, which won't survive WiFi
 # on. So: PSRAM-default + surgical internal pins, not internal-default.
 CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=0
+# Allow individual .bss symbols to be placed in PSRAM via EXT_RAM_BSS_ATTR
+# (exposed as PSRAM_BSS in mem.h). Heap wrappers (operator new / gp_alloc) can
+# only route dynamic allocations off internal DRAM; large static arrays are .bss
+# and stay internal unless tagged. Opt-in per symbol, so enabling this alone
+# moves nothing — only PSRAM_BSS-annotated data, which must never be touched
+# from an ISR/spinlock/cache-disabled path.
+CONFIG_SPIRAM_ALLOW_BSS_SEG_EXTERNAL_MEMORY=y
 # Reserve internal DRAM for DMA-capable allocations. Consumers that can ONLY
 # live in internal DMA RAM and all peak together at boot: WiFi static RX
 # (16 × ~1.6 KB), mbedTLS/lwIP, and — the one that bites — IDF's spi_master

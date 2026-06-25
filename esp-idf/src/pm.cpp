@@ -632,7 +632,7 @@ static void cmdTop(const char* args) {
     size_t delDram = 0, delDblk = 0, delP = 0, delPblk = 0;
 #ifdef CONFIG_HEAP_TASK_TRACKING
     { constexpr size_t MAX_HT = 32;
-      static heap_task_totals_t htotals[MAX_HT];
+      PSRAM_BSS static heap_task_totals_t htotals[MAX_HT];
       memset(htotals, 0, sizeof(htotals));
       size_t ntot = 0;
       heap_task_info_params_t p = {};
