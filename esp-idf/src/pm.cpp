@@ -493,7 +493,7 @@ static void cmdUsb(const char* a) {
 }
 
 static void cmdPm(const char* args) {
-    if (cliWantsHelp(args)) { cliPrintf("%-*s power management status; wifi none|min|max\n", CLI_HELP_COL, "pm [wifi ...]"); return; }
+    if (cliWantsHelp(args)) { cliPrintf("%-*s power management status (-v: lock stats); wifi none|min|max\n", CLI_HELP_COL, "pm [-v] [wifi ...]"); return; }
     if (strstr(args, "allow") || strstr(args, "inhibit")) {
         static pm_lock_handle_t cliDeep = nullptr, cliLight = nullptr, cliSlow = nullptr;
         static bool deepHeld = false, lightHeld = false, slowHeld = false;
@@ -549,7 +549,7 @@ static void cmdPm(const char* args) {
       pmPrintModeLines(grand, rtcDeepSleepUs, grandAwake + rtcDeepSleepUs, rtcDeepSleepCount);
     }
 #endif
-    pmDumpLocks();
+    if (strstr(args, "-v")) pmDumpLocks();   /* lock + mode + sleep stats are opt-in */
 }
 
 static void cmdTop(const char* args) {
