@@ -1,7 +1,7 @@
 # spangap-core/esp-idf — internals
 
-Component-scope developer notes. Module-by-module content lives in
-[../INTERNALS.md](../INTERNALS.md).
+Component-scope developer notes. Per-subsystem maintainer references live in
+[../docs/](../docs/) (each `<func>-internals.md`).
 
 ## Layout
 

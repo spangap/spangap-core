@@ -33,6 +33,7 @@ enum cli_color_t : uint8_t {
 };
 
 typedef struct {
+  /** CLI_ANSI or CLI_LINE for interactive or line mode. */ 
   cli_mode_t mode;
   /** 1 if this client is the device USB serial task — stays in CLI mode
    *  until an empty return, a trailing ';', or Ctrl-C switches back to log. */

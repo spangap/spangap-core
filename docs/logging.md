@@ -1,77 +1,118 @@
 # Logging
 
-`log.cpp/h` — log task (ITS server, send-only + bidirectional inbound), ESP-IDF `vprintf` hook, log-level routing, optional log file on SD.
+The log task is spangap's logging hub: an ITS server that fans every log line out
+to the serial console, the browser, plain-TCP `nc` clients, and an optional file
+on SD. Source [`src/log.cpp`](../esp-idf/src/log.cpp), header
+[`log.h`](../esp-idf/include/log.h). It comes up as part of the platform
+(`logInit`) — consumers never start it.
 
-## Usage
+Logging is built on ESP-IDF's `ESP_LOGx` and its `vprintf` hook: spangap installs
+its own `vprintf` so it can capture, reformat, color, and route what the standard
+macros emit. Code uses the short macros below; the task does the rest.
 
-- Macros: `err()`, `warn()`, `info()`, `dbg()`, `verb()` — route through ESP-IDF logging with task name as TAG. Mapped to `ESP_LOGE/W/I/D/V`.
-- Log messages should NOT include task name prefix — the log task adds `[taskname]` automatically.
-- Exception: `info()` from NTP shows `[network]` tag since it runs on the network task. Code on truly unregistered tasks should prefix manually.
-- CLI responses route through `cliOut` function pointer — set to `itsCliWrite` (sends to active ITS handle) or `cronCliWrite` (routes through `info()`).
+Maintainer reference — the task's wiring, the ring buffer, the serial console
+state machine, and pitfalls — is in [logging-internals.md](logging-internals.md).
+
+## Writing log lines
+
+| Macro | Level | Maps to |
+|-------|-------|---------|
+| `err(fmt, …)` | error | `ESP_LOGE` |
+| `warn(fmt, …)` | warn | `ESP_LOGW` |
+| `info(fmt, …)` | info | `ESP_LOGI` |
+| `dbg(fmt, …)` | debug | `ESP_LOGD` |
+| `verb(fmt, …)` | verbose | `ESP_LOGV` |
+
+Each macro uses the **calling task's name** as the ESP-IDF tag, and the log task
+renders that as a `[taskname]` prefix on the line. **Code must not prefix the task
+name itself** — it is added automatically. A line emitted on a task whose name is
+not the desired tag (e.g. NTP code running on the `network` task) shows that
+task's name; truly unregistered contexts that want a tag prefix it manually.
 
 ## Levels
 
-`error`, `warn`, `info`, `debug`, `verbose`, `espdebug` (also enables ESP-IDF internal logging).
-
-`espdebug` calls `esp_log_level_set("*", ESP_LOG_DEBUG)`; all other levels suppress ESP logging.
+`none`, `error`, `warn`, `info`, `debug`, `verbose` — set by full word or first
+letter (`n`/`e`/`w`/`i`/`d`/`v`). The level applies globally via
+`esp_log_level_set("*", …)`, so at `debug` or `verbose` ESP-IDF's own internal
+component logs surface too. Per-tag overrides are independent (see storage keys).
 
 ## Timestamps
 
-`log timestamp` / `log notimestamp` CLI commands (or `set s.log.timestamp=1`). Format: `Mar 27 16:23:15.342` (wall clock via `fmtWallClock()`, ms precision from `gettimeofday`). Displayed at start of line before log level. Grey (`\033[0;90m`) on ANSI terminals.
+`log timestamp` / `log notimestamp` (or `set s.log.timestamp=1`) toggle a
+wall-clock stamp at the start of each line: `Mon DD HH:MM:SS.mmm`, millisecond
+precision from `gettimeofday`, rendered dark-grey on ANSI terminals.
 
-## Transport — Log/CLI/Serial via ITS
+## Ports
 
-Log task is ITS server (**bidirectional** — accepts inbound lines too, see below), CLI task is ITS server (bidirectional), serial task is ITS client for CLI only.
+The log task is an ITS server on two ports:
 
-- Serial console gets log output via `logVprintf`'s direct `fwrite(stdout)` (no ITS connection from serial to log).
-- Plain TCP clients go through network (stream-mode ports, `nc`-compatible).
-- Browser clients go through `webrtc_task` on the packet-mode `LOG_PORT_DC` / `CLI_PORT_DC` ports. CLI/log tasks do no WS upgrade — the browser side is DC-only.
-- Per-port buffers: `toSize=fromSize=2048` (PSRAM cost ~4 KB per connection — downstream layers absorb bursts).
+- `LOG_PORT_TCP = 8080` — stream mode, plain bytes for raw `nc` access (over
+  spangap-net's TCP).
+- `LOG_PORT_DC = 1` — packet mode, one log line per DataChannel message,
+  addressed from the browser as `log:1`.
 
-## Bidirectional log inbound
+Both ports are **bidirectional**: a connected consumer may also send lines *to*
+the log, which are fanned out to the file and to every *other* consumer (never
+echoed back). See [logging-internals.md](logging-internals.md).
 
-Consumers connected to `log:1` (browser DC) or `LOG_PORT_TCP` (`nc` / external scripts) may also send lines TO the log task. `logSlotDrainInbound()` reads each slot non-blocking each main-loop pass, splits on `\n`, and `logInboundLineOut()` fans each complete line out to file + every OTHER consumer + serial stdout — never echoed back to the source.
+## Storage keys
 
-Inbound lines bypass `logReformat` entirely (no `<ts>` / `[task]` / level char prepended) so the source can stamp its own. ANSI consumers either get the line as-is when it already has escapes, or `colorizePreformatted()` re-applies grey-on-timestamp + level-color around a recognized level char. Plain consumers + log file get an ANSI-stripped copy.
+Logging owns the `s.log.*` tree. Defaults are installed by the module at boot:
 
-`lineLevel()` / `findLevelCharPos()` use a relaxed heuristic: a single E/W/I/D/V surrounded by spaces (or at start of line), so both the device's native `<ts> L [task] msg` and free-form `<ts> L Browser: msg` are recognized.
+| Key | Default | Meaning |
+|-----|---------|---------|
+| `s.log.level` | `info` | Global log level. |
+| `s.log.timestamp` | `1` | Show the wall-clock timestamp on each line. |
+| `s.log.tag.<tag>` | (unset) | Per-tag level override; value `-` means inherit the global level. |
+| `s.log.dir` | `/sdcard/log` | Directory for dated log files and where relative `logfile` paths resolve. |
+| `s.log.file.name` | `""` | Active log-file path (empty = file logging off). Relative names resolve against `s.log.dir`. |
+| `s.log.file.level` | `verbose` | Minimum level written to the file (`verbose` = no filtering). |
+| `s.log.file.interval` | `5` | Flush/fsync coalescing window, seconds. |
+| `s.log.file.paste` | `48` | Scrollback (KiB) replayed from the log file to a newly connected `log:1` consumer (browser / on-device viewer). A DCEP `{"backlog":N}` connect overrides it per-client; `0` disables replay. |
+| `s.log.colors.error` | `0;31` | ANSI color (red) for error lines. |
+| `s.log.colors.warn` | `0;33` | ANSI color (yellow) for warn lines. |
+| `s.log.colors.info` | `0;32` | ANSI color (green) for info lines. |
+| `s.log.colors.debug` | `0;37` | ANSI color (light grey) for debug lines. |
+| `s.log.colors.verbose` | `0;90` | ANSI color (dark grey) for verbose lines. |
+| `s.log.colors.timestamp` | `0;90` | ANSI color (dark grey) for the timestamp. |
 
-## CLI output routing
-
-`itsCliWrite` is a single `itsSend` loop for both modes — in stream (TCP/serial) it partial-sends bytes; in packet (DC) it sends one packet per call. LINE mode clients get output only (no echo). Cron **injects** commands into the CLI task with `info("cli: …")` before each `cliProcess` (same prefix as `cliRunFile`). Cron **stdout** from commands still uses `cronCliWrite` → `info("cron: …")`.
-
-Line editor (`cli_edit` struct): per-handle in CLI task. Backspace, left/right arrows, insert at cursor, history, tab completion. ANSI coloring for `CLI_ANSI` mode clients.
-
-The prompt is `<s.net.hostname> $ ` (re-read every prompt, so a `set s.net.hostname=…` is reflected immediately). One-shot TCP clients keying off the prompt should match a trailing `"$ "`, not the full string.
-
-## Serial console — log/CLI mode switching
-
-The serial task is a stateful shuttle between the on-wire console and the on-device CLI. While `serialInCli=false` (the default) `logVprintf` mirrors every log line straight to `stdout`; while `true` it suppresses that mirror so command output and prompts don't get tangled with log lines. The four user-visible transitions:
-
-| Trigger | Visible effect | Mechanism |
-| --- | --- | --- |
-| Any key (not bare `\n`/`\r`) in log mode | blank line, `"CLI mode, hit return on prompt to return to log"`, blank line, `<host> $ ` | serial task `itsConnect`s `cli:1`, sets `serialInCli=true`, prints the banner, then forwards the keystroke. |
-| Empty return at the prompt | blank line, `"Resuming log"`, blank line, log resumes | line editor's empty-enter branch writes the banner over the active CLI connection, then `itsDisconnect`s — the serial task notices the disconnect and stays silent. |
-| Line ending in `;` | `\rResuming log\r\r`, command runs while logs already flow | line editor writes the overwrite-style banner, flips `serialInCli=false` *before* `cliProcess` so live log lines reach the wire during the command, then sets `cliUsbSerialAutoResumeLog=true` to finalize the disconnect after draining. |
-| Ctrl-C (0x03) on serial | blank line, `"Press Ctrl-] to exit monitor"`, blank line, log resumes | serial task intercepts `0x03` before forwarding; aborts the CLI line by `itsDisconnect`ing the handle, prints the hint via direct `printf`. No-op on the abort if already in log mode. |
-
-TCP/WS CLI clients see none of this — they always stay in CLI mode and just re-prompt on empty enter. Ctrl-C is forwarded through to the line editor as a regular byte (the line editor ignores it, no special meaning).
-
-## Browser path
-
-`webrtc_task` forwards DCs with label `log:1` / `cli:1` / `storage:1` directly to the respective tasks via `itsConnect`. `web.cpp` no longer receives `web_path_msg_t` aux for these paths.
-
-## Log file
-
-Log task writes ANSI-stripped plain text to SD card file. Config: `s.log.file.path` (empty=off), `s.log.file.level` (default "verbose" = no filtering), `s.log.file.interval` (flush/fsync coalescing, default 5s). Log task subscribes to path/level changes, closes old file and opens new one live. Direct `FILE*` on DRAM stack (SD card paths don't need the fs worker). Writes "log file opened"/"log file closed" markers directly to the file.
+The log task subscribes to `s.log.file.*` and `s.log.colors.*` changes and
+applies them live (it closes the old file and opens the new one on a path change).
 
 ## CLI
 
-- `log [tag] [level]` — set log level globally or per tag.
-- `log timestamp` / `log notimestamp` — toggle timestamps.
-- `logfile [level] [path|off]` — starts/stops log file. No args = today's dated file in `s.log.dir`. Level filters what's written (e.g. `logfile info` = only E/W/I). `logfile off` stops. Relative paths resolved against `s.log.dir`. Creates log directory if needed.
-- `logrotate [days]` — rotates to today's dated log file. With days arg, deletes `YYYYMMDD.log` files older than N days from `s.log.dir`. Only works when current log file is in date format.
+```
+log [tag] [level]          show or set the log level — globally, or for one tag
+log timestamp              turn the wall-clock timestamp on
+log notimestamp            turn it off
+logfile [level] [path|off] start/stop the SD log file
+logrotate [days]           rotate to today's dated file; prune old ones
+```
 
-## Helpers
+- `log` with no argument prints the current global level. `log <level>` sets the
+  global level. `log <tag>` prints that tag's level. `log <tag> <level>` sets a
+  per-tag override (`-` to inherit).
+- `logfile` with no argument starts today's dated file in `s.log.dir`. A `level`
+  argument filters what is written (e.g. `logfile info` = only E/W/I); a `path`
+  argument sets an explicit file (relative paths resolve against `s.log.dir`, and
+  the directory is created if needed). `logfile off` stops file logging.
+- `logrotate` switches to today's dated file. With a `days` argument it also
+  deletes `YYYYMMDD.log` files older than N days from `s.log.dir` (a default cron
+  entry runs `logrotate 7` daily). Only operates when the current file is in the
+  dated format.
 
-`safeStrncpy(dst, src, n)` (`compat.h`): replaces `strncpy` project-wide. Always NUL-terminates, logs `ESP_LOGE` on truncation. Only exceptions: WiFi config byte arrays in `net.cpp` (ESP-IDF `uint8_t[]`, not C strings).
+Run any of these on-device with `spangap cli "<command>"`.
+
+## API
+
+Beyond the macros, [`log.h`](../esp-idf/include/log.h) exposes:
+
+| Function | Purpose |
+|----------|---------|
+| `logIsDebug()` | True iff the global level is debug-or-finer — guard expensive `dbg()`-only work. |
+| `logIsDebug(tag)` | Same, resolving the per-tag override first. |
+| `logApplyLevels()` | Re-read global + per-tag levels from storage and apply (boot + on change). |
+| `logSetGlobal(level)` | Set the global level (writes storage + applies). |
+| `logSetTag(tag, level)` | Set a per-tag override (`-` = inherit). |
+| `cfd(fd)` | Returns `"{fd} "` when at debug level, `""` otherwise — prefix per-connection messages with a handle. |
+</content>

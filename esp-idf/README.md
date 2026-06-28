@@ -63,10 +63,5 @@ checkout via the path injected by `--spangap`, layers
 - [INTERNALS.md](INTERNALS.md) for the component-scope developer notes
   (heap-tracking guard, `--wrap` workaround, CMake details).
 - [../README.md](../README.md) for the straddle-level overview.
-- [../INTERNALS.md](../INTERNALS.md) for the module-by-module deep dive.
-
-## See also
-
-- [README-old.md](README-old.md) — pre-split consumer guide (still
-  accurate as a quickstart).
-- [CLAUDE.md](CLAUDE.md) — pre-split component-scope notes.
+- [../docs/](../docs/) for the per-subsystem operator guides and
+  maintainer references.
