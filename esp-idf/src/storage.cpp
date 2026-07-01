@@ -341,14 +341,46 @@ static void walkLeaves(cJSON* node, const char* prefix,
   walkLeavesImpl(node, pathBuf, sizeof(pathBuf), prefixLen, cb, ctx);
 }
 
-/** Walk leaves for CLI output (show / storageList). */
-static void walkTreePrint(cJSON* node, const char* prefix, cli_write_fn write) {
+/** Walk leaves for CLI output (show / storageList), appending "key = val\n"
+ *  lines to `out`. The tree is snapshotted into `out` UNDER CFG_LOCK and the
+ *  caller emits `out` only after releasing the lock — a blocking transport
+ *  write must never run while CFG_LOCK is held. The CLI's own output drains
+ *  over a DataChannel whose consumer (the LCD task) itself takes CFG_LOCK on a
+ *  timer (status-bar clock, wifi/battery subscriptions); holding the lock
+ *  across the back-pressured send therefore deadlocks the drain and wedges both
+ *  tasks into a watchdog reboot once the output is large enough to span a tick. */
+static void walkTreeCollect(cJSON* node, const char* prefix, std::string& out) {
   walkLeaves(node, prefix, [](const char* key, const char* val, void* ctx) {
-    auto write = (cli_write_fn)ctx;
+    auto* out = (std::string*)ctx;
     char line[192];
     int n = snprintf(line, sizeof(line), "%s = %s\n", key, val);
-    if (n > 0) write(line, (size_t)n);
-  }, (void*)write);
+    if (n > 0) out->append(line, (size_t)(n < (int)sizeof(line) ? n : (int)sizeof(line) - 1));
+  }, &out);
+}
+
+/** Append one "key = val\n" leaf line (string/number values only) to `out`. */
+static void appendLeaf(std::string& out, const char* key, cJSON* node) {
+  char vb[32];
+  const char* v = nullptr;
+  if (cJSON_IsString(node)) v = node->valuestring;
+  else if (cJSON_IsNumber(node)) { snprintf(vb, sizeof(vb), "%d", node->valueint); v = vb; }
+  if (!v) return;
+  char line[192];
+  int n = snprintf(line, sizeof(line), "%s = %s\n", key, v);
+  if (n > 0) out.append(line, (size_t)(n < (int)sizeof(line) ? n : (int)sizeof(line) - 1));
+}
+
+/** Emit a collected multi-line buffer to the CLI with NO lock held, one line
+ *  per write() so a packet-mode transport (the DC ports) never sees a body over
+ *  its per-message cap. */
+static void emitLines(const std::string& out, cli_write_fn write) {
+  size_t i = 0, n = out.size();
+  while (i < n) {
+    size_t nl = out.find('\n', i);
+    size_t end = (nl == std::string::npos) ? n : nl + 1;
+    write(out.data() + i, end - i);
+    i = end;
+  }
 }
 
 /* ---- Settings file read/write ---- */
@@ -1544,14 +1576,13 @@ void storageForEach(const char* prefix, void (*cb)(const char* key, const char* 
 }
 
 void storageList(cli_write_fn write) {
+  std::string out;
   CFG_LOCK();
-  if (!cfgRoot || !cfgRoot->child) {
-    CFG_UNLOCK();
-    write("(empty)\n", 8);
-    return;
-  }
-  walkTreePrint(cfgRoot, "", write);
+  bool empty = (!cfgRoot || !cfgRoot->child);
+  if (!empty) walkTreeCollect(cfgRoot, "", out);
   CFG_UNLOCK();
+  if (empty) { write("(empty)\n", 8); return; }
+  emitLines(out, write);   /* write outside CFG_LOCK — see walkTreeCollect */
 }
 
 /* ---- CLI commands ---- */
@@ -1591,56 +1622,47 @@ static void cmdShow(const char* a) {
         return;
     }
 
+    /* Collect all matched output into `out` UNDER the lock, then emit it after
+     * releasing the lock. The blocking transport write must not run while
+     * CFG_LOCK is held (see walkTreeCollect). */
+    std::string out;
+    bool found = false;
+    bool prefixTooLong = false;
+
     CFG_LOCK();
     /* Try exact path first */
     cJSON* node = navigatePath(cfgRoot, a);
     if (node) {
-        if (cJSON_IsObject(node) || cJSON_IsArray(node)) {
-            walkTreePrint(node, a, write);
-        } else {
-            char valBuf[32];
-            const char* val = nullptr;
-            if (cJSON_IsString(node)) val = node->valuestring;
-            else if (cJSON_IsNumber(node)) { snprintf(valBuf, sizeof(valBuf), "%d", node->valueint); val = valBuf; }
-            if (val) cliPrintf("%s = %s\n", a, val);
-        }
-        CFG_UNLOCK();
-        return;
-    }
-
-    /* Partial last-segment match */
-    bool found = false;
-    const char* lastDot = strrchr(a, '.');
-    if (lastDot) {
-        /* Match storage's full-key capacity. Was 64 — too small for paths
-         * with 64-char SHA-256 hex segments. */
+        if (cJSON_IsObject(node) || cJSON_IsArray(node)) walkTreeCollect(node, a, out);
+        else                                             appendLeaf(out, a, node);
+        found = true;   /* an exact path is a match even if it prints nothing */
+    } else if (const char* lastDot = strrchr(a, '.')) {
+        /* Partial last-segment match. parentPath matches storage's full-key
+         * capacity — was 64, too small for paths with 64-char SHA-256 hex
+         * segments. */
         char parentPath[128];
         size_t parentLen = lastDot - a;
-        if (parentLen >= sizeof(parentPath)) { CFG_UNLOCK(); cliPrintf("(prefix too long)\n"); return; }
-        memcpy(parentPath, a, parentLen);
-        parentPath[parentLen] = '\0';
-        cJSON* parent = navigatePath(cfgRoot, parentPath);
-        if (parent && cJSON_IsObject(parent)) {
-            const char* partial = lastDot + 1;
-            size_t partialLen = strlen(partial);
-            cJSON* item;
-            cJSON_ArrayForEach(item, parent) {
-                if (item->string && strncmp(item->string, partial, partialLen) == 0) {
-                    /* parentPath up to 127 chars + '.' + item->string. cJSON
-                     * string keys are bounded by what we've stored (≤ 95
-                     * per the navigatePath limit), so 256 is comfortable. */
-                    char key[256];
-                    snprintf(key, sizeof(key), "%s.%s", parentPath, item->string);
-                    if (cJSON_IsObject(item) || cJSON_IsArray(item))
-                        walkTreePrint(item, key, write);
-                    else {
-                        char vb[32];
-                        const char* v = nullptr;
-                        if (cJSON_IsString(item)) v = item->valuestring;
-                        else if (cJSON_IsNumber(item)) { snprintf(vb, sizeof(vb), "%d", item->valueint); v = vb; }
-                        if (v) cliPrintf("%s = %s\n", key, v);
+        if (parentLen >= sizeof(parentPath)) {
+            prefixTooLong = true;
+        } else {
+            memcpy(parentPath, a, parentLen);
+            parentPath[parentLen] = '\0';
+            cJSON* parent = navigatePath(cfgRoot, parentPath);
+            if (parent && cJSON_IsObject(parent)) {
+                const char* partial = lastDot + 1;
+                size_t partialLen = strlen(partial);
+                cJSON* item;
+                cJSON_ArrayForEach(item, parent) {
+                    if (item->string && strncmp(item->string, partial, partialLen) == 0) {
+                        /* parentPath up to 127 chars + '.' + item->string. cJSON
+                         * string keys are bounded by what we've stored (≤ 95
+                         * per the navigatePath limit), so 256 is comfortable. */
+                        char key[256];
+                        snprintf(key, sizeof(key), "%s.%s", parentPath, item->string);
+                        if (cJSON_IsObject(item) || cJSON_IsArray(item)) walkTreeCollect(item, key, out);
+                        else                                             appendLeaf(out, key, item);
+                        found = true;
                     }
-                    found = true;
                 }
             }
         }
@@ -1650,20 +1672,16 @@ static void cmdShow(const char* a) {
         cJSON* item;
         cJSON_ArrayForEach(item, cfgRoot) {
             if (item->string && strncmp(item->string, a, len) == 0) {
-                if (cJSON_IsObject(item) || cJSON_IsArray(item))
-                    walkTreePrint(item, item->string, write);
-                else {
-                    char vb[32];
-                    const char* v = nullptr;
-                    if (cJSON_IsString(item)) v = item->valuestring;
-                    else if (cJSON_IsNumber(item)) { snprintf(vb, sizeof(vb), "%d", item->valueint); v = vb; }
-                    if (v) cliPrintf("%s = %s\n", item->string, v);
-                }
+                if (cJSON_IsObject(item) || cJSON_IsArray(item)) walkTreeCollect(item, item->string, out);
+                else                                             appendLeaf(out, item->string, item);
                 found = true;
             }
         }
     }
     CFG_UNLOCK();
+
+    if (prefixTooLong) { cliPrintf("(prefix too long)\n"); return; }
+    emitLines(out, write);
     if (!found) cliPrintf("(no matches)\n");
 }
 

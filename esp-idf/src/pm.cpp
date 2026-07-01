@@ -553,7 +553,8 @@ static void cmdPm(const char* args) {
 }
 
 static void cmdTop(const char* args) {
-    if (cliWantsHelp(args)) { cliPrintf("%-*s tasks, CPU%%, heap, uptime (human: readable sizes; -d/-p: sort by DRAM/PSRAM)\n", CLI_HELP_COL, "top [human] [-d|-p]"); return; }
+    if (cliWantsHelp(args)) { cliPrintf("%-*s tasks, CPU%%, heap, uptime (-v: stack/byte/block detail + heap tables; human: readable sizes; -d/-p: sort by DRAM/PSRAM)\n", CLI_HELP_COL, "top [-v] [human] [-d|-p]"); return; }
+    const bool verbose = (strstr(args, "-v") != nullptr);
     const bool human   = (strstr(args, "human") != nullptr);
     const bool byDram  = (strstr(args, "-d") != nullptr);
     const bool byPsram = (strstr(args, "-p") != nullptr);
@@ -704,20 +705,29 @@ static void cmdTop(const char* args) {
         snprintf(pctOut, pctSz, "%u.%u%%", p10 / 10, p10 % 10);
     };
 
-    /* Unified table: Task | Core | Pri | Stack | CPU% | DRAM % blk | PSRAM % blk */
-    cliPrintf("%-12s %4s  %3s  %7s %7s %*s %6s %5s %*s %6s %5s\n",
-              "Task", "Core", "Pri", "Stack", "CPU%",
-              bw, "DRAM", "%", "blk", bw, "PSRAM", "%", "blk");
+    /* Verbose: Task | Core | Pri | Stack | CPU% | DRAM % blk | PSRAM % blk.
+       Default: Task | Core | Pri | CPU% | DRAM% | PSRAM% (percentages only). */
+    if (verbose)
+        cliPrintf("%-12s %4s  %3s  %7s %7s %*s %6s %5s %*s %6s %5s\n",
+                  "Task", "Core", "Pri", "Stack", "CPU%",
+                  bw, "DRAM", "%", "blk", bw, "PSRAM", "%", "blk");
+    else
+        cliPrintf("%-12s %4s  %3s  %7s %7s %7s\n",
+                  "Task", "Core", "Pri", "CPU%", "DRAM%", "PSRAM%");
     for (int i = 0; i < n2; i++) {
         if (strncmp(s2[i].name, "IDLE", 4) == 0) continue;
         char drNum[16], drPct[10], psNum[16], psPct[10];
         fmtMem(drNum, sizeof(drNum), drPct, sizeof(drPct), s2[i].dram, totalDram);
         fmtMem(psNum, sizeof(psNum), psPct, sizeof(psPct), s2[i].psram, totalPsram);
         if (s2[i].h == nullptr) {     /* pre-sched / (deleted): no CPU/stack to show */
-            cliPrintf("%-12s %4s  %3s  %7s %7s %*s %6s %5u %*s %6s %5u\n",
-                s2[i].name, "-", "-", "-", "-",
-                bw, drNum, drPct, (unsigned)s2[i].dblk,
-                bw, psNum, psPct, (unsigned)s2[i].pblk);
+            if (verbose)
+                cliPrintf("%-12s %4s  %3s  %7s %7s %*s %6s %5u %*s %6s %5u\n",
+                    s2[i].name, "-", "-", "-", "-",
+                    bw, drNum, drPct, (unsigned)s2[i].dblk,
+                    bw, psNum, psPct, (unsigned)s2[i].pblk);
+            else
+                cliPrintf("%-12s %4s  %3s  %7s %7s %7s\n",
+                    s2[i].name, "-", "-", "-", drPct, psPct);
             continue;
         }
         unsigned p10 = deltaTotal > 0 ? (unsigned)(s2[i].delta * 1000 / deltaTotal) : 0;
@@ -726,6 +736,11 @@ static void cmdTop(const char* args) {
         else snprintf(cb, sizeof(cb), " %d", s2[i].core);
         char cpuBuf[16];
         snprintf(cpuBuf, sizeof(cpuBuf), "%u.%u%%", p10 / 10, p10 % 10);
+        if (!verbose) {
+            cliPrintf("%-12s %4s  %3d  %7s %7s %7s\n",
+                s2[i].name, cb, s2[i].pri, cpuBuf, drPct, psPct);
+            continue;
+        }
         char stackBuf[12];
         const void* stkBase = pxTaskGetStackStart(s2[i].h);
         char stkMem = esp_ptr_external_ram(stkBase) ? 'P' : 'D';
@@ -750,38 +765,44 @@ static void cmdTop(const char* args) {
      * below. Task stacks/TCBs are heap_caps allocations, so they're already in
      * the allocated figure (and show up per-creator, mostly under (deleted)) —
      * summing the per-task stack column on top would double-count them. */
-    size_t freeDram  = heap_caps_get_free_size(MALLOC_CAP_8BIT | MALLOC_CAP_INTERNAL);
-    size_t freePsram = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
-    size_t ramDram  = totalDram  > freeDram  ? totalDram  - freeDram  : 0;
-    size_t ramPsram = totalPsram > freePsram ? totalPsram - freePsram : 0;
-    char rb[16], rt[16], pb[16];
-    unsigned dp10 = totalDram  ? (unsigned)((uint64_t)ramDram  * 1000 / totalDram)  : 0;
-    unsigned pp10 = totalPsram ? (unsigned)((uint64_t)ramPsram * 1000 / totalPsram) : 0;
-    cliPrintf("\nTotal RAM usage:\n");
-    snprintf(pb, sizeof(pb), "(%u.%u%%)", dp10 / 10, dp10 % 10);
-    cliPrintf("  DRAM:  %*s / %*s %8s\n",
-        bw, fmtBytes(rb, sizeof(rb), ramDram),  bw, fmtBytes(rt, sizeof(rt), totalDram),  pb);
-    snprintf(pb, sizeof(pb), "(%u.%u%%)", pp10 / 10, pp10 % 10);
-    cliPrintf("  PSRAM: %*s / %*s %8s\n",
-        bw, fmtBytes(rb, sizeof(rb), ramPsram), bw, fmtBytes(rt, sizeof(rt), totalPsram), pb);
+    if (verbose) {
+        size_t freeDram  = heap_caps_get_free_size(MALLOC_CAP_8BIT | MALLOC_CAP_INTERNAL);
+        size_t freePsram = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+        size_t ramDram  = totalDram  > freeDram  ? totalDram  - freeDram  : 0;
+        size_t ramPsram = totalPsram > freePsram ? totalPsram - freePsram : 0;
+        char rb[16], rt[16], pb[16];
+        unsigned dp10 = totalDram  ? (unsigned)((uint64_t)ramDram  * 1000 / totalDram)  : 0;
+        unsigned pp10 = totalPsram ? (unsigned)((uint64_t)ramPsram * 1000 / totalPsram) : 0;
+        cliPrintf("\nTotal RAM usage:\n");
+        snprintf(pb, sizeof(pb), "(%u.%u%%)", dp10 / 10, dp10 % 10);
+        cliPrintf("  DRAM:  %*s / %*s %8s\n",
+            bw, fmtBytes(rb, sizeof(rb), ramDram),  bw, fmtBytes(rt, sizeof(rt), totalDram),  pb);
+        snprintf(pb, sizeof(pb), "(%u.%u%%)", pp10 / 10, pp10 % 10);
+        cliPrintf("  PSRAM: %*s / %*s %8s\n",
+            bw, fmtBytes(rb, sizeof(rb), ramPsram), bw, fmtBytes(rt, sizeof(rt), totalPsram), pb);
+    }
 
     free(s1); free(s2);
 #endif
-    cliPrintf("\nHeap:\n");
-    char ha[16], hc[16], hd[16];
-    cliPrintf("%-6s %*s %*s  %10s\n", "", bw, "free", bw, "lowest", "contiguous");
-    cliPrintf("%-6s %*s %*s  %10s\n", "DRAM",
-        bw, fmtBytes(ha, sizeof(ha), heap_caps_get_free_size(MALLOC_CAP_8BIT|MALLOC_CAP_INTERNAL)),
-        bw, fmtBytes(hc, sizeof(hc), heap_caps_get_minimum_free_size(MALLOC_CAP_8BIT|MALLOC_CAP_INTERNAL)),
-        fmtBytes(hd, sizeof(hd), heap_caps_get_largest_free_block(MALLOC_CAP_8BIT|MALLOC_CAP_INTERNAL)));
-    cliPrintf("%-6s %*s %*s  %10s\n", "PSRAM",
-        bw, fmtBytes(ha, sizeof(ha), heap_caps_get_free_size(MALLOC_CAP_SPIRAM)),
-        bw, fmtBytes(hc, sizeof(hc), heap_caps_get_minimum_free_size(MALLOC_CAP_SPIRAM)),
-        fmtBytes(hd, sizeof(hd), heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM)));
-    cliPrintf("%-6s %*s %*s  %10s\n", "DMA",
-        bw, fmtBytes(ha, sizeof(ha), heap_caps_get_free_size(MALLOC_CAP_DMA)),
-        bw, fmtBytes(hc, sizeof(hc), heap_caps_get_minimum_free_size(MALLOC_CAP_DMA)),
-        fmtBytes(hd, sizeof(hd), heap_caps_get_largest_free_block(MALLOC_CAP_DMA)));
+    if (verbose) {
+        cliPrintf("\nHeap:\n");
+        char ha[16], hc[16], hd[16];
+        cliPrintf("%-6s %*s %*s  %10s\n", "", bw, "free", bw, "lowest", "contiguous");
+        cliPrintf("%-6s %*s %*s  %10s\n", "DRAM",
+            bw, fmtBytes(ha, sizeof(ha), heap_caps_get_free_size(MALLOC_CAP_8BIT|MALLOC_CAP_INTERNAL)),
+            bw, fmtBytes(hc, sizeof(hc), heap_caps_get_minimum_free_size(MALLOC_CAP_8BIT|MALLOC_CAP_INTERNAL)),
+            fmtBytes(hd, sizeof(hd), heap_caps_get_largest_free_block(MALLOC_CAP_8BIT|MALLOC_CAP_INTERNAL)));
+        cliPrintf("%-6s %*s %*s  %10s\n", "PSRAM",
+            bw, fmtBytes(ha, sizeof(ha), heap_caps_get_free_size(MALLOC_CAP_SPIRAM)),
+            bw, fmtBytes(hc, sizeof(hc), heap_caps_get_minimum_free_size(MALLOC_CAP_SPIRAM)),
+            fmtBytes(hd, sizeof(hd), heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM)));
+        cliPrintf("%-6s %*s %*s  %10s\n", "DMA",
+            bw, fmtBytes(ha, sizeof(ha), heap_caps_get_free_size(MALLOC_CAP_DMA)),
+            bw, fmtBytes(hc, sizeof(hc), heap_caps_get_minimum_free_size(MALLOC_CAP_DMA)),
+            fmtBytes(hd, sizeof(hd), heap_caps_get_largest_free_block(MALLOC_CAP_DMA)));
+    } else {
+        cliPrintf("\nUse top -v for more detailed memory information\n");
+    }
 
     uint32_t up = (uint32_t)(esp_timer_get_time() / 1000000ULL);
     char eb[32]; fmtElapsed(up, eb, sizeof(eb));

@@ -908,11 +908,23 @@ static void cliEditChar(cli_edit& e, char c, cli_write_fn write) {
       }
     }
   } else if (c >= 0x20 && e.buf.size() < 4096) {   /* sane upper bound */
+    bool atEnd = (e.cursor == (int)e.buf.size());
     if (e.buf.empty() && ansi)
       cliColorWrite(write, CYAN, sizeof(CYAN) - 1);
     e.buf.insert(e.buf.begin() + e.cursor, c);
     e.cursor++;
-    cliEditRefresh(e, e.cursor - 1, write);
+    if (atEnd) {
+      /* Fast path — appending at the end of the line. The terminal cursor is
+       * already where the glyph goes, so just emit it and let the terminal
+       * advance (autowrap handles the wrap column). This avoids the
+       * move-to-start + \033[J clear + full-buffer rewrite that otherwise
+       * repaints the whole input row on every keystroke. SGR state is already
+       * the input colour (set on the first char / left as terminal state). */
+      write(&c, 1);
+    } else {
+      /* Mid-line insert: wrap-aware redraw of the tail past the cursor. */
+      cliEditRefresh(e, e.cursor - 1, write);
+    }
   }
 }
 
@@ -1308,42 +1320,58 @@ static void cliTaskFn(void* arg) {
 
 /* ---- Serial task: byte shuttle between serial port and log/CLI ---- */
 
-/** Write CLI bytes to the console verbatim. Newline translation (\n -> \r\n)
- * happens exactly once, in the USB-Serial-JTAG VFS TX layer (TX mode CRLF) —
- * the same single translation the log path (logVprintf fwrite) relies on.
- * Do NOT pre-expand here: serialEmit and the VFS both expanding produced
- * \r\r\n per line, which terminals render as a duplicated/overwritten
- * output region (looked like CLI output "reappearing"). */
+/** Write CLI bytes to the console.
+ *
+ * On USB-Serial-JTAG we bypass stdout and write straight to the driver's TX
+ * ring buffer via usb_serial_jtag_write_bytes(). We do NOT go through the VFS
+ * write() wrapper, because usb_serial_jtag_write() gates on
+ * usb_serial_jtag_is_connected() and returns -1 — discarding the WHOLE chunk —
+ * whenever that flag reads false. The flag is maintained by a FreeRTOS
+ * tick-hook that watches for SOF packets, and it goes stale after ANY light
+ * sleep: the tick-hook is frozen while asleep, so the flag stays latched false
+ * until a tick runs post-wake. Output emitted in that window (the *front* of a
+ * burst that follows an idle gap) was silently dropped. `top` hits this every
+ * time: its uxTaskGetSystemState() critical section delays a tick, the monitor
+ * — whose tolerance ALLOWED_NO_SOF_TICKS is pdMS_TO_TICKS(3) == 0 at
+ * CONFIG_FREERTOS_HZ=100, i.e. zero — declares a spurious disconnect, releases
+ * its own NO_LIGHT_SLEEP lock, and the device light-sleeps right as the table
+ * starts printing; header + first rows vanish, tail survives.
+ *
+ * write_bytes() carries no is_connected gate: it queues into the ring and the
+ * TX ISR drains to the FIFO whenever the host is actually reading. A host that
+ * has genuinely stopped reading fills the ring and applies real backpressure
+ * (bounded by the timeout below) — the honest signal — instead of a stale
+ * connection flag causing a blind drop. Because we no longer pass through the
+ * VFS TX layer, we apply its \n -> \r\n translation here (skipping any \n that
+ * is already part of a \r\n, so editor output isn't doubled).
+ *
+ * (The log path still writes via stdout/the VFS, so it retains the old gate;
+ * but the monitor holds NO_LIGHT_SLEEP while a host is connected, so a live
+ * log session never sleeps mid-stream — only an interactive command burst
+ * after the top-style spurious disconnect was exposed.) */
 static void serialEmit(const char* p, size_t n) {
 #if CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG
-  /* The USB-Serial-JTAG VFS write() returns -1 and discards the whole chunk
-   * whenever usb_serial_jtag_is_connected() momentarily reads false. That flag
-   * is SOF-based and noisy — it blips false for a single tick (the IDF
-   * disconnect tolerance ALLOWED_NO_SOF_TICKS is pdMS_TO_TICKS(3) == 0 at
-   * CONFIG_FREERTOS_HZ=100, i.e. zero tolerance). A fire-and-forget fwrite then
-   * silently drops any output that lands in a blip. It shows up most clearly as
-   * the *front* of a burst that follows an idle gap (e.g. `top`'s 2 s sampling
-   * delay lets DFS quiet the bus, so a blip lands right as the table starts) —
-   * the header and first rows vanish while the tail survives. Everything
-   * upstream of here (the ITS link, the per-slot buffer) is lossless via
-   * backpressure, so retry the unwritten tail rather than drop it. Bound the
-   * retry so a genuinely absent host (real unplug) can't wedge the serial task:
-   * a blip is ~10-30 ms, a real disconnect is sustained. */
-  size_t off = 0;
-  TickType_t deadline = xTaskGetTickCount() + pdMS_TO_TICKS(250);
-  while (off < n) {
-    size_t w = fwrite(p + off, 1, n - off, stdout);
-    if (w > 0) {
-      off += w;
-      deadline = xTaskGetTickCount() + pdMS_TO_TICKS(250);
-      continue;
+  auto put = [](const char* d, size_t len) {
+    size_t off = 0;
+    while (off < len) {
+      /* Blocks up to 250 ms: a reading host drains the FIFO so this returns at
+       * once; only a host that has stopped reading times out, at which point
+       * dropping the rest is correct (nobody's listening) rather than wedging
+       * the serial task — which would stall every other console consumer. */
+      int w = usb_serial_jtag_write_bytes(d + off, len - off, pdMS_TO_TICKS(250));
+      if (w <= 0) break;
+      off += (size_t)w;
     }
-    clearerr(stdout);
-    if (xTaskGetTickCount() > deadline) break;   /* sustained refusal: real disconnect */
-    fflush(stdout);                              /* push what's buffered, let a SOF land */
-    usb_serial_jtag_ll_txfifo_flush();
-    vTaskDelay(1);
+  };
+  const char* start = p;
+  for (size_t i = 0; i < n; i++) {
+    if (p[i] != '\n') continue;
+    if (i > 0 && p[i - 1] == '\r') continue;      /* already CRLF — leave in run */
+    if (p + i > start) put(start, (size_t)(p + i - start));
+    put("\r\n", 2);
+    start = p + i + 1;
   }
+  if (start < p + n) put(start, (size_t)(p + n - start));
 #else
   fwrite(p, 1, n, stdout);
 #endif
