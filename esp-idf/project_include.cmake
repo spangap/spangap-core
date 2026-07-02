@@ -89,6 +89,21 @@ function(spangap_create_factory_image)
         COMMAND find "${_data_merged}" -name .DS_Store -delete
         VERBATIM)
 
+    # 4. Build manifest → served webroot as /BUILD.md. `spangap build` writes
+    #    build/spangap-build-manifest.md before this configure runs (git hash +
+    #    date of every staged straddle); ship it so the on-device viewer can
+    #    show which commits went into the running image. Guarded on existence:
+    #    a bare `idf.py build` that bypassed the spangap orchestrator won't have
+    #    written one, and that's fine (no BUILD.md that build).
+    if(EXISTS "${CMAKE_BINARY_DIR}/spangap-build-manifest.md")
+        add_custom_command(TARGET spangap_data_merge POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E make_directory "${_data_merged}/webroot"
+            COMMAND ${CMAKE_COMMAND} -E copy
+                "${CMAKE_BINARY_DIR}/spangap-build-manifest.md"
+                "${_data_merged}/webroot/BUILD.md"
+            VERBATIM)
+    endif()
+
     littlefs_create_partition_image(${partition_name} "${_data_merged}" FLASH_IN_PROJECT)
     add_dependencies(littlefs_${partition_name}_bin spangap_data_merge)
 
