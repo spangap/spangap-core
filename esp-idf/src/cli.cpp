@@ -1543,7 +1543,7 @@ static void serialTaskFn(void* arg) {
       if (cliHandle < 0 && c != '\n' && c != '\r') {
         /* Switch to CLI mode — suppress direct-stdout log echo */
         serialInCli = true;
-        cli_connect_t req = { CLI_ANSI, 1, CLI_COLOR, 0 };
+        cli_connect_t req = { CLI_ANSI, 1, CLI_COLOR, 0, /*login*/0 };
         cliHandle = itsConnect("cli", CLI_PORT_TCP, &req, sizeof(req), pdMS_TO_TICKS(500));
         if (cliHandle >= 0) {
           char host[48];
