@@ -8,7 +8,7 @@
 schema_version: 1
 name: spangap/spangap-core
 prefix: ""                 # platform symbols read as language primitives (storageGet, cliRegister, info, ...)
-version: 0.1.0
+version: 0.0.0
 # Firmware identity — the platform's own fallback values. spangap-core sits at
 # the bottom of every dependency tree, so whatever a downstream straddle sets
 # wins over these; a bare spangap-core build shows them.
