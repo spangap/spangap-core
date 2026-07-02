@@ -121,7 +121,8 @@ set(_SPANGAP_SDKCONFIG_DEFAULTS_LIST "${SDKCONFIG_DEFAULTS}" CACHE INTERNAL "")
 # symlink iff the updater straddle is in the build (mirrors the old ota signal).
 # This provisional pass writes generous app/fixed so the first configure can link
 # + pack littlefs; project_include.cmake re-runs it shrink-wrapped post-build.
-set(_FLASH_MB 4)        # floor; overwritten by the configured flash size below
+set(_FLASH_MB 4)        # flash container; overwritten by the configured size below
+set(_MAX_FW_KB 0)       # max firmware size (state floor); 0 = default to container
 
 set(_PARTGEN_FILES ${SDKCONFIG_DEFAULTS} "${_SDKCONFIG}")
 foreach(_f IN LISTS _PARTGEN_FILES)
@@ -132,9 +133,20 @@ foreach(_f IN LISTS _PARTGEN_FILES)
     foreach(_line IN LISTS _lines)
         if(_line MATCHES "^CONFIG_ESPTOOLPY_FLASHSIZE_([0-9]+)MB=y$")
             set(_FLASH_MB "${CMAKE_MATCH_1}")
+        elseif(_line MATCHES "^CONFIG_SPANGAP_MAX_FIRMWARE_KB=([0-9]+)$")
+            set(_MAX_FW_KB "${CMAKE_MATCH_1}")
         endif()
     endforeach()
 endforeach()
+
+# The state floor (= max firmware size, where /state begins). A byte value,
+# decoupled from the power-of-two flash container: the builder sets KB, we pass
+# bytes. 0 → default to the whole container (state starts at the flash top).
+if(_MAX_FW_KB GREATER 0)
+    math(EXPR _STATE_FLOOR "${_MAX_FW_KB} * 1024")
+else()
+    math(EXPR _STATE_FLOOR "${_FLASH_MB} * 1024 * 1024")
+endif()
 
 if(EXISTS "${CMAKE_SOURCE_DIR}/staging/components/updater")
     set(_UPDATER y)
@@ -171,6 +183,7 @@ execute_process(
         --updater ${_UPDATER}
         --app-bytes ${_APP_BYTES}
         --fixed-bytes ${_FIXED_BYTES}
+        --state-floor ${_STATE_FLOOR}
         --out "${CMAKE_SOURCE_DIR}/partitions.csv"
     COMMAND_ERROR_IS_FATAL ANY)
 

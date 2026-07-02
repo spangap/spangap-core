@@ -1007,58 +1007,61 @@ void fsSelectStateStore(void) {
 
 /* Grow flash to the real chip size and register the `state` partition.
  *
- * The flashed image is a size-agnostic FLOOR image (default 4 MB): its on-flash
- * partition table holds only nvs/otadata/updater/app/fixed and `state` is absent.
- * The flash driver clamped its idea of the chip to the floor (header) size at
- * boot, so we (1) read the REAL physical size via SFDP, (2) raise the driver's
- * size to it (g_rom_flashchip + esp_flash_default_chip), and (3) register `state`
- * in the upper part of flash with esp_partition_register_external — purely
- * in-memory, recreated identically every boot, so the LittleFS data persists on
- * flash while the table never has to be rewritten.
+ * The flashed image is a size-agnostic FLOOR image: its on-flash partition table
+ * (nvs/otadata/updater/app/fixed + a trailing `reserved` region) is topped out at
+ * the builder's declared MAXIMUM FIRMWARE SIZE (CONFIG_SPANGAP_MAX_FIRMWARE_KB) —
+ * the "floor". `state` is deliberately absent from that table. We (1) take the
+ * floor as the top of the on-flash table, (2) read the REAL physical size via
+ * SFDP, (3) raise the driver's size to it (g_rom_flashchip + esp_flash_default_
+ * chip), and (4) register `state` as everything ABOVE THE FLOOR with
+ * esp_partition_register_external — purely in-memory, recreated identically every
+ * boot, so the LittleFS data persists on flash while the table never has to be
+ * rewritten.
  *
- * state's share is CONFIG_SPANGAP_STATE_PERCENT of the real flash (default 50%,
- * i.e. starts at the half-flash mark). If the shipped firmware (fixed partition
- * end) would extend past that, fall back to half the share (state starts higher);
- * if it STILL won't fit, clamp state to whatever's above fixed and warn. state's
- * start is stable for a given chip size, so app/fixed upgrades never move it. */
-#ifndef CONFIG_SPANGAP_STATE_PERCENT
-#define CONFIG_SPANGAP_STATE_PERCENT 50
-#endif
+ * state's start IS the floor and nothing else: a deterministic beginning (= the
+ * max firmware size) with size = phys - floor, so a bigger chip yields a bigger
+ * state automatically. The floor is byte-granular and read from the table, not
+ * baked as a constant; it is >= the shipped firmware by construction (the build
+ * fails if app+fixed overflow it), so there is no underwater case to handle. If
+ * the builder changes the floor between releases, the table top moves, state's
+ * start moves with it, its old LittleFS superblock is no longer found, and the
+ * first mount reformats it (format_if_mount_failed) — a clean factory reset the
+ * builder is expected to have warned users about. */
 static void statePartitionEnsure() {
     /* Already present (a board could pin `state` in its table)? Then do nothing. */
     if (esp_partition_find_first(ESP_PARTITION_TYPE_DATA,
                                  ESP_PARTITION_SUBTYPE_ANY, "state"))
         return;
 
+    /* The floor = the top of the on-flash partition table. The `reserved` region
+     * (emitted by gen-partitions) carries the table up to the builder's max
+     * firmware size, so state begins there and fills the rest of the real chip.
+     * Reading the floor from the table — rather than a baked constant — is what
+     * keeps it byte-granular and self-describing. */
+    uint32_t floor = 0;
+    esp_partition_iterator_t it = esp_partition_find(
+        ESP_PARTITION_TYPE_ANY, ESP_PARTITION_SUBTYPE_ANY, nullptr);
+    for (; it != nullptr; it = esp_partition_next(it)) {
+        const esp_partition_t* p = esp_partition_get(it);
+        uint32_t pend = p->address + p->size;
+        if (pend > floor) floor = pend;
+    }
+    esp_partition_iterator_release(it);
+    if (floor == 0) floor = g_rom_flashchip.chip_size;   /* no table? use header */
+
     uint32_t phys = 0;
     if (esp_flash_get_physical_size(nullptr, &phys) != ESP_OK || phys == 0)
-        phys = esp_flash_default_chip->size;     /* fall back to configured size */
+        phys = floor;     /* SFDP unknown → assume floor → no room above it */
 
     /* Unlock the upper region for the partition/flash layer. */
     esp_flash_default_chip->size = phys;
     g_rom_flashchip.chip_size = phys;
 
     const uint32_t ALIGN = 0x1000;               /* LittleFS 4K */
-    uint32_t pct = CONFIG_SPANGAP_STATE_PERCENT;
-    uint32_t start = (uint32_t)(((uint64_t)phys * (100 - pct)) / 100);
-
-    /* Underwater check against the shipped firmware (fixed partition end). */
-    uint32_t fixedEnd = 0;
-    const esp_partition_t* fx = esp_partition_find_first(
-        ESP_PARTITION_TYPE_DATA, ESP_PARTITION_SUBTYPE_ANY, "fixed");
-    if (fx) fixedEnd = fx->address + fx->size;
-
-    if (fixedEnd > start) {                       /* fall back to half the share */
-        start = (uint32_t)(((uint64_t)phys * (100 - pct / 2)) / 100);
-        if (fixedEnd > start) {                   /* still won't fit — clamp + warn */
-            warn("state: firmware (%#" PRIx32 ") past %u%% mark; state shrunk\n",
-                 fixedEnd, pct);
-            start = fixedEnd;
-        }
-    }
-    start = (start + ALIGN - 1) & ~(ALIGN - 1);   /* round up to 4K */
+    uint32_t start = (floor + ALIGN - 1) & ~(ALIGN - 1);
     if (start >= phys) {
-        err("state: no room for a state partition (flash %#" PRIx32 ")\n", phys);
+        warn("state: flash %#" PRIx32 " not above firmware floor %#" PRIx32
+             " — no state partition\n", phys, floor);
         return;
     }
     uint32_t size = phys - start;
@@ -1070,8 +1073,8 @@ static void statePartitionEnsure() {
     if (e != ESP_OK)
         err("state: register_external failed: %s\n", esp_err_to_name(e));
     else
-        info("state: flash %#" PRIx32 ", /state at %#" PRIx32 " size %#" PRIx32 "\n",
-             phys, start, size);
+        info("state: flash %#" PRIx32 ", floor %#" PRIx32 ", /state at %#" PRIx32
+             " size %#" PRIx32 "\n", phys, floor, start, size);
 }
 
 void fs_init() {

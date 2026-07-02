@@ -51,43 +51,64 @@ before the LittleFS mounts:
    in-memory, recreated identically every boot. The LittleFS data persists on
    flash; the on-flash partition table is never rewritten.
 
-`state` occupies the upper `CONFIG_SPANGAP_STATE_PERCENT` of real flash (default
-50 % → starts at the half-flash mark). If the shipped firmware (the `fixed`
-partition end) would extend past that mark, the start falls back to half that
-share (state starts higher up); if it still won't fit, state is clamped to
-whatever is above `fixed` and a warning is logged. Because state's start offset
-is stable for a given chip size, firmware/data upgrades never move it. `state`
-is formatted on first mount (`fs.cpp` `format_if_mount_failed`), so a fresh or
-re-grown device self-heals to factory defaults held in the read-only `fixed`
-partition — usable even unattended.
+`state` starts **at the floor — the top of the on-flash partition table** — and
+runs to the end of the real chip (`size = phys − floor`). The table is topped out
+at the builder's declared **maximum firmware size** (`CONFIG_SPANGAP_MAX_FIRMWARE_KB`)
+by a trailing empty `reserved` partition, so `statePartitionEnsure()` recovers the
+floor by taking the highest partition end — no value is baked into the app. This
+gives a deterministic start and a chip-scaled size (a bigger part yields a bigger
+`state` with no rebuild). The floor is byte-granular and independent of
+`CONFIG_ESPTOOLPY_FLASHSIZE` (the power-of-two flash *container* / bootloader-header
+size, which only has to be a valid enum `≥` the floor). It is `≥` the shipped
+firmware by construction — the build errors if `app + fixed` overflow it — so
+there is no "underwater" case, and it never moves as `app`/`fixed` grow within it.
+
+The floor is a **build-time policy number, not the chip size**: it must be set
+below the smallest physical flash you ship on, or that device gets no `state`
+(the start lands at/above `phys` and `statePartitionEnsure()` logs a warning and
+skips). If the builder changes the floor between releases, the table top and thus
+state's start move, its old LittleFS superblock is no longer found, and the first
+mount reformats it (`fs.cpp` `format_if_mount_failed`) — a clean factory reset.
+**Warn users before bumping the floor.** The same `format_if_mount_failed` means a
+fresh or re-grown device self-heals to the factory defaults held in the read-only
+`fixed` partition — usable even unattended.
 
 If a board pins `state` in its own table, `statePartitionEnsure()` finds it
 already present and does nothing.
 
-To pin a fixed size on a board (disabling self-grow's reach), set
-`CONFIG_ESPTOOLPY_FLASHSIZE_*MB` in the board's `kconfig:` — `state` then fills
-the upper `CONFIG_SPANGAP_STATE_PERCENT` of that pinned size.
-
-## Shrink-wrap (two-pass build)
+## Shrink-wrap (single build + in-place finalize)
 
 App size is only known after link, and data size only after the merge/SPA build,
 so the build measures then shrinks:
 
-1. **Pass 1** — configure with a generous provisional layout (so link and the
+1. **Build once** — configure with a generous provisional layout (so link and the
    LittleFS pack succeed) and build. The provisional `partitions.csv` fills the
-   floor: a floor-scaled slice (1/5 of the floor) for `fixed`, the rest for
-   `app`.
+   container: a container-scaled slice (1/5) for `fixed`, the rest for `app`, and
+   no `reserved`/floor yet.
 2. The post-build `measure_build_sizes()` reads the real `app.bin` size and the
    merged data size (each file rounded up to a 4 KB LittleFS block).
-3. If the measured sizes differ from what was configured, the build touches
-   `partitions.csv` (a CMake configure-dependency) and **rebuilds once**.
-   `bootstrap.cmake` regenerates `partitions.csv` sized to actual — `app`
-   rounded to 64 K, `fixed` to 4 K (bounded only by the floor). IDF regenerates
-   the table, flash offsets, and LittleFS image consistently.
+3. If the measured sizes differ from what was configured, `finalize_shrink_wrap()`
+   (in `spangap-inside`) regenerates **only the four artifacts a resize changes,
+   in place** — no second build:
+   - `partitions.csv` (gen-partitions.py, `app` rounded to 64 K, `fixed` to 4 K,
+     `reserved` carrying the table top up to the floor),
+   - `partition-table.bin` (IDF's `gen_esp32part.py`),
+   - `fixed.bin` (littlefs re-pack — deterministic, so byte-identical to a rebuild),
+   - the `fixed` offset in `flasher_args.json`.
 
-Steady-state rebuilds measure the same sizes and stay **single-pass**. A build
-whose `app + fixed` exceeds the floor errors clearly, naming
-`CONFIG_ESPTOOLPY_FLASHSIZE` and pointing at trimming `app`/`fixed`.
+   `app.bin` and `bootloader.bin` are reused verbatim — `app.bin` is linked at a
+   fixed offset and its content is independent of the partition *size*, so it is
+   never relinked. This replaces the old touch-`partitions.csv`-and-rebuild (which
+   forced a ~30 s CMake reconfigure); that full rebuild remains an automatic
+   **fallback** if the in-place finalize errors, so a broken fixup can't ship a
+   bad image. (`bootstrap.cmake` still reads the cached `.spangap-sizes` on the
+   *next* build, keeping any later reconfigure single-pass.)
+
+Steady-state rebuilds measure the same sizes and skip the finalize entirely. A
+build whose `app + fixed` exceeds the flash container errors naming
+`CONFIG_ESPTOOLPY_FLASHSIZE`; one that fits the container but exceeds the floor
+errors naming `CONFIG_SPANGAP_MAX_FIRMWARE_KB` — both point at trimming
+`app`/`fixed`.
 
 The measure step adds small headroom margins — `app.bin` +128 K, data +64 K over
 the per-file 4 KB rounding — so ordinary build-to-build growth fits the cached
@@ -95,10 +116,13 @@ partition without forcing an extra pass. They are not byte-exact.
 
 ## Kconfig
 
-- `CONFIG_SPANGAP_STATE_PERCENT` (range 10–75, default 50) — state's share of
-  real flash.
-- `CONFIG_ESPTOOLPY_FLASHSIZE_*MB` — the floor. Defaulted to 4 MB by
-  `sdkconfig.defaults.spangap`; a board overrides it to pin a size.
+- `CONFIG_SPANGAP_MAX_FIRMWARE_KB` — the floor = the maximum firmware size and the
+  offset where `state` begins (byte-granular; `0` defaults to the whole container).
+  Must be `≤ CONFIG_ESPTOOLPY_FLASHSIZE` and below the physical flash of every
+  device you ship on, or those devices get no `state`.
+- `CONFIG_ESPTOOLPY_FLASHSIZE_*MB` — the flash *container* / bootloader-header
+  size. A power-of-two enum `≥` the floor. Defaulted to 4 MB by
+  `sdkconfig.defaults.spangap`; a board/buildable overrides it.
 
 ## Updating in the field
 

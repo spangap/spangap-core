@@ -110,9 +110,10 @@ omits `state`. `statePartitionEnsure()` reads the real physical flash size
 `esp_flash_default_chip`), and registers `state` in the upper flash via
 `esp_partition_register_external` — purely in-memory, recreated identically
 every boot, so LittleFS data persists while the on-flash table is never
-rewritten. `state` starts at `CONFIG_SPANGAP_STATE_PERCENT` (default 50) of real
-flash, with fallbacks if the shipped firmware (fixed partition end) would
-overlap. If a board pins `state` in its own table, this no-ops. This is the
+rewritten. `state` starts at the floor — the top of the on-flash table, carried
+up to `CONFIG_SPANGAP_MAX_FIRMWARE_KB` (the max firmware size) by a trailing
+`reserved` partition — and runs to the end of the real chip. If a board pins
+`state` in its own table, this no-ops. This is the
 flash-partition architecture's concern — see the flash-partitions doc; don't
 duplicate the layout reasoning here.
 
