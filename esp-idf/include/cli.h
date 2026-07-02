@@ -45,6 +45,14 @@ typedef struct {
    *  just prefix the command output. Interactive/`nc` clients leave it 0 so
    *  they can read-until-prompt. */
   uint8_t no_prompt;
+  /** 1 = force an admin-password login before any command is accepted. The CLI
+   *  prints "Enter admin password: " on connect and routes every byte to the
+   *  password check (echoed as '*') until authLogin(pw,"admin") succeeds; no
+   *  command runs until then, and three failures drop the session. The gate is
+   *  enforced entirely server-side — a client that sets this bit cannot be
+   *  circumvented by the far end. Used by rnsh's server to expose the CLI over
+   *  Reticulum. Legacy/short payloads default to 0 (no login). */
+  uint8_t login;
 } cli_connect_t;
 
 /* ---- CLI command API ---- */

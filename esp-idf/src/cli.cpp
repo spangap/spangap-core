@@ -2,6 +2,7 @@
  * CLI — command registry, line editor, serial task, CLI task.
  */
 #include "cli.h"
+#include "auth.h"
 #include "fs.h"
 #include "log.h"
 #include "its.h"
@@ -158,6 +159,15 @@ PSRAM_BSS static struct cli_slot_t {
      * connection down when it goes true — avoids the itsSendDrain blocking
      * race that lost bytes on the wire. */
     bool pendingClose;
+    /* Admin-password login gate (cli_connect_t.login). loginRequired is set
+     * from the connect payload; authed starts false when a login is required
+     * and flips true only after authLogin(pw,"admin") succeeds. While
+     * loginRequired && !authed, every received byte is consumed by the
+     * password handler and NO command is dispatched. */
+    bool loginRequired;
+    bool authed;
+    int  pwTries;
+    std::string pwBuf;
 } cliSlots[CLI_MAX_CLIENTS];
 
 /** USB serial reconnects after each command when sticky=0 — keep cwd across sessions */
@@ -1119,6 +1129,16 @@ static void cliInitSlot(cli_slot_t& cl, int slot) {
   } else
     cliApplyStartDir(cl);
 
+  /* Admin-password gate: instead of the command prompt, demand the password
+   * up front. Subsequent bytes are consumed by cliHandleLoginInput until
+   * authLogin succeeds; no command runs before then. */
+  if (cl.loginRequired && !cl.authed) {
+    cliActiveSlot = slot;
+    itsCliWrite("Enter admin password: ", 22);
+    cliActiveSlot = -1;
+    return;
+  }
+
   /* Send initial prompt for ANSI clients (non-serial) and for TCP LINE
    * clients (so a scripted nc client can read-until-prompt rather than
    * relying on timeouts). */
@@ -1145,12 +1165,16 @@ static int cliTcpConnect(int handle, const void* data, size_t len) {
   cl.usbSerial = false;
   cl.color = true;          /* default on; a cli_connect_t may opt out */
   cl.noPrompt = false;      /* default: send the connect-time prompt */
+  cl.loginRequired = false; /* default: no admin gate */
+  cl.pwTries = 0;
+  cl.pwBuf.clear();
   if (len == sizeof(cli_connect_t)) {
     const auto* cc = (const cli_connect_t*)data;
     cl.mode = cc->mode;
     cl.usbSerial = cc->from_usb_serial != 0;
     cl.color = (cc->color == CLI_COLOR);
     cl.noPrompt = cc->no_prompt != 0;
+    cl.loginRequired = cc->login != 0;
   } else if (len >= 1 && len < sizeof(cli_connect_t)) {
     cl.mode = *(const cli_mode_t*)data;
   } else {
@@ -1159,6 +1183,7 @@ static int cliTcpConnect(int handle, const void* data, size_t len) {
      * doesn't decode the forwarder's struct; it only needs LINE mode. */
     cl.mode = CLI_LINE;
   }
+  cl.authed = !cl.loginRequired;
   cliInitSlot(cl, slot);
   return slot;
 }
@@ -1189,6 +1214,12 @@ static int cliDcConnect(int handle, const void* data, size_t len) {
   cl.color = true;          /* xterm renders colour; the LCD strips it */
   cl.noPrompt = false;
   cl.mode = CLI_ANSI;
+  /* The browser DC transport carries no cli_connect_t, so it can't request the
+   * login gate; browser CLI auth is handled at the web layer. */
+  cl.loginRequired = false;
+  cl.authed = true;
+  cl.pwTries = 0;
+  cl.pwBuf.clear();
   cliInitSlot(cl, slot);
   return slot;
 }
@@ -1197,6 +1228,61 @@ static void cliOnDisconnect(int ref) {
   if (ref >= 0 && ref < CLI_MAX_CLIENTS) {
     cliSlots[ref] = {};
     cliSlots[ref].itsHandle = -1;
+  }
+}
+
+/* Admin-password login gate. Consumes bytes for a slot whose loginRequired is
+ * set and authed is not yet true, accumulating a password line (echoed as '*'
+ * in ANSI mode). On CR/LF it checks authLogin(pw,"admin"): success flips authed
+ * and drops the command prompt; three failures tear the session down. No
+ * command is ever dispatched while unauthenticated — the gate is server-side
+ * and cannot be bypassed by the remote end. Caller sets cliActiveSlot. */
+#define CLI_LOGIN_MAX_TRIES 3
+static void cliHandleLoginInput(cli_slot_t& cl, const char* buf, size_t n) {
+  bool ansi = (cl.mode == CLI_ANSI);
+  for (size_t i = 0; i < n; i++) {
+    char c = buf[i];
+    if (c == 0x03 || c == 0x04) {          /* ^C / ^D — abort */
+      itsCliWrite("\r\n", 2);
+      cl.pendingClose = true;
+      cl.pwBuf.clear();
+      return;
+    }
+    if (c == '\r' || c == '\n') {
+      std::string pw = cl.pwBuf;
+      cl.pwBuf.clear();
+      if (ansi) itsCliWrite("\r\n", 2);
+      std::string realm, cookie;
+      if (authLogin(pw.c_str(), "admin", realm, cookie) == AUTH_OK) {
+        cl.authed = true;
+        /* Drop the interactive prompt and hand off to normal processing. Any
+         * bytes after this newline in the same recv are intentionally
+         * discarded so a pipelined "pw\ncommand" can't run a command on the
+         * auth packet. */
+        cliWritePrompt(itsCliWrite);
+        if (ansi) itsCliWrite("\033[0 q", 5);
+        return;
+      }
+      if (++cl.pwTries >= CLI_LOGIN_MAX_TRIES) {
+        itsCliWrite("Authentication failed.\r\n", 24);
+        cl.pendingClose = true;
+        return;
+      }
+      itsCliWrite("Enter admin password: ", 22);
+      continue;
+    }
+    if (c == 0x08 || c == 0x7f) {           /* backspace / DEL */
+      if (!cl.pwBuf.empty()) {
+        cl.pwBuf.pop_back();
+        if (ansi) itsCliWrite("\b \b", 3);
+      }
+      continue;
+    }
+    if ((uint8_t)c < 0x20) continue;        /* ignore other control bytes */
+    if (cl.pwBuf.size() < 128) {
+      cl.pwBuf.push_back(c);
+      if (ansi) itsCliWrite("*", 1);
+    }
   }
 }
 
@@ -1254,6 +1340,13 @@ static void cliTaskFn(void* arg) {
       if (n == 0) continue;
       cliActiveSlot = s;
       auto& cl = cliSlots[s];
+      if (cl.loginRequired && !cl.authed) {
+        /* Unauthenticated: every byte goes to the password gate, never to the
+         * command path. */
+        cliHandleLoginInput(cl, buf, n);
+        cliActiveSlot = -1;
+        continue;
+      }
       if (cl.mode == CLI_ANSI) {
         for (size_t i = 0; i < n; i++)
           cliEditChar(cl.edit, buf[i], itsCliWrite);
