@@ -198,6 +198,7 @@ storage owns four verbs (run any on-device with `spangap cli "<command>"`):
 
 ```
 set <key>=<value>      set a config variable; s.*/secrets.* auto-flush on the save timer
+                       (`set <key> <value>` also works — a space is an equally valid separator)
 show [<prefix>]        print config variables (exact key, subtree, or prefix match)
 unset <key>            delete a key or subtree
 save                   force an immediate flush to flash, blocking until written

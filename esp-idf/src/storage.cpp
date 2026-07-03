@@ -1588,19 +1588,26 @@ void storageList(cli_write_fn write) {
 /* ---- CLI commands ---- */
 
 static void cmdSet(const char* a) {
-    if (cliWantsHelp(a)) { cliPrintf("%-*s set config variable\n", CLI_HELP_COL, "set <key>=<value>"); return; }
+    if (cliWantsHelp(a)) { cliPrintf("%-*s set config variable\n", CLI_HELP_COL, "set <key>=<value>  (or: set <key> <value>)"); return; }
+    while (*a == ' ') a++;
+    /* Accept either `set key=value` or `set key value`: the T-Deck keyboard has
+     * no '=' key, so a space is an equally valid key/value separator. Whichever
+     * of '=' or ' ' appears first is the separator; the rest is the value (so a
+     * value may itself contain '=' or spaces). */
     const char* eq = strchr(a, '=');
-    if (!eq || eq == a) { cliPrintf("usage: set <key>=<value>\n"); return; }
+    const char* sp = strchr(a, ' ');
+    const char* sep = (eq && (!sp || eq < sp)) ? eq : sp;
+    if (!sep || sep == a) { cliPrintf("usage: set <key>=<value>  (or: set <key> <value>)\n"); return; }
     /* Generous full-key buffer (change notifies carry keys at any length).
      * Used to be 48 — small enough that `set s.lxmf.id.0.msgs.<64-hex>.<field>=…`
      * was rejected at the CLI before storageSet ever ran. */
     char key[128];
-    size_t klen = eq - a;
+    size_t klen = sep - a;
     while (klen > 0 && a[klen - 1] == ' ') klen--;
     if (klen == 0 || klen >= sizeof(key)) { cliPrintf("err: key empty or too long\n"); return; }
     memcpy(key, a, klen); key[klen] = '\0';
     if (isFw(key)) { cliPrintf("err: fw.* is read-only firmware identity (compile-time)\n"); return; }
-    const char* val = eq + 1;
+    const char* val = sep + 1;
     while (*val == ' ') val++;
     storageSet(key, val);
     if (strncmp(key, "s.log", 5) == 0)

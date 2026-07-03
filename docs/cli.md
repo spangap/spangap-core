@@ -87,7 +87,7 @@ one-liner and a pointer. The CLI-framework's own commands are documented in full
 
 | Command | |
 |---|---|
-| `set <key>=<value>` | set a config key |
+| `set <key>=<value>` | set a config key (or `set <key> <value>` — space also separates) |
 | `unset <key>` | delete a key |
 | `show [prefix]` | print keys |
 | `save` | flush pending settings to the state store |
