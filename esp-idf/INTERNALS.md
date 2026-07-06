@@ -61,6 +61,80 @@ because they ship as part of the component:
 - `size.py` — section-size report against the most recent build.
 - `build-epoch.py` — embed the build's UTC epoch into the firmware.
 
+## Conventions
+
+These are load-bearing for keeping this component a reusable foundation.
+
+**Expose tunables via Kconfig, not magic constants.** When a value is a
+genuine deployment tunable — SD `max_files`, the FAT format cluster size —
+give it a `CONFIG_SPANGAP_*` option in `Kconfig` (with range, default, and
+help text), reference `CONFIG_...` at the use site, and document it in
+`../README.md`. Operators need to override platform defaults without patching
+source, and the README is the discovery surface. Existing examples:
+`SPANGAP_SDCARD_MAX_FILES` and `SPANGAP_SDCARD_ALLOC_KB`. Board-agnostic IDF
+defaults that are not per-app tunables (e.g. `WL_SECTOR_SIZE_512`,
+`FATFS_ALLOC_PREFER_EXTRAM=n`) go in `sdkconfig.defaults.spangap`, not a
+per-board `straddle.yaml`.
+
+**Don't over-Kconfig, and keep straddle-specific config in the owning
+straddle.** A knob is only worth a config symbol if it is a real deployment
+tunable — otherwise prefer a hardcoded constant with an explaining comment,
+or ask, rather than inventing a switch. And core stays generic: an RNS/rnsd
+policy value (e.g. the boot-settle floor) belongs in the rns straddle, a LoRa
+value in `iface-lora`, and so on. Sibling straddles use bare prefixes
+(`CONFIG_LORA_*`, `CONFIG_LCD_*`), *not* `CONFIG_SPANGAP_*` — that prefix is
+reserved for this foundation component. Generic *primitives* are fine to add
+here (e.g. `waitForFlag(key, timeout)` in `src/spangap_init.cpp`); it is
+straddle-specific values and policy that must not leak in. This is the
+config-placement counterpart of [What does NOT belong here](#what-does-not-belong-here).
+
+**Keep shared platform primitives simple; let consumers do the gymnastics.**
+When the choice is "smarten the shared component" versus "each consumer does a
+little boilerplate", keep the primitive single-responsibility and push the
+boilerplate to the call site. Canonical case (in spangap-lcd): `lcdInstall`
+stays an on-task primitive that returns the new app id; it does *not*
+self-detect task context and internally hop via `lcdRun`. Consumers keep the
+explicit `lcdRun([](void*){ lcdInstall(new FooApp()); })` wrapper at their
+`*LcdRegister` call sites. Folding the hop in would smuggle a context-dependent
+return contract (valid id on-task, `-1` off-task) into a primitive nearly every
+straddle consumes — a mode-dependent API is worse to live with than visible
+boilerplate, and the explicit `lcdRun` also makes the task hop honest. Don't
+push context-detection or dual-path behavior into shared `-core`/`-lcd`/`-web`
+primitives just to save a line at the call site.
+
+## Temporary (revert before ship): heap-corruption debug kit
+
+A heap-corruption debug kit was added 2026-06-13 to hunt a use-after-free that
+poisoning caught as `CORRUPT HEAP`. **Marked temporary because the
+comprehensive poisoning has real CPU / internal-DRAM cost and must not ship
+enabled.**
+
+Current state (verify before relying on this): the aggressive part has already
+been reverted. The DEBUG block in `sdkconfig.defaults.spangap`
+(`CONFIG_HEAP_POISONING_COMPREHENSIVE`, `CONFIG_FREERTOS_CHECK_STACKOVERFLOW_PTRVAL`,
+`CONFIG_SPANGAP_HEAP_INTEGRITY_POLL=y`, `CONFIG_SPANGAP_WATCH_ADDR=0x0`) is
+**gone** — reverting it restored the implicit `HEAP_POISONING_DISABLED` /
+`CHECK_STACKOVERFLOW_CANARY`. The root cause it was chasing (the `main_task`
+TCB UAF — an orphaned cleanup hook) is fixed by wiring `its.cpp`'s
+`vTaskPreDeletionHook` via `CONFIG_FREERTOS_TASK_PRE_DELETION_HOOK`.
+
+What remains (keepable, off by default) are the Kconfig knobs and their guarded
+code, so the kit can be re-armed from menuconfig without re-patching source:
+
+- `SPANGAP_HEAP_INTEGRITY_POLL` (+ `_MS`) — the log task (`logTaskFn` in
+  `src/log.cpp`) runs `heap_caps_check_integrity(MALLOC_CAP_INTERNAL, true)` at
+  the configured interval, aborting at the first corrupted block. For the full
+  hunt this also needs comprehensive poisoning + the strict PTRVAL stack check
+  enabled by hand in menuconfig (kconfiglib can't `select` a choice option).
+- `SPANGAP_WATCH_ADDR` — when non-zero, arms a hardware STORE watchpoint over a
+  16-byte window (both cores via `esp_ipc`, slot 1) at that address to catch a
+  UAF writer's backtrace.
+
+Gotcha worth keeping: a fixed-address watchpoint is useless on memory that is
+live-then-freed (e.g. a TCB) — it fires on the legitimate write during the live
+phase and boot-loops. It is only useful for addresses that stay free for the
+whole watch window.
+
 ## What does NOT belong here
 
 Camera, audio, detect, recording, RTSP, AVI playback are *app*

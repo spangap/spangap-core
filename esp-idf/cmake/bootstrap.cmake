@@ -157,32 +157,19 @@ endif()
 # helpers default to the right name without the consumer knowing the layout.
 set(SPANGAP_FIXED_PARTITION "fixed" CACHE INTERNAL "")
 
-# Shrink-wrap inputs: spangap-inside measures the real app .bin + fixed data
-# after a build and writes build/.spangap-sizes; reading it here sizes app/fixed
-# to actual (no cap on fixed). Absent (first build) → 0 → generous provisional.
-set(_APP_BYTES 0)
-set(_FIXED_BYTES 0)
-set(_SIZES_FILE "${CMAKE_BINARY_DIR}/.spangap-sizes")
-# Reconfigure when the measured sizes change, so spangap-inside's second pass
-# (which writes this file) re-runs gen-partitions with the real sizes.
-set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${_SIZES_FILE}")
-if(EXISTS "${_SIZES_FILE}")
-    file(STRINGS "${_SIZES_FILE}" _szlines)
-    foreach(_l IN LISTS _szlines)
-        if(_l MATCHES "^app=([0-9]+)$")
-            set(_APP_BYTES "${CMAKE_MATCH_1}")
-        elseif(_l MATCHES "^fixed=([0-9]+)$")
-            set(_FIXED_BYTES "${CMAKE_MATCH_1}")
-        endif()
-    endforeach()
-endif()
-
+# Configure is ALWAYS provisional — nothing is carried between runs. `app` is the
+# remainder below a high-placed `fixed`, so the table never needs the app size; and
+# `fixed` gets a generous slice of the firmware region here, which is only ever
+# SAFE, not exact. IDF freezes the littlefs --fs-size from the table at configure,
+# so the build-time pack uses this generous size (it can never NOSPC) and `app`
+# stays huge (check_sizes passes trivially). The post-build pass then shrink-wraps
+# `fixed` to its real measured size — computed fresh from the just-built data, with
+# no cached hint. A smaller `fixed` only grows `app`, so this can never overflow it.
 execute_process(
     COMMAND python3 "${_SPANGAP_CORE_DIR}/scripts/gen-partitions.py"
         --flash-mb ${_FLASH_MB}
         --updater ${_UPDATER}
-        --app-bytes ${_APP_BYTES}
-        --fixed-bytes ${_FIXED_BYTES}
+        --fixed-bytes 0
         --state-floor ${_STATE_FLOOR}
         --out "${CMAKE_SOURCE_DIR}/partitions.csv"
     COMMAND_ERROR_IS_FATAL ANY)

@@ -208,6 +208,14 @@ deadlocks the ack (client gives up after 3 s) and freezes the inbox drain.
 - **`storageDefault*` are silent.** They install seeds without firing change
   subscriptions. A handler that must run on the seeded value won't — use
   `NOW_AND_ON_CHANGE`, which subscribes *and* applies the current value once.
+- **No config-version migrations.** `storageDefault` is idempotent — the actor
+  writes the key only if it is currently unset — so seeding a module's defaults
+  unconditionally on init is sufficient and re-running init is a no-op. Do **not**
+  add schema-version scaffolding (a `s.<mod>.*_version` key or a `*_VERSION`
+  define guarding a seed block, bumped to re-seed migrated devices): there are no
+  deployed devices holding an older schema to migrate, so the version gate is pure
+  ceremony. To add a new default, call `storageDefault(...)` directly in the
+  module's init — no version check, no companion `storageSet(..._version, N)`.
 - **Secrets never leave the device.** `isSecret()` gates the dump, per-key
   patches, and inbound merges. Keep any new "must not reach the browser" key
   under `secrets.*`; do not add a second filtering path.
@@ -224,6 +232,23 @@ deadlocks the ack (client gives up after 3 s) and freezes the inbox drain.
   `navigateLeaf`, the CLI `set`/`show` key buffers, and `leaf[96]` sites all
   assume ≤ 95-char segments. Changing one in isolation reintroduces the silent
   rejected-write class of bug.
+- **Never hold `CFG_LOCK` across a blocking CLI/transport write.** The
+  collect-then-emit shape of `storageList` and `cmdShow` is load-bearing, not a
+  style choice. They snapshot the walked tree into a heap `std::string` under the
+  lock (`walkTreeCollect`), release, then push it line-by-line with the lock
+  dropped (`emitLines`, one `write()` per line so a packet-mode DC never sees a
+  body over its cap). The CLI's own output drains over a depth-1 DataChannel whose
+  consumer is the **LCD task**, and that task takes `CFG_LOCK` on a timer (the
+  status-bar clock's `updateClock`, plus wifi/battery change-subscriptions calling
+  `storageGetStr`/`storageGetInt`). If `show`/`storageList` held `CFG_LOCK` across
+  the back-pressured send, a large output would keep the lock held long enough to
+  span a status tick: the LCD task blocks on `CFG_LOCK` → stops draining the DC →
+  the CLI send never completes → both wedge → watchdog reboot. Small output drains
+  before any tick contends, so it never trips — which is exactly why `show s` (and
+  any large collection) crashed reliably while small `show`s looked fine. Fixed
+  2026-07-01. Any new command that walks `cfgRoot` and writes to the CLI must use
+  the same collect-under-lock, emit-after-unlock shape — never `write()` while
+  holding `CFG_LOCK`.
 - **A `LoadProhibited` in cJSON / `navigatePath` / `storageGetInt` during flash
   reads is MSPI timing, not heap corruption** — marginal 80 MHz octal-PSRAM
   timing. Don't poison-hunt it.

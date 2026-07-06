@@ -12,14 +12,38 @@ thing is built from FreeRTOS queues, stream buffers, task notifications, and
 binary semaphores, with three global tables and one per-task record. Everything
 below is ours.
 
-**Global tables** (all PSRAM, allocated lazily on first use, never shrink):
+**Global tables** (all fixed-capacity, never shrink):
 
-| Table | Constant | Meaning |
-|-------|----------|---------|
-| Connection table | `ITS_MAX_CONNS = 128` | Active connections; handle = slot index, round-robin allocation. |
-| Stream-buffer pool | `ITS_MAX_POOL = 128` | Per-direction byte rings for stream/legacy connections, keyed by size. |
-| Packet-link descriptor rings | `ITS_MAX_LINKS = 256` | Two per packet connection (one per direction); each is a ring of message descriptors. |
-| Task table | `ITS_MAX_TASKS = 48` | One `its_task_t` per ITS-registered task. |
+| Table | Constant | Home | Meaning |
+|-------|----------|------|---------|
+| Connection table (`connTable`) | `ITS_MAX_CONNS = 128` | `.bss` | Active connections; handle = slot index, round-robin allocation. |
+| Stream-buffer pool (`itsPool`) | `ITS_MAX_POOL = 128` | `.bss` descriptors, PSRAM rings | Per-direction byte rings for stream/legacy connections, keyed by size. |
+| Packet-link descriptor rings (`itsLinks`) | `ITS_MAX_LINKS = 256` | PSRAM (lazy) | Two per packet connection (one per direction); each is a ring of message descriptors. |
+| Task table (`s_tasks`) | `ITS_MAX_TASKS = 48` | PSRAM (lazy) | One `its_task_t` per ITS-registered task. |
+
+`s_tasks` (~23 KB) and `itsLinks` are `heap_caps_calloc(..., MALLOC_CAP_SPIRAM)`,
+allocated together on the first `taskFindOrCreate` call — a single serialized
+chokepoint before any connection exists, so a packet connect finds `itsLinks`
+ready without a lazy-alloc race. They live in PSRAM rather than `.bss` on
+purpose: these tables are task-context-only (never touched from an ISR or a
+cache-disabled window — the module's standing invariant), and on a
+display-plus-radio board the scarce resource is internal DRAM / the DMA-capable
+pool, not PSRAM. On the reticulous T-Deck build internal DRAM runs at ~91% (free
+~19 KB, low-water ~4.75 KB, DMA-pool low-water 26 B) while PSRAM sits near 10%.
+Moving these two tables off `.bss` reclaimed ~25 KB of internal DRAM; before the
+move, the ~10 KB of static arrays the ITS-as-mailbox work added tipped the pool
+over — WiFi AP-fallback crashed in `ieee80211_hostap_attach` ("alloc eb … fail")
+and a boot-time SD read crashed in `setup_dma_priv_buffer` ("Failed to allocate
+priv RX buffer"), both internal-DMA-pool exhaustion. `connTable` and `itsPool`'s
+descriptor array are still `.bss`; move them the same way (lazy, count-guarded)
+if more headroom is needed.
+
+**Adding static `.bss` to spangap-core is dangerous.** Any new fixed array in
+this layer competes for the internal DMA pool. Measure `.dram0.bss`
+(`xtensa-esp32s3-elf-size -A build/reticulous.elf`) after such a change and
+prefer PSRAM for task-context-only data. Reclaiming *PSRAM* instead (e.g. the
+packet-link work freed 18×4 KB of rnsd stream-pool buffers and 256 KB of seccam)
+does nothing for the internal-DRAM budget.
 
 **Per-task record** (`its_task_t`): the inbox queue, the server-port table
 (`ITS_MAX_PORTS = 8`), the aux-port table (also 8), the pickup semaphore, and the
@@ -71,6 +95,45 @@ not a global pool. A task is single-threaded, so it can have only one outstandin
 SMP races a shared claim-from-pool design had (non-atomic check-then-claim, and a
 giver firing before the waiter reached its wait).
 
+### Task death and the append-only task table
+
+`s_tasks` is append-only: `taskFindOrCreate` adds a permanent slot the first time
+a task touches ITS — including a transient task that registers only to use the
+connectionless fs/storage pickup proxy (`pickupArm`) and then dies. The slot is
+never removed, so its `TaskHandle_t` would dangle after the task exits. A later
+send routed to that slot does `xTaskNotifyGive(slot->task)`, writing a
+notification word (`ucNotifyState = 2`) into the freed TCB — a use-after-free in
+internal DRAM. The canonical victim is `main_task`: it drives `proxyOp` during
+boot (`tlsInit` → `fs_stat` → `itsSendAux`) and self-deletes when `app_main`
+returns; the corruption surfaced downstream as a NULL-owner
+`xTaskRemoveFromEventList` assert from the USB-Serial-JTAG RX ISR (confirmed with
+a hardware watchpoint that caught `main_task`'s TCB as the victim).
+
+The fix (in tree) is `vTaskPreDeletionHook`: IDF's Xtensa port calls it for every
+deleted task from `prvDeleteTCB`, inside a scheduler critical section, when
+`CONFIG_FREERTOS_TASK_PRE_DELETION_HOOK=y` (set in `sdkconfig.defaults.spangap`).
+ITS's hook NULLs the dead task's `s_tasks[i].task` so `taskFind` can never match
+it again; the slot, its semaphores and inbox stay allocated (honoring the
+append-only invariant, just inert). A cached `its_task_t*` whose `->task` is now
+NULL degrades to `xTaskNotifyGive(NULL)`, which the kernel maps to the *current*
+task — a harmless spurious notify, not a UAF. It is a single aligned pointer
+write, so no lock is needed (and none is allowed: critical-section context
+forbids FreeRTOS calls, malloc, or logging). The one hook also drives storage's
+subscription-table cleanup through a weak `storageOnTaskDeath`.
+
+**The bug was the hook name, and it failed silently.** The cleanup logic was
+always correct but orphaned: it was named `vPortCleanUpTCB`, the legacy hook IDF
+only calls under `CONFIG_FREERTOS_ENABLE_STATIC_TASK_CLEAN_UP` (never set). IDF
+5.5 renamed the live hook to `vTaskPreDeletionHook` (`port.c`
+`vPortTCBPreDeleteHook`), so the old function never ran — no link error, just a
+dead `extern "C"` symbol. Lesson: an `extern "C"` hook with the wrong name links
+cleanly and is never called. Applied in tree; not re-verified on hardware since
+the rename.
+
+Out of scope: a task that dies while still owning *live* connections leaves stale
+`clientTask`/`serverTask` handles that the link-backpressure notifies (`remoteOf`)
+use directly. The hook does not cover that — no such task self-deletes today.
+
 ## 3. Framing
 
 ### Stream connections
@@ -106,7 +169,22 @@ separate borrowed block.
   payload and a nonce. The server's `onConnect` returns its serverRef (`>=0`
   accept, `<0` reject); buffers are allocated at accept. A client whose ack wait
   times out leaves a `CONNECT_CANCEL` keyed on the same nonce to reap the slot the
-  server may later allocate.
+  server may later allocate. This closes a real leak class: on timeout the client
+  returns -1 and walks away, but its CONNECT is still in the server's inbox, so
+  when a slow or briefly saturated server finally drains it, `onConnect` allocates
+  a conn slot, pool/link buffers, and whatever the handler took (e.g. a CLI
+  session slot) for a client that is already gone. Left unreaped this is the "out
+  of CLI sessions" wedge — a server that is momentarily saturated, or not pumping
+  `itsPoll` at all (blocked at boot), refuses every subsequent connect. The
+  trigger is any window where the server task isn't draining its inbox. **Caveat:**
+  the CANCEL is best-effort — it is enqueued with a 50 ms budget and dropped if
+  the inbox is full, so a server wedged inbox-full can still leak the slot; the
+  reap depends on the CANCEL landing behind its CONNECT, which only FIFO ordering
+  from the same sender guarantees. Deferred design that would close this gap: a
+  per-task connect-resolution mutex the server takes before `onConnect`, letting
+  it drop an abandoned connect *before* allocating and letting a client that lost
+  the timeout race recover the ack instead of returning -1 — no CANCEL message
+  needed. Not implemented; the nonce+CANCEL path above is what ships.
 - **Forward** — `itsServerForward` transfers a connection's ownership to another
   server task on a named port; the stream buffers stay, the new owner sees a fresh
   `onConnect`. `itsInject` pushes already-consumed protocol bytes back into a
@@ -205,4 +283,27 @@ the Kconfig-tunable defaults (see [its.md](its.md#configuration)).
 - **A packet body must fit `maxMsg`,** and in legacy mode `4 + len` must fit the
   ring capacity. `itsRecv` into an undersized buffer drains and discards the
   packet and returns 0.
+
+## 9. Keeping ITS portable
+
+ITS is meant to be liftable out of spangap — a generic task-to-task transport
+another project could drop in. So `its.cpp` must not reference spangap
+application concerns or Kconfig symbols that only exist in a spangap build.
+
+- **No spangap Kconfig in ITS primitives.** Don't bake application ordering (e.g.
+  rnsd's boot sequence) into ITS. Prefer making behavior fall out of the generic
+  parameters ITS already has: `itsConnect`'s single caller `timeout` governs the
+  *whole* wait — task-exists, server-ready, and handshake — rather than a separate
+  readiness flag or knob.
+- **Genuine tunables get a self-contained overridable default:** `#ifndef ITS_FOO`
+  / `#define ITS_FOO <default>` / `#endif`, so ITS builds standalone and an
+  embedder overrides with `-DITS_FOO=...`.
+- **Don't over-configure.** A pure implementation detail (e.g. a re-check poll
+  cadence) is a named constant, not a config knob.
+
+The `CONFIG_SPANGAP_ITS_*` symbols (`INBOX_DEPTH`, `INBOX_MSG_MAX`, `PKT_DEPTH`,
+`MSG_MAX`) predate this rule and partly violate it: each is already wrapped in an
+`#ifndef` guard with a standalone default, so ITS still compiles outside spangap,
+but the name carries the spangap namespace. Renaming them to neutral
+`ITS_`-prefixed symbols is a candidate cleanup, not yet done.
 </content>
