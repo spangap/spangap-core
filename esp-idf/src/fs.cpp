@@ -780,7 +780,9 @@ void fs_factory_reset() {
  * FATFS type detection) is shared. Pin numbers and bus width come from
  * Kconfig — see fs.h's fs_mount_sd() for the CONFIG_SPANGAP_SDCARD_* knobs. */
 
+#if CONFIG_SPANGAP_SDCARD
 static sdmmc_card_t* sdCard = nullptr;
+#endif
 /* sdReady + sdAvailable() defined earlier so the fs worker (LISTDIR root case)
  * can gate the synthetic /sdcard entry on whether the card mounted. */
 
