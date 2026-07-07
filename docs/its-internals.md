@@ -95,6 +95,28 @@ not a global pool. A task is single-threaded, so it can have only one outstandin
 SMP races a shared claim-from-pool design had (non-atomic check-then-claim, and a
 giver firing before the waiter reached its wait).
 
+### Why plain heap blocks — rejected alternatives
+
+The borrowed-block design was chosen over several alternatives; the reasons
+still bind, so don't reintroduce them casually:
+
+- **A pooled / size-class payload allocator** — rejected for now: plain heap
+  allocation handles arbitrary sizes and the heap takes the load fine. Heap
+  churn from per-message payloads was judged a non-issue — storage's JSON
+  handling already churns the heap far harder (hundreds of small allocations
+  per second) without trouble. The acquire wrappers (`payAlloc`/`payAdopt` in
+  `its.cpp`) are deliberately the seam a pooled allocator could later drop in
+  behind without touching any caller.
+- **Carrying cJSON pointers as payloads** — rejected: a cJSON tree is many
+  blocks needing a type-specific destructor, which breaks the "any payload is
+  one `free()`" rule the blind teardown drain depends on. Structured data is
+  serialized into the block.
+- **A tagged allocator (prefix headers on payload blocks)** — rejected: it
+  would catch "took ownership and forgot to free", but kills adoption of
+  foreign blocks — `itsSendOwned` adopting `cJSON_PrintUnformatted` output
+  directly is the flagship zero-copy path. The ownership-boundary counters
+  (`itsStatus`) catch everything else.
+
 ### Task death and the append-only task table
 
 `s_tasks` is append-only: `taskFindOrCreate` adds a permanent slot the first time
@@ -306,4 +328,29 @@ The `CONFIG_SPANGAP_ITS_*` symbols (`INBOX_DEPTH`, `INBOX_MSG_MAX`, `PKT_DEPTH`,
 `#ifndef` guard with a standalone default, so ITS still compiles outside spangap,
 but the name carries the spangap namespace. Renaming them to neutral
 `ITS_`-prefixed symbols is a candidate cleanup, not yet done.
+
+## 10. Deferred work
+
+Known, sanctioned follow-ups — each was deliberately left out of a
+verified-working build rather than forgotten:
+
+- **Delete `ITS_PACKET_LEGACY` and the bool `packetBased` overload of
+  `itsServerPortOpen`.** Both are transitional: no port uses legacy mode any
+  more (every remaining bool-overload caller passes `false` → `ITS_STREAM`),
+  so the legacy framing arms in `itsSend`/`itsRecv` are dead code. Removing
+  them is behavior-neutral but means migrating the ~10 stream-port call sites
+  still on the bool overload (fs.cpp ×2, cli.cpp, log.cpp here; web.cpp and
+  webrtc_task.cpp in spangap-web; sshd, net, nomad, lxmf, iface-tcp) to the
+  kind-taking signature.
+- **webrtc router `pendingBuf` → `itsRecvRef`.** The router pulls
+  data-channel-bound packets with a copying `itsRecv` into its shared
+  buffer, then copies again
+  into a per-channel stash when the SCTP rexmit pool is full. Pulling with
+  `itsRecvRef` would adopt the payload block and drop one copy. A
+  micro-optimization, not a bug.
+- **In-place SCTP retransmit / single-message config dump.** Tracking an
+  outbound message's fragments in place (a bitmap) instead of copying each
+  whole message into the rexmit pool, and collapsing the browser config dump
+  into one message, are sketched but unbuilt: the pool already holds large
+  messages, PSRAM is abundant, and the dump streams fine in chunks.
 </content>
