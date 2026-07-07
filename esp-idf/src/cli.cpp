@@ -92,14 +92,20 @@ static cli_write_fn cliOut = nullptr;
 
 int cliPrintf(const char* fmt, ...) {
     if (!cliOut) return 0;
-    char buf[256];
+    /* Format on the heap, not the stack. This is the deepest common frame of
+     * every CLI output path, and `help` prints one line per registered command
+     * through here in a loop — a 256 B stack buffer at this point tipped the
+     * (shallow) cli task over its stack limit. A heap buffer keeps the peak flat
+     * regardless of how much a command prints. */
+    constexpr size_t CAP = 256;
+    std::vector<char> buf(CAP);
     va_list ap;
     va_start(ap, fmt);
-    int n = vsnprintf(buf, sizeof(buf), fmt, ap);
+    int n = vsnprintf(buf.data(), CAP, fmt, ap);
     va_end(ap);
     if (n > 0) {
-        size_t w = (size_t)n < sizeof(buf) ? (size_t)n : sizeof(buf) - 1;
-        cliOut(buf, w);
+        size_t w = (size_t)n < CAP ? (size_t)n : CAP - 1;
+        cliOut(buf.data(), w);
     }
     return n;
 }

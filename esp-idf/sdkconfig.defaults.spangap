@@ -245,5 +245,24 @@ CONFIG_MDNS_TASK_CREATE_FROM_SPIRAM=y
 # CONFIG_ESPTOOLPY_FLASHSIZE_* (both current boards are 16 MB), so no size here.
 CONFIG_ESPTOOLPY_FLASHMODE_QIO=y
 
+# LCD vector fonts (spangap-lcd LCD_FONT_ENGINE). The engine choice `select`s
+# LV_USE_FREETYPE / LV_USE_TINY_TTF; these size the glyph caches, allocated
+# through lv_mem_spangap's PSRAM backend. LV_FONT_MONTSERRAT_14 is the stock
+# symbol face (FontAwesome merged) that lcdFont(SYMBOLS) chains as a fallback, so
+# LV_SYMBOL_* keeps rendering under every engine — keep it compiled in.
+CONFIG_LV_FONT_MONTSERRAT_14=y
+# LVGL diagnostics → our logger (lcd_lvgl.cpp registers a print callback under
+# the 'lvgl' tag). ERROR level keeps genuine failures and strips the noisy
+# deprecation warnings. Not LV_LOG_PRINTF — the callback owns routing.
+CONFIG_LV_USE_LOG=y
+CONFIG_LV_LOG_LEVEL_ERROR=y
+CONFIG_LV_FREETYPE_CACHE_FT_GLYPH_CNT=256
+CONFIG_LV_TINY_TTF_CACHE_GLYPH_CNT=256
+CONFIG_LV_TINY_TTF_CACHE_KERNING_CNT=256
+# Render everything as vector, however small (no bitmap-font fallback for tiny
+# sizes). The clamp mechanism stays in Kconfig; this just disables it. Symbols
+# are vector too (symbols.ttf), so a FreeType image ships no rendered bitmap.
+CONFIG_LCD_FONT_MIN_VECTOR_PX=0
+
 # Target
 CONFIG_IDF_TARGET="esp32s3"

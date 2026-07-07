@@ -37,6 +37,7 @@
 
 #include <string>
 #include <vector>
+#include <deque>
 #include <algorithm>
 #include <functional>
 #include <cstdio>
@@ -90,6 +91,17 @@ static TaskHandle_t storageHandle = nullptr;
  * the storage task that blocks its inbox drain → "notify drop … → [storage]"
  * floods (worst with many lxmf externals). So saves run here, off the loop. */
 static TaskHandle_t saveWorkerHandle = nullptr;
+/* Change-notification dispatch worker: owns the BLOCKING remote-subscriber
+ * CHANGED sends (itsSendAuxOwnedByTaskHandle → inboxEnqueue waits up to
+ * STORAGE_NOTIFY_TIMEOUT_MS for space in a slow subscriber's inbox). Running
+ * that on the storage actor let ONE flooded subscriber stall the actor's own
+ * op-inbox drain: every task's port-44 config write then backed up (the "owned
+ * aux to port 44 … receiver stuck?" burst — self-sustaining once an unreachable
+ * RNS link floods a subscriber). The actor now only BUILDS the per-subscriber
+ * buffers (it owns the sub table, iterated on-task, so no race) and hands them
+ * here; this worker absorbs the inbox/pickup wait off the poll loop. Mirrors the
+ * persist worker: the actor never blocks on a subscriber again. */
+static TaskHandle_t notifyWorkerHandle = nullptr;
 static int dcHandle = -1;               /* single packet-mode DC client */
 static cJSON* dcPendingPatch = nullptr; /* outgoing coalescing */
 
@@ -774,6 +786,72 @@ static std::string logSafe(const char* s, size_t cap = 96) {
  * value. */
 #define STORAGE_NOTIFY_VAL_MAX 512
 
+/* One built CHANGED message awaiting delivery to `task` on STORAGE_CHANGE_PORT.
+ * `buf` is a gp_alloc block owned by the queue until the worker sends it (ITS
+ * adopts it on a successful send; on failure the worker frees it). */
+struct notify_job_t { TaskHandle_t task; uint8_t* buf; size_t n; };
+static std::deque<notify_job_t> notifyQueue;
+static SemaphoreHandle_t         notifyQueueMux = nullptr;
+
+/* Bound the backlog: a permanently-stuck subscriber drains at ~1 per
+ * STORAGE_NOTIFY_TIMEOUT_MS, so a sustained change flood could grow the queue
+ * without limit. Past the cap, drop the OLDEST pending notify (free its buffer).
+ * A CHANGED message is a signal, not value transport — every handler re-reads by
+ * key — so a coalesced drop only costs a redundant re-read, never a lost value. */
+#define STORAGE_NOTIFY_QUEUE_MAX 256
+static uint32_t notifyDropped = 0;
+
+/* Send one built CHANGED buffer to `task`, blocking up to the notify timeout on
+ * its inbox. Frees `buf` on failure (ITS owns it on success). */
+static void notifySend(TaskHandle_t task, uint8_t* buf, size_t n) {
+  if (!itsSendAuxOwnedByTaskHandle(task, STORAGE_CHANGE_PORT, buf, n,
+                                   pdMS_TO_TICKS(CONFIG_SPANGAP_STORAGE_NOTIFY_TIMEOUT_MS))) {
+    /* buf layout {cb ptr, key\0, val\0}; recover the key for the log before we
+     * free the block (the send did not adopt it). */
+    const char* key = (n > sizeof(void*)) ? (const char*)(buf + sizeof(void*)) : "?";
+    const char* tn = pcTaskGetName(task);
+    warn("notify drop: %s → [%s]\n", logSafe(key).c_str(), tn ? tn : "?");
+    free(buf);
+  }
+}
+
+/* Hand a built CHANGED buffer to the dispatch worker (called on the storage
+ * actor). Takes ownership of `buf`. Before the worker spawns (early boot) or if
+ * the queue mux is absent, send inline — same blocking behaviour as before. */
+static void notifyEnqueue(TaskHandle_t task, uint8_t* buf, size_t n) {
+  if (!notifyWorkerHandle || !notifyQueueMux) { notifySend(task, buf, n); return; }
+  uint8_t* stale = nullptr;
+  xSemaphoreTake(notifyQueueMux, portMAX_DELAY);
+  if (notifyQueue.size() >= STORAGE_NOTIFY_QUEUE_MAX) {
+    stale = notifyQueue.front().buf; notifyQueue.pop_front(); notifyDropped++;
+  }
+  notifyQueue.push_back({task, buf, n});
+  xSemaphoreGive(notifyQueueMux);
+  if (stale) {
+    free(stale);
+    if (notifyDropped % 64 == 1)
+      warn("notify backlog full, dropping oldest (total %u)\n", (unsigned)notifyDropped);
+  }
+  xTaskNotifyGive(notifyWorkerHandle);
+}
+
+/* Dispatch worker loop: drain the queue and do the blocking sends here, off the
+ * storage actor's poll loop. ulTaskNotifyTake(pdTRUE) coalesces pokes. */
+static void notifyWorkerFn(void*) {
+  for (;;) {
+    ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+    for (;;) {
+      notify_job_t job;
+      xSemaphoreTake(notifyQueueMux, portMAX_DELAY);
+      if (notifyQueue.empty()) { xSemaphoreGive(notifyQueueMux); break; }
+      job = notifyQueue.front();
+      notifyQueue.pop_front();
+      xSemaphoreGive(notifyQueueMux);
+      notifySend(job.task, job.buf, job.n);
+    }
+  }
+}
+
 static void notifyChange(const char* key, const char* val) {
   for (int i = 0; i < subCount; i++) {
     if (!subs[i].task) continue;   /* owner died — nulled by storageOnTaskDeath */
@@ -793,13 +871,9 @@ static void notifyChange(const char* key, const char* val) {
     memcpy(buf + sizeof(cb), key, klen + 1);
     memcpy(buf + sizeof(cb) + klen + 1, val, vlen);   /* may be truncated */
     buf[sizeof(cb) + klen + 1 + vlen] = '\0';
-    if (!itsSendAuxOwnedByTaskHandle(subs[i].task, STORAGE_CHANGE_PORT, buf, n,
-                                     pdMS_TO_TICKS(CONFIG_SPANGAP_STORAGE_NOTIFY_TIMEOUT_MS))) {
-      free(buf);
-      const char* tn = pcTaskGetName(subs[i].task);
-      warn("notify drop: %s=%s → [%s]\n", logSafe(key).c_str(),
-           logSafe(val).c_str(), tn ? tn : "?");
-    }
+    /* Hand off to the dispatch worker: the blocking send must not run on the
+     * actor (see notifyWorkerHandle). Ownership of buf transfers to the queue. */
+    notifyEnqueue(subs[i].task, buf, n);
   }
 }
 
@@ -2141,6 +2215,12 @@ void storageInit() {
      * loop never stalls on them. Spawn before the storage task so it's ready
      * for the first save poke (the save timer can only fire 60s+ after boot). */
     saveWorkerHandle = spawnTask(saveWorkerFn, "storage_save", 8192, nullptr, 1, 1);
+
+    /* notify worker: owns the blocking remote-subscriber CHANGED sends so a
+     * flooded subscriber can't stall the storage actor's op-inbox drain. Spawn
+     * before the storage task so its first subscribe/change dispatches here. */
+    notifyQueueMux = xSemaphoreCreateMutex();
+    notifyWorkerHandle = spawnTask(notifyWorkerFn, "storage_notify", 8192, nullptr, 1, 1);
 
     /* storage task: PSRAM stack (config WS + ITS, no direct file I/O) */
     storageHandle = spawnTask(storageTaskFn, "storage", 8192, nullptr, 1, 1);
