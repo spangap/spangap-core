@@ -59,6 +59,16 @@ this serializes all SDMMC access and is PSRAM-stack safe unconditionally. The
 direct, un-proxied `fopen` is the pre-boot `settings.json`-era read that happens
 before the worker exists.
 
+`/fixed` is the one mount that doesn't need the detour: it is a spanfs partition
+whose reads are memory-mapped — plain flash-cache fills, the same mechanism as
+code/rodata, exempt from the cache-disable hazard the workers exist for. `FS_FIXED`
+calls still round-trip through the workers anyway (correct, just unnecessary); a
+worker bypass for `FS_FIXED` is a sanctioned follow-up optimization. The mapping
+is cheap address-space-wise: `fixed` (a few MB) mmap'd alongside 8 MB PSRAM sits
+far inside the ESP32-S3's 32 MB data-address window — the budget only needs
+revisiting if a board ships 16+ MB PSRAM together with a very large asset
+partition.
+
 The worker handler `handleOp` does **no path rewriting** — `/state` and
 `/sdcard/state` are both real, and callers already pass whichever is active.
 `STAT`/`LISTDIR` special-case `"/"` (not a real VFS mount) by synthesizing a
@@ -86,8 +96,9 @@ when `sdReady`).
 1. `nvs_flash_init()` (ESP-IDF internals only — WiFi cal / PHY; erase+retry on
    version/page errors).
 2. Resolve `fixedLabel` to `"fixed"`, then `statePartitionEnsure()` (see §5).
-3. Mount every LittleFS partition from `FS_MOUNTS`, **including `/state`** — it
-   is always mounted regardless of where the active store ends up.
+3. Mount every partition from `FS_MOUNTS` (`/fixed` via spanfs, the LittleFS
+   ones via littlefs), **including `/state`** — it is always mounted regardless
+   of where the active store ends up.
 4. Spawn the `fs` and `fs_strm` workers (each gated on a ready semaphore).
 
 `fs_init` deliberately does **not** probe SD or do the first-boot copy —

@@ -20,7 +20,7 @@ Without the updater (default):
 ```
 nvs       data, nvs,     0x9000,   0x5000     IDF internal (WiFi PHY cal)
 app       app,  factory, 0x10000,  <remainder> firmware — everything up to `fixed`
-fixed     data, spiffs,  <high>     <wrapped>  read-only LittleFS (SPA + factory defaults)
+fixed     data, 0x8a,    <high>     <wrapped>  read-only spanfs (SPA + factory defaults)
 reserved  data, 0x40,    ...        <filler>   inert; carries the table top to the floor
 ```
 
@@ -31,7 +31,7 @@ nvs       data, nvs,     0x9000,   0x5000
 otadata   data, ota,     0xe000,   0x2000     selects app vs updater
 updater   app,  ota_1,   0x10000,  0x80000    tiny serial-updated flasher (low/stable)
 app       app,  ota_0,   0x90000,  <remainder> firmware — everything up to `fixed`
-fixed     data, spiffs,  <high>     <wrapped>  read-only LittleFS
+fixed     data, 0x8a,    <high>     <wrapped>  read-only spanfs
 reserved  data, 0x40,    ...        <filler>   inert; carries the table top to the floor
 ```
 
@@ -39,7 +39,7 @@ The updater sits **below** `app` at a fixed 512 K slot, so `app`'s start offset
 is stable and `app.bin` is never relinked. `fixed` is placed as high as possible
 (just under the firmware ceiling); `app` fills the gap between the updater/nvs and
 `fixed`, so it is sized purely by `fixed`'s size and the ceiling — the build never
-measures or pins `app`. App slots are 64 K-aligned, LittleFS partitions
+measures or pins `app`. App slots are 64 K-aligned, data partitions
 4 K-aligned. The trailing `reserved` partition carries the table top up to the
 floor, so `state` (above the table, up to the real chip size) always starts at
 exactly the floor regardless of `fixed`'s size.
@@ -98,30 +98,31 @@ validates `app.bin` against the (large) remainder during the build; the real
 ceiling (`app.bin + fixed ≤` the firmware region below the floor) is asserted in
 the finalize pass and errors naming `CONFIG_SPANGAP_MAX_FIRMWARE_KB`.
 
-**`fixed` is measured, but only within the same build.** IDF's littlefs component
-freezes the image `--fs-size` from the partition table **at configure time** (it
-cannot size the image after packing it), and the data image is only assembled *by*
-the build graph (straddle data dirs are discovered during configure; `spangap-lcd`
-rasterizes icons into it with build-time tooling) — so `fixed`'s real size isn't
-knowable before configure. Rather than cache it, the build sizes `fixed`
-**generously** and shrink-wraps it afterward:
+**`fixed` is measured, but only within the same build.** The data image is only
+assembled *by* the build graph (straddle data dirs are discovered during
+configure; `spangap-lcd` rasterizes icons into it with build-time tooling) — so
+`fixed`'s real size isn't knowable when `partitions.csv` is generated at
+configure. Rather than cache it, the build sizes `fixed` **generously** and
+shrink-wraps it afterward:
 
 1. **Configure** — `bootstrap.cmake` always generates a *provisional* `partitions.csv`:
    `fixed` gets a generous slice of the firmware region, `app` the rest. The size is
    only ever a safe upper bound, never exact — so it needs no prior-run input.
-2. **Build** — link `app.bin` and pack the littlefs image at the generous size. The
+2. **Build** — link `app.bin` and pack the spanfs image at the generous size. The
    pack can never `NOSPC` (it always has room), and `app`, the remainder, is still
    huge so `check_sizes` passes with margin.
-3. **Post-build** — `measure_build_sizes()` reads the real merged data size (each
-   file rounded up to a 4 KB LittleFS block) from the just-built `data_merged`. If it
-   differs from the generous size in `partitions.csv` (this build's own table — not a
-   cross-run cache), `finalize_shrink_wrap()` regenerates, **in place, with no second
-   build**, the artifacts a `fixed` resize touches: `partitions.csv`
-   (gen-partitions.py), `partition-table.bin` (IDF's `gen_esp32part.py`), `fixed.bin`
-   (deterministic littlefs re-pack), and the `fixed` offset in `flasher_args.json`.
-   `app.bin` and `bootloader.bin` are reused verbatim — `app.bin` is linked at a fixed
-   offset, independent of any partition *size*, so it is never relinked. On any
-   failure it falls back to a full rebuild so a broken fixup can't ship a bad image.
+3. **Post-build** — `measure_build_sizes()` takes `fixed`'s real size as the packed
+   `fixed.bin`'s byte size (a spanfs image is byte-exact — no filesystem block
+   rounding or free-space cushion). If it differs from the generous size in
+   `partitions.csv` (this build's own table — not a cross-run cache),
+   `finalize_shrink_wrap()` regenerates, **in place, with no second build**, the
+   artifacts a `fixed` resize touches: `partitions.csv` (gen-partitions.py),
+   `partition-table.bin` (IDF's `gen_esp32part.py`), and the `fixed` offset in
+   `flasher_args.json`. `fixed.bin` itself is reused verbatim — a spanfs image is
+   placement- and partition-size-independent — as are `app.bin` and `bootloader.bin`
+   (`app.bin` is linked at a fixed offset, independent of any partition *size*, so
+   it is never relinked). On any failure it falls back to a full rebuild so a
+   broken fixup can't ship a bad image.
 
 Shrinking `fixed` only ever *grows* `app` (a smaller `fixed` moves higher, freeing
 the space below it), so the generous-then-shrink dance can never overflow `app` and
@@ -129,9 +130,9 @@ the two passes never disagree about app.bin's validity. A rebuild that doesn't
 reconfigure keeps the shrink-wrapped `partitions.csv` and re-measures the same size,
 so the finalize is a no-op.
 
-The measure step adds a small headroom margin — data +64 K over the per-file 4 KB
-rounding, and the `app.bin` ceiling assertion keeps ~128 K of app slack — so
-ordinary build-to-build growth doesn't trip the ceiling. They are not byte-exact.
+`fixed` is byte-exact (gen-partitions.py rounds it up only to the 4 K data
+alignment); the `app.bin` ceiling assertion keeps ~128 K of app slack so
+ordinary build-to-build growth doesn't trip the ceiling.
 
 ## Kconfig
 
@@ -149,6 +150,17 @@ Field updates use the single-slot **`updater`** model. A tiny permanent updater
 app (the `ota_1` slot, kept low and stable) reflashes `app`/`fixed` from a staged
 image; the main app stages the image and flips the boot selection. See the
 [`updater` straddle](../../updater/) for the full flow.
+
+The 512 K updater slot is a fixed size, not shrink-wrapped, and carries no
+growth padding — padding only helps if the binary can grow into it without a
+reflash, but the updater can only change via a serial flash, which rewrites the
+whole layout anyway, so pre-padding would just steal flash from `state`. The
+size itself comes from what a no-network, no-crypto flasher needs: IDF baseline
+plus littlefs, `esp_ota`/partition write, and optional inflate — roughly
+340–580 KB (signature verification is app-side, in the stage path, so no
+mbedTLS). Note the updater is the flasher and structurally skips the slot it
+runs from — it can never write a new copy of *itself* (XIP self-overwrite), so
+updating the updater binary is serial-only by construction.
 
 Only the groundwork exists today: stage-check, the boot-flip into the updater,
 and the runtime `state` / on-flash `updater` partitions. **Signed download and
