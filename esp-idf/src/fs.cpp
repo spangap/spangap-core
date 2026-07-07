@@ -24,6 +24,7 @@
 #include "esp_log.h"
 #include "log.h"
 #include "esp_littlefs.h"
+#include "spanfs.h"
 #include "esp_timer.h"
 #include "nvs_flash.h"
 #include "esp_ota_ops.h"
@@ -62,6 +63,10 @@ static bool firstBoot = false;
 /* ---- OTA-aware mount table (label resolved at fs_init) ---- */
 
 static char fixedLabel[12] = "fixed_a";   /* default: app0 → fixed_a */
+
+/* /fixed is a read-only spanfs image mmap'd in place (not LittleFS). The handle
+ * stays open for the process lifetime; the mapping backs every /fixed read. */
+static spanfs_t* s_fixed = nullptr;
 
 const fs_mount_t FS_MOUNTS[] = {
     { FS_FIXED, fixedLabel, true,  true, false },
@@ -1093,18 +1098,22 @@ void fs_init() {
     safeStrncpy(fixedLabel, "fixed", sizeof(fixedLabel));
     statePartitionEnsure();
 
-    /* Mount all LittleFS partitions from the table, INCLUDING `state`.
-     * /state is the on-flash partition and is always mounted, regardless of
-     * where the active state store ends up. */
-    for (int i = 0; i < FS_MOUNT_COUNT; i++) {
-        auto& m = FS_MOUNTS[i];
-        esp_vfs_littlefs_conf_t conf = {};
-        conf.base_path = m.path;
-        conf.partition_label = m.partition;
-        conf.format_if_mount_failed = m.formatOnFail;
-        if (esp_vfs_littlefs_register(&conf) != ESP_OK)
-            printf("mount %s failed\n", m.path);
+    /* /fixed: read-only spanfs image, mmap'd in place. Reads are plain cache
+     * fills from the mapping (no SPI-flash-driver traffic, no cache-disable
+     * hazard) — safe from any task, PSRAM stack included. Mounted by label, so
+     * the retired A/B plumbing is untouched: fixedLabel is "fixed" here. */
+    {
+        esp_err_t e = spanfs_open_partition(fixedLabel, &s_fixed);
+        if (e == ESP_OK)
+            e = spanfs_vfs_register(s_fixed, FS_FIXED);
+        if (e != ESP_OK)
+            printf("mount %s (spanfs) failed: %s\n", FS_FIXED, esp_err_to_name(e));
     }
+
+    /* /state: writable LittleFS, always mounted, regardless of where the
+     * active state store ends up. */
+    if (mountStateLittlefs() != ESP_OK)
+        printf("mount %s failed\n", FS_STATE);
 
     /* SD probe + active-state-store selection + first-boot factory copy do
      * NOT happen here. They run in fsSelectStateStore(), called from
@@ -1312,6 +1321,16 @@ int fs_stat(const char* path, struct stat* st) {
 }
 
 esp_err_t fsLittlefsInfo(const char* label, size_t* total, size_t* used) {
+    /* /fixed is spanfs now, not LittleFS: report from the mmap'd header
+     * (total == used == the byte-exact image size). A pure memory read, so no
+     * worker proxy is needed. */
+    if (label && strcmp(label, "fixed") == 0) {
+        if (!s_fixed) return ESP_ERR_INVALID_STATE;
+        size_t sz = spanfs_image_size(s_fixed);
+        if (total) *total = sz;
+        if (used)  *used  = sz;
+        return ESP_OK;
+    }
     if (needsProxy(nullptr)) {
         fs_op_t req = {};
         req.op = fs_op_t::LFS_INFO;

@@ -104,13 +104,16 @@ function(spangap_create_factory_image)
             VERBATIM)
     endif()
 
-    littlefs_create_partition_image(${partition_name} "${_data_merged}" FLASH_IN_PROJECT)
-    add_dependencies(littlefs_${partition_name}_bin spangap_data_merge)
+    # `fixed` is a spanfs image now (read-only, mmap-native) instead of a
+    # LittleFS image — byte-exact, placement-independent. spanfs_create_partition_image
+    # mirrors littlefs_create_partition_image(); the target is spanfs_<part>_bin.
+    spanfs_create_partition_image(${partition_name} "${_data_merged}" FLASH_IN_PROJECT)
+    add_dependencies(spanfs_${partition_name}_bin spangap_data_merge)
 
     # Ballpark utilization report — runs after the partition image is built.
     # ESP-IDF already prints app utilization; this is the matching readout for
     # the fixed (factory data) side.
-    add_custom_command(TARGET littlefs_${partition_name}_bin POST_BUILD
+    add_custom_command(TARGET spanfs_${partition_name}_bin POST_BUILD
         COMMAND python3 "${_spangap_core_dir}/scripts/report-sizes.py"
             --partitions "${CMAKE_SOURCE_DIR}/partitions.csv"
             --data-dir "${_data_merged}"
@@ -119,7 +122,7 @@ function(spangap_create_factory_image)
 
     # Full partition layout (name/offset/size) on every build — not just the
     # configure-time print in bootstrap.cmake (which caches away on rebuilds).
-    add_custom_command(TARGET littlefs_${partition_name}_bin POST_BUILD
+    add_custom_command(TARGET spanfs_${partition_name}_bin POST_BUILD
         COMMAND python3 "${_spangap_core_dir}/scripts/report-partitions.py"
             --partitions "${CMAKE_SOURCE_DIR}/partitions.csv"
         VERBATIM)

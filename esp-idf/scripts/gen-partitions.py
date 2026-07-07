@@ -11,7 +11,7 @@ that ship in the image:
     otadata    0x0E000   0x02000     (only with updater — selects app vs updater)
     updater    0x10000   0x80000     (only with updater) tiny serial-updated flasher (ota_1)
     app        ...        <remainder> firmware (factory, or ota_0 when updater present)
-    fixed      <high>     <wrapped>   read-only LittleFS (SPA + factory defaults)
+    fixed      <high>     <wrapped>   read-only spanfs (SPA + factory defaults)
     reserved   ...        <filler>    inert; carries the table top up to the state floor
 
 `state` is deliberately absent — it lives above the table (from the state floor
@@ -129,7 +129,10 @@ def render(flash_mb: int, updater: bool,
                  f"partition is only {app_sz:#x}. Trim app/fixed or raise "
                  "CONFIG_SPANGAP_MAX_FIRMWARE_KB.")
     rows.append(("app", "app", app_sub, app_start, app_sz, ""))
-    rows.append(("fixed", "data", "spiffs", fixed_start, fixed_sz, "readonly"))
+    # subtype 0x8a: spanfs (read-only, mmap-native). An arbitrary spanfs-owned
+    # data subtype, distinct from spiffs/littlefs — runtime mounts by label, so
+    # this is cosmetic but honest. (See components/spanfs/README.md.)
+    rows.append(("fixed", "data", "0x8a", fixed_start, fixed_sz, "readonly"))
 
     # `reserved` carries the table top up to the floor so `state` (runtime, above
     # the table) always begins at exactly the floor, independent of `fixed`'s

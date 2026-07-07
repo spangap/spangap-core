@@ -46,6 +46,7 @@ set(_REQ
     esp_driver_sdmmc
     esp_driver_sdspi
     joltwallet__littlefs
+    spanfs
     esp_rom
     esp_app_format
     app_update

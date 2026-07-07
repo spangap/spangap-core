@@ -1,0 +1,8 @@
+description: "spanfs — read-only, mmap-native filesystem consumed in place from an mmap'd flash partition (or embedded rodata). Zero-copy, no SPI-flash-driver traffic, no cache-disable hazard."
+version: "1.0.0"
+license: "Apache-2.0"
+targets:
+  - esp32s3
+dependencies:
+  idf:
+    version: ">=5.5"
