@@ -8,21 +8,25 @@
  *
  *     #include "spangap.h"
  *
- *     extern "C" void app_main() {
- *         spangapInit();           // core foundations only
- *         spangapInitStraddles();  // every staged straddle's init: hook
- *         // ...consumer's own task graph...
- *         spangapPostAppInit();
- *     }
+ * A buildable ships NO app_main — spangap-inside generates the entire entry
+ * point (staging/spangap_init_dispatch.gen.cpp): it constructs every staged
+ * straddle's boot Service (service.h), registers them in one ordered registry,
+ * and drives the boot phases:
  *
- * No per-straddle init calls and no #if CONFIG_SPANGAP_* guards in app_main:
- * spangapInitStraddles() (generated per buildable by spangap-inside) brings up
- * spangap's own components — core, net, web, lcd, in that fixed order, each only
- * if staged — and then every other staged straddle in dependency order. A board
- * may bracket spangapInit() with its own pre/post HAL bring-up (see hw-tdeck's
- * tdeckStart/tdeckInit). Consumers compose around the platform via
- * netRegister(NET_EV_*, cb), storageSubscribeChanges, cron entries, and
- * /state/boot scripts.
+ *     spangapRegisterServices();  // construct + register all, in init_order
+ *     serviceRunStart();          // onStart walk: bare hardware, before spangapInit()
+ *     spangapInit();              // core foundations only
+ *     serviceRunInit();           // onInit walk: ecosystem up
+ *     spangapPostAppInit();       // finalise boot
+ *
+ * No per-straddle init calls and no #if CONFIG_SPANGAP_* guards anywhere:
+ * registration order is init_order() — spangap's own components (core, net, web,
+ * lcd) first, in that fixed order and each only if staged, then every other
+ * staged straddle in dependency order. A straddle boots by declaring a
+ * `services:` class (or a legacy start:/init: hook the generator wraps in an
+ * adapter Service); see service.h and spangap-core/docs/init.md. Consumers
+ * compose around the platform via netRegister(NET_EV_*, cb),
+ * storageSubscribeChanges, cron entries, and /state/boot scripts.
  */
 #ifndef SPANGAP_H
 #define SPANGAP_H
@@ -38,6 +42,7 @@
 #include "its.h"
 #include "cli.h"
 #include "cron.h"
+#include "service.h"    /* Service base + serviceRegister/serviceRun* (C++ only) */
 
 #ifdef __cplusplus
 extern "C" {
@@ -50,46 +55,20 @@ extern "C" {
  *      → project-mismatch factory reset →
  *      logInit/cliInit/pmInit → cronWakeupHandler → publishBuildTimes
  *
- *  Returns. The consumer's app_main is then responsible for sibling
- *  straddle initialisation (see header docstring above for the typical
- *  ordering) and finally calls spangapPostAppInit() to finalise boot.
+ *  Returns. The generated app_main then runs the serviceRunInit() walk
+ *  (sibling straddle bring-up) and finally spangapPostAppInit() to finalise
+ *  boot — see the header docstring above.
  *
  *  Build epoch (`app_build_unix`) is generated and linked in by
  *  spangap-core itself via scripts/write-build-epoch.py — consumers
  *  don't pass it. */
 void spangapInit(void);
 
-/** Run every staged straddle's declared `start:` hook (straddle.yaml) as the
- *  FIRST statement in app_main, BEFORE spangapInit() — i.e. before fs/storage/
- *  log/cli exist. This is the bare-hardware band for board bring-up the
- *  platform itself depends on: powering a peripheral rail before spangapInit()'s
- *  fs_mount_sd() touches the SD bus, registering the display/touch HAL before
- *  spangap-lcd's lcdInit(). CONTRACT (the strict inverse of
- *  spangapInitStraddles): a start hook runs on bare hardware — no info(),
- *  storage, fs_* helpers, or ITS are up yet; raw peripherals only. Ordered through the same
- *  init_order() walk as init: (a board lands early because its dependents
- *  require: it). By convention a start hook is named xStart.
- *
- *  DEFINED by the generated staging/spangap_init_dispatch.gen.cpp (empty body
- *  when nothing declares start:). Call once, as app_main's first statement. */
-void spangapStartStraddles(void);
-
-/** Run every staged straddle's declared `init:` hook (straddle.yaml) in two
- *  bands: first spangap's own platform components (core, net, web, lcd) in that
- *  fixed order — each only if staged — then every other staged straddle in
- *  dependency-topo order (a straddle inits after the ones it requires:). The
- *  platform band is the contract: anything in the second band can count on
- *  storage/cron, the IP stack, the web stack, and the LCD launcher already
- *  being up, so it neither defers nor orders itself against them.
- *
- *  DEFINED by the generated staging/spangap_init_dispatch.gen.cpp, which
- *  spangap-inside writes for every buildable (empty body when nothing declares
- *  init:). Call once from app_main, right after spangapInit() and before the
- *  consumer's own task graph. From then on a straddle that declares `init:`
- *  initializes automatically when staged — no app_main edit. The buildable
- *  wires the generated file into its main component's SRCS (guarded on
- *  EXISTS). */
-void spangapInitStraddles(void);
+/* Boot participation is a Service (service.h), not a free-function dispatcher.
+ * The generated app_main constructs every staged straddle's Service and walks
+ * the registry: serviceRunStart() (onStart, bare hardware, before spangapInit)
+ * then serviceRunInit() (onInit, ecosystem up). Those walk entry points live in
+ * service.h; there is no consumer-called spangapStartStraddles/InitStraddles. */
 
 /** Finalise platform startup after the consumer has brought up its own
  *  modules. Runs:

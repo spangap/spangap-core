@@ -8,14 +8,15 @@ the deep-sleep contract. Source: [`esp-idf/src/cron.cpp`](../esp-idf/src/cron.cp
 ## 1. What cron adds
 
 - **`cronInit()`** — wired as an `init:` hook in the straddle's `straddle.yaml`
-  (`init: [storageInit, cronInit]`) and run by the generated
-  `spangapInitStraddles()` dispatcher, **not** from `spangapInit()`. core heads
-  the dispatcher's platform band, so it runs first of all straddle inits. It
+  (`init: [storageInit, cronInit]`) and run in the generated `serviceRunInit()`
+  walk (as an adapter `Service`), **not** from `spangapInit()`. core heads the
+  registry's platform band, so it runs first of all straddle inits. It
   seeds `s.cron.enable=1` (version-gated on `s.cron.version` < `CRON_VERSION`,
   currently 1), creates the `cron` `PM_NO_DEEP_SLEEP` lock and **acquires it**,
   then spawns the `cron` task (stack 4096, prio 1, core 0).
 - **`cronWakeupHandler()`** — called early in `spangapInit()` (right after
-  `pmInit()` / `authInit()`, before the dispatcher and before any task spawn).
+  `pmInit()` / `authInit()`, before the `serviceRunInit()` walk and before any
+  task spawn).
   The deep-sleep fast path: if this boot is a timer wake *and* RTC RAM is valid,
   it runs `cronPoll(false)` (dry run); if nothing matches this minute it goes
   **straight back to deep sleep without finishing boot** — no tasks, no straddle

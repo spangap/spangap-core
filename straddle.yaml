@@ -22,14 +22,13 @@ firmware: esp-idf         # ESP-IDF managed component. The build CLI stages this
                           # ESP-IDF component name consumers see (`spangap-core`).
 browser: browser
 platforms: [idf]
-# Auto-init: storage + cron used to be the consumer's responsibility (called
-# by hand in app_main after spangapInit()); they're now folded into the
-# generated spangapInitStraddles() dispatcher. core heads the dispatcher's
+# Auto-init: storage + cron come up as ordinary boot hooks in the generated
+# serviceRunInit() walk (wrapped in adapter Services). core heads the registry's
 # platform band (see spangap-inside PLATFORM_ORDER), so these run first of all —
 # before net/web/lcd and every other straddle. The foundational primitives
 # (fs/log/cli/pm/auth) still come up via the explicit spangapInit() call the
-# buildable makes before the dispatcher; only the storage task and cron move
-# here. Everything the dispatcher starts afterwards can rely on storage being
+# generated app_main makes before the onInit walk; only the storage task and cron
+# are hooks here. Everything the walk starts afterwards can rely on storage being
 # live (settings already loaded by spangapInit) and cron being registered.
 init:
   - call: storageInit

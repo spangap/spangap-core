@@ -2,20 +2,20 @@
  * spangapInit + spangapPostAppInit — bring up the spangap platform CORE.
  *
  * spangapInit() brings up only the foundational primitives that must exist
- * before anything else and have no sensible `init:`-hook ordering (fs, storage
- * load, log, cli, pm, auth). The storage *task* (storageInit) and cron
- * (cronInit) are NOT started here — like every sibling straddle, they declare
- * an `init:` hook in their straddle.yaml and are run by the build-generated
- * spangapInitStraddles() dispatcher. That keeps spangap-core free of compile-
- * AND link-time knowledge of which siblings exist.
+ * before anything else and have no sensible service ordering (fs, storage load,
+ * log, cli, pm, auth). The storage *task* (storageInit) and cron (cronInit) are
+ * NOT started here — like every sibling straddle, they come up in the generated
+ * serviceRunInit() walk (registered in the platform band). That keeps
+ * spangap-core free of compile- AND link-time knowledge of which siblings exist.
  *
- * Consumer pattern is now just three platform calls (plus whatever board /
- * app-policy glue isn't itself a staged straddle):
+ * This file owns only the middle platform call; the buildable's app_main is
+ * fully generated (staging/spangap_init_dispatch.gen.cpp) and drives:
  *
- *     spangapInit();            // core foundations (this file)
- *     spangapInitStraddles();   // generated dispatcher: every staged straddle's
- *                               //   init: hook in (order, dependency) order
- *     spangapPostAppInit();     // finalise: rtcRamSetValid, boot script, cronPoll
+ *     spangapRegisterServices();  // construct + register every staged Service, in order
+ *     serviceRunStart();          // onStart walk: bare hardware, before spangapInit()
+ *     spangapInit();              // core foundations (this file)
+ *     serviceRunInit();           // onInit walk: every straddle, ecosystem up
+ *     spangapPostAppInit();       // finalise: rtcRamSetValid, boot script, cronPoll
  */
 #include "spangap.h"
 #include "auth.h"
@@ -174,8 +174,8 @@ extern "C" void spangapInit(void) {
     publishBuildTimes();
 
     /* That's the lot for core's eager foundations. The storage task, cron, and
-     * every sibling straddle come up next via spangapInitStraddles() (their
-     * declared init: hooks) — see header docstring. */
+     * every sibling straddle come up next in the generated serviceRunInit() walk
+     * (their registered Services / adapted init: hooks) — see header docstring. */
 }
 
 extern "C" void spangapPostAppInit(void) {

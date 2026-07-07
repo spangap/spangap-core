@@ -11,11 +11,14 @@ contracts that order encodes. Source: [`spangap_init.cpp`](../esp-idf/src/spanga
   store, config tree, log/CLI/pm/auth, deep-sleep wake decision, build identity).
 - **`spangapPostAppInit()`** — boot finalisation (RTC watchdog disable, RTC-RAM
   validity, boot script, `sys.boot_complete`, first cron poll).
-- **`spangapStartStraddles()` / `spangapInitStraddles()`** — declared here,
-  **defined by the build-generated** `staging/spangap_init_dispatch.gen.cpp`
-  (`spangap-inside` writes one per buildable; an empty body when nothing declares
-  the hook). They are the seam that keeps spangap-core free of compile- *and*
-  link-time knowledge of which siblings exist.
+- **The Service registry** (`service.h`: `serviceRegister` / `serviceRunStart` /
+  `serviceRunInit`) — the boot-participation seam. spangap-core owns the registry
+  and the two phase walks; the **build-generated**
+  `staging/spangap_init_dispatch.gen.cpp` owns the *contents* — it constructs
+  every staged straddle's `Service` and registers them in order (`spangap-inside`
+  writes one per buildable; an empty registration when nothing declares a
+  service). This keeps spangap-core free of compile- *and* link-time knowledge of
+  which siblings exist.
 - **`waitForTime` / `waitForFlag`** — the boot-barrier primitives, with the
   shared power-management no-deep-sleep lock.
 - The **project-mismatch factory reset** and the **`fw.*` identity** model.
@@ -49,24 +52,51 @@ Exactly this sequence, and the ordering is load-bearing:
    telemetry from the linked-in `app_build_*` symbols and `/fixed/build_times`.
 
 The storage *task* (`storageInit`) and `cronInit` are deliberately **not** here —
-they declare `init:` hooks and come up via `spangapInitStraddles()`, like every
-sibling. Log timestamps start in UTC and switch to the persisted zone once the
-time straddle's `init:` hook applies it.
+they come up in the `onInit` walk like every sibling (spangap-core registers them
+in the platform band). Log timestamps start in UTC and switch to the persisted
+zone once the time service's `onInit` applies it.
 
-## 3. `spangapInitStraddles()` ordering contract
+## 3. Registry ordering contract
 
-Two bands, in order:
+`spangapRegisterServices()` appends services to one registry in `init_order()`,
+and **registration order is boot order** — both walks (`serviceRunStart`,
+`serviceRunInit`) traverse the registry in that one order. Two bands:
 
 1. spangap's own platform components — **core, net, web, lcd, fixed order**, each
    only if staged.
 2. every other staged straddle in dependency-topological order (`require:`
-   relationships), the same `init_order()` walk that orders the `start:` band.
+   relationships).
 
 The contract band-2 code relies on: storage/cron, the IP stack, the web stack,
-and the LCD shell are **already up** by the time a band-2 `init:` hook runs, so a
-consumer neither defers nor self-orders against them. `start:` hooks run the
-strict inverse — bare hardware, no platform services — and are ordered through
-the same walk (a board lands early because its dependents `require:` it).
+and the LCD shell are **already up** by the time a band-2 service's `onInit`
+runs, so a consumer neither defers nor self-orders against them. `onStart` runs
+the strict inverse — bare hardware, no platform services — over the same registry
+order (a board lands early because its dependents `require:` it). One registry
+serves every phase, so phases share this single order and cannot be independently
+reordered — which matches the two old per-phase dispatchers, both of which
+already walked `init_order()`.
+
+### 3a. Why explicit registration, not static-init self-registration
+
+Services join the registry only when `spangapRegisterServices()` — generated,
+`when:`-gated, `init_order()`-ordered — explicitly constructs them. They do
+**not** self-register from a global constructor. That trap is rejected because
+this build would otherwise hit:
+
+- **Linker GC.** Each straddle firmware half is a static archive; with
+  `-ffunction-sections`/`--gc-sections` a TU whose only outward symbol is a
+  self-registering global is garbage-collected, so registration silently never
+  runs. The generated code *references* each trampoline symbol, keeping it linked.
+- **No `when:` gating or band ordering.** A compiled-in self-registrar always
+  registers; the generated list prunes `when:`-gated entries and orders by band.
+- **Static-init-order fiasco.** Global-ctor order across TUs is unspecified; an
+  explicit ordered call list is deterministic.
+
+A fourth, concrete reason: the LCD shell constructs its built-in `LcdApp`s
+(Settings, the launcher) on the lcd task mid-boot — a self-registering ctor would
+mutate the registry while a `serviceRun*` walk is iterating it. A shell-built
+built-in is simply a `Service` that never registers; its boot virtuals never fire
+(it reaches the tile via a direct `lcdInstall`).
 
 ## 4. `spangapPostAppInit()`
 
@@ -123,12 +153,17 @@ reload the SPA.
   inside `spangapInit()` before the foundation tasks for exactly this reason — a
   module that cached a key from a foreign project's `/state` would survive the
   format.
-- **Never hand-write `app_main` or call a straddle's `xInit()` from it.** The
-  dispatcher is generated; adding a manual call double-inits or breaks the
-  band-ordering contract. A straddle runs at boot by declaring an `init:`/`start:`
-  hook, nothing else.
-- **`start:` hooks touch only raw hardware.** No `info()`, storage, `fs_*`, or ITS
-  exist yet in that band; using them there crashes or silently no-ops.
+- **Never hand-write `app_main` or construct/init a straddle's objects from it.**
+  The registration and both walks are generated; a manual call double-inits or
+  breaks the ordering contract. A straddle runs at boot by declaring a `services:`
+  entry (or a legacy `init:`/`start:` hook), nothing else.
+- **Service constructors must be ecosystem-free.** Every service is constructed at
+  the top of `app_main`, before `serviceRunStart` and `spangapInit` — member init
+  only, no storage/fs/log/cli/ITS (heap/PSRAM are up; nothing else is). Real work
+  goes in `onStart`/`onInit`.
+- **The `onStart` band touches only raw hardware.** No `info()`, storage, `fs_*`,
+  or ITS exist yet in that band (a legacy `start:` hook lands here too); using
+  them there crashes or silently no-ops.
 - **`fw.*` is synthesized, never stored.** It is built into the storage dump from
   ROM constants and is not in `cfgRoot`; do not add an `s.sys.banner`-style
   mutable mirror of it.
