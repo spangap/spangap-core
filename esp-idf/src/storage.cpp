@@ -38,6 +38,7 @@
 #include <string>
 #include <vector>
 #include <deque>
+#include <atomic>
 #include <algorithm>
 #include <functional>
 #include <cstdio>
@@ -1835,11 +1836,16 @@ static cJSON* dcGetOrCreateObject(cJSON* parent, const char* name) {
 /* Serialize the accumulated batch as one chunk, append it to dcDumpQueue, and
  * reset *batch to empty. No network I/O — dcPumpDump streams the queue out from
  * the task loop. */
+/* Where a running dump build emits its chunks. Points at dcDumpQueue for the
+ * legacy inline path; the off-actor builder points it at its staging vector.
+ * Only one dump build ever runs at a time (s_dumpBuilding guards). */
+static std::vector<std::string>* s_dumpOut = nullptr;
+
 static void dcDumpEmit(cJSON** batch, size_t* batchLen) {
     if (*batch && (*batch)->child) {
         char* text = cJSON_PrintUnformatted(*batch);
         if (text) {
-            dcDumpQueue.emplace_back(text);
+            s_dumpOut->emplace_back(text);
             cJSON_free(text);
         }
         cJSON_Delete(*batch);
@@ -1889,10 +1895,7 @@ static void dcStreamNode(cJSON** batch, size_t* batchLen,
 /* Build the full dump into dcDumpQueue: a {"__dump":"b"} sentinel, the config
  * tree packed into <=DC_DUMP_MAX chunks, then {"__dump":"e"}. Pure RAM/CPU (no
  * network I/O); dcPumpDump streams the queue out paced to buffer space. */
-static void dcBuildDump() {
-    dcDumpQueue.clear();
-    dcDumpPos = 0;
-
+static void dcBuildDumpInto(std::vector<std::string>& out) {
     CFG_LOCK();
     cJSON* clone = cJSON_Duplicate(cfgRoot, true);
     CFG_UNLOCK();
@@ -1915,7 +1918,8 @@ static void dcBuildDump() {
     }
 
     /* Bracket the stream so the browser knows when the snapshot is complete. */
-    dcDumpQueue.emplace_back("{\"__dump\":\"b\"}");
+    s_dumpOut = &out;
+    out.emplace_back("{\"__dump\":\"b\"}");
 
     cJSON* batch = cJSON_CreateObject();
     size_t batchLen = 0;
@@ -1926,7 +1930,31 @@ static void dcBuildDump() {
     cJSON_Delete(batch);
     cJSON_Delete(clone);
 
-    dcDumpQueue.emplace_back("{\"__dump\":\"e\"}");
+    out.emplace_back("{\"__dump\":\"e\"}");
+    s_dumpOut = nullptr;
+}
+
+/* ---- Off-actor dump builder ----
+ * dcBuildDumpInto is ~1 s of cJSON_Duplicate + serialization on a config tree
+ * bloated by saved announces / Nomad pages. Run inline on the storage actor it
+ * makes the actor deaf for that second — no ping→pong, no port-44 drain — which
+ * trips the browser's 2 s liveness mid-connect and flaps the session in a
+ * connect→dump→abort loop. So the build runs on a one-shot worker task instead:
+ * only the cJSON_Duplicate holds CFG_LOCK (~half the time, and actor waits on
+ * the lock are bounded well under the liveness window); serialization runs
+ * lock-free. The actor adopts the finished queue on its next pass. A generation
+ * counter discards a build whose session died mid-build. */
+static std::vector<std::string> s_dumpStaging;
+static std::atomic<bool>     s_dumpBuilding{false};
+static std::atomic<bool>     s_dumpDone{false};
+static std::atomic<uint32_t> s_dumpGen{0};       /* bumped on connect/disconnect */
+static uint32_t              s_dumpBuildGen = 0; /* gen the running build captured */
+
+static void dumpBuilderFn(void*) {
+    dcBuildDumpInto(s_dumpStaging);
+    s_dumpDone.store(true, std::memory_order_release);
+    xTaskNotifyGive(storageHandle);              /* wake the actor's itsPoll */
+    vTaskDelete(nullptr);
 }
 
 /** Accumulate a changed key into dcPendingPatch for coalesced output. */
@@ -1970,6 +1998,20 @@ static void dcAccumulateChange(const char* key, const char* val) {
  *  stays as a final backstop but should be unreachable below the guard. */
 static void dcFlushPatch() {
     if (!dcPendingPatch || dcHandle < 0) return;
+
+    /* Cheap gate BEFORE serializing: if the DC send link has no room right now
+       (a slow or mid-teardown browser has back-pressured us up to the byte
+       window), don't pay for cJSON_PrintUnformatted of the whole pending patch
+       — which can be a 128 KB Nomad page — on every 10 ms loop pass. A stuck
+       browser would otherwise pin the storage actor in repeated large prints,
+       starving the STORAGE_OP_PORT drain and the ping→pong reply enough to trip
+       the browser's 2 s liveness check (flap) and back up every task's config
+       write. The patch stays intact and coalesces further changes; we retry
+       once the browser drains or reconnects (a reconnect re-dumps anyway).
+       itsSpacesAvailable==0 means no descriptor slot or the window is exhausted;
+       a live browser draining normally always reports the full maxMsg here. */
+    if (itsSpacesAvailable(dcHandle) == 0) return;
+
     char* text = cJSON_PrintUnformatted(dcPendingPatch);
     if (!text) return;
     size_t len = strlen(text);
@@ -2017,7 +2059,29 @@ static bool dcDumpInProgress() {
  *  notification fan-in starves the other. Never blocks. */
 static void dcPumpDump() {
     if (dcHandle < 0) return;
-    if (dcDumpPending) { dcBuildDump(); dcDumpPending = false; }
+    if (dcDumpPending && !s_dumpBuilding.load(std::memory_order_acquire)) {
+        /* Kick the off-actor build. Core 0 (it has headroom; core 1 carries the
+         * UI + actors); 16 KB stack for cJSON_Duplicate's recursion. */
+        s_dumpStaging.clear();
+        s_dumpDone.store(false, std::memory_order_relaxed);
+        s_dumpBuildGen = s_dumpGen.load(std::memory_order_relaxed);
+        s_dumpBuilding.store(true, std::memory_order_release);
+        if (!spawnTask(dumpBuilderFn, "storage_dump", 16384, nullptr, 1, 0, STACK_PSRAM)) {
+            s_dumpBuilding.store(false, std::memory_order_release);
+            warn("dump builder spawn failed — retrying next pass\n");
+        }
+    }
+    if (s_dumpBuilding.load(std::memory_order_acquire) &&
+        s_dumpDone.load(std::memory_order_acquire)) {
+        if (s_dumpBuildGen == s_dumpGen.load(std::memory_order_relaxed) && dcHandle >= 0) {
+            dcDumpQueue = std::move(s_dumpStaging);   /* adopt */
+            dcDumpPos = 0;
+            dcDumpPending = false;
+        }                                             /* else: stale build — discard */
+        s_dumpStaging.clear();
+        s_dumpStaging.shrink_to_fit();
+        s_dumpBuilding.store(false, std::memory_order_release);
+    }
 
     size_t cap = itsSendBufSize(dcHandle);
     while (dcDumpPos < dcDumpQueue.size()) {
@@ -2111,6 +2175,7 @@ static int storageItsConnect(int handle, const void* data, size_t len) {
         return -1;
     }
     dcHandle = handle;
+    s_dumpGen.fetch_add(1, std::memory_order_relaxed);   /* new session — stale builds discard */
     /* Defer the dump to the task loop so we ack the connect immediately. The
        ack is only sent once this callback returns (its.cpp), and the browser
        can't drain the dump stream until it's acked — so building/streaming here
@@ -2122,6 +2187,7 @@ static int storageItsConnect(int handle, const void* data, size_t len) {
 static void storageItsDisconnect(int ref) {
     (void)ref;
     dcHandle = -1;
+    s_dumpGen.fetch_add(1, std::memory_order_relaxed);   /* orphan any in-flight build */
     dcDumpPending = false;
     dcDumpQueue.clear();
     dcDumpQueue.shrink_to_fit();
@@ -2224,4 +2290,5 @@ void storageInit() {
 
     /* storage task: PSRAM stack (config WS + ITS, no direct file I/O) */
     storageHandle = spawnTask(storageTaskFn, "storage", 8192, nullptr, 1, 1);
+
 }

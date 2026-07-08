@@ -188,15 +188,26 @@ sent in the callback, because the connect ack is withheld until the callback
 returns and the browser can't drain the stream until acked; building in-callback
 deadlocks the ack (client gives up after 3 s) and freezes the inbox drain.
 
-- **Dump**: `dcBuildDump` pre-serializes the (secrets-stripped, `fw.*`-injected)
-  tree into `≤ DC_DUMP_MAX` nested-JSON chunks bracketed by `{"__dump":"b"}` /
-  `{"__dump":"e"}`; `dcPumpDump` streams them from the task loop, paced to
-  DataChannel buffer space, never blocking. Chunks are nested objects (not dotted
+- **Dump**: built **off-actor** by a one-shot `storage_dump` worker (core 0,
+  spawned by `dcPumpDump` when `dcDumpPending`): `dcBuildDumpInto` pre-serializes
+  the (secrets-stripped, `fw.*`-injected) tree into `≤ DC_DUMP_MAX` nested-JSON
+  chunks bracketed by `{"__dump":"b"}` / `{"__dump":"e"}`; the actor adopts the
+  finished queue on its next pass (a generation counter, bumped on connect and
+  disconnect, discards a build whose session died mid-build). Off-actor because
+  the build — `cJSON_Duplicate` + serialize over a tree bloated by saved
+  announces / Nomad page bodies — runs ~1 s, and inline it made the actor deaf
+  (no ping→pong, no port-44 drain) long enough to trip the browser's 2 s
+  liveness check on every connect: a connect→dump→abort flap loop. Only the
+  clone holds `CFG_LOCK`; serialization is lock-free. `dcPumpDump` then streams
+  the chunks from the task loop, paced to DataChannel buffer space, never
+  blocking. Chunks are nested objects (not dotted
   paths — announce keys are opaque hashes that may contain `.`); the browser
   deep-merges each.
 - **Patches**: changes coalesce into `dcPendingPatch`; `dcFlushPatch` sends one
   packet per pass, retried on back-pressure, never dropped (a deletion is echoed
-  as an explicit `null`). Patches are **held until the dump fully drains** so a
+  as an explicit `null`). It gates on `itsSpacesAvailable` **before**
+  serializing: against a back-pressured or mid-teardown browser it must not pay
+  `cJSON_PrintUnformatted` of a potentially huge patch on every 10 ms pass. Patches are **held until the dump fully drains** so a
   post-snapshot change can't be overwritten by a late dump chunk.
 - **Inbound**: `dcPollConfig` takes ownership of each JSON body (`itsRecvRef`,
   zero-copy), parses by length. `{"ping":1}`→`{"pong":1}`, `{"save":1}`→poke the
