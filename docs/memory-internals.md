@@ -68,16 +68,106 @@ is gotten wrong.
   independently observed crash — correct, but lower confidence, and it added real
   complexity for an unobserved bug.
 
+- **The corruption window is boot, not steady state (working theory).** Every
+  observed PSRAM-placement casualty so far — the ITS/ring crashes above, the
+  hang after random init, the WiFi heap-struct crash below — fired during or
+  immediately after boot. Boot is the only phase that combines a flash-write storm
+  (`nvs_flash_init` page GC, first-boot PHY-cal write, storage journal replay,
+  littlefs mount metadata) with every init task runnable at once on both cores;
+  each flash program/erase suspends both CPUs' caches, making PSRAM unreachable
+  for its duration, and `SPIRAM_ALLOW_STACK_EXTERNAL_MEMORY=y` +
+  `FREERTOS_TASK_CREATE_ALLOW_EXT_MEM=y` make "no PSRAM-stack task and no
+  PSRAM-touching ISR active across a flash op" a promise we keep by convention,
+  not construction. Steady state does rare, serialized flash writes — the window
+  essentially closes, which is why a "general PSRAM problem" never shows up
+  mid-session. Corollaries: (1) suspect anything newly placed in PSRAM that is
+  *touched during init*; (2) a boot-time stress pair — one task hammering
+  storage/NVS writes, one checksumming a PSRAM buffer — should reproduce the
+  window on demand and is the experiment to run before trusting any fix beyond
+  its observed crash.
+
+- **The WiFi boot crash is the driver's PSRAM *heap* structs, NOT its `.bss`
+  (a whole day of `.bss` pinning was disproven on-device).** The fault: on the
+  first softAP/scan use, ppTask dies dereferencing a near-null pointer —
+  `wifi_nvs_set` **StoreProhibited** via `wifi_softap_set_config` /
+  `wifi_set_mode_process` (EXCVADDR `0x1`/`0x2`/`0x5`), or `ieee80211_send_setup`
+  **LoadProhibited** via the scan path (`scan_*_timeout → clear_bss_queue →
+  send_probereq`, EXCVADDR `0x810`). A pointer *field* inside an otherwise-valid
+  struct has gone to a small garbage value.
+  - **False trail (2026-07-10, do not repeat):** `ALLOW_BSS_SEG_EXTERNAL_MEMORY=y`
+    (added `8019f19`, 06-25, for `PSRAM_BSS`) also keys IDF's `esp_wifi/linker.lf`
+    `extram_bss` mapping, so `libnet80211.a`/`libpp.a` `.bss` moved to PSRAM too.
+    That coincidence drew the diagnosis onto the wifi-nvs shadow table
+    (`s_wifi_nvs`, `ieee80211_nvs.o`). A `spangap-net/esp-idf/linker.lf` fragment
+    pinned first that object, then **every** `libnet80211`/`libpp` object
+    (~7.5 KB) back to internal DRAM. On a build with the whole blob `.bss`
+    confirmed internal (`s_wifi_nvs` at `0x3fcb9a08`, `g_ic` at `0x3fcb9a04`),
+    the **identical** fault recurred. So `.bss` placement was never the live
+    casualty. The fragment has been **backed out** (CMakeLists `LDFRAGMENTS` line
+    + file removed); don't re-add object-pinning fragments for this.
+  - **Real casualty:** the WiFi driver's *runtime heap* allocations — the scanned-
+    BSS list, node/ampdu control structs, the nvs config struct — which land in
+    PSRAM because `ALWAYSINTERNAL=0` (below) routes every uncapped `malloc`
+    there. Corrupted in the boot window, they hand back a garbage pointer. ldgen
+    can only place static sections, so no linker fragment can ever reach these.
+  - **Why it started 2026-07-10 and not before:** two independent changes
+    collided. `ALWAYSINTERNAL=0` (`9c534b2`, 05-28) first sent these control
+    structs to PSRAM; the browser frontend + on-demand radio gating (`31aefa1`
+    06-11, `73baade` 06-13) put softAP/APSTA into regular use — the exact path
+    that allocates and touches them during boot. Before late May they were
+    internal; before mid-June the path never ran.
+  - **Fix shipped (net.cpp): defer bring-up past the boot storm.** The net task
+    waits on `sys.boot_complete` (set by `spangapPostAppInit` after the whole
+    init walk + boot script) then `storageSave()`-drains pending flushes before
+    `wifiHwStart`, so the radio's PSRAM structs are allocated/written against
+    idle flash. **Zero internal-DRAM cost** — the reason to prefer it over the
+    threshold below. Holes: it narrows the window rather than removing the class
+    (a rare steady-state flash+access pairing can still bite), and first-boot PHY
+    calibration is WiFi's *own* NVS write inside `esp_wifi_init`, which deferral
+    can't separate. Confirmed on-device: the every-boot softAP/scan crash stops.
+  - **Gotcha 1 — the gate must PUMP `itsPoll`, not block.** Storage change
+    notifications (incl. `sys.boot_complete`) are delivered over ITS and only
+    dispatched while the subscriber task is *inside* `itsPoll`. A first cut that
+    did `xSemaphoreTake(gateSem, 15s)` before the net task's poll loop deadlocked
+    against its own signal and hit the 15 s timeout **every boot** — WiFi still
+    came up (backstop) and the crash still fixed (15 s clears the storm), so it
+    silently "worked" while never using the signal. The gate now spins on a flag
+    set by the sub callback, calling `itsPoll` each pass. Any future boot-complete
+    subscriber that waits must keep pumping ITS.
+  - **Gotcha 2 — deferring WiFi un-masked a latent GPS light-sleep bug.** The
+    T-Deck GPS UART (`hw-tdeck/gps.cpp`) runs on the APB clock and held no PM
+    lock; its autobaud detect loop blocks in `uart_read_bytes`, so with
+    `PM_ENABLE`+tickless idle, light sleep gates the UART mid-listen and the
+    receiver reads as absent ("no NMEA at any baud", intermittent). It only ever
+    worked because early WiFi bring-up held a pre-connect-scan no-light-sleep
+    lock that blanketed the ~2–4 s autobaud window; deferral removed that cover.
+    Fix: GPS takes its own `PM_NO_LIGHT_SLEEP` across autobaud **only** (steady
+    state tolerates light sleep — WiFi is `WIFI_PS_MAX_MODEM` post-connect, so
+    the receiver already coped). General lesson: don't let one subsystem lean on
+    another's incidental PM lock.
+  - **Deterministic alternative if the gate proves leaky:** a non-zero
+    `ALWAYSINTERNAL` (~4 KB) pulls the sub-4 KB WiFi control structs internal
+    (~15–30 KB, scan-BSS list is the peak). mbedTLS is **not** collateral — it's
+    already `EXTERNAL_MEM_ALLOC` (PSRAM, explicit `MALLOC_CAP_SPIRAM`, immune to
+    the threshold), as is everything via `gp_alloc`/`new`/cJSON. The threshold's
+    real co-passenger is lwIP heap use, bounded by socket count.
+  - **The decisive test:** if the boot-complete gate does *not* stop the crash,
+    the mechanism is not placement corruption — it's a never-initialized pointer
+    (a driver-adapter logic bug), since the tiny EXCVADDR values fit that equally
+    well. Chase it in the WiFi OSI adapter, not memory placement.
+
 - **`CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=0` is the armed landmine (systemic,
-  not yet fixed).** The two fixes above are surgical pins; the root condition —
-  every untagged allocation defaulting to PSRAM — still routes other IDF driver
-  control structs (UART / SPI / SD ring buffers and queues) into PSRAM, where the
-  same bug can fire. The durable fix is to give cJSON explicit PSRAM allocator
-  hooks (it has none today and only tolerates PSRAM residence because of `=0`),
-  then restore a sane `ALWAYSINTERNAL` threshold so driver control structs
-  default to internal — gated on an on-device internal-DRAM headroom check first
-  (WiFi-connected + SD + LCD, per the connect-cost rule below). Until then, treat
-  any new driver ring/queue as suspect.
+  not yet fixed).** The root condition — every untagged allocation defaulting to
+  PSRAM — routes IDF driver control structs (WiFi heap structs per above; also
+  UART / SPI / SD ring buffers and queues) into PSRAM, where boot-window
+  corruption can fire. Note the app's own allocations are mostly safe: `gp_alloc`
+  / `operator new` / cJSON (hooked to `gp_alloc` at `storage.cpp` via
+  `cJSON_InitHooks`) all name `MALLOC_CAP_SPIRAM` explicitly and are immune to
+  the threshold either way. The durable fix is to restore a sane `ALWAYSINTERNAL`
+  threshold so *default-allocator* driver structs land internal — gated on an
+  on-device internal-DRAM headroom check first (WiFi-connected + SD + LCD, per
+  the connect-cost rule below). Until then, treat any new driver ring/queue as
+  suspect.
 
 - **A FreeRTOS task-cleanup hook must match IDF's *live* hook name, or it
   compiles, links, and is never called.** Under IDF 5.5 the live hook is
