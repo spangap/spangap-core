@@ -226,8 +226,9 @@ static int pmBufWrite(void* cookie, const char* data, int len) {
  *  otherwise can't see (wifi, rtos0/1, driver locks) and is NULL-name-safe
  *  since IDF 5.5 (prints lock@<ptr>). It can't see our PM_NO_DEEP_SLEEP locks
  *  (no esp_handle), so we splice those into its table. Under profiling its
- *  output also carries Mode + Sleep stats — we keep both; Sleep stats' light-
- *  sleep reject count is the "why no light sleep" signal. */
+ *  output also carries Mode + Sleep stats — we drop the Mode table (the `pm`
+ *  summary already reports those counters, correctly bucketed) and keep Sleep
+ *  stats, whose light-sleep reject count is the "why no light sleep" signal. */
 static void pmDumpLocks() {
   char* buf = (char*)gp_alloc(4096);
   if (buf) {
@@ -244,9 +245,14 @@ static void pmDumpLocks() {
     return;
   }
 
-  /* esp_pm_dump_locks' table, then our NO_DEEP_SLEEP rows, then (profiling)
-   * the Mode + Sleep stats that trail it — splice our rows in before them. */
-  char* mode = strstr(buf, "\nMode stats:");
+  /* esp_pm_dump_locks' lock table, then our NO_DEEP_SLEEP rows. Under profiling
+   * its output also trails a "Mode stats" table and a "Sleep stats" block. We
+   * DROP the Mode stats table: it's the same per-mode counters the summary above
+   * already reports (correctly bucketed), and printing both raw-and-summary was
+   * the source of the "two different numbers" confusion. We keep Sleep stats —
+   * its light-sleep reject count is the "why no light sleep" signal. */
+  char* mode      = strstr(buf, "\nMode stats:");
+  char* sleepStat = strstr(buf, "\nSleep stats:");
   size_t head = mode ? (size_t)(mode - buf) : strlen(buf);
   cliPrintf("\n");
   cliWrite(buf, head);
@@ -264,7 +270,7 @@ static void pmDumpLocks() {
               l->name ? l->name : "?", pmTypeName(l->type), 0, l->count);
 #endif
   }
-  if (mode) cliWrite(mode, strlen(mode));        /* Mode stats + Sleep stats */
+  if (sleepStat) cliWrite(sleepStat, strlen(sleepStat));  /* Sleep stats only (Mode stats == summary above) */
   free(buf);
 }
 
@@ -416,14 +422,24 @@ static void pmParseModeStats(int64_t modeUs[PM_MODE_COUNT]) {
 static void pmPrintModeLines(int64_t mode[PM_MODE_COUNT], int64_t deepUs,
                              int64_t wall, int32_t dsCount = 0) {
   if (wall <= 0) return;
-  int dsPct    = (int)(deepUs * 100 / wall);
-  int sleepPct = (int)(mode[PM_MODE_LIGHT_SLEEP] * 100 / wall);
-  int minPct   = (int)(mode[PM_MODE_APB_MIN] * 100 / wall);
-  int maxPct   = 100 - dsPct - sleepPct - minPct;
+  int dsPct     = (int)(deepUs * 100 / wall);
+  int sleepPct  = (int)(mode[PM_MODE_LIGHT_SLEEP] * 100 / wall);
+  int cpuMaxPct = (int)(mode[PM_MODE_CPU_MAX] * 100 / wall);
+  /* APB_MIN and APB_MAX BOTH run the CPU at the DFS floor (80 MHz); they differ
+   * only in whether the APB bus is pinned high. So "80 MHz" is their sum and
+   * only CPU_MAX is 240 MHz. (The old split folded APB_MAX — CPU 80 — into the
+   * 240 MHz line, so a chip pinned at APB-max by a radio read as "240 MHz".) */
+  int cpu80Pct  = 100 - dsPct - sleepPct - cpuMaxPct;
+  /* Share of wall time the APB bus was pinned high while awake (APB_MAX +
+   * CPU_MAX). This — not CPU speed — is what holds off light sleep: a high value
+   * alongside a LOW 240 MHz figure is a peripheral/radio APB lock (Wi-Fi,
+   * SoftAP), not CPU load. Orthogonal to the CPU lines, so it doesn't sum in. */
+  int apbHiPct  = (int)((mode[PM_MODE_APB_MAX] + mode[PM_MODE_CPU_MAX]) * 100 / wall);
   cliPrintf("deep sleep    %d%% (%d)\n", dsPct, (int)dsCount);
   cliPrintf("light sleep   %d%%\n", sleepPct);
-  cliPrintf("80 MHz        %d%%\n", minPct);
-  cliPrintf("240 MHz       %d%%\n", maxPct);
+  cliPrintf("CPU  80 MHz   %d%%\n", cpu80Pct);
+  cliPrintf("CPU 240 MHz   %d%%\n", cpuMaxPct);
+  cliPrintf("\nAPB_FREQ_MAX  %d%%  (prevents light sleep)\n", apbHiPct);
 }
 #endif
 
