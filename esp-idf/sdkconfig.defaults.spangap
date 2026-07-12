@@ -95,6 +95,15 @@ CONFIG_HEAP_TASK_TRACKING=y
 # switch that also pulls in comprehensive poisoning + the strict PTRVAL stack
 # check. Set CONFIG_SPANGAP_WATCH_ADDR=<addr> to catch a UAF writer's backtrace.
 
+# --- PARKED: heap-corruption hunt. The prime suspect (the lcd task overflowing
+# its 16 KB PSRAM stack into adjacent PSRAM) is now fixed (lcd stack → 32 KB), so
+# the poisoning kit is stood down to remove its CPU cost while we confirm the
+# genBuf panic is gone and to keep input timing clean. Re-enable all three lines
+# if `genBuf ... outside heap` / a stack overflow recurs:
+#   CONFIG_SPANGAP_HEAP_INTEGRITY_POLL=y
+#   CONFIG_HEAP_POISONING_COMPREHENSIVE=y
+#   CONFIG_FREERTOS_CHECK_STACKOVERFLOW_PTRVAL=y
+
 # IPC task stack — IDF default 1280 B is enough for the bare IPC service but not
 # for cross-core init callbacks: the LittleFS init path that runs on ipc0 during
 # spangap_init has been seen to overflow 1280 B. 4 KiB gives comfortable room.
