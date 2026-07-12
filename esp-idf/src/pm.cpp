@@ -338,28 +338,33 @@ void pmPollUsb() {
   /* Up acts immediately (keep the console alive ASAP); down needs 3
    * consecutive 1 Hz samples so a brief SOF gap — e.g. a monitor
    * respawn around a reflash — can't latch light sleep on. */
-  static uint8_t downStreak = 0;
-  static bool    recoveryTried = false;
+  static uint8_t  downStreak = 0;
+  static uint32_t lastRecoverMs = 0;   /* 0 = none attempted this outage */
   if (connected || inGrace) {
     downStreak = 0;
-    recoveryTried = false;
+    lastRecoverMs = 0;
     if (!held) pmLockAcquire(usbLock);
   } else {
     if (downStreak < 3) downStreak++;
     if (downStreak >= 3) {
-      if (!recoveryTried) {
-        /* Sustained loss. Before conceding to light sleep, force one
-         * clean re-enumeration: if a host is actually still attached
-         * (slow monitor respawn, or the controller wedged after an
-         * earlier light-sleep nap), cliUsbUp() resets the peripheral +
-         * re-asserts the D+ pull-up so the host re-detects us. It also
-         * re-acquires the lock; give it ~3 s to come back. */
-        recoveryTried = true;
+      if (!lastRecoverMs || now - lastRecoverMs >= 60000) {
+        /* Sustained loss. Force a clean re-enumeration: if a host is
+         * actually attached (slow monitor respawn, or the controller
+         * wedged after a light-sleep nap), cliUsbUp() resets the
+         * peripheral + re-asserts the D+ pull-up so the host re-detects
+         * us. It also re-acquires the lock; give it ~3 s to come back.
+         * Retried every 60 s, never just once: a wedge means the
+         * controller can't see SOF *at all*, so if the single attempt
+         * misses the host (or the host is plugged in only after we've
+         * already slept) nothing would ever read connected again — the
+         * console would be dead until reboot. Cost of retrying while
+         * genuinely unplugged: ~3 s of held lock per minute. */
+        lastRecoverMs = now ? now : 1;
         downStreak = 0;
         cliUsbUp();
       } else if (held) {
-        /* Recovery didn't bring a host back — genuine disconnect.
-         * Release so light sleep can proceed. */
+        /* Recovery didn't bring a host back — no host right now.
+         * Release so light sleep can proceed; the 60 s retry re-checks. */
         pmLockRelease(usbLock);
       }
     }

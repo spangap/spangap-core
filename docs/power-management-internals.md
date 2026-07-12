@@ -80,9 +80,13 @@ once a second and debounces:
 - **Up** acts immediately (keep the console alive ASAP) — acquire `usb` if not
   held, on connection or within the 5 s boot grace.
 - **Down** needs **3 consecutive 1 Hz down samples**, and before conceding it
-  calls `cliUsbUp()` once to force a clean re-enumeration (a slow monitor respawn
+  calls `cliUsbUp()` to force a clean re-enumeration (a slow monitor respawn
   or a controller wedged after a light-sleep nap looks like a disconnect). Only if
-  that recovery brings no host back does it release `usb`.
+  that recovery brings no host back does it release `usb` — and it keeps retrying
+  the recovery every 60 s while down. The retry is load-bearing: a sleep-wedged
+  controller can't see SOF at all, so without it a host plugged in after the
+  device has already slept would never be detected and the console would stay
+  dead until reboot (~3 s of held lock per retry while genuinely unplugged).
 
 `cliUsbDown()` disables the D+ pullup via
 `usb_serial_jtag_ll_phy_enable_pull_override()` (all pulls off → host sees
