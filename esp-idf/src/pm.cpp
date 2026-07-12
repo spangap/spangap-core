@@ -481,6 +481,13 @@ int pmGpioWakeEnable(int pin, int wakeLevel) {
     err("pmGpioWakeEnable: gpio_wakeup_enable(%d): %s", pin, esp_err_to_name(r));
     return r;
   }
+  /* CONFIG_PM_SLP_DISABLE_GPIO isolates every pin to its sleep config on entering
+   * automatic light sleep (the "isolate all GPIO pins in sleep state" boot line).
+   * A wake pin isolated that way never sees its edge/level, so the wakeup silently
+   * never fires. Exclude this pin from the sleep-config switch so it keeps its live
+   * input + pull + interrupt config across light sleep and can actually wake us.
+   * Restored with gpio_sleep_sel_en() in pmGpioWakeDisable. */
+  gpio_sleep_sel_dis((gpio_num_t)pin);
   if (!s_gpioWakeArmed) {
     r = esp_sleep_enable_gpio_wakeup();
     if (r != ESP_OK) {
@@ -496,6 +503,7 @@ int pmGpioWakeEnable(int pin, int wakeLevel) {
 
 void pmGpioWakeDisable(int pin) {
   gpio_wakeup_disable((gpio_num_t)pin);
+  gpio_sleep_sel_en((gpio_num_t)pin);   /* re-join the sleep-config switch (undo pmGpioWakeEnable) */
   /* We do not turn off the global esp_sleep_enable_gpio_wakeup() — other
    * pins may still rely on it, and it's a no-op for unconfigured pins. */
 }
