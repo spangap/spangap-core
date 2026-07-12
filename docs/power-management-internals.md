@@ -18,7 +18,10 @@ is the user-facing surface. Source:
   `pmListMux`; `esp_pm_lock_create` runs outside that spinlock.
 - **`sys.going_down` trigger** — `pmLockRelease()` writes `sys.going_down=1` when
   `deepSleepAllowed()` flips true. This is the only place that signals sleep; pm
-  itself never calls `esp_deep_sleep_start()`.
+  itself never calls `esp_deep_sleep_start()`. **Currently commented out** — deep
+  sleep is not supported at the moment, along with cron's `going_down`
+  subscription / `cronDeepSleep()` and the `pm` command's deep-sleep line and
+  NO_DEEP_SLEEP lock rows.
 - **CPU boost** — `pmBoostAuto` / `pmBoost` / `pmBoostEnd` / `pmBoostHeld`, per-task
   `CPU_FREQ_MAX` locks, the `boost_task_t` registry, and the `TLS_PM_BOOST` slot
   (§7).

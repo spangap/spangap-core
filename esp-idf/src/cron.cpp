@@ -264,6 +264,11 @@ bool cronPoll(bool execute) {
 
 /* ---- Deep sleep ---- */
 
+/* Deep sleep is not supported at the moment — every entry path is commented
+ * out: pmLockRelease() no longer raises sys.going_down (pm.cpp), the
+ * subscription below is disabled, and cronWakeupHandler() no longer re-sleeps
+ * on a no-work wake. */
+#if 0
 static void cronDeepSleep() {
     time_t now = time(nullptr);
     int sleepSec = 61 - (int)(now % 60);  /* +1s so we land inside the new minute */
@@ -276,6 +281,7 @@ static void cronDeepSleep() {
     esp_sleep_enable_timer_wakeup((uint64_t)sleepUs);
     esp_deep_sleep_start();
 }
+#endif
 
 bool cronWakeupHandler() {
     if (esp_sleep_get_wakeup_cause() != ESP_SLEEP_WAKEUP_TIMER)
@@ -286,11 +292,13 @@ bool cronWakeupHandler() {
     isDeepSleepWake = true;
     printf("cron: deep sleep wakeup\n");
 
-    if (!cronPoll(false)) {
-        /* No work this minute — go back to sleep */
-        cronDeepSleep();
-        return false;  /* unreachable */
-    }
+    /* Deep sleep is not supported at the moment — never re-enter it on a
+     * no-work wake; finish booting instead. */
+    // if (!cronPoll(false)) {
+    //     /* No work this minute — go back to sleep */
+    //     cronDeepSleep();
+    //     return false;  /* unreachable */
+    // }
 
     /* Work to do — stay awake, cron task will handle it */
     return true;
@@ -305,9 +313,11 @@ static void cronTaskFn(void*) {
     cronUpdateLock();
 
     storageSubscribeChanges("s.cron", ON_CHANGE { cronUpdateLock(); });
-    storageSubscribeChanges("sys.going_down", ON_CHANGE {
-        if (atoi(val)) cronDeepSleep();  /* never returns */
-    });
+    /* Deep sleep is not supported at the moment (see cronDeepSleep above) —
+     * and going_down must not sleep the device even if set by hand. */
+    // storageSubscribeChanges("sys.going_down", ON_CHANGE {
+    //     if (atoi(val)) cronDeepSleep();  /* never returns */
+    // });
 
     for (;;) {
         while (itsPoll(pdMS_TO_TICKS(30000))) {}

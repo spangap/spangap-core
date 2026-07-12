@@ -102,8 +102,12 @@ void pmLockRelease(pm_lock_handle_t h) {
     h->time_held += esp_timer_get_time() - h->last_taken;
   if (h->esp_handle)
     esp_pm_lock_release(h->esp_handle);
-  if (deepSleepAllowed())
-    storageSet("sys.going_down", 1);
+  /* Deep sleep is not supported at the moment. This was its sole trigger:
+   * last NO_DEEP_SLEEP lock out → sys.going_down=1 → cron's subscription
+   * enters deep sleep. Re-enable together with the going_down subscription
+   * and cronDeepSleep() in cron.cpp. */
+  // if (deepSleepAllowed())
+  //   storageSet("sys.going_down", 1);
 }
 
 /* ---- CPU boost (notify-driven) ---- (see pm.h / docs/plans/pm-task-boost.md) */
@@ -239,9 +243,11 @@ static void pmDumpLocks() {
   if (!buf || !buf[0]) {                 /* fallback: at least our own locks */
     free(buf);
     cliPrintf("\nPM locks (own only):\n");
-    for (pm_lock* l = pmLockList; l; l = l->next)
+    for (pm_lock* l = pmLockList; l; l = l->next) {
+      if (l->type == PM_NO_DEEP_SLEEP) continue;   /* deep sleep unsupported — hidden */
       cliPrintf("%-15.15s %-14s  %d\n", l->name ? l->name : "?",
                 pmTypeName(l->type), l->count);
+    }
     return;
   }
 
@@ -256,6 +262,9 @@ static void pmDumpLocks() {
   size_t head = mode ? (size_t)(mode - buf) : strlen(buf);
   cliPrintf("\n");
   cliWrite(buf, head);
+  /* Deep sleep is not supported at the moment — the NO_DEEP_SLEEP rows (our
+   * own locks, spliced in because esp_pm can't see them) are hidden. */
+#if 0
   for (pm_lock* l = pmLockList; l; l = l->next) {
     if (l->type != PM_NO_DEEP_SLEEP) continue;   /* esp-backed locks already listed */
 #ifdef CONFIG_PM_PROFILING
@@ -270,6 +279,7 @@ static void pmDumpLocks() {
               l->name ? l->name : "?", pmTypeName(l->type), 0, l->count);
 #endif
   }
+#endif
   if (sleepStat) cliWrite(sleepStat, strlen(sleepStat));  /* Sleep stats only (Mode stats == summary above) */
   free(buf);
 }
@@ -435,7 +445,10 @@ static void pmPrintModeLines(int64_t mode[PM_MODE_COUNT], int64_t deepUs,
    * alongside a LOW 240 MHz figure is a peripheral/radio APB lock (Wi-Fi,
    * SoftAP), not CPU load. Orthogonal to the CPU lines, so it doesn't sum in. */
   int apbHiPct  = (int)((mode[PM_MODE_APB_MAX] + mode[PM_MODE_CPU_MAX]) * 100 / wall);
-  cliPrintf("deep sleep    %d%% (%d)\n", dsPct, (int)dsCount);
+  /* Deep sleep is not supported at the moment — hide its always-0 line. dsPct
+   * stays in the cpu80Pct math above so the split still sums when re-enabled. */
+  (void)dsCount;
+  // cliPrintf("deep sleep    %d%% (%d)\n", dsPct, (int)dsCount);
   cliPrintf("light sleep   %d%%\n", sleepPct);
   cliPrintf("CPU  80 MHz   %d%%\n", cpu80Pct);
   cliPrintf("CPU 240 MHz   %d%%\n", cpuMaxPct);
