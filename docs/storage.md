@@ -173,7 +173,10 @@ key appear at next boot beside untouched existing values.
 A subtree can be persisted to its own file under
 `<stateDir>/storage/external/<prefix>.json` instead of bloating `root.json`, so
 a chatty subtree (one contact's message history) rewrites only its own small
-file. Drop a file in `data/factory_state/storage/external/` and it is picked up
+file. (On disk the file is actually written gzip-compressed as
+`<prefix>.json.gz` — as is `root.json` — but a plain hand-placed `.json` is
+read fine and converted on the next flush.) Drop a file in
+`data/factory_state/storage/external/` and it is picked up
 at boot with no compile-time registration; or call `storageNewTreeFile("s.foo")`
 at runtime (RAM-only — safe from `itsPoll`-serving tasks; the physical file is
 created on the next flush when a key under the prefix dirties it). Deleting the

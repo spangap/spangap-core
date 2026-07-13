@@ -75,8 +75,10 @@ arrays in a patch still replace wholesale.
 `routePatchDirty` walks the committed patch and sets dirty flags: a subtree
 whose path exactly equals a registered external prefix marks **that external**
 dirty (and stops descending); any primitive/array leaf under `s.`/`secrets.`
-marks `rootDirty`. `externals` is kept longest-prefix-first so overlapping
-prefixes route correctly.
+marks `rootDirty`. `externals` is kept **shortest-prefix-first** — a *load*-order
+invariant (§5), not a routing one: `routePatchDirty` exact-matches the patch
+path at each depth, so vector order never changes which external a write
+dirties.
 
 ## 3. The actor: op-list framing and apply pipeline
 
@@ -158,11 +160,14 @@ compacts it.
 
 The save timer (`esp_timer`, `s.storage.flash_delay` seconds, 1 s floor) fires
 `requestSave` → `xTaskNotifyGive(storage_save)`. The worker runs
-`writeSettingsFile`: it processes external deletes (`fs_remove` + unregister)
-and dirty externals (each writes its own subtree atomically), then rewrites
-`root.json` if `rootDirty`. `root.json` is `cfgRoot` minus the external subtrees
-(detached during the snapshot via `withExternalsDetached`, then reattached)
-minus ephemerals (only `s` and `secrets` are serialized).
+`writeSettingsFile` in a **crash-safe order**: dirty externals first (each
+writes its own subtree atomically), then `root.json` if `rootDirty`, and only
+*then* external deletes (`fs_remove` of both format siblings + unregister) —
+data is never deleted before its replacement is durable. `root.json` is
+`cfgRoot` minus the external subtrees (detached during the snapshot via
+`withExternalsDetached`, then reattached — a `pendingDelete` external is
+skipped there, so its content persists via `root.json`) minus ephemerals (only
+`s` and `secrets` are serialized).
 
 Both writers follow the dump-builder lock shape: only the `cJSON_Duplicate`
 snapshot holds `CFG_LOCK`; `cJSON_PrintUnformatted` runs lock-free. Printing a
@@ -171,14 +176,30 @@ large conversation external under the lock blocked the actor's
 long enough to time out every task's sync write and trip the browser's 2 s DC
 liveness. Compact output also shrinks the flash write itself.
 
-All writes go through `atomicWriteJson` (`<file>.new` + `fs_rename`) —
-overwrite-correct on FAT because `fs_rename` removes an existing dest and
-retries (see [fs](fs.md)). It writes in `STORAGE_FLUSH_CHUNK` (8 KB) pieces
-with a tick's sleep between them: each flash program/erase op disables the
-PSRAM cache, and one large `fs_write` keeps those windows back-to-back for the
-whole file, starving every PSRAM-stack task (actor, rnsd, lxmf, ifaces) for
+All writes go through `atomicWriteJsonGz` → `atomicWriteFile` (`<file>.new` +
+`fs_rename`) — overwrite-correct on FAT because `fs_rename` removes an existing
+dest and retries (see [fs](fs.md)). It writes in `STORAGE_FLUSH_CHUNK` (8 KB)
+pieces with a tick's sleep between them: each flash program/erase op disables
+the PSRAM cache, and one large `fs_write` keeps those windows back-to-back for
+the whole file, starving every PSRAM-stack task (actor, rnsd, lxmf, ifaces) for
 its duration. The inter-chunk tick is what keeps the actor responsive while a
-multi-hundred-KB external flushes.
+large external flushes.
+
+**Files are persisted gzip-compressed** (`<name>.json.gz`, ROM miniz
+tdefl/tinfl + `esp_rom_crc32_le` for the footer): JSON compresses ~5–10×, and
+since the fs worker's flash write windows are the system's stall source, a
+smaller file shortens the blocking write far more than deflate costs on the
+background save worker. Reads (`readJsonFile`) accept both `<base>.json.gz`
+and plain `<base>.json` (legacy files, hand-placed files, factory seeds; a
+corrupt `.gz` falls back to the plain sibling); writes only ever produce the
+`.gz` and remove the plain sibling so a stale format can't shadow newer data.
+The miniz one-shot entry points are deliberately avoided — they put an ~11 KB
+decompressor on the caller stack or allocate from the ROM heap — state is
+`gp_alloc`'d (PSRAM) and transient instead. Callers always name the base
+`.json` path; only the read/write helpers know about the `.gz` sibling.
+`storageNewTreeFile` refuses a prefix whose basename would exceed
+`fs_dirent_t`'s 64-byte name (it would be re-registered *truncated* on the
+next boot's rescan); the subtree then simply persists via `root.json`.
 
 `storageSave()` is a synchronous `'W'` op carrying a binary semaphore the worker
 gives after the flush; **never call it from the storage task** (it would wait on
@@ -188,10 +209,27 @@ directly.
 `storageLoad` (run on `main_task`, before the storage task spawns): mkdirp
 `<stateDir>/storage/external`, parse `root.json` (absent → `{}`), `scanExternals`
 + `loadExternals` (external files overwrite same-path content from `root.json`),
-and on first boot deep-merge `/fixed/additional_state/settings.json`. The storage
-task then **re-homes** the tree onto itself (`cJSON_Duplicate` of `cfgRoot`) so
-the long-lived tree is attributed to `storage`, not the self-deleting
-`main_task`.
+and on first boot deep-merge `/fixed/additional_state/settings.json`. Externals
+load **shortest-prefix-first**: a parent external (`s.lxmf`) must attach before
+a deeper one (`s.lxmf.id.0.msgs.<peer>`) so the deeper file's newer content
+overwrites its slice of the parent — `attachAtPath` replaces the whole node at
+the prefix. The storage task then **re-homes** the tree onto itself
+(`cJSON_Duplicate` of `cfgRoot`) so the long-lived tree is attributed to
+`storage`, not the self-deleting `main_task`.
+
+**Legacy `s.lxmf` monolith split** (`migrateLxmfMonolith`, end of
+`storageLoad`): a monolithic `s.lxmf` external predates lxmf's per-conversation
+`storageNewTreeFile` registration and would otherwise persist forever —
+`scanExternals` resurrects registrations from filenames, so nothing retires it
+and every message write rewrites the whole file. The one-time split registers a
+dirty external per non-empty conversation, marks the monolith `pendingDelete`
+and sets `rootDirty` (contacts/identity fall through to `root.json` because
+`withExternalsDetached` skips `pendingDelete` entries); `storageInit` kicks a
+save if any migration dirt is pending. Crash-safe end to end: deletes flush
+last, and until the monolith file is actually removed a reboot just re-runs the
+split — with both generations on disk, the load order above makes the deeper
+per-conversation files win. A conversation whose prefix would overflow the
+64-byte dirent name is left unsplit (it persists via `root.json`).
 
 ## 6. Browser DataChannel protocol
 

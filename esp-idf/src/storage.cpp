@@ -48,6 +48,8 @@
 #include "cJSON.h"
 #include "esp_timer.h"
 #include "esp_heap_caps.h"
+#include "miniz.h"        /* ROM tdefl/tinfl — gz-compressed storage files */
+#include "esp_rom_crc.h"  /* esp_rom_crc32_le == zlib crc32 for the gzip footer */
 
 /* ---- External storage files ----
  *
@@ -410,8 +412,9 @@ static bool isFw(const char* key) {
   return strcmp(key, "fw") == 0 || strncmp(key, "fw.", 3) == 0;
 }
 
-/** Read entire file into malloc'd buffer (NUL-terminated). Uses fs API. */
-static char* readFileStr(const char* path) {
+/** Read entire file into malloc'd buffer (NUL-terminated). Uses fs API.
+ *  Optionally reports the byte length (excluding the NUL) via outLen. */
+static char* readFileStr(const char* path, size_t* outLen = nullptr) {
   struct stat st;
   if (fs_stat(path, &st) != 0 || st.st_size <= 0) return nullptr;
   int f = fs_open(path, "rb");
@@ -421,6 +424,7 @@ static char* readFileStr(const char* path) {
   fs_read(buf, 1, st.st_size, f);
   buf[st.st_size] = '\0';
   fs_close(f);
+  if (outLen) *outLen = (size_t)st.st_size;
   return buf;
 }
 
@@ -435,17 +439,16 @@ static char* readFileStr(const char* path) {
  * ticks on the background flush. */
 #define STORAGE_FLUSH_CHUNK 8192
 
-/** Atomic write of `text` to `path` via `<path>.new` + rename. */
-static bool atomicWriteJson(const char* path, const char* text) {
+/** Atomic write of `data[len]` to `path` via `<path>.new` + rename. */
+static bool atomicWriteFile(const char* path, const void* data, size_t len) {
   std::string tmp = std::string(path) + ".new";
   int f = fs_open(tmp.c_str(), "w");
   if (f < 0) return false;
-  size_t len = strlen(text);
   bool ok = true;
   for (size_t off = 0; off < len; ) {
     size_t n = len - off;
     if (n > STORAGE_FLUSH_CHUNK) n = STORAGE_FLUSH_CHUNK;
-    if (fs_write(text + off, 1, n, f) != n) { ok = false; break; }
+    if (fs_write((const char*)data + off, 1, n, f) != n) { ok = false; break; }
     off += n;
     if (off < len) vTaskDelay(1);
   }
@@ -453,6 +456,142 @@ static bool atomicWriteJson(const char* path, const char* text) {
   if (ok) fs_rename(tmp.c_str(), path);
   else    fs_remove(tmp.c_str());
   return ok;
+}
+
+/* ---- gzip storage files (ROM miniz) ----
+ *
+ * Storage JSON is persisted gzip-compressed: JSON compresses ~5-10×, and the
+ * single fs worker + SD/flash write windows are the system's stall source —
+ * a smaller file shortens the blocking write far more than deflate costs on
+ * the (background) saving task. Reads accept BOTH <base>.gz and plain <base>
+ * (legacy files, hand-placed files, factory seeds); writes only ever produce
+ * <base>.gz and remove the plain sibling so the stale format can't shadow
+ * newer data on the next read.
+ *
+ * The ROM one-shot entry points (tdefl/tinfl *_mem_to_mem/_to_heap) are
+ * deliberately avoided: they place an ~11 KB tinfl_decompressor on the caller
+ * stack, or MZ_MALLOC state from the ROM heap — wrong on our 8 KB PSRAM-stack
+ * tasks. State is gp_alloc'd (PSRAM) instead: ~160 KB tdefl_compressor per
+ * save, ~11 KB tinfl_decompressor per load, both transient. */
+
+#define GZ_HDR_LEN   10
+#define GZ_FOOT_LEN  8
+/* Fast-and-good-enough deflate: greedy parsing, 32 dictionary probes. JSON
+ * still compresses ~5× here at roughly twice the speed of the 128-probe
+ * default; the save worker pays the CPU, the fs worker saves the I/O. */
+#define GZ_TDEFL_FLAGS (32 | TDEFL_GREEDY_PARSING_FLAG)
+
+/** Compress `in[inLen]` into a malloc'd gzip stream. NULL on failure. */
+static uint8_t* gzDeflate(const void* in, size_t inLen, size_t* outLen) {
+  /* Raw-deflate worst case is a hair over input (stored blocks: 5 B/64 KB);
+   * inLen/8 + 192 covers it plus header/footer with a wide margin. */
+  size_t cap = GZ_HDR_LEN + GZ_FOOT_LEN + inLen + inLen / 8 + 192;
+  uint8_t* out = (uint8_t*)gp_alloc(cap);
+  if (!out) return nullptr;
+  tdefl_compressor* comp = (tdefl_compressor*)gp_alloc(sizeof(tdefl_compressor));
+  if (!comp) { free(out); return nullptr; }
+
+  static const uint8_t hdr[GZ_HDR_LEN] =
+      { 0x1f, 0x8b, 8, 0, 0, 0, 0, 0, 0, 0xff };  /* deflate, no name, OS=unknown */
+  memcpy(out, hdr, GZ_HDR_LEN);
+
+  size_t inSz = inLen, outSz = cap - GZ_HDR_LEN - GZ_FOOT_LEN;
+  tdefl_init(comp, nullptr, nullptr, GZ_TDEFL_FLAGS);
+  tdefl_status st = tdefl_compress(comp, in, &inSz,
+                                   out + GZ_HDR_LEN, &outSz, TDEFL_FINISH);
+  free(comp);
+  if (st != TDEFL_STATUS_DONE || inSz != inLen) { free(out); return nullptr; }
+
+  uint32_t crc = esp_rom_crc32_le(0, (const uint8_t*)in, inLen);
+  uint32_t isz = (uint32_t)inLen;
+  memcpy(out + GZ_HDR_LEN + outSz,     &crc, 4);   /* LE target, direct copy */
+  memcpy(out + GZ_HDR_LEN + outSz + 4, &isz, 4);
+  *outLen = GZ_HDR_LEN + outSz + GZ_FOOT_LEN;
+  return out;
+}
+
+/** Inflate a gzip stream into a malloc'd NUL-terminated string. NULL on any
+ *  malformation (bad magic, truncation, CRC mismatch, size lie). */
+static char* gzInflate(const uint8_t* gz, size_t n) {
+  if (n < GZ_HDR_LEN + GZ_FOOT_LEN || gz[0] != 0x1f || gz[1] != 0x8b || gz[2] != 8)
+    return nullptr;
+  uint8_t flg = gz[3];
+  size_t off = GZ_HDR_LEN;
+  if (flg & 0x04) {                       /* FEXTRA */
+    if (off + 2 > n) return nullptr;
+    uint16_t xlen; memcpy(&xlen, gz + off, 2);
+    off += 2 + xlen;
+  }
+  if (flg & 0x08) {                       /* FNAME: NUL-terminated */
+    while (off < n && gz[off]) off++;
+    off++;
+  }
+  if (flg & 0x10) {                       /* FCOMMENT */
+    while (off < n && gz[off]) off++;
+    off++;
+  }
+  if (flg & 0x02) off += 2;               /* FHCRC */
+  if (off + GZ_FOOT_LEN > n) return nullptr;
+
+  uint32_t crc, isz;
+  memcpy(&crc, gz + n - 8, 4);
+  memcpy(&isz, gz + n - 4, 4);
+  /* Sanity bound: storage files are hundreds of KB; a multi-MB ISIZE means
+   * corruption — don't let a flipped bit demand a 4 GB allocation. */
+  if (isz > 8 * 1024 * 1024) return nullptr;
+
+  char* out = (char*)gp_alloc((size_t)isz + 1);
+  if (!out) return nullptr;
+  tinfl_decompressor* inf = (tinfl_decompressor*)gp_alloc(sizeof(tinfl_decompressor));
+  if (!inf) { free(out); return nullptr; }
+
+  size_t inSz = n - off - GZ_FOOT_LEN, outSz = isz;
+  tinfl_init(inf);
+  tinfl_status st = tinfl_decompress(inf, gz + off, &inSz,
+                                     (mz_uint8*)out, (mz_uint8*)out, &outSz,
+                                     TINFL_FLAG_USING_NON_WRAPPING_OUTPUT_BUF);
+  free(inf);
+  if (st != TINFL_STATUS_DONE || outSz != isz ||
+      esp_rom_crc32_le(0, (const uint8_t*)out, outSz) != crc) {
+    free(out);
+    return nullptr;
+  }
+  out[outSz] = '\0';
+  return out;
+}
+
+/** Read a storage JSON file: try `<path>.gz` first, then plain `<path>`.
+ *  `path` is always the base .json path — callers never name the .gz. */
+static char* readJsonFile(const char* path) {
+  std::string gzPath = std::string(path) + ".gz";
+  size_t n = 0;
+  char* raw = readFileStr(gzPath.c_str(), &n);
+  if (raw) {
+    char* text = gzInflate((const uint8_t*)raw, n);
+    free(raw);
+    if (text) return text;
+    warn("storage: corrupt %s, trying plain\n", gzPath.c_str());
+  }
+  return readFileStr(path);
+}
+
+/** Write a storage JSON file: gzip to `<path>.gz` (atomic), falling back to
+ *  plain `<path>` if compression fails. On success remove the other-format
+ *  sibling so a stale copy can't shadow this write on the next read. */
+static bool atomicWriteJsonGz(const char* path, const char* text) {
+  std::string gzPath = std::string(path) + ".gz";
+  size_t gzLen = 0;
+  uint8_t* gz = gzDeflate(text, strlen(text), &gzLen);
+  if (gz) {
+    bool ok = atomicWriteFile(gzPath.c_str(), gz, gzLen);
+    free(gz);
+    if (ok) { fs_remove(path); return true; }
+    return false;
+  }
+  warn("storage: gzip failed, writing %s uncompressed\n", path);
+  if (!atomicWriteFile(path, text, strlen(text))) return false;
+  fs_remove(gzPath.c_str());
+  return true;
 }
 
 /** Resolve a prefix-or-leaf path inside an object. Returns the parent of the
@@ -493,6 +632,13 @@ static void withExternalsDetached(std::function<void()> fn) {
   struct save_t { cJSON* parent; std::string leaf; cJSON* item; };
   std::vector<save_t> saved;
   for (auto& ext : externals) {
+    /* A pendingDelete external is no longer a real external — whatever still
+     * lives at its prefix must persist via root.json (this is what lets the
+     * lxmf monolith split move contacts/identity into root.json while the
+     * conversation subtrees leave through their own — detached — externals).
+     * For storageDeleteTree-marked entries the subtree is already gone from
+     * cfgRoot, so skipping is a no-op there. */
+    if (ext.pendingDelete) continue;
     char leaf[96];  /* see navigatePath */
     cJSON* parent = navigateLeaf(cfgRoot, ext.prefix.c_str(), leaf, sizeof(leaf));
     if (!parent) continue;
@@ -523,7 +669,7 @@ static void writeExternalFile(const external_t& ext) {
   char* text = cJSON_PrintUnformatted(snap);
   cJSON_Delete(snap);
   if (!text) return;
-  atomicWriteJson(ext.path.c_str(), text);
+  atomicWriteJsonGz(ext.path.c_str(), text);
   cJSON_free(text);
 }
 
@@ -549,42 +695,63 @@ static void writeSettingsFileOnly() {
   char* text = cJSON_PrintUnformatted(out);
   cJSON_Delete(out);
   if (!text) return;
-  atomicWriteJson(fsStatePath(ROOT_JSON_PATH).c_str(), text);
+  atomicWriteJsonGz(fsStatePath(ROOT_JSON_PATH).c_str(), text);
   cJSON_free(text);
 }
 
 static void writeSettingsFile() {
-  /* Externals: process deletes (fs_remove + unregister) and dirty writes.
+  /* Order is load-bearing for crash safety: write dirty externals, then
+     root.json, and only THEN remove pendingDelete files — data must never be
+     deleted before its replacement is durable. The lxmf monolith split leans
+     on this: its conversations flush to per-conv files, its remainder to
+     root.json (withExternalsDetached skips pendingDelete), and the monolith
+     file is removed last; a crash anywhere in between leaves the monolith on
+     disk and the split simply re-runs next boot (per-conv files, being the
+     deeper prefixes, load after it and win).
+
      Index-walk re-checking size() each step so a concurrent storageNewTreeFile
      push_back can't invalidate us; fs I/O stays OUTSIDE CFG_LOCK (writeExternalFile
      snapshots under the lock then writes lock-free), matching prior behaviour. */
   for (size_t i = 0; ; ) {
-    bool doDelete = false, doWrite = false;
+    bool doWrite = false;
     external_t work;
     CFG_LOCK();
     if (i >= externals.size()) { CFG_UNLOCK(); break; }
     external_t& ext = externals[i];
-    if (ext.pendingDelete) {
-      work.path = ext.path;
-      externals.erase(externals.begin() + i);   /* don't advance i */
-      doDelete = true;
-    } else if (ext.dirty) {
+    if (ext.dirty && !ext.pendingDelete) {
       ext.dirty = false;
       work.prefix = ext.prefix;
       work.path   = ext.path;
       doWrite = true;
-      i++;
-    } else {
-      i++;
     }
+    i++;
     CFG_UNLOCK();
-    if (doDelete)      fs_remove(work.path.c_str());
-    else if (doWrite)  writeExternalFile(work);
+    if (doWrite) writeExternalFile(work);
   }
 
   if (rootDirty) {
     writeSettingsFileOnly();
     rootDirty = false;
+  }
+
+  /* Deletes last (see above). Erase re-checks from index 0 each round since
+     the erase shifts the vector. */
+  for (;;) {
+    external_t work;
+    bool doDelete = false;
+    CFG_LOCK();
+    for (size_t i = 0; i < externals.size(); i++) {
+      if (externals[i].pendingDelete) {
+        work.path = externals[i].path;
+        externals.erase(externals.begin() + i);
+        doDelete = true;
+        break;
+      }
+    }
+    CFG_UNLOCK();
+    if (!doDelete) break;
+    fs_remove(work.path.c_str());
+    fs_remove((work.path + ".gz").c_str());
   }
   savePending = false;
 }
@@ -1223,9 +1390,11 @@ static void attachAtPath(const char* dotPath, cJSON* subtree) {
   cJSON_AddItemToObject(parent, leaf, subtree);
 }
 
-/** Scan /state/storage/MODE/ for .json files; register each as an external.
- *  Filename's stem (sans .json) is the dot-path prefix where its content lives
- *  in cfgRoot. Subdir under storage/ is the "mode" — only "external" today. */
+/** Scan /state/storage/MODE/ for .json and .json.gz files; register each as
+ *  an external. Filename's stem (sans extension) is the dot-path prefix where
+ *  its content lives in cfgRoot; ext.path is always the BASE .json path (the
+ *  read/write helpers handle the .gz sibling). Subdir under storage/ is the
+ *  "mode" — only "external" today. */
 static void scanExternals() {
   externals.clear();
   const char* modes[] = { "external" };
@@ -1236,33 +1405,105 @@ static void scanExternals() {
     if (dh < 0) continue;
     fs_dirent_t ent;
     while (fs_readdir(dh, &ent)) {
-      const char* dot = strrchr(ent.name, '.');
-      if (!dot || strcmp(dot, ".json") != 0) continue;
+      size_t nl = strlen(ent.name);
+      size_t stem;
+      if (nl > 8 && strcmp(ent.name + nl - 8, ".json.gz") == 0) stem = nl - 8;
+      else if (nl > 5 && strcmp(ent.name + nl - 5, ".json") == 0) stem = nl - 5;
+      else continue;
+      std::string prefix(ent.name, stem);
+      /* Both formats may exist for one prefix (e.g. crash between the .gz
+       * write and the plain-sibling remove) — register once. */
+      bool dup = false;
+      for (auto& e : externals) if (e.prefix == prefix) { dup = true; break; }
+      if (dup) continue;
       external_t ext;
-      ext.prefix.assign(ent.name, dot - ent.name);
-      ext.path  = std::string(dirPath) + "/" + ent.name;
-      ext.dirty = false;
+      ext.prefix = std::move(prefix);
+      ext.path   = std::string(dirPath) + "/" + ext.prefix + ".json";
+      ext.dirty  = false;
       externals.push_back(std::move(ext));
     }
     fs_closedir(dh);
   }
-  /* Longest prefix first — needed for correct dirty routing if two externals
-   * ever overlap (e.g. "s.foo" and "s.foo.bar"). */
+  /* Shortest prefix first — the LOAD order invariant: a parent external
+   * ("s.lxmf") must attach before any deeper one ("s.lxmf.id.0.msgs.<peer>")
+   * so the deeper file's newer content overwrites its slice of the parent,
+   * not the other way around (attachAtPath replaces the whole node at the
+   * prefix). This is what makes the monolith→per-conversation split below
+   * crash-safe: if both generations coexist on disk, the split files win.
+   * Dirty routing is unaffected — routePatchDirty exact-matches the patch
+   * path at each depth, so vector order never changes which external a
+   * write dirties. */
   std::sort(externals.begin(), externals.end(),
             [](const external_t& a, const external_t& b) {
-              return a.prefix.size() > b.prefix.size();
+              return a.prefix.size() < b.prefix.size();
             });
 }
 
-/** Read each external's file and attach its content to cfgRoot. */
+/** Read each external's file and attach its content to cfgRoot. Iterates in
+ *  scanExternals' shortest-prefix-first order (see the sort comment there). */
 static void loadExternals() {
   for (auto& ext : externals) {
-    char* text = readFileStr(ext.path.c_str());
+    char* text = readJsonFile(ext.path.c_str());
     if (!text) continue;
     cJSON* node = cJSON_Parse(text);
     free(text);
     if (node) attachAtPath(ext.prefix.c_str(), node);
   }
+}
+
+/** One-time split of a legacy monolithic "s.lxmf" external into the
+ *  per-conversation externals current lxmf uses ("s.lxmf.id.<n>.msgs.<peer>").
+ *  Runs at load, pre-tasks, with cfgRoot fully assembled. Registers a dirty
+ *  external per conversation, marks the monolith pendingDelete and rootDirty;
+ *  the flush happens on the save worker once storageInit kicks it. */
+static void migrateLxmfMonolith() {
+  external_t* mono = nullptr;
+  for (auto& e : externals)
+    if (e.prefix == "s.lxmf") { mono = &e; break; }
+  if (!mono) return;
+
+  int registered = 0, skipped = 0;
+  cJSON* ids = navigatePath(cfgRoot, "s.lxmf.id");
+  if (ids && cJSON_IsObject(ids)) {
+    for (cJSON* id = ids->child; id; id = id->next) {
+      if (!id->string) continue;
+      cJSON* msgs = cJSON_GetObjectItem(id, "msgs");
+      if (!msgs || !cJSON_IsObject(msgs)) continue;
+      for (cJSON* conv = msgs->child; conv; conv = conv->next) {
+        if (!conv->string || !conv->child) continue;   /* skip empty convs */
+        char prefix[96];
+        int n = snprintf(prefix, sizeof(prefix), "s.lxmf.id.%s.msgs.%s",
+                         id->string, conv->string);
+        /* The basename must survive fs_dirent_t's name[64] on the rescan
+         * next boot — a too-long prefix would be re-registered truncated
+         * (i.e. wrong). Leave such a conversation unsplit: with no external
+         * covering it, it simply persists into root.json via rootDirty. */
+        if (n < 0 || (size_t)n >= sizeof(prefix) || n + 8 >= 64) {
+          skipped++;
+          continue;
+        }
+        bool dup = false;
+        for (auto& e : externals) if (e.prefix == prefix) { dup = true; break; }
+        if (dup) continue;
+        external_t ext;
+        ext.prefix = prefix;
+        ext.path   = std::string(fsStateDir()) + "/storage/external/"
+                     + prefix + ".json";
+        ext.dirty  = true;
+        externals.push_back(std::move(ext));
+        registered++;
+      }
+    }
+  }
+
+  /* push_back may reallocate — re-find the monolith instead of trusting the
+   * pointer captured before the loop. */
+  for (auto& e : externals)
+    if (e.prefix == "s.lxmf") { e.pendingDelete = true; e.dirty = false; break; }
+  rootDirty = true;
+  info("splitting legacy s.lxmf external: %d conversation file(s)%s\n",
+       registered,
+       skipped ? " (some left in root.json: name too long)" : "");
 }
 
 void storageLoad() {
@@ -1282,11 +1523,11 @@ void storageLoad() {
 
   /* Ensure <stateDir>/storage/ (and storage/external/) exist before any
    * read/write — a freshly-seeded SD store may only have what factory_state
-   * shipped, and atomicWriteJson() does not create parent dirs. */
+   * shipped, and atomicWriteFile() does not create parent dirs. */
   fs_mkdirp(fsStatePath("/storage/external").c_str());
 
-  /* Load <stateDir>/storage/root.json — the single source of truth. */
-  char* text = readFileStr(fsStatePath(ROOT_JSON_PATH).c_str());
+  /* Load <stateDir>/storage/root.json(.gz) — the single source of truth. */
+  char* text = readJsonFile(fsStatePath(ROOT_JSON_PATH).c_str());
   if (text) {
     cfgRoot = cJSON_Parse(text);
     free(text);
@@ -1298,6 +1539,20 @@ void storageLoad() {
    * at the same path that may have been in root.json. */
   scanExternals();
   loadExternals();
+
+  /* Split a legacy monolithic s.lxmf external into the per-conversation
+   * externals current lxmf registers (see ensureConvFile in lxmf.cpp). The
+   * monolith predates per-conv registration and would otherwise persist
+   * forever: scanExternals resurrects registrations from filenames, so
+   * nothing ever retires it, every message write rewrites the whole file,
+   * and — worse — once per-conv files appear next to it, the load-order
+   * rule above means the shallower monolith loads FIRST specifically so it
+   * cannot clobber them. All content is already in cfgRoot at this point;
+   * the split is pure bookkeeping (register + mark dirty), flushed by the
+   * save kicked in storageInit. Non-msgs lxmf state (contacts, identity)
+   * falls through to root.json via rootDirty. Crash-safe: until the flush
+   * deletes the monolith file, a reboot just re-runs this split. */
+  migrateLxmfMonolith();
 
   /* First boot only: deep-merge additional_state/settings.json overlay.
    * fs_init() copies plain files from additional_state/; settings.json is
@@ -1316,10 +1571,11 @@ void storageLoad() {
     }
   }
 
-  /* Drop a stale temp from a crash between write and rename (atomicWriteJson
+  /* Drop a stale temp from a crash between write and rename (atomicWriteFile
    * writes "<path>.new"). With the FAT-safe rename this is rare, but cheap
    * to clear. */
   fs_remove(fsStatePath(ROOT_JSON_PATH ".new").c_str());
+  fs_remove(fsStatePath(ROOT_JSON_PATH ".gz.new").c_str());
 }
 
 bool storageExists(const char* key) {
@@ -1532,6 +1788,14 @@ void storageSave() {
 void storageNewTreeFile(const char* prefix) {
   std::string p = stripDots(prefix);
   if (p.empty()) return;
+  /* The basename must survive fs_dirent_t's name[64] on the next boot's
+   * rescan — a longer name would be re-registered truncated (wrong prefix).
+   * Refuse; the subtree just persists into root.json instead. */
+  if (p.size() + 8 /* ".json.gz" */ >= 64) {
+    warn("storage: external prefix too long for dirent (%u B): %s\n",
+         (unsigned)p.size(), p.c_str());
+    return;
+  }
 
   CFG_LOCK();
   /* Idempotent. If a just-deleted prefix is being re-created before the flush
@@ -2321,4 +2585,16 @@ void storageInit() {
     /* storage task: PSRAM stack (config WS + ITS, no direct file I/O) */
     storageHandle = spawnTask(storageTaskFn, "storage", 8192, nullptr, 1, 1);
 
+    /* Flush any dirt storageLoad left behind (the lxmf monolith split marks
+     * externals dirty + pendingDelete + rootDirty). Normal boots have none —
+     * this is a no-op then. Without the kick, migration state would sit
+     * unflushed until the first ordinary write arms the save timer, and a
+     * reboot before that would just re-run the split (harmless, but the
+     * monolith would never actually retire). */
+    bool pending;
+    CFG_LOCK();
+    pending = rootDirty;
+    for (auto& e : externals) pending = pending || e.dirty || e.pendingDelete;
+    CFG_UNLOCK();
+    if (pending) requestSave();
 }
