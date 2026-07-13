@@ -8,10 +8,12 @@ without breaking it.
 
 **Tasks**
 
-- **`storage`** — the actor. PSRAM stack (8 KB), prio 1, core 1. Owns `cfgRoot`
-  (after re-homing it onto this task), the subscription table, the single
-  browser DataChannel handle, and the op-apply pipeline. Its only blocking call
-  is `itsPoll`; it must never do fs I/O on its loop.
+- **`storage`** — the side-effect actor. PSRAM stack (8 KB), prio 1, core 1.
+  Owns the subscription table, the single browser DataChannel handle, and the
+  deferred work: it drains the handoff deque (subscriber fan-out), pumps the
+  browser dump/patch stream, and applies SUB/UNSUB ops that arrive on port 44.
+  It does **not** apply data writes — those commit in the calling task (§3). Its
+  only blocking call is `itsPoll`; it must never do fs I/O on its loop.
 - **`storage_save`** — the persist worker. 8 KB stack, prio 1, core 1. Owns the
   blocking flash writes (`writeSettingsFile`). Not an ITS task; it blocks on
   `ulTaskNotifyTake` and flushes when poked. Spawned *before* the storage task
@@ -22,7 +24,7 @@ without breaking it.
 | Port | Name | Role |
 |---|---|---|
 | 1 | `STORAGE_CONFIG_PORT` | The `storage:1` browser DataChannel (packet-mode, single client). `webrtc_task` in **spangap-web** forwards it from the shared PeerConnection. |
-| 44 | `STORAGE_OP_PORT` | Config-write op-lists arrive here from foreign tasks. |
+| 44 | `STORAGE_OP_PORT` | SUB/UNSUB op-lists arrive here from foreign tasks (data writes commit in the caller — §3). |
 | 42 | `STORAGE_CHANGE_PORT` | Change-dispatch aux installed on every subscribing task. |
 | 43 | `STORAGE_SAVE_PORT` | Reserved (saves now run on the `storage_save` worker, not a port). |
 
@@ -30,9 +32,9 @@ without breaking it.
 
 | Symbol | Default | Meaning |
 |---|---|---|
-| `CONFIG_SPANGAP_STORAGE_OP_TIMEOUT_MS` | `5000` | How long a sync write waits for the actor to apply its op message before warning. |
+| `CONFIG_SPANGAP_STORAGE_OP_TIMEOUT_MS` | `5000` | How long a SUB/UNSUB op waits for the actor to apply it before warning (data writes no longer travel — they commit in the caller). |
 | `CONFIG_SPANGAP_STORAGE_NOTIFY_TIMEOUT_MS` | `10` | How long the actor blocks enqueuing one CHANGED message to a remote subscriber before dropping it. |
-| `CONFIG_SPANGAP_STORAGE_NOTIFY_INBOX` | `256` | Depth of the storage task's PSRAM inbox (op messages + the `""`-sub self-sends). Sized to absorb a ~1 Hz multi-producer stats burst (>100 notifies in one drain window). |
+| `CONFIG_SPANGAP_STORAGE_NOTIFY_INBOX` | `256` | Depth of the storage task's PSRAM inbox (SUB/UNSUB op messages + browser DC traffic). Sized to absorb a ~1 Hz multi-producer burst without back-pressure. |
 | `CONFIG_SPANGAP_STORAGE_OP_MSG_MAX` | `196608` (192 KB) | Per-message size guard: the largest single op a foreign task can send (a big `storageSetTree`/`storageCopy` subtree, or the largest published value — Nomad page bodies run to ~128 KB). |
 
 **Compile-time constants**: `STORAGE_NOTIFY_VAL_MAX = 512` (a cross-task CHANGED
@@ -51,7 +53,8 @@ directions (`mergeIncomingPatch` skips both on inbound).
 
 `cfgRoot` is one cJSON tree; cJSON's allocator is hooked to `gp_alloc` (PSRAM on
 PSRAM targets) at load. `cfgMux` is a recursive mutex guarding readers against
-the single actor-writer, plus the `externals` bookkeeping. Reads
+writers (any task commits), the `externals` bookkeeping, and the handoff deque.
+Reads
 (`storageGetInt`/`getStr`/`Exists`/`ForEach`/…) take the lock directly and
 resolve against the committed tree — there is no pending-write overlay, so a
 read never sees an op that has not yet been applied.
@@ -80,17 +83,14 @@ invariant (§5), not a routing one: `routePatchDirty` exact-matches the patch
 path at each depth, so vector order never changes which external a write
 dirties.
 
-## 3. The actor: op-list framing and apply pipeline
+## 3. Commit-in-caller: op-list framing and apply pipeline
 
-All writes serialize into an op-list (a `std::string` buffer) and reach the
-actor one of two ways:
-
-- **Fast path** — if the caller *is* the storage task, or storage has not
-  spawned yet, `storageSubmit` applies the ops inline (no message).
-- **Sync message** — otherwise the buffer is copied to a `gp_alloc` block and
-  sent to `STORAGE_OP_PORT` with `ITS_WAIT_PICKUP` (or `ITS_WAIT_DELIVERY`); the
-  caller blocks until the actor has applied it. Read-your-writes holds because
-  the call returns only after apply.
+All writes serialize into an op-list (a `std::string` buffer). **Data writes
+(`S`/`d`/`D`) commit on the calling task** — no message, no copy, no park:
+`storageCommitLocal` runs `opsParse` then `opsCommit` inline. **SUB/UNSUB
+(`+`/`-`)** still reach the actor: `storageSendOp` sends the buffer to
+`STORAGE_OP_PORT` with `ITS_WAIT_PICKUP` (before the actor spawns, or on the
+actor itself, it applies inline), so the subscription table stays actor-owned.
 
 Op-list wire format (one heap block, single leading flags byte; `bit0 = SILENT`):
 
@@ -100,17 +100,39 @@ Op-list wire format (one heap block, single leading flags byte; `bit0 = SILENT`)
 'd' DEFAULT key\0 vtype value            'J': u32 len + printed JSON subtree
 '+' SUB     scope\0 cb(void*)
 '-' UNSUB   scope\0 cb(void*)     cb NULL = all of sender's subs on scope
-'W' SAVE    sem(SemaphoreHandle_t)
 ```
 
-`storageApplyOps` runs in two passes: **pass 1** validates and parses the whole
-list with no side effects (a malformed list is rejected whole, and any queued
-SAVE sems are released so `storageSave` callers don't hang); **pass 2** applies
-under `cfgMux` — builds a patch tree, dedups, `deepMerge`s it into `cfgRoot`,
-collects changes, routes dirty flags + arms the save timer, then mutates the
-subscription table (SUB/UNSUB), all atomically. Notifications fire **after** the
-unlock so callbacks see committed state and direct-called ones may re-take the
-recursive mutex.
+(There is no longer a `W` SAVE op — `storageSave` pushes its semaphore onto
+`pendingSaveSems` under `cfgMux` and pokes the persist worker directly.)
+
+`opsParse` (**pass 1**) validates and parses the whole list with no side effects
+(a malformed list is rejected whole). `opsCommit` (**pass 2**) applies under
+`cfgMux` — builds a patch tree, dedups, `deepMerge`s it into `cfgRoot`, collects
+changes, routes dirty flags + arms the save timer; when called on the actor's
+port-44 path (`applySubs`) it also mutates the subscription table, all
+atomically. Then — **still under the lock** — it appends the collected change
+records to the `handoffQueue` in commit order and `xTaskNotifyGive`s the actor.
+No subscriber code runs on the commit path. The actor's `drainHandoff` pops the
+deque (each under a brief lock) and runs `notifyChange` off the commit path, so
+callbacks see committed state and direct-called ones may re-take the recursive
+mutex. Before the actor spawns, `storageCommitLocal` drains inline (boot writes
+notify synchronously, as the old fast path did).
+
+**The handoff deque** carries `(key, value≤512 B)` records — a signal, not value
+transport (every handler re-reads by key). Appended under `cfgMux`, so deque
+order == commit order == fan-out order. Bounded at 512: on overflow it coalesces
+the incoming key's earlier records (a same-key counter burst collapses), then
+drops-oldest with a warn and forces a browser re-dump if connected (a dropped
+record is a missed *signal*; a re-dump self-heals the browser mirror that a
+silently missed patch would desync).
+
+**Snapshot holds are now writer stalls.** The lock-held `cJSON_Duplicate`s in
+`writeExternalFile`, `writeSettingsFileOnly`, `dcBuildDumpInto`, and the boot
+re-home are the longest single `cfgMux` holds and now bound the worst-case
+*writer* park (a committing task waits the full duplicate). `cfgHoldReport` logs
+each at debug and warns past 50 ms. Shrinking these holds (or the tree) is the
+real fix if the numbers disappoint; mitigations are tracked in
+`plans/storage-commit-in-caller.md` (F2).
 
 **Dedup is load-bearing.** A SET whose value equals the committed value is
 skipped entirely (no patch, no notify). This is the defence against notify-inbox
@@ -171,10 +193,11 @@ skipped there, so its content persists via `root.json`) minus ephemerals (only
 
 Both writers follow the dump-builder lock shape: only the `cJSON_Duplicate`
 snapshot holds `CFG_LOCK`; `cJSON_PrintUnformatted` runs lock-free. Printing a
-large conversation external under the lock blocked the actor's
-`storageApplyOps` (port-44 drain, browser ping→pong) for the whole serialize —
-long enough to time out every task's sync write and trip the browser's 2 s DC
-liveness. Compact output also shrinks the flash write itself.
+large conversation external under the lock would hold `cfgMux` for the whole
+serialize — under commit-in-caller that parks *every committing task* for its
+duration (and the actor's handoff drain and browser ping→pong with it), long
+enough to trip the browser's 2 s DC liveness. Compact output also shrinks the
+flash write itself.
 
 All writes go through `atomicWriteJsonGz` → `atomicWriteFile` (`<file>.new` +
 `fs_rename`) — overwrite-correct on FAT because `fs_rename` removes an existing
@@ -201,10 +224,11 @@ decompressor on the caller stack or allocate from the ROM heap — state is
 `fs_dirent_t`'s 64-byte name (it would be re-registered *truncated* on the
 next boot's rescan); the subtree then simply persists via `root.json`.
 
-`storageSave()` is a synchronous `'W'` op carrying a binary semaphore the worker
-gives after the flush; **never call it from the storage task** (it would wait on
-its own actor — guarded). `{"save":1}` from the browser pokes the worker
-directly.
+`storageSave()` pushes a binary semaphore onto `pendingSaveSems` under `cfgMux`
+and pokes the persist worker directly (no actor round-trip — the old `'W'` op is
+gone); the worker gives the semaphore after the flush. **Never call it from the
+storage task** (blocking the actor stalls the fan-out — guarded). `{"save":1}`
+from the browser pokes the worker directly.
 
 `storageLoad` (run on `main_task`, before the storage task spawns): mkdirp
 `<stateDir>/storage/external`, parse `root.json` (absent → `{}`), `scanExternals`
@@ -271,7 +295,7 @@ deadlocks the ack (client gives up after 3 s) and freezes the inbox drain.
 - **`storageDefault*` are silent.** They install seeds without firing change
   subscriptions. A handler that must run on the seeded value won't — use
   `NOW_AND_ON_CHANGE`, which subscribes *and* applies the current value once.
-- **No config-version migrations.** `storageDefault` is idempotent — the actor
+- **No config-version migrations.** `storageDefault` is idempotent — the commit
   writes the key only if it is currently unset — so seeding a module's defaults
   unconditionally on init is sufficient and re-running init is a no-op. Do **not**
   add schema-version scaffolding (a `s.<mod>.*_version` key or a `*_VERSION`
@@ -288,9 +312,9 @@ deadlocks the ack (client gives up after 3 s) and freezes the inbox drain.
   stream-buffers, mutexes) must **not** live in PSRAM — they trip the `S32C1I`
   spinlock assert. See the memory doc for the placement policy.
 - **Never `storageSave()` or do fs I/O on the storage task.** The save worker
-  exists precisely so the actor's `itsPoll` loop never blocks on flash; a single
-  `proxyOp` would park the inbox drain and trigger a `notify drop → [storage]`
-  storm.
+  exists precisely so the actor's `itsPoll` loop never blocks on flash; blocking
+  the actor stalls the handoff drain (subscriber fan-out) and the browser
+  dump/patch pump.
 - **Bump segment buffers together.** `navigatePath`, `navigateOrCreate`,
   `navigateLeaf`, the CLI `set`/`show` key buffers, and `leaf[96]` sites all
   assume ≤ 95-char segments. Changing one in isolation reintroduces the silent

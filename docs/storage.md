@@ -7,12 +7,13 @@ JSON on the active state store, and mirrored live to the browser over a WebRTC
 DataChannel. Every straddle uses it; there is no other place device settings or
 cross-task status flags live.
 
-Storage is an **actor**: reads go directly to the tree under a recursive mutex,
-but all writes funnel through a single owning task that applies them as atomic
-op-list messages (build patch → RFC 7396 deep-merge → notify subscribers → arm
-the save timer). Writes are synchronous — the caller blocks until applied, so
-read-your-writes holds. File I/O is delegated to [fs](fs.md); storage never
-touches flash on its own poll loop.
+Storage **commits in the caller**: reads go directly to the tree under a
+recursive mutex, and writes apply inline on the calling task as one atomic op
+list (build patch → RFC 7396 deep-merge → arm the save timer), so a write is
+committed and read-your-writes holds the instant it returns. Subscriber
+notifications are fanned out afterwards by a background storage task, off the
+commit path. File I/O is delegated to [fs](fs.md); storage never touches flash
+on its own poll loop.
 
 ## What it does and how straddles use it
 

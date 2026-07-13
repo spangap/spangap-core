@@ -1,16 +1,16 @@
 /**
  * storage — config store.
  *
- * Config: cJSON tree in RAM, backed by JSON on /state. Storage is an ACTOR:
- * writes (storageSet and friends) are op-list messages applied by the storage
- * task — build a patch tree, RFC 7396 deepMerge into cfgRoot, notify
- * subscribers, trigger the save timer, all atomically per message. Writes are
- * synchronous (read-your-writes holds); when the caller is the storage task or
- * storage hasn't spawned yet, the write applies directly. Reads are direct
- * under a recursive mutex (readers vs the single actor-writer).
+ * Config: cJSON tree in RAM, backed by JSON on /state. Writes COMMIT IN THE
+ * CALLER: storageSet and friends build a patch tree and apply it inline under a
+ * recursive mutex — RFC 7396 deepMerge into cfgRoot, route the save timer, all
+ * atomically per op list — so read-your-writes is free and a data write cannot
+ * be lost in flight. Subscriber fan-out is deferred: the change records hand off
+ * to the storage task, which runs the callbacks off the commit path (no
+ * subscriber code ever runs under the mutex). Reads are direct under the mutex.
  *
  * storageBegin()/storageEnd() bracket a task-local op accumulator (one atomic
- * message at the outer End). NOTE: reads INSIDE an open bracket see committed
+ * commit at the outer End). NOTE: reads INSIDE an open bracket see committed
  * state, not the bracket's own pending writes — read before the bracket.
  *
  * Keys starting with "s." are persisted to <stateDir>/storage/root.json
