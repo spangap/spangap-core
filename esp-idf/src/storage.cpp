@@ -424,13 +424,31 @@ static char* readFileStr(const char* path) {
   return buf;
 }
 
+/* Flush writes go to flash in chunks this size with a tick's sleep between
+ * them. Each flash program/erase op disables the PSRAM cache, and a single
+ * large fs_write keeps those windows back-to-back for the whole file — every
+ * PSRAM-stack task (the storage actor, rnsd, lxmf, the ifaces) is starved for
+ * the duration. A multi-hundred-KB conversation external held the actor deaf
+ * for 5+ s: every task's sync port-44 write timed out ("owned aux … receiver
+ * stuck?") and the browser's 2 s DC liveness tripped. The inter-chunk tick
+ * lets PSRAM-stack tasks drain between windows; a 256 KB file costs ~32 extra
+ * ticks on the background flush. */
+#define STORAGE_FLUSH_CHUNK 8192
+
 /** Atomic write of `text` to `path` via `<path>.new` + rename. */
 static bool atomicWriteJson(const char* path, const char* text) {
   std::string tmp = std::string(path) + ".new";
   int f = fs_open(tmp.c_str(), "w");
   if (f < 0) return false;
   size_t len = strlen(text);
-  bool ok = (fs_write(text, 1, len, f) == len);
+  bool ok = true;
+  for (size_t off = 0; off < len; ) {
+    size_t n = len - off;
+    if (n > STORAGE_FLUSH_CHUNK) n = STORAGE_FLUSH_CHUNK;
+    if (fs_write(text + off, 1, n, f) != n) { ok = false; break; }
+    off += n;
+    if (off < len) vTaskDelay(1);
+  }
   fs_close(f);
   if (ok) fs_rename(tmp.c_str(), path);
   else    fs_remove(tmp.c_str());
@@ -469,8 +487,8 @@ static cJSON* navigateLeaf(cJSON* root, const char* dotPath,
 }
 
 /** Detach all external sub-trees from cfgRoot, run `fn`, then reattach.
- *  Used so cJSON_Print of cfgRoot omits external blobs from root.json
- *  without copying the whole tree. Caller holds CFG_LOCK. */
+ *  Used so the root.json snapshot omits external blobs without copying
+ *  the whole tree first. Caller holds CFG_LOCK. */
 static void withExternalsDetached(std::function<void()> fn) {
   struct save_t { cJSON* parent; std::string leaf; cJSON* item; };
   std::vector<save_t> saved;
@@ -488,12 +506,22 @@ static void withExternalsDetached(std::function<void()> fn) {
     cJSON_AddItemToObject(it->parent, it->leaf.c_str(), it->item);
 }
 
-/** Serialize one external's sub-tree at its prefix to its own file. */
+/** Serialize one external's sub-tree at its prefix to its own file.
+ *
+ *  Only the cJSON_Duplicate snapshot holds CFG_LOCK; serialization runs
+ *  lock-free (the dump-builder shape). Printing a large conversation external
+ *  under the lock blocked the actor's storageApplyOps — and with it the
+ *  port-44 op drain and the browser ping→pong — for the whole serialize.
+ *  Unformatted: nothing on-device reads these files by eye, and the compact
+ *  form shrinks the flash write (fewer PSRAM-cache-disable windows). */
 static void writeExternalFile(const external_t& ext) {
   CFG_LOCK();
   cJSON* node = navigatePath(cfgRoot, ext.prefix.c_str());
-  char* text = node ? cJSON_Print(node) : nullptr;
+  cJSON* snap = node ? cJSON_Duplicate(node, true) : nullptr;
   CFG_UNLOCK();
+  if (!snap) return;
+  char* text = cJSON_PrintUnformatted(snap);
+  cJSON_Delete(snap);
   if (!text) return;
   atomicWriteJson(ext.path.c_str(), text);
   cJSON_free(text);
@@ -504,20 +532,22 @@ static void writeExternalFile(const external_t& ext) {
  * everything persisted is under storage/. */
 #define ROOT_JSON_PATH "/storage/root.json"
 
-/** Write root.json (cfgRoot minus external sub-trees). */
+/** Write root.json (cfgRoot minus external sub-trees).
+ *  Same lock discipline as writeExternalFile: snapshot under CFG_LOCK,
+ *  serialize lock-free, compact form. */
 static void writeSettingsFileOnly() {
+  cJSON* out = cJSON_CreateObject();
+  if (!out) return;
   CFG_LOCK();
-  char* text = nullptr;
   withExternalsDetached([&]() {
-    cJSON* out = cJSON_CreateObject();
     cJSON* s = cJSON_GetObjectItem(cfgRoot, "s");
     cJSON* sec = cJSON_GetObjectItem(cfgRoot, "secrets");
     if (s)   cJSON_AddItemToObject(out, "s",       cJSON_Duplicate(s, true));
     if (sec) cJSON_AddItemToObject(out, "secrets", cJSON_Duplicate(sec, true));
-    text = cJSON_Print(out);
-    cJSON_Delete(out);
   });
   CFG_UNLOCK();
+  char* text = cJSON_PrintUnformatted(out);
+  cJSON_Delete(out);
   if (!text) return;
   atomicWriteJson(fsStatePath(ROOT_JSON_PATH).c_str(), text);
   cJSON_free(text);

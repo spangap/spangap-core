@@ -161,10 +161,24 @@ The save timer (`esp_timer`, `s.storage.flash_delay` seconds, 1 s floor) fires
 `writeSettingsFile`: it processes external deletes (`fs_remove` + unregister)
 and dirty externals (each writes its own subtree atomically), then rewrites
 `root.json` if `rootDirty`. `root.json` is `cfgRoot` minus the external subtrees
-(detached during print via `withExternalsDetached`, then reattached) minus
-ephemerals (only `s` and `secrets` are serialized). All writes go through
-`atomicWriteJson` (`<file>.new` + `fs_rename`) — overwrite-correct on FAT
-because `fs_rename` removes an existing dest and retries (see [fs](fs.md)).
+(detached during the snapshot via `withExternalsDetached`, then reattached)
+minus ephemerals (only `s` and `secrets` are serialized).
+
+Both writers follow the dump-builder lock shape: only the `cJSON_Duplicate`
+snapshot holds `CFG_LOCK`; `cJSON_PrintUnformatted` runs lock-free. Printing a
+large conversation external under the lock blocked the actor's
+`storageApplyOps` (port-44 drain, browser ping→pong) for the whole serialize —
+long enough to time out every task's sync write and trip the browser's 2 s DC
+liveness. Compact output also shrinks the flash write itself.
+
+All writes go through `atomicWriteJson` (`<file>.new` + `fs_rename`) —
+overwrite-correct on FAT because `fs_rename` removes an existing dest and
+retries (see [fs](fs.md)). It writes in `STORAGE_FLUSH_CHUNK` (8 KB) pieces
+with a tick's sleep between them: each flash program/erase op disables the
+PSRAM cache, and one large `fs_write` keeps those windows back-to-back for the
+whole file, starving every PSRAM-stack task (actor, rnsd, lxmf, ifaces) for
+its duration. The inter-chunk tick is what keeps the actor responsive while a
+multi-hundred-KB external flushes.
 
 `storageSave()` is a synchronous `'W'` op carrying a binary semaphore the worker
 gives after the flush; **never call it from the storage task** (it would wait on
