@@ -311,12 +311,14 @@ static void passwdCliCmd(const char* args) {
 void authInit() {
     int v = storageGetInt("secrets.auth.version", 0);
     if (v < AUTH_VERSION) {
+        storageBegin();
         storageDefaultTree("secrets.auth", R"({
             "enable": 1,
             "realms": [{"name":"admin", "hash":""}],
             "cookies": []
         })");
         storageSet("secrets.auth.version", AUTH_VERSION);
+        storageEnd();
     }
 
     /* Sweep expired cookies (skip when wall clock isn't valid yet). */

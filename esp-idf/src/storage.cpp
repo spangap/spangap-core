@@ -77,6 +77,14 @@ static SemaphoreHandle_t cfgMux = nullptr;  /* recursive mutex: readers vs the s
 #define CFG_LOCK()   xSemaphoreTakeRecursive(cfgMux, portMAX_DELAY)
 #define CFG_UNLOCK() xSemaphoreGiveRecursive(cfgMux)
 
+/* ── phase-0 latency instrumentation (temporary; see plans/storage-needs-work) ─
+ * Surface the two ways storage can starve the browser DC's 2 s liveness ping:
+ * a CFG_LOCK snapshot hold (whole-tree/subtree cJSON_Duplicate) and an actor
+ * poll-loop iteration that runs long (a heavy op-apply, patch serialize, or
+ * dump pump). Both warns are self-throttling — they fire only past threshold. */
+#define CFG_HOLD_WARN_US    50000    /* 50 ms  — a lock-held duplicate/print   */
+#define ACTOR_STALL_WARN_US 250000   /* 250 ms — a single poll-loop iteration  */
+
 static bool savePending = false;
 static esp_timer_handle_t saveTimer = nullptr;
 
@@ -661,10 +669,14 @@ static void withExternalsDetached(std::function<void()> fn) {
  *  Unformatted: nothing on-device reads these files by eye, and the compact
  *  form shrinks the flash write (fewer PSRAM-cache-disable windows). */
 static void writeExternalFile(const external_t& ext) {
+  int64_t t0 = esp_timer_get_time();
   CFG_LOCK();
   cJSON* node = navigatePath(cfgRoot, ext.prefix.c_str());
   cJSON* snap = node ? cJSON_Duplicate(node, true) : nullptr;
   CFG_UNLOCK();
+  int64_t held = esp_timer_get_time() - t0;
+  if (held > CFG_HOLD_WARN_US)
+    warn("CFG_LOCK hold %lldms: dup external %s\n", held / 1000, ext.prefix.c_str());
   if (!snap) return;
   char* text = cJSON_PrintUnformatted(snap);
   cJSON_Delete(snap);
@@ -684,6 +696,7 @@ static void writeExternalFile(const external_t& ext) {
 static void writeSettingsFileOnly() {
   cJSON* out = cJSON_CreateObject();
   if (!out) return;
+  int64_t t0 = esp_timer_get_time();
   CFG_LOCK();
   withExternalsDetached([&]() {
     cJSON* s = cJSON_GetObjectItem(cfgRoot, "s");
@@ -692,6 +705,9 @@ static void writeSettingsFileOnly() {
     if (sec) cJSON_AddItemToObject(out, "secrets", cJSON_Duplicate(sec, true));
   });
   CFG_UNLOCK();
+  int64_t held = esp_timer_get_time() - t0;
+  if (held > CFG_HOLD_WARN_US)
+    warn("CFG_LOCK hold %lldms: dup root.json\n", held / 1000);
   char* text = cJSON_PrintUnformatted(out);
   cJSON_Delete(out);
   if (!text) return;
@@ -2190,9 +2206,13 @@ static void dcStreamNode(cJSON** batch, size_t* batchLen,
  * tree packed into <=DC_DUMP_MAX chunks, then {"__dump":"e"}. Pure RAM/CPU (no
  * network I/O); dcPumpDump streams the queue out paced to buffer space. */
 static void dcBuildDumpInto(std::vector<std::string>& out) {
+    int64_t t0 = esp_timer_get_time();
     CFG_LOCK();
     cJSON* clone = cJSON_Duplicate(cfgRoot, true);
     CFG_UNLOCK();
+    int64_t held = esp_timer_get_time() - t0;
+    if (held > CFG_HOLD_WARN_US)
+        warn("CFG_LOCK hold %lldms: dup full dump\n", held / 1000);
     if (!clone) return;
 
     /* Remove secrets from the dump */
@@ -2550,14 +2570,28 @@ static void storageTaskFn(void* arg) {
     info("ready\n");
 
     for (;;) {
-        TickType_t timeout = (dcHandle >= 0) ? pdMS_TO_TICKS(10) : portMAX_DELAY;
-        while (itsPoll(timeout)) { timeout = 0; }
+        int64_t it0 = esp_timer_get_time();
+        bool dc_active = (dcHandle >= 0);   /* gate the stall warn on entry state:
+                                               a fresh connect unblocks a MAX-delay
+                                               poll and would read as a false stall */
+        TickType_t timeout = dc_active ? pdMS_TO_TICKS(10) : portMAX_DELAY;
+        int drained = 0;
+        while (itsPoll(timeout)) { timeout = 0; drained++; }
+        int64_t t_poll = esp_timer_get_time();
         dcPollConfig();
+        int64_t t_cfg = esp_timer_get_time();
         dcPumpDump();
+        int64_t t_dump = esp_timer_get_time();
         /* Hold patches until the dump drains: a chunk carries the snapshot
            value, a patch the newer one, so the patch must land after its
            chunk. dcAccumulateChange keeps coalescing meanwhile. */
         if (!dcDumpInProgress()) dcFlushPatch();
+        int64_t t_end = esp_timer_get_time();
+        if (dc_active && (t_end - it0) > ACTOR_STALL_WARN_US)
+            warn("actor stall %lldms: applyPoll=%lld(ops=%d) cfgPoll=%lld dump=%lld patch=%lld\n",
+                 (t_end - it0) / 1000, (t_poll - it0) / 1000, drained,
+                 (t_cfg - t_poll) / 1000, (t_dump - t_cfg) / 1000,
+                 (t_end - t_dump) / 1000);
     }
 }
 
@@ -2567,8 +2601,10 @@ static void storageTaskFn(void* arg) {
 void storageInit() {
     int v = storageGetInt("s.storage.version", 0);
     if (v < STORAGE_VERSION) {
+        storageBegin();
         storageDefault("s.storage.flash_delay", 60);
         storageSet("s.storage.version", STORAGE_VERSION);
+        storageEnd();
     }
 
     /* persist worker: owns the blocking fs writes so the storage task's poll

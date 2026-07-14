@@ -1626,11 +1626,13 @@ static void serialTaskFn(void* arg) {
 void cliInit() {
   int v = storageGetInt("s.cli.version", 0);
   if (v < CLI_VERSION) {
+    storageBegin();
     storageDefaultTree("s.cli", R"({
       "start_dir": "/"
     })");
     storageUnset("s.cli.sticky");
     storageSet("s.cli.version", CLI_VERSION);
+    storageEnd();
   }
 
   /* Register builtin commands on main task's context, before spawning the cli

@@ -75,6 +75,7 @@ void publishBuildTimes() {
         }
         fs_close(f);
     }
+    storageBegin();
     storageSet("sys.buildtime.fixed", (int)fixedMaxMtime);
     if (haveWebrootCrc)
         storageSet("sys.buildtime.web", (int)webrootCrc32);
@@ -102,6 +103,7 @@ void publishBuildTimes() {
     storageSet("sys.build.straddle", app_build_straddle);
     storageSet("sys.build.version", app_build_version);
     storageSet("sys.build.args", app_build_args);
+    storageEnd();
     info("build: straddle %s v%s\n", app_build_straddle, app_build_version);
     info("build: invocation %s\n", app_build_args);
 }

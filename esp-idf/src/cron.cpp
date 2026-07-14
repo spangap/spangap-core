@@ -331,8 +331,10 @@ static void cronTaskFn(void*) {
 void cronInit() {
     int v = storageGetInt("s.cron.version", 0);
     if (v < CRON_VERSION) {
+        storageBegin();
         storageDefault("s.cron.enable", 1);
         storageSet("s.cron.version", CRON_VERSION);
+        storageEnd();
     }
 
     pmLockCreate(PM_NO_DEEP_SLEEP, "cron", &cronDeepLock);
