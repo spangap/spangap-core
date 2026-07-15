@@ -93,6 +93,18 @@ int pmGpioWakeEnable(int pin, int wakeLevel);
 /** Disable light-sleep wakeup on this pin. */
 void pmGpioWakeDisable(int pin);
 
+/** Called on each automatic light-sleep exit, from IDLE-task context, with the
+ *  wake cause (an esp_sleep_wakeup_cause_t, e.g. ESP_SLEEP_WAKEUP_GPIO). Runs
+ *  after clocks/cache are restored; must not block. A level-triggered GPIO wake
+ *  source whose ISR can miss the edge (a press that has bounced back to the
+ *  inactive level by the time the post-wake interrupt is sampled) uses this to
+ *  re-check the line on the wake itself. */
+typedef void (*pm_wake_cb_t)(int cause);
+
+/** Register a light-sleep wake callback. Idempotent per cb; a handful of slots.
+ *  Needs CONFIG_PM_LIGHT_SLEEP_CALLBACKS + tickless idle (both on by default). */
+void pmOnLightSleepWake(pm_wake_cb_t cb);
+
 /** Record that we're about to enter deep sleep for durationUs microseconds.
  *  Call just before esp_deep_sleep_start(). Stats survive in RTC RAM. */
 void pmRecordDeepSleep(int64_t durationUs);

@@ -508,6 +508,47 @@ void pmGpioWakeDisable(int pin) {
    * pins may still rely on it, and it's a no-op for unconfigured pins. */
 }
 
+/* ---- light-sleep wake callbacks ---- */
+
+#define PM_WAKE_CB_MAX 4
+static pm_wake_cb_t s_wakeCbs[PM_WAKE_CB_MAX] = {};
+
+#if CONFIG_PM_LIGHT_SLEEP_CALLBACKS
+/* Runs from IDLE-task context on every automatic light-sleep exit (clocks/cache
+ * already restored). Fan out the wake cause to the registered callbacks. Kept
+ * lean — most exits are timer wakes a subscriber ignores in a couple of ops. */
+static esp_err_t pmLightSleepExit(int64_t /*slept_us*/, void* /*arg*/) {
+  int cause = (int)esp_sleep_get_wakeup_cause();
+  for (int i = 0; i < PM_WAKE_CB_MAX; i++)
+    if (s_wakeCbs[i]) s_wakeCbs[i](cause);
+  return ESP_OK;
+}
+#endif
+
+void pmOnLightSleepWake(pm_wake_cb_t cb) {
+  if (!cb) return;
+#if CONFIG_PM_LIGHT_SLEEP_CALLBACKS
+  int slot = -1;
+  for (int i = 0; i < PM_WAKE_CB_MAX; i++) {
+    if (s_wakeCbs[i] == cb) return;                 /* already registered */
+    if (!s_wakeCbs[i] && slot < 0) slot = i;
+  }
+  if (slot < 0) { err("pmOnLightSleepWake: no free slot"); return; }
+  s_wakeCbs[slot] = cb;
+
+  static bool registered = false;
+  if (!registered) {
+    esp_pm_sleep_cbs_register_config_t cfg = {};
+    cfg.exit_cb = pmLightSleepExit;
+    esp_err_t r = esp_pm_light_sleep_register_cbs(&cfg);
+    if (r != ESP_OK) { err("esp_pm_light_sleep_register_cbs: %s", esp_err_to_name(r)); return; }
+    registered = true;
+  }
+#else
+  err("pmOnLightSleepWake: CONFIG_PM_LIGHT_SLEEP_CALLBACKS disabled");
+#endif
+}
+
 void pmRecordDeepSleep(int64_t durationUs) {
   rtcDeepSleepCount++;
   rtcDeepSleepUs += durationUs;
