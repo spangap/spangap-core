@@ -86,6 +86,7 @@ static SemaphoreHandle_t cfgMux = nullptr;  /* recursive mutex: readers vs the s
  * dump pump). Both warns are self-throttling — they fire only past threshold. */
 #define CFG_HOLD_WARN_US    50000    /* 50 ms  — a lock-held duplicate/print   */
 #define ACTOR_STALL_WARN_US 250000   /* 250 ms — a single poll-loop iteration  */
+#define ACTOR_STALL_LOUD_US 500000   /* > 500 ms: warn; 250-500 ms is debug-only */
 
 static bool savePending = false;
 static esp_timer_handle_t saveTimer = nullptr;
@@ -3257,11 +3258,21 @@ static void storageTaskFn(void* arg) {
            chunk. dcAccumulateChange keeps coalescing meanwhile. */
         if (!dcDumpInProgress()) dcFlushPatch();
         int64_t t_end = esp_timer_get_time();
-        if (dc_active && (t_end - it0) > ACTOR_STALL_WARN_US)
-            warn("actor stall %lldms: applyPoll=%lld(ops=%d) cfgPoll=%lld dump=%lld patch=%lld\n",
-                 (t_end - it0) / 1000, (t_poll - it0) / 1000, drained,
-                 (t_cfg - t_poll) / 1000, (t_dump - t_cfg) / 1000,
-                 (t_end - t_dump) / 1000);
+        /* Sub-500ms stalls are routine (a flash/SD write burst disables the cache
+         * for both cores) and only noise at warn — log them at debug and keep warn
+         * for the ones long enough to actually hurt. */
+        if (dc_active && (t_end - it0) > ACTOR_STALL_WARN_US) {
+            if ((t_end - it0) > ACTOR_STALL_LOUD_US)
+                warn("actor stall %lldms: applyPoll=%lld(ops=%d) cfgPoll=%lld dump=%lld patch=%lld\n",
+                     (t_end - it0) / 1000, (t_poll - it0) / 1000, drained,
+                     (t_cfg - t_poll) / 1000, (t_dump - t_cfg) / 1000,
+                     (t_end - t_dump) / 1000);
+            else
+                dbg("actor stall %lldms: applyPoll=%lld(ops=%d) cfgPoll=%lld dump=%lld patch=%lld\n",
+                    (t_end - it0) / 1000, (t_poll - it0) / 1000, drained,
+                    (t_cfg - t_poll) / 1000, (t_dump - t_cfg) / 1000,
+                    (t_end - t_dump) / 1000);
+        }
     }
 }
 
