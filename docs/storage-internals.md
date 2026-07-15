@@ -4,6 +4,120 @@ Maintainer reference for `storage.cpp` / `storage.h`. The
 [operator guide](storage.md) covers usage; this is for changing the code
 without breaking it.
 
+## 0. Structured record stores (`storage_db.*` + routing in `storage.cpp`)
+
+Large homogeneous collections (LXMF message history first) no longer live in the
+cJSON tree. They move to packed fixed-schema record stores — `storage_db.cpp` is
+the value-agnostic engine, `storage.cpp` owns the routing/notify/registry glue.
+Design rationale: [`plans/storage-structured-db.md`](../../plans/storage-structured-db.md).
+
+**Engine (`storage_db.h/.cpp`).** A store is one contiguous PSRAM arena
+(`[16 B file header][record][record]…`) plus a `key→offset` index. A record is
+`[u32 rec_len][u8 flags][fixed fields…][u16 keyLen,key][u16 len,text]…`. Field
+kinds: `SDB_U8`/`SDB_U32`/`SDB_FIXSTR` are fixed-width and **mutate in place**
+(the hot path — a stage transition is one memcpy at a known offset);
+`SDB_TEXT` is length-prefixed and immutable (a changed text field rebuilds the
+record: overwrite in place if the new size matches, else tombstone + append).
+`flags` bit0 is a RAM-only tombstone; the next flush drops tombstoned records
+(the flush **is** the compaction) and rebuilds the index. On disk the block is
+gzip-wrapped (own binary codec — storage.cpp's is text/NUL-oriented); load =
+gunzip + validate `SGDB` magic/schema-id/hdr_size + walk to rebuild the index.
+Ephemeral stores (`cap_records > 0`) drop the oldest records past the cap.
+Unit-tested host-side (create/mutate/rebuild/tombstone/compact/cap/round-trip).
+
+**Registration + registry.** `storageStructuredDB(name, keyPattern, schema, opts)`
+registers a store; the owner keeps the `sdb_schema` alive (a static). The
+declaration is also published to the ephemeral, browser-synced, **firmware-only**
+`storage.db.<name>` registry (schema/pattern/file) so the browser can decode
+records; `isStorageDb()` gates it out of inbound patches like `fw.*`. LXMF
+registers `s.lxmf.id.$.msgs.$` → `lxmf/msgs/$1/$2.db.gz` in `LxmfService::onInit`.
+
+**Routing.** `sdbRoute()` matches a dot-key against each registration's pattern
+(`$` = wildcard bind); the tail after the matched pattern is 0 segs (instance),
+1 (record), or 2 (`record.field`). A cheap `litPrefix` strncmp precedes the
+`splitDots` allocation so ordinary config reads pay almost nothing. The strncmp
+runs over `min(key_len, litPrefix_len)`: a key that IS the bare instance prefix
+(a zero-wildcard store — `lxmf.announces` — iterated at exactly its pattern) is
+one char shorter than `litPrefix`'s trailing dot and must still be a candidate;
+over-matching is harmless, the full segment compare rejects any real mismatch.
+Matching keys are served from the store, **not** cfgRoot:
+
+- **Reads** (`storageGetStr/Int/Exists/ForEach`) try `sdbGetLocked` /
+  `sdbExistsLocked` / `sdbForEachUnderLocked` first, under `CFG_LOCK`.
+  `storageForEach` over a whole-identity prefix (`…id.N.msgs`) enumerates
+  instances from the resident set + a disk scan.
+- **Writes** are intercepted in `storageApplyOps` pass 2 (`sdbApplyOpLocked`)
+  before they reach the cfgRoot patch. The store applies the op and appends the
+  synthesized change to the same `changes` vector, so the post-unlock notify
+  fan-out is identical to a cfgRoot write — **that** is what keeps the LCD
+  `s.lxmf.id` subscription and the browser updating (the plan's crux seam). A
+  routed write arms the save timer via `routedDirty`.
+
+All store access is serialized by `CFG_LOCK` (the same recursive mutex guarding
+cfgRoot): the resident block only mutates with the lock held, so a reader holding
+it is safe from writes and from block relocation (the moving-block footgun).
+
+**Flush.** `storageDbFlushDirty()` runs on the persist worker (in
+`writeSettingsFile`): snapshot each dirty instance's raw block under `CFG_LOCK`
+(`sdbSnapshotRaw`), then deflate + atomic-write lock-free — the `writeExternalFile`
+discipline (never hold the lock across a deflate/flash write). Instance-file
+unlinks are deferred to `g_sdbPendingDeletes`, drained here (fs I/O off the actor).
+
+**Browser sync (three layers).** (1) The connect dump is cheap because bodies
+aren't in cfgRoot. (2) On open, the browser sends `{"fetch":"<instance-prefix>"}`;
+`dcShipStorePrefix` ships that instance's records as one merge-patch at the
+instance path (where the browser's message code already reads) and records
+`dcOpenPrefix`. (3) `dcAccumulateChange` mirrors a routed body change **only**
+when it's under `dcOpenPrefix` (reading the value from the store, not cfgRoot);
+other conversations are represented only by their directory entry.
+*Note:* this ships records as JSON, not the plan's raw `.db.gz` cold-ship — a
+correctness-first realization; the raw-bytes speedup is a future optimization.
+(4) **Browser-mirrored stores** (`opts.browserMirror`) are small always-needed
+collections — a directory or catalogue, not a body — so they behave like a
+cfgRoot subtree used to: the browser fetches each once (same `{"fetch":…}` →
+`dcShipStorePrefix`, but it does **not** claim `dcOpenPrefix`), and
+`dcAccumulateChange` mirrors **every** change to them, not just while open. So a
+mirrored store stays live in the browser without being the open instance. LXMF's
+contacts + announces set this; message bodies do not.
+
+**Conversation directory (LXMF-side, maintained).** `contacts.<peer>.{count,
+last_ts,preview,unread,display_name,…}` is now its own **browser-mirrored**
+record store (`s.lxmf.id.$.contacts` → `lxmf/contacts/$1.db.gz`), one record per
+peer, bumped by `bumpConvDirectory` as messages are written; `unread` is a
+maintained counter cleared by `convMarkRead` (and by the browser on open), not
+derived by walking messages. The browser conversation list and the LCD list read
+it — O(conversations). It left cfgRoot so it no longer rides the config
+save/deflate, but stays browser-visible via the mirror. Announces
+(`lxmf.announces`) are likewise a store now: a RAM-only (`persist=null`),
+self-capped (`STORAGE_DB_DROP`, `s.lxmf.max_announces`), browser-mirrored
+catalogue — one record per heard dest (`last`/`hops`/`cost`/`ratchet`/`name`).
+
+**Migration (`storageDbMigrate`, one-way, crash-safe).** Run once from
+`LxmfService::onInit` after registration, guarded by `storage/external.old`.
+Walks cfgRoot per pattern, packs each record subtree into its store, detaches the
+subtree from cfgRoot, collapses the legacy externals into `root.json`
+(`externals.clear()` + `rootDirty`), `storageSave()` (durable), then renames
+`storage/external → storage/external.old` (done-marker + recovery backup).
+Subsumes `migrateLxmfMonolith`. A crash before the rename re-runs it next boot.
+
+`storageDbMigrateStore(name)` migrates **one** store, independent of the global
+done-marker: for a store added *after* the initial split already ran (its
+`external.old` marker is present), so the global migrate would early-return and
+strand the store's existing cfgRoot data. Guarded by its own
+`storage/migrated-<name>` marker; packs the matching subtree, detaches it,
+`storageSave()`, then writes the marker. LXMF calls it for `lxmf_contacts` so a
+device that already migrated messages still packs its existing contacts.
+
+**Known follow-ups (not yet done):** idle eviction of resident instances (they
+stay resident once loaded — bounded by session breadth, not total history);
+raw-`.db.gz` cold-ship (bodies are shipped as JSON on demand instead). *Done
+since:* the conversation directory (contacts) and the announce catalogue both
+moved out of cfgRoot into browser-mirrored stores (announces RAM-only + capped).
+*Done since:* the `wire` RAM-outbox (packed outbound bytes live in lxmf's
+`g_wireOutbox`, not the record — schema v2 dropped the field; a resend reuses the
+cached wire instead of re-packing + re-stamping); drafts are already transient
+(browser keeps them client-local, never a store record).
+
 ## 1. Inventory: what storage owns
 
 **Tasks**
@@ -159,7 +273,14 @@ compacts it.
 ## 5. Persistence
 
 The save timer (`esp_timer`, `s.storage.flash_delay` seconds, 1 s floor) fires
-`requestSave` → `xTaskNotifyGive(storage_save)`. The worker runs
+`requestSave` → `xTaskNotifyGive(storage_save)`. It is **armed once**: the first
+dirtying write after a flush starts the countdown and later writes ride the same
+window without resetting it (`startSaveTimer` returns early while `savePending`).
+Resetting on every write starved the flush on a busy device — background traffic
+(rnsd stats, announces, per-message directory bumps) wrote more often than
+`flash_delay`, pushing the deadline out forever so nothing persisted despite
+ample wall-clock time. `savePending` is cleared at the **start** of
+`writeSettingsFile`, so a change during a flush re-arms for the next window. The worker runs
 `writeSettingsFile` in a **crash-safe order**: dirty externals first (each
 writes its own subtree atomically), then `root.json` if `rootDirty`, and only
 *then* external deletes (`fs_remove` of both format siblings + unregister) —

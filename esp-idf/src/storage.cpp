@@ -28,6 +28,7 @@
  * signaling WS — by the time a DC arrives here the peer is authenticated.
  */
 #include "storage.h"
+#include "storage_db.h"
 #include "fs.h"
 #include "log.h"
 #include "cli.h"
@@ -38,6 +39,7 @@
 #include <string>
 #include <vector>
 #include <deque>
+#include <set>
 #include <atomic>
 #include <algorithm>
 #include <functional>
@@ -115,6 +117,11 @@ static TaskHandle_t saveWorkerHandle = nullptr;
 static TaskHandle_t notifyWorkerHandle = nullptr;
 static int dcHandle = -1;               /* single packet-mode DC client */
 static cJSON* dcPendingPatch = nullptr; /* outgoing coalescing */
+/* The structured-DB instance prefix the single client currently has "open"
+ * (set by a {"fetch":...} request). Record bodies never ride the connect dump
+ * (they aren't in cfgRoot); on fetch we ship the instance's records once, then
+ * mirror only that instance's live changes as ordinary patches. */
+static std::string dcOpenPrefix;
 
 /* File I/O moved to fs.cpp/h — unified PSRAM-safe API. */
 
@@ -231,6 +238,7 @@ static void startSaveTimer();                                    /* defined belo
 static void routePatchDirty(const cJSON* node, char* path, size_t cap, size_t len);
 static bool isSecret(const char* key);
 static cfg_type_t inferType(const char* val);                    /* defined below */
+static void storageDbFlushDirty();                               /* structured-DB flush (defined below) */
 
 /** True if every (named) child of obj has an all-digits name. Empty objects
  *  return false — we don't want to interpret `{}` as "merge nothing into the
@@ -418,6 +426,14 @@ static bool isSecret(const char* key) {
  * patches and `set fw.* ...` are rejected. */
 static bool isFw(const char* key) {
   return strcmp(key, "fw") == 0 || strncmp(key, "fw.", 3) == 0;
+}
+
+/* The `storage.db` structured-DB registry (schemas, patterns) is ephemeral,
+ * browser-synced (for record decoding) but FIRMWARE-WRITABLE ONLY — a browser
+ * patch must not register a store or make storage create files. Gated like
+ * fw.*: skipped on inbound merges. */
+static bool isStorageDb(const char* key) {
+  return strcmp(key, "storage") == 0 || strncmp(key, "storage.", 8) == 0;
 }
 
 /** Read entire file into malloc'd buffer (NUL-terminated). Uses fs API.
@@ -728,6 +744,11 @@ static void writeSettingsFile() {
      Index-walk re-checking size() each step so a concurrent storageNewTreeFile
      push_back can't invalidate us; fs I/O stays OUTSIDE CFG_LOCK (writeExternalFile
      snapshots under the lock then writes lock-free), matching prior behaviour. */
+  /* Clear the pending flag up front (not at the end): a write that dirties state
+     while this flush is in flight then re-arms the timer via startSaveTimer, so
+     its change flushes next window instead of waiting for an unrelated later
+     write to re-arm. */
+  savePending = false;
   for (size_t i = 0; ; ) {
     bool doWrite = false;
     external_t work;
@@ -750,6 +771,10 @@ static void writeSettingsFile() {
     rootDirty = false;
   }
 
+  /* Structured-DB instances: independent per-conversation files, same
+   * snapshot-under-lock / write-lock-free discipline as externals. */
+  storageDbFlushDirty();
+
   /* Deletes last (see above). Erase re-checks from index 0 each round since
      the erase shifts the vector. */
   for (;;) {
@@ -769,7 +794,7 @@ static void writeSettingsFile() {
     fs_remove(work.path.c_str());
     fs_remove((work.path + ".gz").c_str());
   }
-  savePending = false;
+  /* savePending was cleared at the top so mid-flush changes re-arm the timer. */
 }
 
 /* Persist worker loop: block until poked, then flush. ulTaskNotifyTake(pdTRUE)
@@ -803,7 +828,17 @@ static void startSaveTimer() {
     args.name = "storage_save";
     esp_timer_create(&args, &saveTimer);
   }
-  esp_timer_stop(saveTimer);
+  /* Arm ONCE: the first unsaved change starts the clock; later changes ride the
+     same window and must NOT reset it. Resetting on every write (the old
+     behaviour) starves the flush on a busy device — background traffic (rnsd
+     link stats, the announce catalogue, lxmf stats, per-message directory
+     bumps) writes more often than flash_delay, so the deadline was pushed out
+     forever and nothing ever persisted despite ample wall-clock time. Arm-once
+     guarantees a flush within flash_delay of the first dirty write while still
+     coalescing the whole window into one rewrite. `savePending` is cleared at
+     the start of writeSettingsFile, so a change during a flush re-arms. */
+  if (savePending) return;
+  esp_timer_stop(saveTimer);   /* clear any stale arm left by a direct requestSave; harmless if idle */
   int delaySec = storageGetInt("s.storage.flash_delay", 60);
   if (delaySec < 1) delaySec = 1;
   esp_timer_start_once(saveTimer, (int64_t)delaySec * 1000000);
@@ -1091,6 +1126,361 @@ static void notifyChange(const char* key, const char* val) {
   }
 }
 
+/* ======================================================================
+ * Structured-DB routing (storage_db.h; plans/storage-structured-db.md)
+ *
+ * A registered store claims a dot-path pattern with `$` wildcards
+ * ("s.lxmf.id.$.msgs.$"). A key that matches, with a two-segment
+ * <record>.<field> tail, is served from the packed record store instead of
+ * cfgRoot: reads resolve against it (this task or a reader, under CFG_LOCK),
+ * writes are applied in the actor's pass 2, and both synthesize the SAME
+ * dot-path change events a cfgRoot write would — so the LCD subscription and
+ * (later) the browser keep updating. Message bodies never enter cfgRoot, so
+ * they cost nothing in the whole-tree dup/dump/save/mirror paths.
+ *
+ * All store access is serialized by CFG_LOCK (the same recursive mutex that
+ * guards cfgRoot): the resident block only mutates with the lock held, so a
+ * reader holding it is safe from the actor's writes and from block relocation.
+ * ==================================================================== */
+
+struct sdb_reg {
+  std::string              name;
+  std::vector<std::string> pat;        /* pattern segments; "$" = wildcard bind */
+  std::string              litPrefix;  /* pattern up to the first wildcard + '.'; a
+                                        * cheap strncmp reject so ordinary config reads
+                                        * never pay the splitDots allocation */
+  size_t                   patLen = 0;
+  std::string              filePat;    /* relative path pattern w/ $1..; "" = ephemeral */
+  const sdb_schema*        schema = nullptr;
+  bool                     persist = false;
+  storage_db_evict         evict = STORAGE_DB_RELOAD;
+  uint32_t                 cap = 0;
+  bool                     browserMirror = false;   /* mirror every change to the browser (directory/
+                                                      * catalogue), not just while the instance is open */
+  std::unordered_map<std::string, sdb_store*> insts;  /* joined-binds -> instance */
+};
+static std::vector<sdb_reg*> g_sdbRegs;
+/* Instance files to unlink, drained on the persist worker — fs I/O must never
+ * run on the storage actor's poll loop. */
+static std::vector<std::string> g_sdbPendingDeletes;
+
+static std::vector<std::string> splitDots(const char* key) {
+  std::vector<std::string> out;
+  const char* p = key;
+  while (*p) {
+    const char* dot = strchr(p, '.');
+    if (!dot) { out.emplace_back(p); break; }
+    out.emplace_back(p, (size_t)(dot - p));
+    p = dot + 1;
+  }
+  if (*key && key[strlen(key) - 1] == '.') out.emplace_back("");
+  return out;
+}
+
+/* Substitute $1..$9 in a file pattern with the bound wildcard values. */
+static std::string sdbSubst(const std::string& pat, const std::vector<std::string>& binds) {
+  std::string out;
+  for (size_t i = 0; i < pat.size(); i++) {
+    if (pat[i] == '$' && i + 1 < pat.size() && pat[i + 1] >= '1' && pat[i + 1] <= '9') {
+      size_t idx = (size_t)(pat[i + 1] - '1');
+      if (idx < binds.size()) out += binds[idx];
+      i++;
+    } else out += pat[i];
+  }
+  return out;
+}
+
+static std::string joinBinds(const std::vector<std::string>& b) {
+  std::string k;
+  for (size_t i = 0; i < b.size(); i++) { if (i) k += '\x1f'; k += b[i]; }
+  return k;
+}
+
+struct sdb_match {
+  sdb_reg*                 reg = nullptr;
+  std::vector<std::string> binds;
+  std::vector<std::string> tail;   /* segments after the matched pattern (0=instance,1=record,2=field) */
+};
+
+/* Match a full key against the registry. Returns false (no match) fast when
+ * there are no registrations or the key is too short / literal segs differ. */
+static bool sdbRoute(const char* key, sdb_match& m) {
+  if (g_sdbRegs.empty()) return false;
+  /* Fast reject before the splitDots allocation: an ordinary config read only
+   * pays a couple of strncmp against each store's literal prefix. Compare over
+   * min(key, litPrefix) length: a key that IS the bare instance prefix (a
+   * zero-wildcard store queried at exactly its pattern, e.g. storageForEach over
+   * "lxmf.announces") is one char shorter than litPrefix's trailing dot and must
+   * still be a candidate. Over-matching is harmless — the full segment compare
+   * below rejects any real mismatch. */
+  size_t klen = strlen(key);
+  bool cand = false;
+  for (auto* r : g_sdbRegs) {
+    if (r->litPrefix.empty()) { cand = true; break; }
+    size_t n = klen < r->litPrefix.size() ? klen : r->litPrefix.size();
+    if (strncmp(key, r->litPrefix.c_str(), n) == 0) { cand = true; break; }
+  }
+  if (!cand) return false;
+  std::vector<std::string> segs = splitDots(key);
+  for (auto* r : g_sdbRegs) {
+    if (segs.size() < r->patLen) continue;
+    bool ok = true;
+    std::vector<std::string> binds;
+    for (size_t i = 0; i < r->patLen; i++) {
+      if (r->pat[i] == "$") binds.push_back(segs[i]);
+      else if (r->pat[i] != segs[i]) { ok = false; break; }
+    }
+    if (!ok) continue;
+    m.reg = r;
+    m.binds = std::move(binds);
+    m.tail.assign(segs.begin() + r->patLen, segs.end());
+    return true;
+  }
+  return false;
+}
+
+/* True if a write/read to this key belongs to a store (so cfgRoot / browser JSON
+ * mirror must not also handle it). */
+static bool sdbRoutes(const char* key) { sdb_match m; return sdbRoute(key, m); }
+
+static void mkdirpParent(const std::string& filePath) {
+  size_t slash = filePath.find_last_of('/');
+  if (slash != std::string::npos) fs_mkdirp(filePath.substr(0, slash).c_str());
+}
+
+/* Find or create the instance for these binds. Caller holds CFG_LOCK. */
+static sdb_store* sdbInstance(sdb_reg* r, const std::vector<std::string>& binds) {
+  std::string ik = joinBinds(binds);
+  auto it = r->insts.find(ik);
+  if (it != r->insts.end()) return it->second;
+  sdb_store* st = new sdb_store();
+  st->schema = r->schema;
+  st->cap_records = (r->evict == STORAGE_DB_DROP) ? r->cap : 0;
+  if (r->persist) {
+    st->path = fsStatePath(("/" + sdbSubst(r->filePat, binds)).c_str());
+    mkdirpParent(st->path);
+  }
+  r->insts[ik] = st;
+  return st;
+}
+
+/* Resolve + load the instance addressed by a match's binds. Caller holds CFG_LOCK. */
+static sdb_store* sdbResolveLoaded(sdb_match& m) {
+  sdb_store* st = sdbInstance(m.reg, m.binds);
+  if (!st->loaded) sdbLoad(st);
+  return st;
+}
+
+/* ---- read side (caller holds CFG_LOCK) ---- */
+
+/* Resolve a routed key's value. Returns false if not routed / record or field
+ * absent. Caller holds CFG_LOCK. */
+static bool sdbGetLocked(const char* key, std::string& out) {
+  sdb_match m;
+  if (!sdbRoute(key, m)) return false;
+  if (m.tail.size() != 2) return false;            /* only a record.field leaf has a value */
+  if (!m.reg->schema->find(m.tail[1].c_str())) return false;  /* unknown field (e.g. peer) */
+  sdb_store* st = sdbResolveLoaded(m);
+  return sdbGetField(st, m.tail[0].c_str(), m.tail[1].c_str(), out);
+}
+
+/* Existence of a routed leaf/record. Caller holds CFG_LOCK. */
+static bool sdbExistsLocked(const char* key, bool& exists) {
+  sdb_match m;
+  if (!sdbRoute(key, m)) return false;
+  sdb_store* st = sdbResolveLoaded(m);
+  if (m.tail.size() == 2) {
+    if (!m.reg->schema->find(m.tail[1].c_str())) { exists = false; return true; }
+    std::string v; exists = sdbGetField(st, m.tail[0].c_str(), m.tail[1].c_str(), v);
+  } else if (m.tail.size() == 1) {
+    exists = sdbHasRecord(st, m.tail[0].c_str());
+  } else exists = false;
+  return true;
+}
+
+/* ---- iterate a subtree that spans one or more instances (caller holds CFG_LOCK) ----
+ * Handles storageForEach over a store prefix: a full instance prefix (tail 0),
+ * or a shorter prefix that leaves the last wildcard unbound (all conversations
+ * of an identity). The latter enumerates instances from disk + resident set. */
+static void sdbForEachInstance(sdb_store* st, const std::string& fullPrefix,
+                               void (*cb)(const char* key, const char* val), std::vector<std::string>& out) {
+  struct ctx_t { const std::string* pre; std::vector<std::string>* out; } c{ &fullPrefix, &out };
+  sdbForEach(st, [](const char* rec, const char* field, const char* val, void* vp) {
+    auto* c = (ctx_t*)vp;
+    std::string k = *c->pre + "." + rec + "." + field;
+    c->out->push_back(k);
+    c->out->push_back(val);
+  }, &c);
+  (void)cb;
+}
+
+/* Returns true if the prefix was handled by a store (values collected into
+ * `out` as alternating key,val). Caller holds CFG_LOCK. */
+static bool sdbForEachUnderLocked(const char* prefix, std::vector<std::string>& out) {
+  if (g_sdbRegs.empty()) return false;
+  std::vector<std::string> pre = splitDots(prefix);
+  for (auto* r : g_sdbRegs) {
+    /* Case A: prefix is at/below a full instance (>= patLen segments). */
+    if (pre.size() >= r->patLen) {
+      sdb_match m;
+      if (!sdbRoute(prefix, m) || m.reg != r) continue;
+      sdb_store* st = sdbResolveLoaded(m);
+      /* the instance's full dot-prefix is the first patLen key segments */
+      std::string instPrefix;
+      for (size_t i = 0; i < r->patLen; i++) { if (i) instPrefix += '.'; instPrefix += pre[i]; }
+      sdbForEachInstance(st, instPrefix, nullptr, out);
+      return true;
+    }
+    /* Case B: prefix matches a leading portion, last wildcard unbound —
+     * enumerate every instance (disk + resident) consistent with the binds. */
+    if (pre.size() < r->patLen) {
+      bool ok = true;
+      std::vector<std::string> binds;
+      for (size_t i = 0; i < pre.size(); i++) {
+        if (r->pat[i] == "$") binds.push_back(pre[i]);
+        else if (r->pat[i] != pre[i]) { ok = false; break; }
+      }
+      if (!ok) continue;
+      /* Only the simple case is supported: exactly one trailing unbound wildcard
+       * that is the file stem (covers "s.lxmf.id.N.msgs" over per-peer files). */
+      if (pre.size() != r->patLen - 1 || r->pat[r->patLen - 1] != "$") continue;
+      std::set<std::string> stems;   /* the unbound $ values */
+      /* resident instances */
+      for (auto& kv : r->insts) {
+        /* instance key = joinBinds; the last bind is the unbound stem */
+        std::vector<std::string> ib;
+        size_t s = 0;
+        for (size_t i = 0; i <= kv.first.size(); i++)
+          if (i == kv.first.size() || kv.first[i] == '\x1f') { ib.emplace_back(kv.first.substr(s, i - s)); s = i + 1; }
+        if (ib.size() != binds.size() + 1) continue;
+        bool consistent = true;
+        for (size_t i = 0; i < binds.size(); i++) if (ib[i] != binds[i]) { consistent = false; break; }
+        if (consistent) stems.insert(ib.back());
+      }
+      /* disk files */
+      if (r->persist) {
+        std::string dir = fsStatePath(("/" + sdbSubst(r->filePat, binds)).c_str());
+        size_t slash = dir.find_last_of('/');
+        if (slash != std::string::npos) dir = dir.substr(0, slash);
+        int dh = fs_opendir(dir.c_str());
+        if (dh >= 0) {
+          fs_dirent_t ent;
+          while (fs_readdir(dh, &ent)) {
+            size_t nl = strlen(ent.name);
+            if (nl > 6 && strcmp(ent.name + nl - 6, ".db.gz") == 0)
+              stems.insert(std::string(ent.name, nl - 6));
+          }
+          fs_closedir(dh);
+        }
+      }
+      for (const std::string& stem : stems) {
+        std::vector<std::string> ib = binds; ib.push_back(stem);
+        sdb_store* st = sdbInstance(r, ib);
+        if (!st->loaded) sdbLoad(st);
+        std::string instPrefix(prefix); instPrefix += '.'; instPrefix += stem;
+        sdbForEachInstance(st, instPrefix, nullptr, out);
+      }
+      return true;
+    }
+  }
+  return false;
+}
+
+/* ---- write side (runs in the actor's pass 2, under CFG_LOCK) ----
+ * Apply one routed op to its store and record the synthesized change (for the
+ * post-unlock notify fan-out). Returns true if the op was routed (and must not
+ * enter the cfgRoot patch). `vs` is the op's value as a string ("" for delete). */
+static bool sdbApplyOpLocked(char op, const char* key, const std::string& vs, bool silent,
+                             std::vector<std::pair<std::string,std::string>>& changes,
+                             bool& routedDirty) {
+  sdb_match m;
+  if (!sdbRoute(key, m)) return false;
+
+  if (m.tail.size() == 2) {                     /* <record>.<field> */
+    const sdb_field* fd = m.reg->schema->find(m.tail[1].c_str());
+    if (!fd) return true;                        /* swallow unknown field (e.g. redundant peer) */
+    sdb_store* st = sdbResolveLoaded(m);
+    const char* rec = m.tail[0].c_str();
+    const char* field = m.tail[1].c_str();
+    if (op == 'D') { return true; }              /* single-field delete: unused, swallow */
+    std::string cur;
+    bool have = sdbGetField(st, rec, field, cur);
+    if (op == 'd' && have && !cur.empty()) return true;   /* DEFAULT: keep existing */
+    if (have && cur == vs) return true;          /* dedup (load-bearing vs notify floods) */
+    sdbSetField(st, rec, field, vs.c_str());
+    routedDirty = true;
+    if (!silent) changes.emplace_back(key, vs);
+    return true;
+  }
+
+  if (m.tail.size() == 1) {                      /* whole record */
+    sdb_store* st = sdbResolveLoaded(m);
+    if (op == 'D') {
+      sdbDeleteRecord(st, m.tail[0].c_str());
+      routedDirty = true;
+      if (!silent) changes.emplace_back(key, "");   /* record subtree gone */
+    }
+    return true;
+  }
+
+  /* tail 0: whole instance. A DELETE drops the instance; handled by
+   * storageDbDropInstance via markExternals path below, so just swallow SETs. */
+  if (op == 'D') {
+    sdb_store* st = sdbInstance(m.reg, m.binds);
+    if (st->loaded) sdbEvict(st);
+    if (!st->path.empty()) g_sdbPendingDeletes.push_back(st->path);  /* unlink on the worker */
+    delete st;
+    m.reg->insts.erase(joinBinds(m.binds));
+    routedDirty = true;
+    if (!silent) changes.emplace_back(key, "");
+  }
+  return true;
+}
+
+/* Flush every dirty resident instance. Snapshot the raw block under CFG_LOCK,
+ * then deflate + write lock-free (the writeExternalFile discipline). Runs on the
+ * persist worker. */
+static void storageDbFlushDirty() {
+  struct job_t { std::string path; uint8_t* raw; size_t len; };
+  std::vector<job_t> jobs;
+  std::vector<std::string> deletes;
+  CFG_LOCK();
+  for (auto* r : g_sdbRegs) {
+    if (!r->persist) continue;
+    for (auto& kv : r->insts) {
+      sdb_store* st = kv.second;
+      if (st->loaded && st->dirty && !st->path.empty()) {
+        size_t len = 0;
+        uint8_t* raw = sdbSnapshotRaw(st, &len);
+        st->dirty = false;
+        if (raw) jobs.push_back({ st->path, raw, len });
+      }
+    }
+  }
+  deletes = std::move(g_sdbPendingDeletes);
+  g_sdbPendingDeletes.clear();
+  CFG_UNLOCK();
+  for (auto& p : deletes) fs_remove(p.c_str());
+  for (auto& j : jobs) {
+    size_t gzLen = 0;
+    uint8_t* gz = sdbGzDeflate(j.raw, j.len, &gzLen);
+    free(j.raw);
+    if (!gz) { warn("storage_db: deflate %s failed\n", j.path.c_str()); continue; }
+    std::string tmp = j.path + ".new";
+    if (atomicWriteFile(tmp.c_str(), gz, gzLen)) fs_rename(tmp.c_str(), j.path.c_str());
+    free(gz);
+  }
+}
+
+/* True if any resident instance needs a flush (arms the boot save kick). */
+static bool storageDbAnyDirty() {
+  if (!g_sdbPendingDeletes.empty()) return true;
+  for (auto* r : g_sdbRegs)
+    for (auto& kv : r->insts)
+      if (kv.second->dirty) return true;
+  return false;
+}
+
 /* The apply pipeline — runs on the storage task (aux handler) and on the D1
  * fast path. `sender` owns any SUB/UNSUB registered by this message. */
 static void storageApplyOps(const uint8_t* p, size_t len, TaskHandle_t sender) {
@@ -1154,10 +1544,25 @@ static void storageApplyOps(const uint8_t* p, size_t len, TaskHandle_t sender) {
   /* Pass 2: apply under the config mutex. */
   cJSON* patch = cJSON_CreateObject();
   std::vector<std::pair<std::string,std::string>> changes;
+  bool routedDirty = false;
 
   CFG_LOCK();
   for (auto& o : ops) {
     if (o.op == '+' || o.op == '-') continue;
+
+    /* Route structured-DB keys to their record store instead of cfgRoot. The
+     * store applies the op and appends the synthesized change to `changes`, so
+     * the notify fan-out below is identical to a cfgRoot write. */
+    if (!g_sdbRegs.empty()) {
+      std::string vs;
+      if (o.op != 'D' && o.val) {
+        if (cJSON_IsString(o.val))      vs = o.val->valuestring;
+        else if (cJSON_IsNumber(o.val)) vs = std::to_string(o.val->valueint);
+        else { char* j = cJSON_PrintUnformatted(o.val); if (j) { vs = j; cJSON_free(j); } }
+      }
+      if (sdbApplyOpLocked(o.op, o.key.c_str(), vs, silent, changes, routedDirty)) continue;
+    }
+
     char leaf[96];  /* see navigatePath */
     if (o.op == 'D') {
       cJSON* parent = navigateOrCreate(patch, o.key.c_str(), leaf, sizeof(leaf));
@@ -1192,6 +1597,7 @@ static void storageApplyOps(const uint8_t* p, size_t len, TaskHandle_t sender) {
     routePatchDirty(patch, rb, sizeof(rb), 0);
     startSaveTimer();
   }
+  if (routedDirty) startSaveTimer();   /* a structured-DB instance went dirty */
   cJSON_Delete(patch);
 
   /* SUB/UNSUB: mutate the actor-owned table under the lock (race-free). */
@@ -1596,19 +2002,27 @@ void storageLoad() {
 
 bool storageExists(const char* key) {
   CFG_LOCK();
-  cJSON* node = resolveKey(key);
-  bool exists = node && !cJSON_IsObject(node) && !cJSON_IsArray(node);
+  bool exists;
+  if (!sdbExistsLocked(key, exists)) {
+    cJSON* node = resolveKey(key);
+    exists = node && !cJSON_IsObject(node) && !cJSON_IsArray(node);
+  }
   CFG_UNLOCK();
   return exists;
 }
 
 int storageGetInt(const char* key, int def) {
   CFG_LOCK();
-  cJSON* node = resolveKey(key);
   int result = def;
-  if (node) {
-    if (cJSON_IsNumber(node)) result = node->valueint;
-    else if (cJSON_IsString(node)) result = atoi(node->valuestring);
+  std::string sv;
+  if (sdbGetLocked(key, sv)) {
+    result = atoi(sv.c_str());
+  } else {
+    cJSON* node = resolveKey(key);
+    if (node) {
+      if (cJSON_IsNumber(node)) result = node->valueint;
+      else if (cJSON_IsString(node)) result = atoi(node->valuestring);
+    }
   }
   CFG_UNLOCK();
   return result;
@@ -1617,6 +2031,8 @@ int storageGetInt(const char* key, int def) {
 void storageGetStr(const char* key, char* out, size_t outLen, const char* def) {
   if (outLen == 0) return;
   CFG_LOCK();
+  std::string sv;
+  if (sdbGetLocked(key, sv)) { safeStrncpy(out, sv.c_str(), outLen); CFG_UNLOCK(); return; }
   cJSON* node = resolveKey(key);
   if (!node) { CFG_UNLOCK(); safeStrncpy(out, def, outLen); return; }
   if (cJSON_IsString(node)) { safeStrncpy(out, node->valuestring, outLen); CFG_UNLOCK(); return; }
@@ -1627,8 +2043,9 @@ void storageGetStr(const char* key, char* out, size_t outLen, const char* def) {
 
 std::string storageGetStr(const char* key, const char* def) {
   CFG_LOCK();
-  cJSON* node = resolveKey(key);
   std::string out;
+  if (sdbGetLocked(key, out)) { CFG_UNLOCK(); return out; }
+  cJSON* node = resolveKey(key);
   if (node && cJSON_IsString(node))      out = node->valuestring;
   else if (node && cJSON_IsNumber(node)) out = std::to_string(node->valueint);
   else                                   out = def ? def : "";
@@ -1838,6 +2255,184 @@ void storageNewTreeFile(const char* prefix) {
      no orphaned file, no new data-loss window beyond the existing save delay. */
 }
 
+/* ---- Structured record store registration ---- */
+
+void storageStructuredDB(const char* name, const char* keyPattern,
+                         const sdb_schema* schema, const storage_db_opts& opts) {
+  if (!name || !keyPattern || !schema) return;
+
+  CFG_LOCK();
+  for (auto* r : g_sdbRegs) if (r->name == name) { CFG_UNLOCK(); return; }  /* idempotent */
+  sdb_reg* r  = new sdb_reg();
+  r->name     = name;
+  r->pat      = splitDots(keyPattern);
+  r->patLen   = r->pat.size();
+  for (auto& seg : r->pat) {                 /* literal prefix up to the first wildcard */
+    if (seg == "$") break;
+    if (!r->litPrefix.empty()) r->litPrefix += '.';
+    r->litPrefix += seg;
+  }
+  if (!r->litPrefix.empty()) r->litPrefix += '.';
+  r->filePat  = opts.persist ? opts.persist : "";
+  r->schema   = schema;
+  r->persist  = opts.persist != nullptr;
+  r->browserMirror = opts.browserMirror;
+  r->evict    = opts.evict;
+  r->cap      = opts.cap;
+  g_sdbRegs.push_back(r);
+  CFG_UNLOCK();
+
+  /* Publish the declaration into the ephemeral, browser-synced, firmware-only
+   * `storage.db.<name>` registry so the browser can decode the raw record
+   * files it is shipped. Rebuilt from code each boot (never persisted). */
+  cJSON* d = cJSON_CreateObject();
+  cJSON_AddStringToObject(d, "pattern", keyPattern);
+  if (opts.persist) cJSON_AddStringToObject(d, "file", opts.persist);
+  cJSON_AddNumberToObject(d, "persist",    opts.persist ? 1 : 0);
+  cJSON_AddNumberToObject(d, "schema_id",  schema->schema_id);
+  cJSON_AddNumberToObject(d, "schema_ver", schema->schema_ver);
+  cJSON_AddNumberToObject(d, "hdr_size",   schema->hdr_size);
+  cJSON* farr = cJSON_CreateArray();
+  for (auto& f : schema->fields) {
+    cJSON* fo = cJSON_CreateObject();
+    cJSON_AddStringToObject(fo, "name", f.name.c_str());
+    cJSON_AddNumberToObject(fo, "kind", f.kind);
+    cJSON_AddNumberToObject(fo, "off",  f.off);
+    cJSON_AddNumberToObject(fo, "width", f.width);
+    cJSON_AddItemToArray(farr, fo);
+  }
+  cJSON_AddItemToObject(d, "fields", farr);
+  std::string rk = std::string("storage.db.") + name;
+  storageSetTree(rk.c_str(), d);   /* ephemeral (bare prefix), synced, takes ownership */
+}
+
+/* ---- one-way migration: cfgRoot subtrees -> record stores ---- */
+
+/* Walk cfgRoot following a store's key pattern; at each instance subtree pack
+ * every record's schema fields into the store and record the (parent,leaf) to
+ * detach afterwards. Caller holds CFG_LOCK. */
+static void migrateWalk(cJSON* node, sdb_reg* r, size_t depth,
+                        std::vector<std::string>& binds,
+                        std::vector<std::pair<cJSON*, std::string>>& detach,
+                        int& packed) {
+  if (!node) return;
+  if (depth == r->patLen) {
+    /* `node` is the instance subtree: an object of <record> children. */
+    sdb_store* st = sdbInstance(r, binds);
+    if (!st->loaded) sdbLoad(st);
+    bool any = false;
+    for (cJSON* rec = node->child; rec; rec = rec->next) {
+      if (!rec->string || !cJSON_IsObject(rec)) continue;
+      for (cJSON* fld = rec->child; fld; fld = fld->next) {
+        if (!fld->string) continue;
+        if (!r->schema->find(fld->string)) continue;   /* skip redundant fields (e.g. peer) */
+        std::string v;
+        if (cJSON_IsString(fld))      v = fld->valuestring;
+        else if (cJSON_IsNumber(fld)) v = std::to_string(fld->valueint);
+        else continue;
+        sdbSetField(st, rec->string, fld->string, v.c_str());
+        any = true;
+      }
+    }
+    if (any) packed++;
+    return;
+  }
+  const std::string& pseg = r->pat[depth];
+  if (pseg == "$") {
+    for (cJSON* c = node->child; c; c = c->next) {
+      if (!c->string) continue;
+      binds.push_back(c->string);
+      if (depth + 1 == r->patLen) detach.emplace_back(node, c->string);
+      migrateWalk(c, r, depth + 1, binds, detach, packed);
+      binds.pop_back();
+    }
+  } else {
+    cJSON* c = cJSON_GetObjectItem(node, pseg.c_str());
+    if (c) {
+      if (depth + 1 == r->patLen) detach.emplace_back(node, pseg);
+      migrateWalk(c, r, depth + 1, binds, detach, packed);
+    }
+  }
+}
+
+void storageDbMigrate() {
+  std::string oldDir = fsStatePath("/storage/external.old");
+  std::string curDir = fsStatePath("/storage/external");
+  struct stat st;
+
+  CFG_LOCK();
+  if (fs_stat(oldDir.c_str(), &st) == 0) { CFG_UNLOCK(); return; }   /* already migrated */
+
+  int packed = 0;
+  std::vector<std::pair<cJSON*, std::string>> detach;
+  for (auto* r : g_sdbRegs) {
+    if (!r->persist) continue;
+    std::vector<std::string> binds;
+    migrateWalk(cfgRoot, r, 0, binds, detach, packed);
+  }
+  /* Detach the migrated subtrees from cfgRoot so they can't re-mirror or fall
+   * back into root.json. */
+  for (auto& d : detach) cJSON_DeleteItemFromObject(d.first, d.second.c_str());
+
+  /* Collapse every legacy external back into root.json: their message data now
+   * lives in the stores; anything else they held (contacts, identity) is still
+   * in cfgRoot and, with the externals forgotten, persists via root.json. This
+   * is what makes renaming the whole external/ dir safe. */
+  externals.clear();
+  rootDirty = true;
+  CFG_UNLOCK();
+
+  /* Durable before we touch the old data: flush the new stores + root.json. */
+  storageSave();
+
+  /* Done-marker + recovery backup. Keep external.old (don't delete); a crash
+   * before this rename simply re-runs the migration next boot. */
+  fs_rename(curDir.c_str(), oldDir.c_str());
+  info("storage_db: migrated %d conversation(s) to record stores\n", packed);
+}
+
+void storageDbMigrateStore(const char* name) {
+  if (!name || !*name) return;
+  std::string marker = fsStatePath((std::string("/storage/migrated-") + name).c_str());
+  struct stat st;
+
+  CFG_LOCK();
+  if (fs_stat(marker.c_str(), &st) == 0) { CFG_UNLOCK(); return; }   /* already done */
+
+  sdb_reg* reg = nullptr;
+  for (auto* r : g_sdbRegs) if (r->name == name) { reg = r; break; }
+  if (!reg || !reg->persist) { CFG_UNLOCK(); return; }   /* unknown or RAM-only */
+
+  int packed = 0;
+  std::vector<std::pair<cJSON*, std::string>> detach;
+  std::vector<std::string> binds;
+  migrateWalk(cfgRoot, reg, 0, binds, detach, packed);
+  /* Detach the packed subtree so it can't re-mirror or fall back into root.json. */
+  for (auto& d : detach) cJSON_DeleteItemFromObject(d.first, d.second.c_str());
+  rootDirty = true;
+  CFG_UNLOCK();
+
+  /* Durable before we mark done: flush the new store(s) + the shrunk root.json. */
+  storageSave();
+
+  /* Per-store done-marker (touch an empty file). A crash before this re-runs. */
+  int f = fs_open(marker.c_str(), "w");
+  if (f >= 0) fs_close(f);
+  info("storage_db: migrated store '%s' (%d instance(s))\n", name, packed);
+}
+
+bool storageDbDropInstance(const char* instancePrefix) {
+  if (!instancePrefix || !*instancePrefix) return false;
+  CFG_LOCK();
+  bool routes = sdbRoutes(instancePrefix);
+  CFG_UNLOCK();
+  if (!routes) return false;
+  /* A DELETE op routes through sdbApplyOpLocked (tail 0 → drop the instance,
+   * remove its file, synthesize the subtree-gone notification). */
+  storageDeleteTree(instancePrefix);
+  return true;
+}
+
 cfg_type_t storageGetType(const char* key) {
   CFG_LOCK();
   cJSON* node = resolveKey(key);
@@ -1941,7 +2536,17 @@ int storageArrayCount(const char* prefix) {
 
 void storageForEach(const char* prefix, void (*cb)(const char* key, const char* val)) {
   std::string pre = stripDots(prefix);
+  /* A prefix that lands in a record store iterates its instance(s) instead of
+   * cfgRoot — collect under the lock, then invoke cb after releasing it (a cb
+   * that re-enters storage would re-take the recursive lock; keep parity with
+   * the collect-then-emit CLI discipline). */
+  std::vector<std::string> routed;
   CFG_LOCK();
+  if (sdbForEachUnderLocked(pre.c_str(), routed)) {
+    CFG_UNLOCK();
+    for (size_t i = 0; i + 1 < routed.size(); i += 2) cb(routed[i].c_str(), routed[i + 1].c_str());
+    return;
+  }
   cJSON* node = pre.empty() ? cfgRoot : navigatePath(cfgRoot, pre.c_str());
   if (!node) { CFG_UNLOCK(); return; }
   if (cJSON_IsObject(node) || cJSON_IsArray(node)) {
@@ -2277,13 +2882,41 @@ static void dcAccumulateChange(const char* key, const char* val) {
     if (dcHandle < 0) return;
     if (isSecret(key)) return;
 
+    CFG_LOCK();
+
+    /* Structured-DB bodies aren't in cfgRoot. Mirror a body change only for the
+     * instance the client currently has open (record-scoped, per the plan) — its
+     * value comes from the store, not cfgRoot. Changes to other conversations
+     * are represented to the browser only by their maintained directory entry. */
+    sdb_match sm;
+    if (sdbRoute(key, sm)) {
+        bool open = !dcOpenPrefix.empty() &&
+                    strncmp(key, dcOpenPrefix.c_str(), dcOpenPrefix.size()) == 0 &&
+                    key[dcOpenPrefix.size()] == '.';
+        /* A body (message conversation) only mirrors while it is the open instance;
+         * a browser-mirrored store (contacts directory, announce catalogue) mirrors
+         * every change, exactly as the equivalent cfgRoot subtree used to. */
+        if (!open && !sm.reg->browserMirror) { CFG_UNLOCK(); return; }
+        std::string sv;
+        bool has = sdbGetLocked(key, sv);
+        if (!dcPendingPatch) dcPendingPatch = cJSON_CreateObject();
+        char leaf[96];
+        cJSON* parent = navigateOrCreate(dcPendingPatch, key, leaf, sizeof(leaf));
+        if (parent) {
+            cJSON_DeleteItemFromObject(parent, leaf);
+            if (has) cJSON_AddStringToObject(parent, leaf, sv.c_str());
+            else     cJSON_AddNullToObject(parent, leaf);
+        }
+        CFG_UNLOCK();
+        return;
+    }
+
     /* The key may be gone (storageUnset / storageDeleteTree removed it
        before firing callbacks). Previously we skipped — so deletions were
        never echoed and a deleted conversation lingered in open clients
        until a full reload. Instead echo an explicit null at the key: the
        coalesced patch is retried under back-pressure (never dropped), so
        the browser reliably drops the (sub)tree. */
-    CFG_LOCK();
     cJSON* node = navigatePath(cfgRoot, key);
 
     if (!dcPendingPatch) dcPendingPatch = cJSON_CreateObject();
@@ -2298,6 +2931,31 @@ static void dcAccumulateChange(const char* key, const char* val) {
     } else {
         bool deep = cJSON_IsObject(node) || cJSON_IsArray(node);
         cJSON_AddItemToObject(parent, leaf, cJSON_Duplicate(node, deep));
+    }
+    CFG_UNLOCK();
+}
+
+/* Ship a structured-DB instance's records to the browser as one merge patch,
+ * placed at the instance's dot-path so the browser merges them into its mirror
+ * exactly where its message-reading code already looks. Called on {"fetch":...}.
+ * Runs on the storage task. */
+static void dcShipStorePrefix(const char* prefix) {
+    std::vector<std::string> kv;
+    CFG_LOCK();
+    if (!sdbForEachUnderLocked(prefix, kv)) { CFG_UNLOCK(); return; }
+    /* Track the open instance only for on-demand bodies (conversations). A
+     * browser-mirrored store is fetched once and then kept live by the change
+     * mirror, so it must not displace the open conversation here. */
+    sdb_match sm;
+    if (!(sdbRoute(prefix, sm) && sm.reg->browserMirror)) dcOpenPrefix = prefix;
+    if (!dcPendingPatch) dcPendingPatch = cJSON_CreateObject();
+    for (size_t i = 0; i + 1 < kv.size(); i += 2) {
+        char leaf[96];
+        cJSON* parent = navigateOrCreate(dcPendingPatch, kv[i].c_str(), leaf, sizeof(leaf));
+        if (parent) {
+            cJSON_DeleteItemFromObject(parent, leaf);
+            cJSON_AddStringToObject(parent, leaf, kv[i + 1].c_str());
+        }
     }
     CFG_UNLOCK();
 }
@@ -2428,6 +3086,7 @@ static void mergeIncomingPatch(cJSON* obj, const std::string& prefix) {
     std::string key = prefix.empty() ? item->string : prefix + "." + item->string;
     if (isSecret(key.c_str())) continue;
     if (isFw(key.c_str())) continue;   /* read-only firmware identity */
+    if (isStorageDb(key.c_str())) continue;   /* read-only structured-DB registry */
     if (cJSON_IsNull(item)) {
       /* Browser-initiated silent delete: a SILENT DELETE op (no subscription
        * callbacks). Runs on the storage task, so this fast-paths straight into
@@ -2460,6 +3119,16 @@ static void dcHandleMessage(int handle, const char* text, size_t len) {
     /* The borrowed packet block carries no NUL terminator — parse by length. */
     cJSON* root = cJSON_ParseWithLength(text, len);
     if (!root) return;
+    /* {"fetch":"<store-prefix>"} — the client opened a conversation: ship that
+     * instance's records once, and mark it open so its live changes mirror. An
+     * empty/absent fetch closes (stops mirroring bodies). */
+    cJSON* fetch = cJSON_GetObjectItem(root, "fetch");
+    if (fetch && cJSON_IsString(fetch)) {
+        if (*fetch->valuestring) dcShipStorePrefix(fetch->valuestring);
+        else                     dcOpenPrefix.clear();
+        cJSON_Delete(root);
+        return;
+    }
     mergeIncomingPatch(root, "");
     cJSON_Delete(root);
 }
@@ -2501,6 +3170,7 @@ static int storageItsConnect(int handle, const void* data, size_t len) {
 static void storageItsDisconnect(int ref) {
     (void)ref;
     dcHandle = -1;
+    dcOpenPrefix.clear();
     s_dumpGen.fetch_add(1, std::memory_order_relaxed);   /* orphan any in-flight build */
     dcDumpPending = false;
     dcDumpQueue.clear();
@@ -2607,19 +3277,27 @@ void storageInit() {
         storageEnd();
     }
 
-    /* persist worker: owns the blocking fs writes so the storage task's poll
-     * loop never stalls on them. Spawn before the storage task so it's ready
+    /* All three storage tasks run on CORE 0, off the LCD's core (the UI task is
+     * prio-1 core-1). Same priority means same-core storage work — the save
+     * worker's gzip deflate above all, but also the actor's op-apply and the
+     * notify sends — time-slices with LVGL rendering and stalls the UI for the
+     * duration (~0.5 s while a busy conversation flushes). On core 0 (with rnsd
+     * prio-2 / lxmf / wifi) the LCD keeps core 1 to itself; the only remaining
+     * coupling is the brief CFG_LOCK a UI read takes, which is cross-core. */
+
+    /* persist worker: owns the blocking fs writes + gzip so the storage task's
+     * poll loop never stalls on them. Spawn before the storage task so it's ready
      * for the first save poke (the save timer can only fire 60s+ after boot). */
-    saveWorkerHandle = spawnTask(saveWorkerFn, "storage_save", 8192, nullptr, 1, 1);
+    saveWorkerHandle = spawnTask(saveWorkerFn, "storage_save", 8192, nullptr, 1, 0);
 
     /* notify worker: owns the blocking remote-subscriber CHANGED sends so a
      * flooded subscriber can't stall the storage actor's op-inbox drain. Spawn
      * before the storage task so its first subscribe/change dispatches here. */
     notifyQueueMux = xSemaphoreCreateMutex();
-    notifyWorkerHandle = spawnTask(notifyWorkerFn, "storage_notify", 8192, nullptr, 1, 1);
+    notifyWorkerHandle = spawnTask(notifyWorkerFn, "storage_notify", 8192, nullptr, 1, 0);
 
     /* storage task: PSRAM stack (config WS + ITS, no direct file I/O) */
-    storageHandle = spawnTask(storageTaskFn, "storage", 8192, nullptr, 1, 1);
+    storageHandle = spawnTask(storageTaskFn, "storage", 8192, nullptr, 1, 0);
 
     /* Flush any dirt storageLoad left behind (the lxmf monolith split marks
      * externals dirty + pendingDelete + rootDirty). Normal boots have none —
@@ -2631,6 +3309,7 @@ void storageInit() {
     CFG_LOCK();
     pending = rootDirty;
     for (auto& e : externals) pending = pending || e.dirty || e.pendingDelete;
+    pending = pending || storageDbAnyDirty();
     CFG_UNLOCK();
     if (pending) requestSave();
 }

@@ -114,6 +114,68 @@ void   storageSave();                   /** Force immediate JSON write. */
  *  cfgRoot and still syncs to the browser. */
 void   storageNewTreeFile(const char* prefix);
 
+/* ---- Structured record stores (storage_db.h) ----
+ *
+ * Move a large homogeneous collection out of the cJSON tree into packed
+ * fixed-schema record files, keyed by a dot-path pattern. Callers keep using
+ * storageSet/storageGetStr/storageForEach/storageDeleteTree on the same key
+ * strings — storage transparently routes matching keys to the record store and
+ * synthesizes the same change notifications a cfgRoot write would. See
+ * plans/storage-structured-db.md. */
+
+struct sdb_schema;   /* defined in storage_db.h; the owner builds and keeps it alive */
+
+enum storage_db_evict : uint8_t {
+  STORAGE_DB_RELOAD,   /* durable: evict idle instances, reload from file on access */
+  STORAGE_DB_DROP,     /* ephemeral: hard cap, drop oldest past it (persist off) */
+};
+
+struct storage_db_opts {
+  const char*       persist = nullptr;  /* file pattern under stateDir with $1.. binds
+                                         * (e.g. "lxmf/msgs/$1/$2.db.gz"); null => RAM-only */
+  storage_db_evict  evict   = STORAGE_DB_RELOAD;
+  uint32_t          cap     = 0;        /* STORAGE_DB_DROP: max live records per instance */
+  bool              browserMirror = false;  /* true: a small always-needed collection (a directory
+                                             * or catalogue). The browser fetches it once, then the
+                                             * device mirrors every change to it — like a cfgRoot
+                                             * subtree did. false (default): a body only mirrored
+                                             * while its instance is the open one (dcOpenPrefix). */
+};
+
+/** Register a structured record store. `keyPattern` is a dot-path with `$`
+ *  wildcards that bind per instance (e.g. "s.lxmf.id.$.msgs.$"); the two path
+ *  segments after the matched pattern are the record key and the field name.
+ *  `schema` must outlive the registration (use a static). Firmware-only:
+ *  browsers cannot register stores. Idempotent on `name`. */
+void storageStructuredDB(const char* name, const char* keyPattern,
+                         const sdb_schema* schema, const storage_db_opts& opts);
+
+/** Delete one whole store instance (its file + resident block), e.g. a whole
+ *  conversation. `keyOrPrefix` names the instance prefix (pattern with binds,
+ *  no record/field tail). Fires coalesced directory-side notifications via the
+ *  caller. No-op if the key doesn't name a structured-DB instance. */
+bool storageDbDropInstance(const char* instancePrefix);
+
+/** One-way migration of existing cfgRoot data into the registered record
+ *  stores, run once (guarded by <stateDir>/storage/external.old). Packs every
+ *  matching subtree into its store, detaches it from cfgRoot, collapses the
+ *  legacy externals into root.json, and renames storage/external ->
+ *  storage/external.old as a durable done-marker + recovery backup. Subsumes
+ *  the legacy monolith split. Call once, from an owner's init, after that
+ *  owner has registered its stores (so the schemas exist). Idempotent /
+ *  crash-safe: a crash before the rename re-runs it next boot. */
+void storageDbMigrate();
+
+/** Migrate ONE registered store's cfgRoot subtree into it, independent of the
+ *  global storageDbMigrate() done-marker. For stores added AFTER the initial
+ *  monolith split already ran (its `external.old` marker is present), so the
+ *  global migrate would early-return and strand their existing cfgRoot data.
+ *  Guarded by its own <stateDir>/storage/migrated-<name> marker; packs the
+ *  matching subtree, detaches it from cfgRoot, saves, then writes the marker.
+ *  No-op for an unregistered or RAM-only (non-persist) store. Idempotent /
+ *  crash-safe: a crash before the marker re-runs it next boot. */
+void storageDbMigrateStore(const char* name);
+
 /** Begin a transaction. All storageSet/Unset calls accumulate in a patch tree.
  *  storageEnd() commits atomically: one merge, one WS message, subscriptions
  *  fire once per key (final state only). Nestable. */
