@@ -340,13 +340,18 @@ void pmPollUsb() {
    * respawn around a reflash — can't latch light sleep on. */
   static uint8_t  downStreak = 0;
   static uint32_t lastRecoverMs = 0;   /* 0 = none attempted this outage */
+  static bool     wasDown = false;     /* latched down long enough to matter */
   if (connected || inGrace) {
     downStreak = 0;
     lastRecoverMs = 0;
     if (!held) pmLockAcquire(usbLock);
+    /* Rising edge after a real outage: the host is back (fresh plug-in or a
+     * recovery that took). Log once here, not per 60 s retry. */
+    if (connected && wasDown) { info("usb up\n"); wasDown = false; }
   } else {
     if (downStreak < 3) downStreak++;
     if (downStreak >= 3) {
+      wasDown = true;
       if (!lastRecoverMs || now - lastRecoverMs >= 60000) {
         /* Sustained loss. Force a clean re-enumeration: if a host is
          * actually attached (slow monitor respawn, or the controller
@@ -404,9 +409,12 @@ static void cliUsbUp() {
   usb_serial_jtag_ll_phy_enable_external(false);
   usb_serial_jtag_ll_phy_enable_pad(true);
   usb_serial_jtag_ll_phy_disable_pull_override();
-  info("usb up\n");
+  /* Mechanism trace only — the info-level "usb up" is emitted by pmPollUsb on
+   * the rising edge when a host is actually seen, so the 60 s unplugged retry
+   * doesn't spam the log. */
+  dbg("usb up: re-enumerate\n");
 #else
-  info("usb up: no-op on UART console\n");
+  dbg("usb up: no-op on UART console\n");
 #endif
 }
 
@@ -569,9 +577,9 @@ static void cmdUsb(const char* a) {
     if (strcmp(a, "down") == 0) cliUsbDown();
     else if (strcmp(a, "up") == 0) cliUsbUp();
 #if CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG
-    else cliPrintf("usb: %s\n", usb_serial_jtag_is_connected() ? "connected" : "disconnected");
+    cliPrintf("usb: %s\n", usb_serial_jtag_is_connected() ? "connected" : "disconnected");
 #else
-    else cliPrintf("usb: n/a\n");
+    cliPrintf("usb: n/a\n");
 #endif
 }
 
