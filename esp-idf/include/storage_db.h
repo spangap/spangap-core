@@ -112,6 +112,13 @@ void sdbInitEmpty(sdb_store* s);
  * returns false. Safe to call repeatedly (no-op if already loaded). */
 bool sdbLoad(sdb_store* s);
 
+/* Read a record file's header — schema_id / schema_ver / hdr_size — WITHOUT
+ * validating it against any schema (for migration probing: decide which decoder a
+ * file needs). Returns false if the file is missing or not a valid SGDB gzip. Any
+ * out-pointer may be null. */
+bool sdbPeekHeader(const char* path, uint16_t* schema_id,
+                   uint16_t* schema_ver, uint16_t* hdr_size);
+
 /* Free the resident block and index (write-back is the caller's job — check
  * s->dirty and sdbFlush first). After this the store is not loaded. */
 void sdbEvict(sdb_store* s);

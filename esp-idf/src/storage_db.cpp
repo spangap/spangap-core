@@ -246,6 +246,31 @@ void sdbInitEmpty(sdb_store* s) {
   s->dirty = false;
 }
 
+bool sdbPeekHeader(const char* path, uint16_t* schema_id,
+                   uint16_t* schema_ver, uint16_t* hdr_size) {
+  if (!path) return false;
+  struct stat st;
+  if (fs_stat(path, &st) != 0 || st.st_size <= 0) return false;
+  int f = fs_open(path, "rb");
+  if (f < 0) return false;
+  uint8_t* raw = (uint8_t*)gp_alloc(st.st_size);
+  if (!raw) { fs_close(f); return false; }
+  size_t got = fs_read(raw, 1, st.st_size, f);
+  fs_close(f);
+  size_t inflated = 0;
+  uint8_t* blk = gzInflateBin(raw, got, &inflated);
+  free(raw);
+  if (!blk) return false;
+  bool ok = inflated >= SDB_FILE_HDR && memcmp(blk, SDB_MAGIC, 4) == 0;
+  if (ok) {
+    if (schema_id)  *schema_id  = rdU16(blk + 6);
+    if (schema_ver) *schema_ver = rdU16(blk + 8);
+    if (hdr_size)   *hdr_size   = rdU16(blk + 10);
+  }
+  free(blk);
+  return ok;
+}
+
 bool sdbLoad(sdb_store* s) {
   if (s->loaded) return true;
   if (s->path.empty()) { sdbInitEmpty(s); return true; }
