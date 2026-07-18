@@ -86,6 +86,37 @@ static uint8_t* gzInflateBin(const uint8_t* gz, size_t n, size_t* outLen) {
   return out;
 }
 
+/* ---- hex transcode (SDB_DATA renders/accepts its raw bytes as hex, so the
+ *      string-oriented routing layer and browser mirror carry it losslessly) ---- */
+
+static inline int hexNib(char c) {
+  if (c >= '0' && c <= '9') return c - '0';
+  if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+  if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+  return -1;
+}
+static void hexEncodeBytes(const uint8_t* p, size_t n, std::string& out) {
+  static const char* H = "0123456789abcdef";
+  out.clear(); out.reserve(n * 2);
+  for (size_t i = 0; i < n; i++) { out.push_back(H[p[i] >> 4]); out.push_back(H[p[i] & 0xf]); }
+}
+/* Decode up to maxOut bytes from a hex string into out; returns bytes written.
+ * Stops at a non-hex char or an odd trailing nibble. */
+static size_t hexDecodeInto(const char* s, uint8_t* out, size_t maxOut) {
+  size_t n = 0;
+  while (s[0] && s[1] && n < maxOut) {
+    int hi = hexNib(s[0]), lo = hexNib(s[1]);
+    if (hi < 0 || lo < 0) break;
+    out[n++] = (uint8_t)((hi << 4) | lo);
+    s += 2;
+  }
+  return n;
+}
+static bool isAllZero(const uint8_t* p, size_t n) {
+  for (size_t i = 0; i < n; i++) if (p[i]) return false;
+  return true;
+}
+
 /* ---- schema builders ---- */
 
 sdb_schema& sdb_schema::u8(const char* name) {
@@ -98,6 +129,9 @@ sdb_schema& sdb_schema::u32(const char* name) {
 }
 sdb_schema& sdb_schema::fixstr(const char* name, uint16_t width) {
   fields.push_back({ name, SDB_FIXSTR, hdr_size, width }); hdr_size += width; return *this;
+}
+sdb_schema& sdb_schema::data(const char* name, uint16_t nbytes) {
+  fields.push_back({ name, SDB_DATA, hdr_size, nbytes }); hdr_size += nbytes; return *this;
 }
 sdb_schema& sdb_schema::text(const char* name) {
   fields.push_back({ name, SDB_TEXT, textCount(), 0 }); return *this;
@@ -374,6 +408,12 @@ bool sdbGetField(sdb_store* s, const char* key, const char* field, std::string& 
       out.assign(p, l);
       return true;
     }
+    case SDB_DATA: {
+      const uint8_t* p = h + fd->off;
+      if (isAllZero(p, fd->width)) { out.clear(); return true; }   /* unset */
+      hexEncodeBytes(p, fd->width, out);
+      return true;
+    }
     case SDB_TEXT: {
       std::string k; std::vector<std::string> texts;
       readRecordText(s, off, k, texts);
@@ -382,6 +422,22 @@ bool sdbGetField(sdb_store* s, const char* key, const char* field, std::string& 
     }
   }
   return false;
+}
+
+bool sdbGetFieldBin(sdb_store* s, const char* key, const char* field, void* out, size_t* len) {
+  if (!len) return false;
+  size_t cap = *len; *len = 0;
+  if (!s->loaded) return false;
+  size_t off = findRec(s, key);
+  if (off == SIZE_MAX) return false;
+  const sdb_field* fd = s->schema->find(field);
+  if (!fd || fd->kind != SDB_DATA) return false;
+  const uint8_t* p = s->block + off + fd->off;
+  if (isAllZero(p, fd->width)) return false;          /* unset sentinel */
+  if (fd->width > cap) { *len = fd->width; return false; }  /* buffer too small */
+  memcpy(out, p, fd->width);
+  *len = fd->width;
+  return true;
 }
 
 void sdbSetField(sdb_store* s, const char* key, const char* field, const char* val) {
@@ -416,6 +472,13 @@ void sdbSetField(sdb_store* s, const char* key, const char* field, const char* v
       if (l >= fd->width) l = fd->width - 1;
       memset(h + fd->off, 0, fd->width);
       memcpy(h + fd->off, val, l);
+      break;
+    }
+    case SDB_DATA: {
+      /* val is 2N hex; anything else (incl. "") clears the field to the unset
+       * sentinel. Mutated in place — it lives in the fixed header. */
+      memset(h + fd->off, 0, fd->width);
+      if (strlen(val) == (size_t)fd->width * 2) hexDecodeInto(val, h + fd->off, fd->width);
       break;
     }
     case SDB_TEXT: {
@@ -472,6 +535,14 @@ void sdbForEach(sdb_store* s,
             const char* p = (const char*)h + fd.off;
             size_t l = strnlen(p, fd.width);
             if (l) cb(key.c_str(), fd.name.c_str(), std::string(p, l).c_str(), ctx);
+            break;
+          }
+          case SDB_DATA: {
+            const uint8_t* p = h + fd.off;
+            if (!isAllZero(p, fd.width)) {
+              std::string hx; hexEncodeBytes(p, fd.width, hx);
+              cb(key.c_str(), fd.name.c_str(), hx.c_str(), ctx);
+            }
             break;
           }
           case SDB_TEXT:

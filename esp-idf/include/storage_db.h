@@ -46,7 +46,11 @@ enum sdb_kind : uint8_t {
   SDB_FIXSTR = 3,  /* fixed N B NUL-padded string, mutable in place (enum-like
                     * strings: stage/method/dir, plus the coarse last_error) */
   SDB_TEXT   = 4,  /* variable length, length-prefixed, IMMUTABLE once written
-                    * (title/content/thread) */
+                    * (title/content) */
+  SDB_DATA   = 5,  /* fixed N B raw binary, mutable in place (hashes/keys). The
+                    * string API renders it as 2N hex chars and accepts 2N hex on
+                    * write; all-zero reads back as "" (the unset sentinel). Unlike
+                    * SDB_FIXSTR the full N bytes are payload — no reserved NUL. */
 };
 
 /* One field in a record schema. `name` must contain no '.' (the routing layer
@@ -54,9 +58,10 @@ enum sdb_kind : uint8_t {
 struct sdb_field {
   std::string name;
   sdb_kind    kind;
-  uint16_t    off;    /* SDB_U8/U32/FIXSTR: byte offset within the fixed header.
+  uint16_t    off;    /* SDB_U8/U32/FIXSTR/DATA: byte offset within the fixed header.
                        * SDB_TEXT: the field's order index among text fields. */
-  uint16_t    width;  /* SDB_FIXSTR only: total slot bytes (incl. the NUL room). */
+  uint16_t    width;  /* SDB_FIXSTR: total slot bytes (incl. the NUL room).
+                       * SDB_DATA: the raw byte count N (all payload). */
 };
 
 /* Built-in header layout, present in every schema regardless of fields:
@@ -79,6 +84,7 @@ struct sdb_schema {
   sdb_schema& u8(const char* name);
   sdb_schema& u32(const char* name);
   sdb_schema& fixstr(const char* name, uint16_t width);
+  sdb_schema& data(const char* name, uint16_t nbytes);
   sdb_schema& text(const char* name);
 
   const sdb_field* find(const char* name) const;
@@ -136,6 +142,12 @@ bool sdbHasRecord(const sdb_store* s, const char* key);
 /* Read one field of one record into `out`. Returns false if the record or field
  * is absent (out is left untouched). Numeric fields render as decimal. */
 bool sdbGetField(sdb_store* s, const char* key, const char* field, std::string& out);
+
+/* Read a raw SDB_DATA field with no hex transcode. `*len` is the caller's buffer
+ * capacity on entry, the byte count on return. Returns false (and *len=0) if the
+ * record/field is absent, the field isn't SDB_DATA, or the field is unset
+ * (all-zero); false with *len set to the needed size if capacity is too small. */
+bool sdbGetFieldBin(sdb_store* s, const char* key, const char* field, void* out, size_t* len);
 
 /* Set one field of one record. Creates the record (with defaulted fields) if the
  * key is new. Fixed fields mutate in place; a text field whose value changes

@@ -68,6 +68,15 @@ void   storageSet(const char* key, int val);
 void   storageSet(const char* key, const char* val);
 inline void storageSet(const char* key, const std::string& val) { storageSet(key, val.c_str()); }
 
+/* Raw-binary value access, for SDB_DATA fields (and hex-backed flat keys).
+ * storageGetData reads with no hex transcode when the key routes to a structured
+ * DATA field; `*len` is the buffer capacity in, byte count out (see
+ * sdbGetFieldBin). storageSetData carries the bytes as hex through the normal
+ * write pipeline (where a string form is needed for dedup/notify/mirror anyway);
+ * the store decodes back to raw. */
+void   storageSetData(const char* key, const void* data, size_t len);
+bool   storageGetData(const char* key, void* out, size_t* len);
+
 /** Set a key only if it does not currently exist. Returns true if written.
  *  Use from module init() to seed config defaults that the module owns. */
 bool   storageDefault(const char* key, int val);

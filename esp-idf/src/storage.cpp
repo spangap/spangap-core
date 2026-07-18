@@ -2068,6 +2068,65 @@ void storageSet(const char* key, const char* val) {
   storageEmitOp(op, /*silentSingle=*/false);
 }
 
+/* ---- raw-binary value access (SDB_DATA fields) ---- */
+
+static void hexEncodeStr(const uint8_t* p, size_t n, std::string& out) {
+  static const char* H = "0123456789abcdef";
+  out.clear(); out.reserve(n * 2);
+  for (size_t i = 0; i < n; i++) { out.push_back(H[p[i] >> 4]); out.push_back(H[p[i] & 0xf]); }
+}
+static size_t hexDecodeBuf(const char* s, uint8_t* out, size_t maxOut) {
+  auto nib = [](char c) -> int {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+  };
+  size_t n = 0;
+  while (s[0] && s[1] && n < maxOut) {
+    int hi = nib(s[0]), lo = nib(s[1]);
+    if (hi < 0 || lo < 0) break;
+    out[n++] = (uint8_t)((hi << 4) | lo);
+    s += 2;
+  }
+  return n;
+}
+
+void storageSetData(const char* key, const void* data, size_t len) {
+  std::string hex;
+  hexEncodeStr((const uint8_t*)data, len, hex);
+  storageSet(key, hex.c_str());
+}
+
+bool storageGetData(const char* key, void* out, size_t* len) {
+  if (!len) return false;
+  size_t cap = *len;
+  CFG_LOCK();
+  sdb_match m;
+  if (sdbRoute(key, m)) {
+    /* structured DATA field — read raw, no transcode */
+    bool ok = false;
+    if (m.tail.size() == 2 && m.reg->schema->find(m.tail[1].c_str())) {
+      sdb_store* st = sdbResolveLoaded(m);
+      *len = cap;
+      ok = sdbGetFieldBin(st, m.tail[0].c_str(), m.tail[1].c_str(), out, len);
+    } else *len = 0;
+    CFG_UNLOCK();
+    return ok;
+  }
+  /* flat key — value is stored hex (JSON can't hold NULs); decode it */
+  std::string hex;
+  cJSON* node = resolveKey(key);
+  if (node && cJSON_IsString(node)) hex = node->valuestring;
+  CFG_UNLOCK();
+  *len = 0;
+  if (hex.empty() || (hex.size() & 1)) return false;
+  size_t need = hex.size() / 2;
+  if (need > cap) { *len = need; return false; }
+  *len = hexDecodeBuf(hex.c_str(), (uint8_t*)out, cap);
+  return *len == need;
+}
+
 /* Default writes don't fire change subscriptions: by definition the value
  * was absent before, and these are firmware-bundled defaults being seeded
  * once (typically dozens at first boot), not real config changes. Without
