@@ -1674,8 +1674,8 @@ int itsConnectByTaskHandle(TaskHandle_t serverTask, uint16_t port,
         if (connTable[i].active && connTable[i].clientTask == me->task)
             clientActive++;
     if (clientActive >= me->maxConns) {
-        ITS_LOGE("itsConnect: [%s] has %d/%d client conns already; raise itsClientInit cap",
-                 pcTaskGetName(nullptr), clientActive, me->maxConns);
+        ITS_LOGE("itsConnect: has %d/%d client conns already; raise itsClientInit cap",
+                 clientActive, me->maxConns);
         return -1;
     }
 
