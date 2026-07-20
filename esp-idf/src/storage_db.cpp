@@ -159,13 +159,31 @@ static void writeFileHeader(sdb_store* s, uint32_t recCount) {
 }
 
 static bool ensureCap(sdb_store* s, size_t need) {
-  if (need <= s->cap) return true;
+  if (need <= s->cap) { s->grow_failed = false; return true; }
   size_t ncap = s->cap ? s->cap : 256;
   while (ncap < need) ncap *= 2;
   uint8_t* nb = (uint8_t*)gp_realloc(s->block, ncap);
-  if (!nb) { warn("storage_db: grow to %u B failed\n", (unsigned)ncap); return false; }
+  if (!nb) {
+    /* Doubling asks for a large contiguous run a fragmented heap may lack even
+     * with ample total free; retry at just what's needed (page-rounded) before
+     * declaring failure. Sacrifices amortized-O(1) growth only under pressure. */
+    ncap = (need + 4095) & ~size_t(4095);
+    nb = (uint8_t*)gp_realloc(s->block, ncap);
+  }
+  if (!nb) {
+    if (!s->grow_failed) {   /* one warning per failed episode, with the fragmentation signal */
+      s->grow_failed = true;
+      warn("storage_db[%s]: grow %u->%u B failed (heap free %u, largest block %u)\n",
+           s->path.empty() ? "(ram)" : s->path.c_str(),
+           (unsigned)s->cap, (unsigned)need,
+           (unsigned)heap_caps_get_free_size(MALLOC_CAP_DEFAULT),
+           (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DEFAULT));
+    }
+    return false;
+  }
   s->block = nb;
   s->cap = ncap;
+  s->grow_failed = false;
   return true;
 }
 
@@ -228,9 +246,120 @@ static std::string buildRecord(const sdb_store* s, const uint8_t* hdrCopy,
   return r;
 }
 
+/* Scratch buffer for in-place compaction — batches live records so we flush a
+ * few large copies instead of thousands of per-record moves. Static (store
+ * mutations are serialized under the storage lock, single-threaded), and
+ * PSRAM-resident, so the OOM reclaim path needs no heap and no scarce DRAM. */
+static constexpr size_t SDB_COMPACT_SCRATCH = 8192;
+static uint8_t PSRAM_BSS sdbScratch[SDB_COMPACT_SCRATCH];
+
+/* Repoint the live index entry for the record whose image starts at `recPtr` to
+ * `newOff`. Every live key already owns a map node (tombstoned keys are erased at
+ * tombstone time), so this only overwrites an offset — no node allocation. */
+static inline void sdbReindexRec(sdb_store* s, const uint8_t* recPtr, size_t newOff) {
+  const uint8_t* tp = recPtr + s->schema->hdr_size;
+  uint16_t klen = rdU16(tp);
+  s->index[std::string((const char*)tp + 2, klen)] = (uint32_t)newOff;
+}
+
+/* Compact the resident block in place, dropping tombstones. Live records stream
+ * through sdbScratch and flush back to the arena write cursor in big batches; the
+ * write cursor always trails the read cursor (we only remove bytes) so a flush
+ * never clobbers unread records. Allocates nothing large. Rebuilds no index —
+ * offsets are patched as records move. */
+static void sdbCompactInPlace(sdb_store* s) {
+  uint16_t hs = s->schema->hdr_size;
+  size_t w = SDB_FILE_HDR;    /* destination (write) cursor */
+  size_t off = SDB_FILE_HDR;  /* source (read) cursor */
+  size_t sc = 0;              /* live bytes currently buffered in sdbScratch */
+  uint32_t kept = 0;
+  while (off < s->used) {
+    uint32_t rlen = rdU32(s->block + off + SDB_REC_LEN_OFF);
+    if (rlen < hs || off + rlen > s->used) break;
+    if (!(s->block[off + SDB_FLAGS_OFF] & SDB_FLAG_DELETED)) {
+      if (rlen > SDB_COMPACT_SCRATCH) {                 /* too big to batch: move direct */
+        if (sc) { memcpy(s->block + w, sdbScratch, sc); w += sc; sc = 0; }
+        sdbReindexRec(s, s->block + off, w);
+        memmove(s->block + w, s->block + off, rlen);
+        w += rlen; kept++;
+      } else {
+        if (sc + rlen > SDB_COMPACT_SCRATCH) { memcpy(s->block + w, sdbScratch, sc); w += sc; sc = 0; }
+        sdbReindexRec(s, s->block + off, w + sc);       /* final resting offset once flushed */
+        memcpy(sdbScratch + sc, s->block + off, rlen);
+        sc += rlen; kept++;
+      }
+    }
+    off += rlen;
+  }
+  if (sc) { memcpy(s->block + w, sdbScratch, sc); w += sc; }
+  s->used = w;
+  writeFileHeader(s, kept);
+}
+
+/* OOM reclaim for an append that neither fit nor could grow the arena. One scan
+ * sizes the live set, then: if tombstones are scarce (live still ~fills the
+ * block) relocate the live records into a fresh, 20%-larger contiguous block — a
+ * new allocation can land where an in-place grow could not; otherwise compact in
+ * place (cheap, no large allocation). Returns true if `recSize` more bytes now
+ * fit within s->cap. */
+static bool reclaimForAppend(sdb_store* s, size_t recSize) {
+  uint16_t hs = s->schema->hdr_size;
+  const char* label = s->path.empty() ? "(ram)" : s->path.c_str();
+  size_t oldUsed = s->used;
+  size_t liveBytes = SDB_FILE_HDR;
+  size_t off = SDB_FILE_HDR;
+  while (off < s->used) {
+    uint32_t rlen = rdU32(s->block + off + SDB_REC_LEN_OFF);
+    if (rlen < hs || off + rlen > s->used) break;
+    if (!(s->block[off + SDB_FLAGS_OFF] & SDB_FLAG_DELETED)) liveBytes += rlen;
+    off += rlen;
+  }
+  size_t target = liveBytes + recSize;
+
+  if (liveBytes * 10 >= s->cap * 9) {   /* < ~10% reclaimable: relocate rather than shuffle */
+    size_t newcap = liveBytes + liveBytes / 5;      /* +20% headroom */
+    if (newcap < target) newcap = target;
+    newcap = (newcap + 4095) & ~size_t(4095);
+    uint8_t* nb = (uint8_t*)gp_alloc(newcap);
+    if (nb) {
+      memcpy(nb, s->block, SDB_FILE_HDR);
+      size_t w = SDB_FILE_HDR, o = SDB_FILE_HDR;
+      uint32_t kept = 0;
+      while (o < s->used) {
+        uint32_t rlen = rdU32(s->block + o + SDB_REC_LEN_OFF);
+        if (rlen < hs || o + rlen > s->used) break;
+        if (!(s->block[o + SDB_FLAGS_OFF] & SDB_FLAG_DELETED)) {
+          memcpy(nb + w, s->block + o, rlen);
+          sdbReindexRec(s, nb + w, w);
+          w += rlen; kept++;
+        }
+        o += rlen;
+      }
+      gp_free(s->block);
+      s->block = nb; s->cap = newcap; s->used = w;
+      writeFileHeader(s, kept);
+      s->grow_failed = false;
+      dbg("storage_db[%s]: relocate compact %u->%u B, cap ->%u\n",
+          label, (unsigned)oldUsed, (unsigned)s->used, (unsigned)s->cap);
+      return s->used + recSize <= s->cap;
+    }
+    /* the larger block didn't fit either — reclaim what we can in place */
+  }
+
+  sdbCompactInPlace(s);
+  dbg("storage_db[%s]: inplace compact %u->%u B, cap %u\n",
+      label, (unsigned)oldUsed, (unsigned)s->used, (unsigned)s->cap);
+  if (s->used + recSize <= s->cap) { s->grow_failed = false; return true; }
+  return false;
+}
+
 /* Append a fully-built record image, indexing it by `key`. */
 static bool appendRecord(sdb_store* s, const std::string& key, const std::string& rec) {
-  if (!ensureCap(s, s->used + rec.size())) return false;
+  if (!ensureCap(s, s->used + rec.size())) {
+    /* Grow failed on a fragmented heap: reclaim (drop tombstones, or relocate the
+     * live set into a fresh block) and retry without a big in-place grow. */
+    if (!reclaimForAppend(s, rec.size())) return false;
+  }
   memcpy(s->block + s->used, rec.data(), rec.size());
   s->index[key] = (uint32_t)s->used;
   s->used += rec.size();
@@ -262,10 +391,20 @@ static void compact(sdb_store* s, size_t dropOldest) {
     kept++;
   }
   if (!ensureCap(s, nb.size())) return;
+  size_t oldUsed = s->used;
   memcpy(s->block, nb.data(), nb.size());
   s->used = nb.size();
   writeFileHeader(s, kept);
   rebuildIndex(s);
+  /* drop-oldest fires on every insert past a full ephemeral cap — verbose;
+   * the flush/serialize compaction (dropOldest==0) is occasional — debug. */
+  const char* label = s->path.empty() ? "(ram)" : s->path.c_str();
+  if (dropOldest)
+    verb("storage_db[%s]: cap compact %u->%u B, dropped %u, kept %u\n",
+         label, (unsigned)oldUsed, (unsigned)s->used, (unsigned)dropOldest, kept);
+  else
+    dbg("storage_db[%s]: flush compact %u->%u B, kept %u\n",
+        label, (unsigned)oldUsed, (unsigned)s->used, kept);
 }
 
 /* ---- lifecycle ---- */

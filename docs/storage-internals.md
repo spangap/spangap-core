@@ -25,6 +25,18 @@ gunzip + validate `SGDB` magic/schema-id/hdr_size + walk to rebuild the index.
 Ephemeral stores (`cap_records > 0`) drop the oldest records past the cap.
 Unit-tested host-side (create/mutate/rebuild/tombstone/compact/cap/round-trip).
 
+**Growth & OOM reclaim.** `ensureCap` doubles the arena, but on a fragmented
+heap the large contiguous `realloc` can fail even with ample total free — so it
+retries at just the page-rounded size needed before giving up, and warns once
+per failed episode with the free/largest-block figures (`grow_failed` gates the
+spam). When an append can neither fit nor grow, `reclaimForAppend` runs without
+any large allocation: if tombstones are scarce (live ≳ 90% of `cap`) it relocates
+the live set into a fresh +20% block (a new allocation can land where an in-place
+grow could not); otherwise `sdbCompactInPlace` streams live records through an
+8 KB PSRAM scratch and drops tombstones in place, patching offsets as records
+move (no index rebuild). This is a RAM-path compaction distinct from the
+flush-time one above.
+
 **Registration + registry.** `storageStructuredDB(name, keyPattern, schema, opts)`
 registers a store; the owner keeps the `sdb_schema` alive (a static). The
 declaration is also published to the ephemeral, browser-synced, **firmware-only**

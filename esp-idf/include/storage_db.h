@@ -103,6 +103,7 @@ struct sdb_store {
   size_t   cap   = 0;            /* allocated capacity of `block` */
   bool     loaded = false;       /* file decompressed into RAM (or RAM-only inited) */
   bool     dirty  = false;       /* needs flush */
+  bool     grow_failed = false;  /* last arena grow hit OOM; gates one warning per episode */
 
   std::unordered_map<std::string, uint32_t> index;  /* record key -> byte offset in block */
 };
