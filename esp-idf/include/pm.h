@@ -114,4 +114,16 @@ void pmRecordDeepSleep(int64_t durationUs);
  *  (per-task requires CONFIG_HEAP_TASK_TRACKING). */
 void heapDump(const char* reason);
 
+/* ---- CPU / PM activity ring (1 Hz history for the on-device activity graph) ----
+ * pmInit spawns a background sampler that records one sample per second. Each
+ * holds integer-percent figures; apbMin (the 80 MHz APB-locked-but-not-boosted
+ * residency) is derived by the reader as 100 - sleep - apbMax - cpuMax. */
+struct PmStatSample { uint8_t core0, core1, sleep, apbMax, cpuMax; };
+
+/** Copy up to `max` most-recent ring samples into out[], oldest first so
+ *  out[n-1] is the latest second. Returns the count written (0 if no sample has
+ *  been produced yet, the ring is disabled, or the build lacks run-time stats).
+ *  Thread-safe. */
+int pmStatsHistory(PmStatSample* out, int max);
+
 #endif

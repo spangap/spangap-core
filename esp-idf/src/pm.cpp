@@ -27,9 +27,15 @@
 #include <driver/usb_serial_jtag.h>
 #include <hal/usb_serial_jtag_ll.h>
 #endif
+#include <freertos/FreeRTOS.h>
+#include <freertos/semphr.h>
 #include <cstdio>
 #include <cstring>
 #include <algorithm>
+
+/* 1 Hz CPU/PM stats sampler — defined below pmParseModeStats, spawned from
+   pmInit(). Forward-declared so pmInit (above the definition) can call it. */
+static void pmStatsInit();
 
 /* ---- Central RTC RAM validity ---- */
 #define RTC_APP_MAGIC 0x5ECC0001
@@ -305,6 +311,8 @@ void pmInit() {
    * The "usb" lock stays released; light sleep is governed by other holders. */
   rtcUsbDisabled = false;
 #endif
+
+  pmStatsInit();
 }
 
 #if CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG
@@ -468,6 +476,194 @@ static void pmPrintModeLines(int64_t mode[PM_MODE_COUNT], int64_t deepUs,
   cliPrintf("\nAPB_FREQ_MAX  %d%%  (prevents light sleep)\n", apbHiPct);
 }
 #endif
+
+/* ================= 1 Hz CPU / PM stats sampler =================
+ *
+ * A background task samples per-task CPU, per-core busy, and PM-mode residency
+ * once a second, diffing against the previous second. It:
+ *   - publishes the latest figures to the ephemeral sys.stats.* storage subtree
+ *     (sys.stats.cpu_pct.0/.1, sys.stats.SLEEP/APB_MAX/CPU_MAX);
+ *   - fills a ring of the last `s.sys.cpu_sample_buf` seconds (5 bytes/sample:
+ *     core0, core1, SLEEP, APB_MAX, CPU_MAX — all integer percent; APB_MIN, the
+ *     80 MHz line, and the APB-high line are derived at read time);
+ *   - keeps the latest per-task delta table so `top` renders instantly instead
+ *     of blocking for a 2 s sampling window of its own.
+ *
+ * Sources: per-task/-core figures come from uxTaskGetSystemState run-time
+ * counters (see the FreeRTOS run-time-stats build option); mode residency from
+ * pmParseModeStats (esp_pm's numeric counters, only under CONFIG_PM_PROFILING).
+ */
+#if CONFIG_FREERTOS_USE_TRACE_FACILITY && CONFIG_FREERTOS_GENERATE_RUN_TIME_STATS
+
+/* Latest per-task CPU slice, refreshed each second. Heap/stack columns are not
+   here — `top` joins those fresh at print time (they're point-in-time, not
+   windowed). */
+struct cpuSnap {
+  TaskHandle_t h;
+  char     name[configMAX_TASK_NAME_LEN];
+  int      core, pri;
+  uint16_t stack;
+  char     stkMem;      /* 'D' internal / 'P' PSRAM — captured while the handle
+                           is known-live, so top never derefs a stale handle */
+  uint32_t delta;       /* run-counter delta over the last sample window */
+};
+
+/* Ring element is PmStatSample (pm.h) — one second, integer percent. */
+
+/* Shared with cmdTop — guarded by s_statsMux. */
+static SemaphoreHandle_t s_statsMux;
+static cpuSnap* s_snap;            /* latest per-task table (PSRAM) */
+static int      s_snapN;
+static uint32_t s_snapWindow;      /* run-time ticks spanned by the last window */
+static uint32_t s_snapIdle0, s_snapIdle1;  /* IDLE0/IDLE1 deltas → per-core busy */
+static bool     s_snapReady;
+static PmStatSample* s_ring;
+static int s_ringCap, s_ringHead, s_ringCount;
+
+/* Sampler-private previous snapshot (only the sampler task touches these). */
+struct cpuPrev { TaskHandle_t h; uint32_t run; };
+static cpuPrev* s_prevRun;
+static int      s_prevRunN, s_prevRunCap;
+static uint32_t s_prevWall;
+#ifdef CONFIG_PM_PROFILING
+static int64_t  s_prevGrand[PM_MODE_COUNT];
+static bool     s_prevGrandValid;
+#endif
+
+static void statsTick() {
+  UBaseType_t ntask = uxTaskGetNumberOfTasks();
+  int cap = (int)ntask + 8;                 /* headroom for tasks spawned mid-walk */
+  auto* raw = (TaskStatus_t*)gp_alloc(cap * sizeof(TaskStatus_t));
+  if (!raw) return;
+  uint32_t wall = 0;
+  int cnt = (int)uxTaskGetSystemState(raw, cap, &wall);
+
+  auto* cur = (cpuSnap*)gp_alloc((cnt ? cnt : 1) * sizeof(cpuSnap));
+  if (!cur) { free(raw); return; }
+
+  uint32_t idle0 = 0, idle1 = 0;
+  for (int i = 0; i < cnt; i++) {
+    cur[i].h = raw[i].xHandle;
+    safeStrncpy(cur[i].name, raw[i].pcTaskName, configMAX_TASK_NAME_LEN);
+    cur[i].pri   = (int)raw[i].uxCurrentPriority;
+    cur[i].stack = raw[i].usStackHighWaterMark;
+    cur[i].stkMem = esp_ptr_external_ram(pxTaskGetStackStart(raw[i].xHandle)) ? 'P' : 'D';
+#if CONFIG_FREERTOS_VTASKLIST_INCLUDE_COREID
+    cur[i].core = raw[i].xCoreID == tskNO_AFFINITY ? -1 : (int)raw[i].xCoreID;
+#else
+    cur[i].core = -2;
+#endif
+    uint32_t prev = 0; bool found = false;
+    for (int j = 0; j < s_prevRunN; j++)
+      if (s_prevRun[j].h == raw[i].xHandle) { prev = s_prevRun[j].run; found = true; break; }
+    cur[i].delta = found ? (raw[i].ulRunTimeCounter - prev) : 0;
+    if      (strcmp(cur[i].name, "IDLE0") == 0) idle0 = cur[i].delta;
+    else if (strcmp(cur[i].name, "IDLE1") == 0) idle1 = cur[i].delta;
+  }
+
+  uint32_t window = (s_prevWall && wall > s_prevWall) ? (wall - s_prevWall) : 0;
+
+  /* Save this walk as next tick's baseline. */
+  if (cnt > s_prevRunCap) {
+    free(s_prevRun);
+    s_prevRun = (cpuPrev*)gp_alloc(cnt * sizeof(cpuPrev));
+    s_prevRunCap = s_prevRun ? cnt : 0;
+  }
+  s_prevRunN = 0;
+  for (int i = 0; i < cnt && i < s_prevRunCap; i++) {
+    s_prevRun[i].h = raw[i].xHandle; s_prevRun[i].run = raw[i].ulRunTimeCounter;
+    s_prevRunN++;
+  }
+  s_prevWall = wall;
+  free(raw);
+
+  if (!window) { free(cur); return; }        /* first tick: baseline only */
+
+  /* Any nonzero busy time rounds up to at least 1% so the graph always shows a
+     pixel for a core that did any work this second. */
+  unsigned b0 = 0, b1 = 0;
+  if (window > idle0) { b0 = (unsigned)((uint64_t)(window - idle0) * 100 / window); if (!b0) b0 = 1; }
+  if (window > idle1) { b1 = (unsigned)((uint64_t)(window - idle1) * 100 / window); if (!b1) b1 = 1; }
+
+  int sleepPct = 0, apbMaxPct = 0, cpuMaxPct = 0;
+#ifdef CONFIG_PM_PROFILING
+  { int64_t modeUs[PM_MODE_COUNT] = {};
+    pmParseModeStats(modeUs);
+    int64_t grand[PM_MODE_COUNT];
+    for (int i = 0; i < PM_MODE_COUNT; i++) grand[i] = rtcAccumModeUs[i] + modeUs[i];
+    if (s_prevGrandValid) {
+      int64_t d[PM_MODE_COUNT], da = 0;
+      for (int i = 0; i < PM_MODE_COUNT; i++) { d[i] = grand[i] - s_prevGrand[i]; if (d[i] < 0) d[i] = 0; da += d[i]; }
+      if (da > 0) {
+        sleepPct  = (int)(d[PM_MODE_LIGHT_SLEEP] * 100 / da);
+        apbMaxPct = (int)(d[PM_MODE_APB_MAX]     * 100 / da);
+        cpuMaxPct = (int)(d[PM_MODE_CPU_MAX]     * 100 / da);
+      }
+    }
+    for (int i = 0; i < PM_MODE_COUNT; i++) s_prevGrand[i] = grand[i];
+    s_prevGrandValid = true;
+  }
+#endif
+
+  /* Swap in the fresh snapshot + append the ring sample under the lock. */
+  xSemaphoreTake(s_statsMux, portMAX_DELAY);
+  cpuSnap* old = s_snap;
+  s_snap = cur; s_snapN = cnt;
+  s_snapWindow = window; s_snapIdle0 = idle0; s_snapIdle1 = idle1;
+  s_snapReady = true;
+  if (s_ring && s_ringCap > 0) {
+    PmStatSample& e = s_ring[s_ringHead];
+    e.core0 = (uint8_t)b0; e.core1 = (uint8_t)b1;
+    e.sleep = (uint8_t)sleepPct; e.apbMax = (uint8_t)apbMaxPct; e.cpuMax = (uint8_t)cpuMaxPct;
+    s_ringHead = (s_ringHead + 1) % s_ringCap;
+    if (s_ringCount < s_ringCap) s_ringCount++;
+  }
+  xSemaphoreGive(s_statsMux);
+  free(old);
+
+  /* Publish the latest second, coalesced into one commit. sys.stats.* has no
+     "s." prefix → ephemeral (never persisted), but still mirrored to browsers. */
+  storageBegin();
+  storageSet("sys.stats.cpu_pct.0", (int)b0);
+  storageSet("sys.stats.cpu_pct.1", (int)b1);
+  storageSet("sys.stats.SLEEP",   sleepPct);
+  storageSet("sys.stats.APB_MAX", apbMaxPct);
+  storageSet("sys.stats.CPU_MAX", cpuMaxPct);
+  storageEnd();
+}
+
+static void statsTaskFn(void*) {
+  for (;;) { statsTick(); vTaskDelay(pdMS_TO_TICKS(1000)); }
+}
+
+int pmStatsHistory(PmStatSample* out, int max) {
+  if (!out || max <= 0 || !s_statsMux || !s_ring || s_ringCap <= 0) return 0;
+  xSemaphoreTake(s_statsMux, portMAX_DELAY);
+  int n = s_ringCount < max ? s_ringCount : max;
+  int start = ((s_ringHead - n) % s_ringCap + s_ringCap) % s_ringCap;
+  for (int i = 0; i < n; i++) out[i] = s_ring[(start + i) % s_ringCap];
+  xSemaphoreGive(s_statsMux);
+  return n;
+}
+#else
+int pmStatsHistory(PmStatSample* out, int max) { (void)out; (void)max; return 0; }
+#endif  /* run-time stats */
+
+static void pmStatsInit() {
+#if CONFIG_FREERTOS_USE_TRACE_FACILITY && CONFIG_FREERTOS_GENERATE_RUN_TIME_STATS
+  storageDefault("s.sys.cpu_sample_buf", 320);   /* 320 = default screen width */
+  int cap = storageGetInt("s.sys.cpu_sample_buf", 320);
+  if (cap < 0) cap = 0;
+  if (cap > 3600) cap = 3600;                     /* an hour of 1 Hz samples */
+  s_statsMux = xSemaphoreCreateMutex();
+  if (cap > 0) {
+    s_ring = (PmStatSample*)gp_alloc((size_t)cap * sizeof(PmStatSample));
+    s_ringCap = s_ring ? cap : 0;
+  }
+  /* stdio (funopen/fprintf/sscanf in the mode parse) wants a roomy stack. */
+  spawnTask(statsTaskFn, "cpustat", 6144, nullptr, 1, 0, STACK_PSRAM);
+#endif
+}
 
 /* ---- GPIO wake source ---- */
 
@@ -658,66 +854,34 @@ static void cmdTop(const char* args) {
         return buf;
     };
 #if CONFIG_FREERTOS_USE_TRACE_FACILITY && CONFIG_FREERTOS_GENERATE_RUN_TIME_STATS
-    /* Size the snapshot buffers to the live task count, plus headroom for tasks
-       that may spawn during the 2s sampling window. A fixed cap (was 32) silently
-       truncated the task set once the system grew past it, and since the order
-       from uxTaskGetSystemState() isn't stable, a task could land in snap2 with
-       no match in snap1 -> prev stayed 0 -> delta became the task's *lifetime*
-       run counter instead of its 2s slice, printing bogus >100% rows. */
-    const int maxSnap = (int)uxTaskGetNumberOfTasks() + 8;
     struct snap {
         TaskHandle_t h;
         char name[configMAX_TASK_NAME_LEN];
-        uint32_t run;
-        int core; int pri; uint16_t stack;
+        int core; int pri; uint16_t stack; char stkMem;
         /* Filled after matching against heap task totals */
         size_t dram, psram; uint16_t dblk, pblk;
         uint32_t delta;
     };
-    auto* s1 = (snap*)gp_alloc(maxSnap * sizeof(snap));
+    /* CPU/per-task figures come from the background 1 Hz sampler (statsTick), so
+       this command never blocks for a sampling window of its own — it copies the
+       most recent (≤1 s old) per-task delta table under the stats lock and joins
+       fresh heap/stack columns below. */
+    if (!s_snapReady) { cliPrintf("top: CPU stats warming up, retry in ~1s\n"); return; }
+    xSemaphoreTake(s_statsMux, portMAX_DELAY);
+    const int maxSnap = s_snapN + 4;   /* +headroom for the addAgg pseudo-rows */
     auto* s2 = (snap*)gp_alloc(maxSnap * sizeof(snap));
-    if (!s1 || !s2) { free(s1); free(s2); cliPrintf("top: out of memory\n"); return; }
-    memset(s1, 0, maxSnap * sizeof(snap));
+    if (!s2) { xSemaphoreGive(s_statsMux); cliPrintf("top: out of memory\n"); return; }
     memset(s2, 0, maxSnap * sizeof(snap));
-    auto takeSnap = [](snap* out, int max, uint32_t& total) -> int {
-        UBaseType_t n = uxTaskGetNumberOfTasks();
-        auto* raw = (TaskStatus_t*)gp_alloc(n * sizeof(TaskStatus_t));
-        if (!raw) return 0;
-        n = uxTaskGetSystemState(raw, n, &total);
-        int cnt = n < (UBaseType_t)max ? (int)n : max;
-        for (int i = 0; i < cnt; i++) {
-            out[i].h = raw[i].xHandle;
-            safeStrncpy(out[i].name, raw[i].pcTaskName, configMAX_TASK_NAME_LEN);
-            out[i].run = raw[i].ulRunTimeCounter;
-            out[i].pri = (int)raw[i].uxCurrentPriority;
-            out[i].stack = raw[i].usStackHighWaterMark;
-#if CONFIG_FREERTOS_VTASKLIST_INCLUDE_COREID
-            out[i].core = raw[i].xCoreID == tskNO_AFFINITY ? -1 : (int)raw[i].xCoreID;
-#else
-            out[i].core = -2;
-#endif
-        }
-        free(raw);
-        return cnt;
-    };
-    uint32_t t1 = 0, t2 = 0;
-    int n1 = takeSnap(s1, maxSnap, t1);
-    vTaskDelay(pdMS_TO_TICKS(2000));
-    int n2 = takeSnap(s2, maxSnap, t2);
-    uint32_t deltaTotal = t2 - t1;
-
-    /* Compute per-task CPU delta; also capture IDLE0/IDLE1 for per-core busy. */
-    uint32_t idle0 = 0, idle1 = 0;
+    int n2 = s_snapN;
+    uint32_t deltaTotal = s_snapWindow, idle0 = s_snapIdle0, idle1 = s_snapIdle1;
     for (int i = 0; i < n2; i++) {
-        uint32_t prev = 0; bool found = false;
-        for (int j = 0; j < n1; j++)
-            if (s1[j].h == s2[i].h) { prev = s1[j].run; found = true; break; }
-        /* No baseline (task spawned mid-window, or a reused handle) -> report 0%
-           rather than letting delta default to the full lifetime counter. */
-        s2[i].delta = found ? (s2[i].run - prev) : 0;
-        if (strcmp(s2[i].name, "IDLE0") == 0) idle0 = s2[i].delta;
-        else if (strcmp(s2[i].name, "IDLE1") == 0) idle1 = s2[i].delta;
+        s2[i].h = s_snap[i].h;
+        safeStrncpy(s2[i].name, s_snap[i].name, configMAX_TASK_NAME_LEN);
+        s2[i].core = s_snap[i].core; s2[i].pri = s_snap[i].pri;
+        s2[i].stack = s_snap[i].stack; s2[i].stkMem = s_snap[i].stkMem;
+        s2[i].delta = s_snap[i].delta;
     }
+    xSemaphoreGive(s_statsMux);
 
     /* Merge per-task heap totals into s2 by TaskHandle_t; accumulate unmatched. */
     size_t preDram = 0, preDblk = 0, preP = 0, prePblk = 0;
@@ -833,9 +997,7 @@ static void cmdTop(const char* args) {
             continue;
         }
         char stackBuf[12];
-        const void* stkBase = pxTaskGetStackStart(s2[i].h);
-        char stkMem = esp_ptr_external_ram(stkBase) ? 'P' : 'D';
-        snprintf(stackBuf, sizeof(stackBuf), "%u %c", (unsigned)s2[i].stack, stkMem);
+        snprintf(stackBuf, sizeof(stackBuf), "%u %c", (unsigned)s2[i].stack, s2[i].stkMem);
         cliPrintf("%-12s %4s  %3d  %7s %7s %*s %6s %5u %*s %6s %5u\n",
             s2[i].name, cb, s2[i].pri, stackBuf, cpuBuf,
             bw, drNum, drPct, (unsigned)s2[i].dblk,
@@ -873,7 +1035,7 @@ static void cmdTop(const char* args) {
             bw, fmtBytes(rb, sizeof(rb), ramPsram), bw, fmtBytes(rt, sizeof(rt), totalPsram), pb);
     }
 
-    free(s1); free(s2);
+    free(s2);
 #endif
     if (verbose) {
         cliPrintf("\nHeap:\n");

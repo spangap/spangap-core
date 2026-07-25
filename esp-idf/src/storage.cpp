@@ -3364,7 +3364,7 @@ void storageInit() {
      * flooded subscriber can't stall the storage actor's op-inbox drain. Spawn
      * before the storage task so its first subscribe/change dispatches here. */
     notifyQueueMux = xSemaphoreCreateMutex();
-    notifyWorkerHandle = spawnTask(notifyWorkerFn, "storage_notify", 8192, nullptr, 1, 0);
+    notifyWorkerHandle = spawnTask(notifyWorkerFn, "storage_ntfy", 8192, nullptr, 1, 0);
 
     /* storage task: PSRAM stack (config WS + ITS, no direct file I/O) */
     storageHandle = spawnTask(storageTaskFn, "storage", 8192, nullptr, 1, 0);
