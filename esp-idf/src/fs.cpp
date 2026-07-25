@@ -875,7 +875,7 @@ bool fs_mount_sd(void) {
         (CONFIG_SPANGAP_SDCARD_SPI_HOST == 2) ? SPI2_HOST : SPI3_HOST;
     esp_err_t br = spiHelperInitBus(host_id, &bus);
     if (br != ESP_OK) {
-        warn("SD: SPI bus init failed: %s\n", esp_err_to_name(br));
+        warn("SD: SPI bus init failed: %s", esp_err_to_name(br));
         esp_log_level_set("sdmmc_common",  ESP_LOG_WARN);
         esp_log_level_set("sdmmc_sd",      ESP_LOG_WARN);
         esp_log_level_set("vfs_fat_sdmmc", ESP_LOG_WARN);
@@ -903,7 +903,7 @@ bool fs_mount_sd(void) {
     esp_log_level_set("vfs_fat_sdmmc", ESP_LOG_WARN);
 
     if (ret != ESP_OK) {
-        warn("no SD card mounted at " FS_SDCARD " (mount rc=%s)\n",
+        warn("no SD card mounted at " FS_SDCARD " (mount rc=%s)",
              esp_err_to_name(ret));
         return false;
     }
@@ -921,7 +921,7 @@ bool fs_mount_sd(void) {
 #endif
         }
     }
-    info("SD: %s %llu MB %s\n", sdCard->cid.name,
+    info("SD: %s %llu MB %s", sdCard->cid.name,
          ((uint64_t)sdCard->csd.capacity) * sdCard->csd.sector_size / (1024 * 1024), fsName);
     sdReady = true;
     return true;
@@ -987,8 +987,22 @@ void fsSelectStateStore(void) {
     struct stat st;
     if (sdAvailable() && stat(FS_SDCARD "/state", &st) == 0 && S_ISDIR(st.st_mode))
         safeStrncpy(s_stateDir, FS_SDCARD "/state", sizeof(s_stateDir));
-    printf("state: active store is %s (flash %s always mounted)\n",
-           fsStateDir(), FS_STATE);
+
+    /* Flash 'state' partition size (kB) for the banner. */
+    const esp_partition_t* sp = esp_partition_find_first(
+        ESP_PARTITION_TYPE_DATA, ESP_PARTITION_SUBTYPE_ANY, "state");
+    uint32_t stateKb = sp ? sp->size / 1024 : 0;
+
+    /* No trailing \n: pre-logInit(), the native ESP-IDF logger appends its own. */
+    if (fsStateOnSd()) {
+        info("spangap 'state' dir on SD-card found, active user state store is %s",
+             fsStateDir());
+        info("spangap (partition 'state' (%" PRIu32 " kB) in flash is mounted at %s "
+             "but not used by system.)", stateKb, FS_STATE);
+    } else {
+        info("spangap active user state store is partition 'state' (%" PRIu32
+             " kB) in flash, mounted at %s", stateKb, FS_STATE);
+    }
 
     /* First boot: the active store has no non-dot entries. We can't probe a
      * specific file (settings.json may legitimately not exist now that all
@@ -1068,7 +1082,7 @@ static void statePartitionEnsure() {
     uint32_t start = (floor + ALIGN - 1) & ~(ALIGN - 1);
     if (start >= phys) {
         warn("state: flash %#" PRIx32 " not above firmware floor %#" PRIx32
-             " — no state partition\n", phys, floor);
+             " — no state partition", phys, floor);
         return;
     }
     uint32_t size = phys - start;
@@ -1078,10 +1092,10 @@ static void statePartitionEnsure() {
         esp_flash_default_chip, start, size, "state",
         ESP_PARTITION_TYPE_DATA, ESP_PARTITION_SUBTYPE_DATA_SPIFFS, &out);
     if (e != ESP_OK)
-        err("state: register_external failed: %s\n", esp_err_to_name(e));
+        err("state: register_external failed: %s", esp_err_to_name(e));
     else
         info("state: flash %#" PRIx32 ", floor %#" PRIx32 ", /state at %#" PRIx32
-             " size %#" PRIx32 "\n", phys, floor, start, size);
+             " size %#" PRIx32, phys, floor, start, size);
 }
 
 void fs_init() {

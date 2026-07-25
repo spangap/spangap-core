@@ -120,7 +120,9 @@ extern "C" void spangapInit(void) {
     /* Line-buffer stdout so each \n flushes immediately (USB Serial JTAG
      * default is fully-buffered, hides log lines until full or close). */
     setvbuf(stdout, nullptr, _IOLBF, 0);
-    printf("spangap: starting\n");
+    /* No trailing \n: this fires before logInit() installs the log task, so it
+     * goes through the native ESP-IDF logger, which appends its own newline. */
+    info("spangap starting");
     vTaskDelay(pdMS_TO_TICKS(100));
 
     /* Filesystem first; SD mount needs fs_init; storageLoad needs the active
@@ -215,7 +217,7 @@ extern "C" void spangapPostAppInit(void) {
     storageSet("sys.boot_complete", 1);
 
     logApplyLevels();
-    info("spangap: ready\n");
+    info("spangap ready\n");
 
     /* Run any cron entries that fall in the current minute (deep-sleep wake
      * may already have moved time forward through a scheduled minute). */
