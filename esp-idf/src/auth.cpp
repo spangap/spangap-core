@@ -343,6 +343,15 @@ bool authEnabled() {
     return storageGetInt("secrets.auth.enable", 0) == 1;
 }
 
+bool authRealmUnset(const char* realm) {
+    int idx = realmFind(realm);
+    if (idx < 0) return false;
+    char key[64], hash[128];
+    snprintf(key, sizeof(key), "secrets.auth.realms.%d.hash", idx);
+    storageGetStr(key, hash, sizeof(hash));
+    return hash[0] == '\0';
+}
+
 auth_err_t authPasswd(const char* realm, const char* oldPw, const char* newPw) {
     int idx = realmFind(realm);
     if (idx < 0) return AUTH_NO_SUCH_REALM;

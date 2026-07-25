@@ -27,6 +27,9 @@ void authInit();
 /** Returns true when secrets.auth.enable == 1. */
 bool authEnabled();
 
+/** True if `realm` exists but has no password set yet (empty hash). */
+bool authRealmUnset(const char* realm);
+
 /** Set or change a realm password.
  *  - Probe unset state: old="" + new="" → AUTH_OK if password is unset.
  *  - Set initial password: old="" + new=<pw> (realm hash must be "" or "--").
