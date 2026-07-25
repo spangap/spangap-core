@@ -83,7 +83,7 @@ void spangapPostAppInit(void);
 
 /** Block the calling task until the platform clock is known-valid — the storage
  *  key `sys.time.valid` flips to 1 when a time source syncs (SNTP in
- *  spangap-net, GPS/RTC in hw-tdeck) — or until `timeout_s` elapses, whichever
+ *  spangap-net, GPS/RTC in hw-lilygo-tdeck) — or until `timeout_s` elapses, whichever
  *  comes first. Returns true if time became valid, false on timeout.
  *
  *  `timeout_s <= 0` uses the operator-tunable default `s.sys.time_wait_s`

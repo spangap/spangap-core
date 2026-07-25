@@ -135,7 +135,7 @@ is gotten wrong.
     set by the sub callback, calling `itsPoll` each pass. Any future boot-complete
     subscriber that waits must keep pumping ITS.
   - **Gotcha 2 — deferring WiFi un-masked a latent GPS light-sleep bug.** The
-    T-Deck GPS UART (`hw-tdeck/gps.cpp`) runs on the APB clock and held no PM
+    T-Deck GPS UART (`hw-lilygo-tdeck/gps.cpp`) runs on the APB clock and held no PM
     lock; its autobaud detect loop blocks in `uart_read_bytes`, so with
     `PM_ENABLE`+tickless idle, light sleep gates the UART mid-listen and the
     receiver reads as absent ("no NMEA at any baud", intermittent). It only ever
