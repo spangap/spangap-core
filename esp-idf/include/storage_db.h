@@ -14,12 +14,20 @@
  * two apart is what lets the same records back a durable+paged collection
  * (messages) and an ephemeral+capped one (announces) with two knobs.
  *
- * Representation (RAM block == on-disk block, the disk copy just gzip-wrapped):
+ * Representation. The RAM block is [file header 16 B][record][record]...; the
+ * on-disk file is the same, gzip-wrapped, with a self-describing field
+ * descriptor spliced in between the header and the records (format_ver 2):
  *
- *   [file header 16 B] [record] [record] ...
+ *   RAM:  [file header 16 B] [record] [record] ...
+ *   disk: gz([file header 16 B] [u16 desc_len][descriptor] [record] [record] ...)
  *
  *   file header: 'SGDB' magic, u16 format_ver, u16 schema_id, u16 schema_ver,
  *                u16 hdr_size, u32 record_count
+ *   descriptor:  u16 field_count, then per field:
+ *                u8 kind, u16 off, u16 width, u8 name_len, name bytes.
+ *                Written from the LIVE schema on every flush, so a file always
+ *                describes its own layout; the loader diffs it against the
+ *                current schema and auto-migrates on mismatch (storage_db.cpp).
  *   record:      [u32 rec_len][u8 flags][fixed fields...] [key][text fields...]
  *                fixed fields are overwritten IN PLACE (the mutable ones);
  *                the key and text fields are length-prefixed and immutable once
@@ -80,7 +88,14 @@ struct sdb_schema {
   uint16_t hdr_size   = SDB_HDR_BUILTIN;  /* fixed header total; >= SDB_HDR_BUILTIN */
   std::vector<sdb_field> fields;
 
-  /* Builder helpers — append a field and grow hdr_size for fixed kinds. */
+  /* Builder helpers — append a field and grow hdr_size for fixed kinds.
+   *
+   * Adding or removing a field needs NO migration code: the loader's generic
+   * auto-migrator (sdbLoad) drops fields gone from the schema, defaults fields
+   * new to it, and converts a field whose kind/width changed through the value's
+   * string form. A RENAME reads as delete+add and silently loses the field's
+   * data — do renames as an explicit bespoke pass BEFORE the store registers, or
+   * don't rename. */
   sdb_schema& u8(const char* name);
   sdb_schema& u32(const char* name);
   sdb_schema& fixstr(const char* name, uint16_t width);
@@ -122,9 +137,26 @@ bool sdbLoad(sdb_store* s);
 /* Read a record file's header — schema_id / schema_ver / hdr_size — WITHOUT
  * validating it against any schema (for migration probing: decide which decoder a
  * file needs). Returns false if the file is missing or not a valid SGDB gzip. Any
- * out-pointer may be null. */
+ * out-pointer may be null. Inflates only the file's leading window, so it is
+ * cheap enough to peek every file on a per-boot sweep. */
 bool sdbPeekHeader(const char* path, uint16_t* schema_id,
                    uint16_t* schema_ver, uint16_t* hdr_size);
+
+/* Register a retired schema so the auto-migrator can decode format_ver-1 files
+ * (which carry no embedded descriptor) written under it. Keyed by (schema_id,
+ * hdr_size) — the only layout signal a v1 file exposes. Call before the store
+ * whose old files it describes is registered/loaded. Consumer-owned: storage_db
+ * keeps only the pointer. Deletable once no v1 files remain in the field. */
+void sdbRegisterLegacyLayout(const sdb_schema* schema);
+
+/* If `path` is not already stored in the current on-disk format (format_ver 2
+ * with a descriptor byte-identical to `cur`), load it — auto-migrating any older
+ * layout — and rewrite it in the current format, then evict. A no-op (returns
+ * false) when the file is missing, already current, or an unrecognized layout
+ * that sdbLoad refuses (left untouched, never emptied). Returns true when it
+ * rewrote the file. The peek is the bounded inflate, so on a steady-state boot
+ * this is one cheap descriptor compare per file. */
+bool sdbUpgradeFileIfStale(const char* path, const sdb_schema* cur);
 
 /* Free the resident block and index (write-back is the caller's job — check
  * s->dirty and sdbFlush first). After this the store is not loaded. */

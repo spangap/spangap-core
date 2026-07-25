@@ -21,7 +21,7 @@
 /* ---- File header ---- */
 
 static const uint8_t SDB_MAGIC[4] = { 'S', 'G', 'D', 'B' };
-static constexpr uint16_t SDB_FORMAT_VER = 1;
+static constexpr uint16_t SDB_FORMAT_VER = 2;   /* 2 = embedded field descriptor on disk */
 static constexpr size_t   SDB_FILE_HDR   = 16;  /* magic(4)+fmt(2)+id(2)+ver(2)+hdr(2)+count(4) */
 
 /* ---- little-endian scalar access into the block ---- */
@@ -86,6 +86,33 @@ static uint8_t* gzInflateBin(const uint8_t* gz, size_t n, size_t* outLen) {
   return out;
 }
 
+/* Inflate only the leading `maxOut` bytes of a gzip stream into `out`. Enough to
+ * read the file header + descriptor without paying to inflate a whole (possibly
+ * large) conversation just to peek. Uses a non-wrapping output buffer sized to
+ * the prefix: back-references within the first maxOut bytes stay in range, and a
+ * stream that would produce more simply stops (HAS_MORE_OUTPUT is success here).
+ * No CRC check — a partial inflate can't verify it; the real load does. Returns
+ * bytes produced, or 0 on a malformed stream. */
+static size_t gzInflatePrefix(const uint8_t* gz, size_t n, uint8_t* out, size_t maxOut) {
+  if (n < SDB_GZ_HDR + SDB_GZ_FOOT || gz[0] != 0x1f || gz[1] != 0x8b || gz[2] != 8) return 0;
+  uint8_t flg = gz[3];
+  size_t off = SDB_GZ_HDR;
+  if (flg & 0x04) { if (off + 2 > n) return 0; off += 2 + rdU16(gz + off); }
+  if (flg & 0x08) { while (off < n && gz[off]) off++; off++; }
+  if (flg & 0x10) { while (off < n && gz[off]) off++; off++; }
+  if (flg & 0x02) off += 2;
+  if (off + SDB_GZ_FOOT > n) return 0;
+  tinfl_decompressor* inf = (tinfl_decompressor*)gp_alloc(sizeof(tinfl_decompressor));
+  if (!inf) return 0;
+  size_t inSz = n - off - SDB_GZ_FOOT, outSz = maxOut;
+  tinfl_init(inf);
+  tinfl_status st = tinfl_decompress(inf, gz + off, &inSz, out, out, &outSz,
+                                     TINFL_FLAG_USING_NON_WRAPPING_OUTPUT_BUF);
+  free(inf);
+  if (st != TINFL_STATUS_DONE && st != TINFL_STATUS_HAS_MORE_OUTPUT) return 0;
+  return outSz;
+}
+
 /* ---- hex transcode (SDB_DATA renders/accepts its raw bytes as hex, so the
  *      string-oriented routing layer and browser mirror carry it losslessly) ---- */
 
@@ -146,6 +173,80 @@ uint16_t sdb_schema::textCount() const {
   return n;
 }
 
+/* ---- schema descriptor (the self-describing layout embedded on disk) ---- */
+
+/* Serialize a schema's field table: u16 field_count, then per field
+ * u8 kind, u16 off, u16 width, u8 name_len, name bytes. The 16-byte file header
+ * already carries schema_id/ver/hdr_size, so those are not repeated here. */
+static void serializeDescriptor(const sdb_schema& sc, std::string& out) {
+  out.clear();
+  uint8_t lb[2];
+  wrU16(lb, (uint16_t)sc.fields.size()); out.append((const char*)lb, 2);
+  for (auto& f : sc.fields) {
+    out.push_back((char)f.kind);
+    wrU16(lb, f.off);   out.append((const char*)lb, 2);
+    wrU16(lb, f.width); out.append((const char*)lb, 2);
+    uint8_t nl = (uint8_t)(f.name.size() > 255 ? 255 : f.name.size());
+    out.push_back((char)nl);
+    out.append(f.name.data(), nl);
+  }
+}
+
+/* Rebuild an sdb_schema from a serialized descriptor + the file header's
+ * id/ver/hdr. Preserves stored off/width verbatim (does NOT recompute via the
+ * builder helpers) so it decodes records exactly as they were written. Returns
+ * false on a truncated/garbled descriptor. */
+static bool parseDescriptor(const uint8_t* p, size_t n, uint16_t id, uint16_t ver,
+                            uint16_t hdr, sdb_schema& out) {
+  out = sdb_schema{};
+  out.schema_id = id; out.schema_ver = ver; out.hdr_size = hdr;
+  if (n < 2) return false;
+  uint16_t nf = rdU16(p); size_t o = 2;
+  for (uint16_t i = 0; i < nf; i++) {
+    if (o + 6 > n) return false;
+    sdb_field f;
+    f.kind  = (sdb_kind)p[o];         o += 1;
+    f.off   = rdU16(p + o);           o += 2;
+    f.width = rdU16(p + o);           o += 2;
+    uint8_t nl = p[o];                o += 1;
+    if (o + nl > n) return false;
+    f.name.assign((const char*)p + o, nl); o += nl;
+    out.fields.push_back(std::move(f));
+  }
+  return true;
+}
+
+/* Two schemas decode records identically iff their field tables and hdr_size
+ * match field-for-field (name, kind, off, width). schema_ver is provenance only
+ * and deliberately excluded — a field add/delete needs no version bump. */
+static bool schemaLayoutEqual(const sdb_schema& a, const sdb_schema& b) {
+  if (a.hdr_size != b.hdr_size) return false;
+  if (a.fields.size() != b.fields.size()) return false;
+  for (size_t i = 0; i < a.fields.size(); i++) {
+    const sdb_field& x = a.fields[i];
+    const sdb_field& y = b.fields[i];
+    if (x.kind != y.kind || x.off != y.off || x.width != y.width || x.name != y.name)
+      return false;
+  }
+  return true;
+}
+
+/* ---- legacy (format_ver 1) layout hint table ---- */
+
+struct sdb_legacy { uint16_t id; uint16_t hdr; const sdb_schema* schema; };
+static std::vector<sdb_legacy> g_legacyLayouts;
+
+void sdbRegisterLegacyLayout(const sdb_schema* schema) {
+  if (!schema) return;
+  for (auto& l : g_legacyLayouts)
+    if (l.id == schema->schema_id && l.hdr == schema->hdr_size) { l.schema = schema; return; }
+  g_legacyLayouts.push_back({ schema->schema_id, schema->hdr_size, schema });
+}
+static const sdb_schema* sdbFindLegacy(uint16_t id, uint16_t hdr) {
+  for (auto& l : g_legacyLayouts) if (l.id == id && l.hdr == hdr) return l.schema;
+  return nullptr;
+}
+
 /* ---- block / record helpers ---- */
 
 static void writeFileHeader(sdb_store* s, uint32_t recCount) {
@@ -156,6 +257,27 @@ static void writeFileHeader(sdb_store* s, uint32_t recCount) {
   wrU16(b + 8,  s->schema->schema_ver);
   wrU16(b + 10, s->schema->hdr_size);
   wrU32(b + 12, recCount);
+}
+
+/* Build the uncompressed on-disk image from the resident block: the 16-byte
+ * header (rewritten current), then the embedded field descriptor, then the
+ * records verbatim. The descriptor is always serialized from the LIVE schema, so
+ * every write self-describes as the current layout and old formats age out.
+ * gp_alloc'd; caller frees. Returns nullptr on OOM. */
+static uint8_t* buildDiskImage(sdb_store* s, size_t* outLen) {
+  std::string desc;
+  serializeDescriptor(*s->schema, desc);
+  size_t recBytes = s->used - SDB_FILE_HDR;
+  size_t total = SDB_FILE_HDR + 2 + desc.size() + recBytes;
+  uint8_t* img = (uint8_t*)gp_alloc(total);
+  if (!img) return nullptr;
+  memcpy(img, s->block, SDB_FILE_HDR);            /* header (already current) */
+  wrU16(img + 4, SDB_FORMAT_VER);                 /* force fmt=2 even for adopted v1 blocks */
+  wrU16(img + SDB_FILE_HDR, (uint16_t)desc.size());
+  memcpy(img + SDB_FILE_HDR + 2, desc.data(), desc.size());
+  memcpy(img + SDB_FILE_HDR + 2 + desc.size(), s->block + SDB_FILE_HDR, recBytes);
+  *outLen = total;
+  return img;
 }
 
 static bool ensureCap(sdb_store* s, size_t need) {
@@ -419,29 +541,97 @@ void sdbInitEmpty(sdb_store* s) {
   s->dirty = false;
 }
 
+/* Read up to `cap` decompressed bytes of a file's prefix into `out`. Returns the
+ * byte count (0 on missing/unreadable/corrupt). The bounded inflate keeps a
+ * per-boot sweep cheap — no whole-file decompress just to read a header. */
+static size_t peekPrefix(const char* path, uint8_t* out, size_t cap) {
+  struct stat st;
+  if (fs_stat(path, &st) != 0 || st.st_size <= 0) return 0;
+  int f = fs_open(path, "rb");
+  if (f < 0) return 0;
+  uint8_t* raw = (uint8_t*)gp_alloc(st.st_size);
+  if (!raw) { fs_close(f); return 0; }
+  size_t got = fs_read(raw, 1, st.st_size, f);
+  fs_close(f);
+  size_t n = gzInflatePrefix(raw, got, out, cap);
+  free(raw);
+  return n;
+}
+
 bool sdbPeekHeader(const char* path, uint16_t* schema_id,
                    uint16_t* schema_ver, uint16_t* hdr_size) {
   if (!path) return false;
-  struct stat st;
-  if (fs_stat(path, &st) != 0 || st.st_size <= 0) return false;
-  int f = fs_open(path, "rb");
-  if (f < 0) return false;
-  uint8_t* raw = (uint8_t*)gp_alloc(st.st_size);
-  if (!raw) { fs_close(f); return false; }
-  size_t got = fs_read(raw, 1, st.st_size, f);
-  fs_close(f);
-  size_t inflated = 0;
-  uint8_t* blk = gzInflateBin(raw, got, &inflated);
-  free(raw);
-  if (!blk) return false;
-  bool ok = inflated >= SDB_FILE_HDR && memcmp(blk, SDB_MAGIC, 4) == 0;
-  if (ok) {
-    if (schema_id)  *schema_id  = rdU16(blk + 6);
-    if (schema_ver) *schema_ver = rdU16(blk + 8);
-    if (hdr_size)   *hdr_size   = rdU16(blk + 10);
+  uint8_t pre[SDB_FILE_HDR];
+  size_t n = peekPrefix(path, pre, sizeof(pre));
+  if (n < SDB_FILE_HDR || memcmp(pre, SDB_MAGIC, 4) != 0) return false;
+  if (schema_id)  *schema_id  = rdU16(pre + 6);
+  if (schema_ver) *schema_ver = rdU16(pre + 8);
+  if (hdr_size)   *hdr_size   = rdU16(pre + 10);
+  return true;
+}
+
+/* True iff `path` is a format_ver>=2 file whose embedded descriptor is
+ * byte-identical to `cur`'s — i.e. already stored in the current layout, so a
+ * sweep can skip it. Bounded inflate; false on missing / v1 / any mismatch. */
+static bool sdbFileMatchesSchema(const char* path, const sdb_schema* cur) {
+  uint8_t pre[512];
+  size_t n = peekPrefix(path, pre, sizeof(pre));
+  if (n < SDB_FILE_HDR + 2 || memcmp(pre, SDB_MAGIC, 4) != 0) return false;
+  if (rdU16(pre + 4) < 2) return false;                 /* v1: no descriptor */
+  uint16_t descLen = rdU16(pre + SDB_FILE_HDR);
+  if ((size_t)SDB_FILE_HDR + 2 + descLen > n) return false;   /* didn't fit the window */
+  std::string want; serializeDescriptor(*cur, want);
+  return want.size() == descLen &&
+         memcmp(pre + SDB_FILE_HDR + 2, want.data(), descLen) == 0;
+}
+
+/* Re-pack every live record of `src` (decoded with its own, older schema) into
+ * `dst` (the current schema) via the field API's string round-trip. Fields gone
+ * from the current schema are dropped; fields new to it stay defaulted; a field
+ * present in both is converted through its string form (u8<->u32, fixstr<->text,
+ * DATA<->hex, ...); a value the target parser can't represent lands on the
+ * default. Arena (arrival) order is preserved. Yields periodically: a store with
+ * many records (a full contact directory, a long conversation) is one file, so
+ * without this the whole re-pack runs in a single uninterrupted pass and trips
+ * the task WDT. */
+static void sdbMigrateRecords(sdb_store* dst, sdb_store* src) {
+  uint16_t hs = src->schema->hdr_size;
+  size_t off = SDB_FILE_HDR;
+  int dropped = 0;
+  uint32_t seen = 0;
+  while (off < src->used) {
+    uint32_t rlen = rdU32(src->block + off + SDB_REC_LEN_OFF);
+    if (rlen < hs || off + rlen > src->used) break;
+    if ((++seen & 0x3f) == 0) vTaskDelay(1);   /* feed the WDT every 64 records */
+    if (!(src->block[off + SDB_FLAGS_OFF] & SDB_FLAG_DELETED)) {
+      std::string key; std::vector<std::string> texts;
+      readRecordText(src, off, key, texts);
+      bool materialized = false;
+      for (auto& fd : src->schema->fields) {
+        if (!dst->schema->find(fd.name.c_str())) { dropped++; continue; }  /* field removed */
+        std::string val;
+        if (sdbGetField(src, key.c_str(), fd.name.c_str(), val)) {
+          sdbSetField(dst, key.c_str(), fd.name.c_str(), val.c_str());
+          materialized = true;
+        }
+      }
+      /* No field survived (schemas share nothing but the key) — still create the
+       * record so it isn't silently lost; the first current field defaults. */
+      if (!materialized && !dst->schema->fields.empty())
+        sdbSetField(dst, key.c_str(), dst->schema->fields[0].name.c_str(), "");
+    }
+    off += rlen;
   }
-  free(blk);
-  return ok;
+  if (dropped)
+    dbg("storage_db: migrate dropped %d field value(s) absent from the current schema\n", dropped);
+}
+
+/* Reset a store to loaded-empty after a failed load (block already freed). */
+static bool sdbLoadFailEmpty(sdb_store* s, const char* why, const char* path) {
+  warn("storage_db: %s %s, starting empty\n", why, path);
+  s->block = nullptr; s->cap = 0; s->used = 0; s->loaded = false;
+  sdbInitEmpty(s);
+  return false;
 }
 
 bool sdbLoad(sdb_store* s) {
@@ -463,26 +653,107 @@ bool sdbLoad(sdb_store* s) {
   free(raw);
   if (!blk) { warn("storage_db: corrupt %s, starting empty\n", gzPath.c_str()); sdbInitEmpty(s); return false; }
 
-  /* Validate the file header against this schema. Version mismatch is tolerated
-   * best-effort only when hdr_size matches (future: per-version decoders). */
-  bool ok = inflated >= SDB_FILE_HDR && memcmp(blk, SDB_MAGIC, 4) == 0 &&
-            rdU16(blk + 6)  == s->schema->schema_id &&
-            rdU16(blk + 10) == s->schema->hdr_size;
-  if (!ok) { free(blk); warn("storage_db: header mismatch %s, starting empty\n", gzPath.c_str()); sdbInitEmpty(s); return false; }
+  if (inflated < SDB_FILE_HDR || memcmp(blk, SDB_MAGIC, 4) != 0) {
+    free(blk); return sdbLoadFailEmpty(s, "header mismatch", gzPath.c_str());
+  }
+  uint16_t fmt  = rdU16(blk + 4);
+  uint16_t fid  = rdU16(blk + 6);
+  uint16_t fver = rdU16(blk + 8);
+  uint16_t fhdr = rdU16(blk + 10);
+  if (fid != s->schema->schema_id) {   /* different store entirely — never auto-convert */
+    free(blk); return sdbLoadFailEmpty(s, "schema_id mismatch", gzPath.c_str());
+  }
+
+  /* Resolve the schema the file's records were written with, and where records
+   * begin. format_ver>=2 carries its own descriptor; v1 has none, so match the
+   * current layout by (ver,hdr) or fall back to the legacy hint table. */
+  sdb_schema parsed;
+  const sdb_schema* reader = nullptr;
+  size_t recStart = SDB_FILE_HDR;
+  if (fmt >= 2) {
+    if (inflated < SDB_FILE_HDR + 2) { free(blk); return sdbLoadFailEmpty(s, "truncated descriptor", gzPath.c_str()); }
+    uint16_t descLen = rdU16(blk + SDB_FILE_HDR);
+    recStart = SDB_FILE_HDR + 2 + descLen;
+    if (recStart > inflated ||
+        !parseDescriptor(blk + SDB_FILE_HDR + 2, descLen, fid, fver, fhdr, parsed)) {
+      free(blk); return sdbLoadFailEmpty(s, "bad descriptor", gzPath.c_str());
+    }
+    reader = &parsed;
+  } else {
+    /* v1 exposes only (id, hdr) as a layout signal; hdr match ⇒ current layout
+     * (ver is provenance, never gates). Otherwise consult the legacy hint table. */
+    if (fhdr == s->schema->hdr_size) reader = s->schema;
+    else reader = sdbFindLegacy(fid, fhdr);
+    if (!reader) {
+      free(blk);
+      warn("storage_db: unknown v1 layout id=%u ver=%u hdr=%u in %s, starting empty\n",
+           fid, fver, fhdr, gzPath.c_str());
+      s->block = nullptr; s->cap = 0; s->used = 0; s->loaded = false;
+      sdbInitEmpty(s);
+      return false;
+    }
+  }
+
+  /* Rebuild a resident [16-byte header][records] block for the reader schema
+   * (strip the on-disk descriptor). */
+  size_t recBytes = inflated - recStart;
+  uint8_t* rb = (uint8_t*)gp_alloc(SDB_FILE_HDR + recBytes);
+  if (!rb) { free(blk); sdbInitEmpty(s); return false; }
+  memcpy(rb, blk, SDB_FILE_HDR);
+  memcpy(rb + SDB_FILE_HDR, blk + recStart, recBytes);
+  free(blk);
+
+  if (schemaLayoutEqual(*reader, *s->schema)) {
+    /* Current layout — adopt as-is (v1 files upgrade to v2 framing on next flush). */
+    free(s->block);
+    s->block = rb;
+    s->cap = SDB_FILE_HDR + recBytes;
+    s->used = SDB_FILE_HDR + recBytes;
+    s->loaded = true;
+    s->dirty = false;
+    if (!rebuildIndex(s)) { free(rb); return sdbLoadFailEmpty(s, "bad records in", gzPath.c_str()); }
+    writeFileHeader(s, (uint32_t)s->index.size());   /* normalize header to fmt=2 in RAM */
+    return true;
+  }
+
+  /* Layout differs — auto-migrate: decode with the reader schema, re-pack under
+   * the current one. */
+  sdb_store rs{};
+  rs.schema = reader; rs.block = rb;
+  rs.cap = SDB_FILE_HDR + recBytes; rs.used = SDB_FILE_HDR + recBytes; rs.loaded = true;
+  if (!rebuildIndex(&rs)) { free(rb); return sdbLoadFailEmpty(s, "bad records in", gzPath.c_str()); }
+
+  sdb_store ds{};
+  ds.schema = s->schema; ds.path = s->path;
+  sdbInitEmpty(&ds);
+  if (!ds.loaded) { free(rb); sdbInitEmpty(s); return false; }
+  sdbMigrateRecords(&ds, &rs);
+  free(rb);   /* rs.block */
 
   free(s->block);
-  s->block = blk;
-  s->cap = inflated;
-  s->used = inflated;
+  s->block = ds.block;
+  s->cap = ds.cap;
+  s->used = ds.used;
+  s->index = std::move(ds.index);
   s->loaded = true;
-  s->dirty = false;
-  if (!rebuildIndex(s)) {
-    warn("storage_db: bad records in %s, starting empty\n", gzPath.c_str());
-    free(s->block); s->block = nullptr; s->cap = 0; s->used = 0; s->loaded = false;
-    sdbInitEmpty(s);
-    return false;
-  }
+  s->dirty = true;   /* the migrated layout persists on the next flush */
+  writeFileHeader(s, (uint32_t)s->index.size());
+  info("storage_db: migrated %s to the current layout (%u records)\n",
+       gzPath.c_str(), (unsigned)s->index.size());
   return true;
+}
+
+bool sdbUpgradeFileIfStale(const char* path, const sdb_schema* cur) {
+  if (!path || !cur) return false;
+  struct stat st;
+  if (fs_stat(path, &st) != 0 || st.st_size <= 0) return false;   /* nothing to upgrade */
+  if (sdbFileMatchesSchema(path, cur)) return false;              /* already current v2 */
+  sdb_store s{};
+  s.schema = cur; s.path = path;
+  if (!sdbLoad(&s)) { sdbEvict(&s); return false; }   /* unknown/corrupt → left untouched */
+  bool ok = sdbFlush(&s);                              /* rewrite in current (v2) framing */
+  sdbEvict(&s);
+  return ok;
 }
 
 void sdbEvict(sdb_store* s) {
@@ -499,8 +770,12 @@ bool sdbFlush(sdb_store* s) {
   if (!s->loaded || s->path.empty()) { s->dirty = false; return true; }
   compact(s, 0);   /* drop tombstones; the flush IS the compaction */
 
+  size_t imgLen = 0;
+  uint8_t* img = buildDiskImage(s, &imgLen);
+  if (!img) { warn("storage_db: image %s failed\n", s->path.c_str()); return false; }
   size_t gzLen = 0;
-  uint8_t* gz = gzDeflateBin(s->block, s->used, &gzLen);
+  uint8_t* gz = gzDeflateBin(img, imgLen, &gzLen);
+  free(img);
   if (!gz) { warn("storage_db: deflate %s failed\n", s->path.c_str()); return false; }
 
   std::string tmp = s->path + ".new";
@@ -698,17 +973,20 @@ void sdbForEach(sdb_store* s,
 uint8_t* sdbSerializeGz(sdb_store* s, size_t* outLen) {
   if (!s->loaded) return nullptr;
   compact(s, 0);
-  return gzDeflateBin(s->block, s->used, outLen);
+  size_t imgLen = 0;
+  uint8_t* img = buildDiskImage(s, &imgLen);
+  if (!img) return nullptr;
+  uint8_t* gz = gzDeflateBin(img, imgLen, outLen);
+  free(img);
+  return gz;
 }
 
 uint8_t* sdbSnapshotRaw(sdb_store* s, size_t* outLen) {
   if (!s->loaded) return nullptr;
   compact(s, 0);
-  uint8_t* copy = (uint8_t*)gp_alloc(s->used ? s->used : 1);
-  if (!copy) return nullptr;
-  memcpy(copy, s->block, s->used);
-  *outLen = s->used;
-  return copy;
+  /* The disk image (header + descriptor + records) — the caller deflates it
+   * lock-free. buildDiskImage already copies, so this is the snapshot. */
+  return buildDiskImage(s, outLen);
 }
 
 uint8_t* sdbGzDeflate(const void* in, size_t inLen, size_t* outLen) {
