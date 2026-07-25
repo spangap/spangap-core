@@ -39,6 +39,7 @@ extern "C" const uint32_t app_build_unix;
 extern "C" const char app_build_straddle[];
 extern "C" const char app_build_version[];
 extern "C" const char app_build_args[];
+extern "C" const char app_build_datetime[];
 
 namespace {
 
@@ -103,9 +104,14 @@ void publishBuildTimes() {
     storageSet("sys.build.straddle", app_build_straddle);
     storageSet("sys.build.version", app_build_version);
     storageSet("sys.build.args", app_build_args);
+    storageSet("sys.build.datetime", app_build_datetime);
     storageEnd();
     info("build: straddle %s v%s\n", app_build_straddle, app_build_version);
     info("build: invocation %s\n", app_build_args);
+    /* The catalogue build stamp, when this image is one. A flasher tails this to
+     * decide whether the catalogue holds a newer build than what's running. */
+    if (app_build_datetime[0])
+        info("build: datetime %s\n", app_build_datetime);
 }
 
 }  // namespace
