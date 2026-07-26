@@ -1009,6 +1009,8 @@ const char* cfd(int fd) {
 
 /* ---- CLI commands: log, logfile, logrotate ---- */
 
+static bool isLogDateFile(const char* name);
+
 static void cmdLogfile(const char* a) {
     if (strcmp(a, "help") == 0) { cliPrintf("%-*s log-file status/control\n", CLI_HELP_COL, "logfile [<level>] [on|off|<name>]"); return; }
     if (cliWantsHelp(a)) {
@@ -1050,6 +1052,23 @@ static void cmdLogfile(const char* a) {
     }
 
     if (level) storageSet("s.log.file.level", level);
+
+    /* `logfile boot` — the boot script's auto-enable. Unlike `logfile on` it
+     * must not resurrect a log the user turned off, so it branches on the
+     * persisted intent instead of forcing today's file:
+     *   - key never set (fresh device) → default on, roll to today
+     *   - set empty (`logfile off`)     → stay off
+     *   - dated name                    → roll to today (daily file)
+     *   - fixed custom name             → keep, logInit opens it as-is */
+    if (strcmp(action, "boot") == 0) {
+        if (storageExists("s.log.file.name")) {
+            char cur[64];
+            storageGetStr("s.log.file.name", cur, sizeof(cur));
+            if (!cur[0]) return;              /* explicitly off */
+            if (!isLogDateFile(cur)) return;  /* fixed name — leave it */
+        }
+        action = "on";                        /* fresh or dated → today's file */
+    }
 
     if (strcmp(action, "off") == 0) {
         storageSet("s.log.file.name", "");

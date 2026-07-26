@@ -95,7 +95,13 @@ logrotate [days]           rotate to today's dated file; prune old ones
 - `logfile` with no argument starts today's dated file in `s.log.dir`. A `level`
   argument filters what is written (e.g. `logfile info` = only E/W/I); a `path`
   argument sets an explicit file (relative paths resolve against `s.log.dir`, and
-  the directory is created if needed). `logfile off` stops file logging.
+  the directory is created if needed). `logfile off` stops file logging, and the
+  disabled state persists across reboots.
+- `logfile boot` is the auto-enable the boot script runs each boot. It defaults a
+  never-configured device on (today's dated file) and rolls an existing dated log
+  to today, but honors an explicit `logfile off` (empty `s.log.file.name`) and
+  leaves a fixed custom name untouched — so it never resurrects a log the user
+  turned off.
 - `logrotate` switches to today's dated file. With a `days` argument it also
   deletes `YYYYMMDD.log` files older than N days from `s.log.dir` (a default cron
   entry runs `logrotate 7` daily). Only operates when the current file is in the
