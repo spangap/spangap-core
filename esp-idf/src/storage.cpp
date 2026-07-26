@@ -1593,12 +1593,22 @@ static void storageApplyOps(const uint8_t* p, size_t len, TaskHandle_t sender) {
 
   deepMerge(cfgRoot, patch);
   if (!silent) { char pb[128] = ""; collectChanges(patch, pb, sizeof(pb), 0, changes); }
+  /* A save window opens on the first persistent/DB change after a flush. Capture
+   * that transition so `log storage debug` names what dirtied config each cycle
+   * — the direct answer to "who writes every N seconds". */
+  bool freshWindow = !savePending;
   if (cJSON_GetObjectItem(patch, "s") || cJSON_GetObjectItem(patch, "secrets")) {
     char rb[128] = "";
     routePatchDirty(patch, rb, sizeof(rb), 0);
     startSaveTimer();
   }
   if (routedDirty) startSaveTimer();   /* a structured-DB instance went dirty */
+  if (freshWindow && savePending) {
+    const char* what = nullptr;
+    for (auto& c : changes)
+      if (c.first.rfind("s.", 0) == 0 || c.first.rfind("secrets.", 0) == 0) { what = c.first.c_str(); break; }
+    dbg("save window armed by %s\n", what ? what : "(structured-db)");
+  }
   cJSON_Delete(patch);
 
   /* SUB/UNSUB: mutate the actor-owned table under the lock (race-free). */
