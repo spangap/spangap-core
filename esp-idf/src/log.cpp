@@ -1113,14 +1113,20 @@ static void cmdLogrotate(const char* a) {
         return;
     }
 
-    /* Set log name to today's date */
     time_t now = time(nullptr);
     struct tm tm;
     localtime_r(&now, &tm);
-    char name[64];
-    snprintf(name, sizeof(name), "%04d%02d%02d.log",
-        tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday);
-    storageSet("s.log.file.name", name);
+
+    /* Roll the active log to today's date — but only when one is actually
+     * running. An empty name means the user turned logging off (`logfile off`);
+     * rotation must not resurrect it, so leave it off and just fall through to
+     * prune old files. (A non-date fixed name already returned above.) */
+    if (curName[0]) {
+        char name[64];
+        snprintf(name, sizeof(name), "%04d%02d%02d.log",
+            tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday);
+        storageSet("s.log.file.name", name);
+    }
 
     /* Delete expired files if days specified */
     int days = *a ? atoi(a) : 0;
