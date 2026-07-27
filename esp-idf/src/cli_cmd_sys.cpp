@@ -115,7 +115,9 @@ static void cmdFormatSd(const char* a) {
 static void cmdSleep(const char* a) {
     if (cliWantsHelp(a)) { cliPrintf("%-*s delay execution\n", CLI_HELP_COL, "sleep <seconds>"); return; }
     int secs = atoi(a);
-    if (secs > 0) vTaskDelay(pdMS_TO_TICKS(secs * 1000));
+    /* delay() drops this CLI task's auto boost for the wait — a raw vTaskDelay
+     * would pin 240 MHz (and block light sleep) for the whole sleep. */
+    if (secs > 0) delay((uint32_t)secs * 1000);
 }
 
 static void cmdRun(const char* a) {

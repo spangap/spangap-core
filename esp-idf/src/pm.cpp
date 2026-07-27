@@ -8,6 +8,7 @@
 #include "cli.h"
 #include "storage.h"
 #include "compat.h"
+#include "its.h"
 #include <esp_system.h>
 #include <esp_heap_caps.h>
 #ifdef CONFIG_HEAP_TASK_TRACKING
@@ -33,9 +34,15 @@
 #include <cstring>
 #include <algorithm>
 
-/* 1 Hz CPU/PM stats sampler — defined below pmParseModeStats, spawned from
-   pmInit(). Forward-declared so pmInit (above the definition) can call it. */
-static void pmStatsInit();
+/* 1 Hz CPU/PM stats sampler. Not started by pmInit and not always-on: the
+   sampler task and its history ring exist only while an Activity monitor is
+   watching. A subscription on sys.stats.web_actmon / .lcd_actmon (set up on the
+   log task, see pmStatsPoll) spawns them when a flag goes set and tears them down
+   (freeing the ring) when the last watcher leaves. This is flag-driven on every
+   build, so a headless node with the flag never set never allocates the ring nor
+   wakes the sampler — yet can still be started by hand for its published
+   averages. pmStatsRequest() only adds the -web pre-fill responder. `top` samples
+   inline when the background sampler isn't running. */
 
 /* ---- Central RTC RAM validity ---- */
 #define RTC_APP_MAGIC 0x5ECC0001
@@ -311,15 +318,16 @@ void pmInit() {
    * The "usb" lock stays released; light sleep is governed by other holders. */
   rtcUsbDisabled = false;
 #endif
-
-  pmStatsInit();
 }
 
 #if CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG
 static void cliUsbUp();   /* defined below; pmPollUsb auto-recovers with it */
 #endif
 
+static void pmStatsPoll();   /* start/stop the sampler off the actmon flags */
+
 void pmPollUsb() {
+  pmStatsPoll();             /* runs every log-loop iteration, before USB early-outs */
 #if CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG
   if (!usbLock) return;
 
@@ -387,9 +395,13 @@ void pmPollUsb() {
 #endif
 }
 
+/* Serial task drops any open USB-console CLI session while this is set. */
+extern "C" volatile bool cliUsbSerialLinkDown;
+
 static void cliUsbDown() {
 #if CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG
   info("usb down\n");
+  cliUsbSerialLinkDown = true;   /* the session this command runs in must not outlive the link */
   vTaskDelay(pdMS_TO_TICKS(10));
   /* Disable D+ pullup → host sees disconnect, stops SOF packets */
   usb_serial_jtag_pull_override_vals_t vals = { .dp_pu = false, .dm_pu = false,
@@ -407,6 +419,7 @@ static void cliUsbUp() {
 #if CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG
   /* Acquire lock first to prevent light sleep during re-enumeration */
   rtcUsbDisabled = false;
+  cliUsbSerialLinkDown = false;   /* console link is back; serial CLI sessions allowed again */
   if (usbLock && usbLock->count == 0)
     pmLockAcquire(usbLock);
   /* Reset the USB Serial JTAG peripheral — clears internal state machine
@@ -417,6 +430,13 @@ static void cliUsbUp() {
   usb_serial_jtag_ll_phy_enable_external(false);
   usb_serial_jtag_ll_phy_enable_pad(true);
   usb_serial_jtag_ll_phy_disable_pull_override();
+  /* The peripheral reset above cleared int_ena. The installed driver arms the
+   * RX interrupt (SERIAL_OUT_RECV_PKT) only once at install time, and its ISR
+   * is what drains the hardware FIFO into the ring buffer that stdin reads from.
+   * Without re-arming it here the console goes deaf — bytes sit in the FIFO and
+   * never reach the ring. TX self-heals because write_bytes() re-enables its
+   * interrupt on every call, which is why output survives a reset but input doesn't. */
+  usb_serial_jtag_ll_ena_intr_mask(USB_SERIAL_JTAG_INTR_SERIAL_OUT_RECV_PKT);
   /* Mechanism trace only — the info-level "usb up" is emitted by pmPollUsb on
    * the rising edge when a host is actually seen, so the 60 s unplugged retry
    * doesn't spam the log. */
@@ -479,20 +499,37 @@ static void pmPrintModeLines(int64_t mode[PM_MODE_COUNT], int64_t deepUs,
 
 /* ================= 1 Hz CPU / PM stats sampler =================
  *
- * A background task samples per-task CPU, per-core busy, and PM-mode residency
- * once a second, diffing against the previous second. It:
+ * A background task (alive only while an Activity monitor is watching — see the
+ * lifecycle note above) samples per-task CPU, per-core busy, and PM-mode
+ * residency once a second, diffing against the previous second. It:
  *   - publishes the latest figures to the ephemeral sys.stats.* storage subtree
- *     (sys.stats.cpu_pct.0/.1, sys.stats.SLEEP/APB_MAX/CPU_MAX);
+ *     (sys.stats.cpu_pct.0/.1, sys.stats.SLEEP/APB_MAX/CPU_MAX) plus a
+ *     sys.stats.ts unix-second heartbeat that stalls when sampling stops;
  *   - fills a ring of the last `s.sys.cpu_sample_buf` seconds (5 bytes/sample:
  *     core0, core1, SLEEP, APB_MAX, CPU_MAX — all integer percent; APB_MIN, the
  *     80 MHz line, and the APB-high line are derived at read time);
- *   - keeps the latest per-task delta table so `top` renders instantly instead
- *     of blocking for a 2 s sampling window of its own.
+ *   - keeps the latest per-task delta table so `top` renders instantly while the
+ *     sampler is up (when it's down, `top` takes its own one-second sample).
  *
  * Sources: per-task/-core figures come from uxTaskGetSystemState run-time
  * counters (see the FreeRTOS run-time-stats build option); mode residency from
  * pmParseModeStats (esp_pm's numeric counters, only under CONFIG_PM_PROFILING).
  */
+
+/* Extra per-second samplers other straddles hang off the shared cadence (e.g.
+ * -net's Wi-Fi traffic ring). Registered at init, invoked by statsTick once a
+ * second — so they run only while the sampler runs (a UI consumer is watching),
+ * and never on a headless build. onStart/onStop fire on the running-state
+ * transitions so a piggy-backed sampler can alloc/free its buffers in lockstep.
+ * Init-time registration is single-threaded. */
+struct StatSampler { void (*tick)(void); void (*onStart)(void); void (*onStop)(void); };
+static StatSampler s_samplers[4];
+static int s_samplerN = 0;
+void pmStatsAddSampler(void (*tick)(void), void (*onStart)(void), void (*onStop)(void)) {
+  if (tick && s_samplerN < (int)(sizeof(s_samplers) / sizeof(s_samplers[0])))
+    s_samplers[s_samplerN++] = { tick, onStart, onStop };
+}
+
 #if CONFIG_FREERTOS_USE_TRACE_FACILITY && CONFIG_FREERTOS_GENERATE_RUN_TIME_STATS
 
 /* Latest per-task CPU slice, refreshed each second. Heap/stack columns are not
@@ -520,6 +557,22 @@ static bool     s_snapReady;
 static PmStatSample* s_ring;
 static int s_ringCap, s_ringHead, s_ringCount;
 
+/* Sampler lifecycle. The task + ring exist only while an Activity monitor is
+ * watching. A subscription on the actmon flags (registered on the log task, see
+ * pmStatsPoll) drives the transitions — on every build, UI or headless, so a
+ * headless node can start it by hand (`store set sys.stats.web_actmon 1`) to make
+ * it publish the sys.stats.avg.* figures. */
+static volatile bool s_statsRunning = false;
+static volatile bool s_statsStop    = false;
+static TaskHandle_t  s_statsTask    = nullptr;
+
+/* Averaging windows the sampler publishes (seconds). The web monitor's draggable
+ * average pill picks one; 300 s (5 min) is the default. Kept in sync with the
+ * browser's list. */
+static const int AVG_WINDOWS[] = { 30, 60, 120, 180, 240, 300 };
+static constexpr int N_AVG_WINDOWS = (int)(sizeof(AVG_WINDOWS) / sizeof(AVG_WINDOWS[0]));
+static void pmStatsAvgSet(PmStatAvg* out);   /* one-pass multi-window; defined below */
+
 /* Sampler-private previous snapshot (only the sampler task touches these). */
 struct cpuPrev { TaskHandle_t h; uint32_t run; };
 static cpuPrev* s_prevRun;
@@ -530,7 +583,7 @@ static int64_t  s_prevGrand[PM_MODE_COUNT];
 static bool     s_prevGrandValid;
 #endif
 
-static void statsTick() {
+static void statsTick(bool driveSamplers = true) {
   UBaseType_t ntask = uxTaskGetNumberOfTasks();
   int cap = (int)ntask + 8;                 /* headroom for tasks spawned mid-walk */
   auto* raw = (TaskStatus_t*)gp_alloc(cap * sizeof(TaskStatus_t));
@@ -621,19 +674,131 @@ static void statsTick() {
   xSemaphoreGive(s_statsMux);
   free(old);
 
-  /* Publish the latest second, coalesced into one commit. sys.stats.* has no
-     "s." prefix → ephemeral (never persisted), but still mirrored to browsers. */
-  storageBegin();
-  storageSet("sys.stats.cpu_pct.0", (int)b0);
-  storageSet("sys.stats.cpu_pct.1", (int)b1);
-  storageSet("sys.stats.SLEEP",   sleepPct);
-  storageSet("sys.stats.APB_MAX", apbMaxPct);
-  storageSet("sys.stats.CPU_MAX", cpuMaxPct);
-  storageEnd();
+  /* Drive any piggy-backed samplers (e.g. -net traffic) on the same 1 Hz beat.
+     They run every tick for ring pre-fill and self-gate their own publishing.
+     Skipped on the `top` fallback path, which is a private point-in-time read
+     that must not allocate or advance another straddle's ring. */
+  if (driveSamplers)
+    for (int i = 0; i < s_samplerN; i++) s_samplers[i].tick();
+
+  /* Publish the latest second, coalesced into one commit. The web and on-device
+     monitors each raise an ephemeral flag (sys.stats.web_actmon / .lcd_actmon)
+     while open; those flags are also what keep this sampler alive, so the guard
+     is normally true — it only goes false for the one teardown second between
+     the last watcher leaving and the task noticing, which we skip publishing.
+
+     sys.stats.* has no "s." prefix → ephemeral (never persisted), but mirrored
+     to browsers. sys.stats.ts is a unix-second heartbeat: it advances once per
+     published sample, so a browser that sees it stall knows the device stopped
+     publishing rather than merely reporting an idle second. */
+  if (storageGetInt("sys.stats.web_actmon", 0) || storageGetInt("sys.stats.lcd_actmon", 0)) {
+    /* Averages for every window (single source of truth for the model), so the
+       web monitor's draggable pill can switch windows with no round-trip. Keys
+       are sys.stats.avg.w<secs>.{cpu_max,apb_max,apb_min,ma_x10}. */
+    PmStatAvg avg[N_AVG_WINDOWS];
+    pmStatsAvgSet(avg);
+    storageBegin();
+    storageSet("sys.stats.cpu_pct.0", (int)b0);
+    storageSet("sys.stats.cpu_pct.1", (int)b1);
+    storageSet("sys.stats.SLEEP",   sleepPct);
+    storageSet("sys.stats.APB_MAX", apbMaxPct);
+    storageSet("sys.stats.CPU_MAX", cpuMaxPct);
+    storageSet("sys.stats.ts",      (int)time(nullptr));
+    for (int i = 0; i < N_AVG_WINDOWS; i++) {
+      char key[48]; int w = AVG_WINDOWS[i];
+      snprintf(key, sizeof key, "sys.stats.avg.w%d.cpu_max", w); storageSet(key, avg[i].cpuMax);
+      snprintf(key, sizeof key, "sys.stats.avg.w%d.apb_max", w); storageSet(key, avg[i].apbMax);
+      snprintf(key, sizeof key, "sys.stats.avg.w%d.apb_min", w); storageSet(key, avg[i].apbMin);
+      snprintf(key, sizeof key, "sys.stats.avg.w%d.ma_x10",  w); storageSet(key, avg[i].mA10);
+    }
+    storageEnd();
+  }
+}
+
+/* Free the ring + per-task snapshot under the stats lock, so a concurrent
+   pmStatsHistory/pmStatsAvg/`top` reader (which all take s_statsMux and re-check
+   s_ring/s_snapReady) sees them gone rather than dangling. The mutex itself
+   persists across restarts. */
+static void statsFreeState() {
+  xSemaphoreTake(s_statsMux, portMAX_DELAY);
+  free(s_ring);  s_ring = nullptr; s_ringCap = 0; s_ringHead = 0; s_ringCount = 0;
+  free(s_snap);  s_snap = nullptr; s_snapN = 0;   s_snapReady = false;
+  xSemaphoreGive(s_statsMux);
+  free(s_prevRun); s_prevRun = nullptr; s_prevRunN = 0; s_prevRunCap = 0;
+  s_prevWall = 0;
+#ifdef CONFIG_PM_PROFILING
+  s_prevGrandValid = false;
+#endif
 }
 
 static void statsTaskFn(void*) {
-  for (;;) { statsTick(); vTaskDelay(pdMS_TO_TICKS(1000)); }
+  for (;;) {
+    if (s_statsStop) break;
+    statsTick();
+    delay(1000);
+  }
+  /* Nobody's watching: drop the piggy-backed rings, then our own, and vanish. */
+  for (int i = 0; i < s_samplerN; i++) if (s_samplers[i].onStop) s_samplers[i].onStop();
+  statsFreeState();
+  s_statsTask = nullptr;
+  s_statsRunning = false;      /* published last: pmStatsPoll may now respawn us */
+  vTaskDelete(nullptr);
+}
+
+/* Allocate a fresh zeroed ring and spawn the sampler. Runs on the log task
+   (pmStatsPoll) with no sampler task alive, so touching the statics is safe. */
+static void statsStart() {
+  if (s_statsRunning) return;
+  int cap = storageGetInt("s.sys.cpu_sample_buf", 320);
+  if (cap < 0) cap = 0;
+  if (cap > 3600) cap = 3600;
+  xSemaphoreTake(s_statsMux, portMAX_DELAY);
+  s_ring = nullptr; s_ringCap = 0; s_ringHead = 0; s_ringCount = 0;
+  if (cap > 0) {
+    s_ring = (PmStatSample*)gp_alloc((size_t)cap * sizeof(PmStatSample));
+    if (s_ring) { memset(s_ring, 0, (size_t)cap * sizeof(PmStatSample)); s_ringCap = cap; }
+  }
+  s_snap = nullptr; s_snapN = 0; s_snapReady = false;
+  xSemaphoreGive(s_statsMux);
+  s_prevRun = nullptr; s_prevRunN = 0; s_prevRunCap = 0;   /* freed at prior teardown */
+  s_prevWall = 0;
+#ifdef CONFIG_PM_PROFILING
+  s_prevGrandValid = false;
+#endif
+  for (int i = 0; i < s_samplerN; i++) if (s_samplers[i].onStart) s_samplers[i].onStart();
+  s_statsStop = false;
+  s_statsRunning = true;
+  s_statsTask = spawnTask(statsTaskFn, "cpustat", 6144, nullptr, 1, 0, STACK_PSRAM);
+  if (!s_statsTask) { statsFreeState(); s_statsRunning = false; }   /* spawn failed */
+}
+
+/* Match the sampler's presence to whether any Activity monitor is watching.
+   Runs on the log task: either from the change subscription below, or once at
+   setup to honour a flag already set at boot. */
+static void statsWatchApply() {
+  bool want = storageGetInt("sys.stats.web_actmon", 0) ||
+              storageGetInt("sys.stats.lcd_actmon", 0);
+  if (want) {
+    if (s_statsStop)          s_statsStop = false;   /* cancel a teardown still pending */
+    else if (!s_statsRunning) statsStart();
+  } else if (s_statsRunning && !s_statsStop) {
+    s_statsStop = true;                              /* task tears itself down within ~1s */
+  }
+}
+
+/* Called every log-loop iteration; sets up the flag subscription once. The
+   subscription must be registered from a task that runs itsPoll (that's where
+   change callbacks are delivered) — the log task is that host, and it's present
+   on every build, so the sampler is reachable even on a headless node. */
+static void pmStatsPoll() {
+  static bool inited = false;
+  if (inited) return;
+  inited = true;
+  s_statsMux = xSemaphoreCreateMutex();
+  storageDefault("s.sys.cpu_sample_buf", 320);   /* 320 = default screen width */
+  storageSubscribeChanges("sys.stats.web_actmon", [](const char*, const char*) { statsWatchApply(); });
+  storageSubscribeChanges("sys.stats.lcd_actmon", [](const char*, const char*) { statsWatchApply(); });
+  statsWatchApply();                             /* honour a flag already set at boot */
 }
 
 int pmStatsHistory(PmStatSample* out, int max) {
@@ -645,23 +810,181 @@ int pmStatsHistory(PmStatSample* out, int max) {
   xSemaphoreGive(s_statsMux);
   return n;
 }
+
+/* Private one-second per-task delta for `top` when the background sampler isn't
+   running (no Activity monitor watching). Two uxTaskGetSystemState walks a second
+   apart into freshly-allocated buffers — it never touches the sampler's statics,
+   so it can't race a sampler that starts mid-measurement. Returns a gp_alloc'd
+   cpuSnap[*outN] (caller frees) or nullptr on allocation failure. */
+static cpuSnap* topSample(int* outN, uint32_t* outWindow, uint32_t* outIdle0, uint32_t* outIdle1) {
+  *outN = 0; *outWindow = 0; *outIdle0 = 0; *outIdle1 = 0;
+  struct Prev { TaskHandle_t h; uint32_t run; };
+  int cap0 = (int)uxTaskGetNumberOfTasks() + 8;
+  auto* raw0 = (TaskStatus_t*)gp_alloc(cap0 * sizeof(TaskStatus_t));
+  if (!raw0) return nullptr;
+  uint32_t wall0 = 0;
+  int cnt0 = (int)uxTaskGetSystemState(raw0, cap0, &wall0);
+  auto* prev = (Prev*)gp_alloc((cnt0 ? cnt0 : 1) * sizeof(Prev));
+  if (!prev) { free(raw0); return nullptr; }
+  for (int i = 0; i < cnt0; i++) { prev[i].h = raw0[i].xHandle; prev[i].run = raw0[i].ulRunTimeCounter; }
+  free(raw0);
+
+  delay(1000);
+
+  int cap = (int)uxTaskGetNumberOfTasks() + 8;
+  auto* raw = (TaskStatus_t*)gp_alloc(cap * sizeof(TaskStatus_t));
+  if (!raw) { free(prev); return nullptr; }
+  uint32_t wall = 0;
+  int cnt = (int)uxTaskGetSystemState(raw, cap, &wall);
+  auto* cur = (cpuSnap*)gp_alloc((cnt ? cnt : 1) * sizeof(cpuSnap));
+  if (!cur) { free(raw); free(prev); return nullptr; }
+  uint32_t idle0 = 0, idle1 = 0;
+  for (int i = 0; i < cnt; i++) {
+    cur[i].h = raw[i].xHandle;
+    safeStrncpy(cur[i].name, raw[i].pcTaskName, configMAX_TASK_NAME_LEN);
+    cur[i].pri   = (int)raw[i].uxCurrentPriority;
+    cur[i].stack = raw[i].usStackHighWaterMark;
+    cur[i].stkMem = esp_ptr_external_ram(pxTaskGetStackStart(raw[i].xHandle)) ? 'P' : 'D';
+#if CONFIG_FREERTOS_VTASKLIST_INCLUDE_COREID
+    cur[i].core = raw[i].xCoreID == tskNO_AFFINITY ? -1 : (int)raw[i].xCoreID;
+#else
+    cur[i].core = -2;
+#endif
+    uint32_t p = 0; bool found = false;
+    for (int j = 0; j < cnt0; j++)
+      if (prev[j].h == raw[i].xHandle) { p = prev[j].run; found = true; break; }
+    cur[i].delta = found ? (raw[i].ulRunTimeCounter - p) : 0;
+    if      (strcmp(cur[i].name, "IDLE0") == 0) idle0 = cur[i].delta;
+    else if (strcmp(cur[i].name, "IDLE1") == 0) idle1 = cur[i].delta;
+  }
+  free(raw); free(prev);
+  *outN = cnt;
+  *outWindow = (wall > wall0) ? (wall - wall0) : 0;
+  *outIdle0 = idle0; *outIdle1 = idle1;
+  return cur;
+}
+
+/* Nominal per-DFS-mode SoC current (mA) — rough ESP32-class figures to calibrate
+ * against a real measurement. CPU_MAX=240 MHz, APB_MAX/APB_MIN=80 MHz (APB bus
+ * high/low), SLEEP=light sleep. Radio/peripherals are not modelled. */
+static const int MA_CPU_MAX = 40, MA_APB_MAX = 30, MA_APB_MIN = 25, MA_SLEEP = 2;
+
+/* Average `n` samples' running sums into *out and derive the current estimate. */
+static void avgFromSums(PmStatAvg* out, long sc, long sa, long sn, long ss, int n) {
+  if (n <= 0) { out->cpuMax = out->apbMax = out->apbMin = out->sleep = 0; out->mA10 = 0; return; }
+  int cpu  = (int)((sc + n / 2) / n);
+  int apb  = (int)((sa + n / 2) / n);
+  int amin = (int)((sn + n / 2) / n);
+  int slp  = (int)((ss + n / 2) / n);
+  out->cpuMax = (uint8_t)cpu; out->apbMax = (uint8_t)apb;
+  out->apbMin = (uint8_t)amin; out->sleep = (uint8_t)slp;
+  /* mA = Σ(pct · mA_mode) / 100, expressed in tenths (÷10 instead of ÷100). */
+  int num = cpu * MA_CPU_MAX + apb * MA_APB_MAX + amin * MA_APB_MIN + slp * MA_SLEEP;
+  out->mA10 = (num + 5) / 10;
+}
+
+int pmStatsAvg(PmStatAvg* out, int secs) {
+  if (!out) return 0;
+  if (secs <= 0) secs = 300;
+  long sc = 0, sa = 0, sn = 0, ss = 0;
+  int n = 0;
+  if (s_statsMux && s_ring && s_ringCap > 0) {
+    xSemaphoreTake(s_statsMux, portMAX_DELAY);
+    n = s_ringCount < secs ? s_ringCount : secs;
+    int start = ((s_ringHead - n) % s_ringCap + s_ringCap) % s_ringCap;
+    for (int i = 0; i < n; i++) {
+      const PmStatSample& e = s_ring[(start + i) % s_ringCap];
+      int cpu = e.cpuMax, apb = e.apbMax, slp = e.sleep;
+      int amin = 100 - slp - apb - cpu; if (amin < 0) amin = 0;
+      sc += cpu; sa += apb; sn += amin; ss += slp;
+    }
+    xSemaphoreGive(s_statsMux);
+  }
+  avgFromSums(out, sc, sa, sn, ss, n);
+  return n;
+}
+
+/* All AVG_WINDOWS in one backward pass: the windows are nested (30 ⊂ 60 ⊂ … ⊂
+ * 300), so we accumulate newest→oldest and snapshot the average as the count
+ * crosses each window boundary. Windows past the data we have get the average of
+ * everything available. */
+static void pmStatsAvgSet(PmStatAvg* out) {
+  for (int i = 0; i < N_AVG_WINDOWS; i++) avgFromSums(&out[i], 0, 0, 0, 0, 0);
+  long sc = 0, sa = 0, sn = 0, ss = 0;
+  int cnt = 0, wi = 0;
+  if (s_statsMux && s_ring && s_ringCap > 0) {
+    xSemaphoreTake(s_statsMux, portMAX_DELAY);
+    int total = s_ringCount < AVG_WINDOWS[N_AVG_WINDOWS - 1] ? s_ringCount : AVG_WINDOWS[N_AVG_WINDOWS - 1];
+    for (int k = 0; k < total; k++) {
+      int idx = ((s_ringHead - 1 - k) % s_ringCap + s_ringCap) % s_ringCap;
+      const PmStatSample& e = s_ring[idx];
+      int cpu = e.cpuMax, apb = e.apbMax, slp = e.sleep;
+      int amin = 100 - slp - apb - cpu; if (amin < 0) amin = 0;
+      sc += cpu; sa += apb; sn += amin; ss += slp; cnt++;
+      while (wi < N_AVG_WINDOWS && cnt == AVG_WINDOWS[wi]) { avgFromSums(&out[wi], sc, sa, sn, ss, cnt); wi++; }
+    }
+    xSemaphoreGive(s_statsMux);
+  }
+  for (; wi < N_AVG_WINDOWS; wi++) avgFromSums(&out[wi], sc, sa, sn, ss, cnt);
+}
 #else
 int pmStatsHistory(PmStatSample* out, int max) { (void)out; (void)max; return 0; }
+int pmStatsAvg(PmStatAvg* out, int secs) {
+  (void)secs;
+  if (out) { out->cpuMax = out->apbMax = out->apbMin = out->sleep = 0; out->mA10 = 0; }
+  return 0;
+}
+static void pmStatsPoll() {}
 #endif  /* run-time stats */
 
-static void pmStatsInit() {
 #if CONFIG_FREERTOS_USE_TRACE_FACILITY && CONFIG_FREERTOS_GENERATE_RUN_TIME_STATS
-  storageDefault("s.sys.cpu_sample_buf", 320);   /* 320 = default screen width */
-  int cap = storageGetInt("s.sys.cpu_sample_buf", 320);
-  if (cap < 0) cap = 0;
-  if (cap > 3600) cap = 3600;                     /* an hour of 1 Hz samples */
-  s_statsMux = xSemaphoreCreateMutex();
-  if (cap > 0) {
-    s_ring = (PmStatSample*)gp_alloc((size_t)cap * sizeof(PmStatSample));
-    s_ringCap = s_ring ? cap : 0;
+/* cpuhist: an ITS server that hands a browser the whole CPU/PM ring in one shot
+ * on connect, then disconnects — so a freshly-opened web monitor pre-fills its
+ * graphs instead of accumulating one sample a second. The browser opens a
+ * DataChannel labelled "cpuhist:1"; the on-device monitor reads the ring
+ * directly and needs none of this. */
+static constexpr uint16_t CPUHIST_PORT = 1;
+static constexpr int      HIST_MAX = 320;            /* one screen-width of samples */
+static int s_cpuHistClient = -1;
+
+static int cpuHistOnConnect(int handle, const void*, size_t) { s_cpuHistClient = handle; return 0; }
+
+static void cpuHistTask(void*) {
+  itsServerInit();
+  itsServerPortOpen(CPUHIST_PORT, ITS_PACKET, 1, 0, 4096, 0, 4096);
+  itsServerOnConnect(CPUHIST_PORT, cpuHistOnConnect);
+  for (;;) {
+    /* Park until a browser opens the cpuhist DataChannel — the connect posts an
+     * ITS notification that wakes us, so there's nothing to poll for. Blocking
+     * indefinitely keeps this task off the idle wake path entirely (it was a
+     * 2 Hz core-0 waker for a channel that opens maybe once a session). */
+    itsPoll(portMAX_DELAY);
+    while (itsPoll(0)) {}
+    if (s_cpuHistClient >= 0) {
+      int h = s_cpuHistClient; s_cpuHistClient = -1;
+      auto* tmp = (PmStatSample*)gp_alloc((size_t)HIST_MAX * sizeof(PmStatSample));
+      if (tmp) {
+        int n = pmStatsHistory(tmp, HIST_MAX);
+        itsSend(h, tmp, (size_t)n * sizeof(PmStatSample), pdMS_TO_TICKS(1000));
+        free(tmp);
+      }
+      itsDisconnect(h);          /* one-shot: blob then close */
+    }
   }
-  /* stdio (funopen/fprintf/sscanf in the mode parse) wants a roomy stack. */
-  spawnTask(statsTaskFn, "cpustat", 6144, nullptr, 1, 0, STACK_PSRAM);
+}
+#endif
+
+void pmStatsRequest(void) {
+#if CONFIG_FREERTOS_USE_TRACE_FACILITY && CONFIG_FREERTOS_GENERATE_RUN_TIME_STATS
+  /* The sampler itself is flag-driven on every build (see pmStatsPoll). This only
+     adds the web pre-fill responder, which a headless node has no use for. cpuhist
+     is a passive responder (idle-blocked on a DataChannel connect), not a sampler,
+     so a freshly-opened web monitor gets its blob without a start-up race; it
+     returns an empty ring while unwatched. */
+  static bool histUp = false;
+  if (histUp) return;                             /* idempotent: -web + -lcd both call it */
+  histUp = true;
+  spawnTask(cpuHistTask, "cpuhist", 4096, nullptr, 1, 0, STACK_PSRAM);
 #endif
 }
 
@@ -770,8 +1093,9 @@ void pmRecordDeepSleep(int64_t durationUs) {
 
 static void cmdUsb(const char* a) {
     if (cliWantsHelp(a)) { cliPrintf("%-*s USB status; up/down to reconnect/disconnect\n", CLI_HELP_COL, "usb [up|down]"); return; }
-    if (strcmp(a, "down") == 0) cliUsbDown();
-    else if (strcmp(a, "up") == 0) cliUsbUp();
+    if (strcmp(a, "down") == 0) { cliUsbDown(); return; }
+    if (strcmp(a, "up") == 0) { cliUsbUp(); return; }
+    /* Bare `usb` reports status; up/down are silent. */
 #if CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG
     cliPrintf("usb: %s\n", usb_serial_jtag_is_connected() ? "connected" : "disconnected");
 #else
@@ -862,26 +1186,39 @@ static void cmdTop(const char* args) {
         size_t dram, psram; uint16_t dblk, pblk;
         uint32_t delta;
     };
-    /* CPU/per-task figures come from the background 1 Hz sampler (statsTick), so
-       this command never blocks for a sampling window of its own — it copies the
-       most recent (≤1 s old) per-task delta table under the stats lock and joins
-       fresh heap/stack columns below. */
-    if (!s_snapReady) { cliPrintf("top: CPU stats warming up, retry in ~1s\n"); return; }
+    /* When an Activity monitor is watching, the background 1 Hz sampler is
+       running: copy its most recent (≤1 s old) per-task delta table under the
+       stats lock — no sampling window of our own. When nobody's watching, the
+       sampler is torn down, so take a private one-second sample and free it right
+       after, leaving no sampling buffers alive on an idle node. */
+    int n2 = 0; uint32_t deltaTotal = 0, idle0 = 0, idle1 = 0;
+    cpuSnap* localSnap = nullptr;
+    const bool live = s_statsRunning;
+    if (live && !s_snapReady) { cliPrintf("top: CPU stats warming up, retry in ~1s\n"); return; }
+    if (!live) {
+        localSnap = topSample(&n2, &deltaTotal, &idle0, &idle1);
+        if (!localSnap) { cliPrintf("top: sampling unavailable\n"); return; }
+    }
     xSemaphoreTake(s_statsMux, portMAX_DELAY);
-    const int maxSnap = s_snapN + 4;   /* +headroom for the addAgg pseudo-rows */
+    if (live && !s_snap) {   /* sampler stopped between the check and the lock */
+        xSemaphoreGive(s_statsMux);
+        cliPrintf("top: CPU stats warming up, retry in ~1s\n"); return;
+    }
+    const cpuSnap* src = live ? s_snap : localSnap;
+    if (live) { n2 = s_snapN; deltaTotal = s_snapWindow; idle0 = s_snapIdle0; idle1 = s_snapIdle1; }
+    const int maxSnap = n2 + 4;   /* +headroom for the addAgg pseudo-rows */
     auto* s2 = (snap*)gp_alloc(maxSnap * sizeof(snap));
-    if (!s2) { xSemaphoreGive(s_statsMux); cliPrintf("top: out of memory\n"); return; }
+    if (!s2) { xSemaphoreGive(s_statsMux); free(localSnap); cliPrintf("top: out of memory\n"); return; }
     memset(s2, 0, maxSnap * sizeof(snap));
-    int n2 = s_snapN;
-    uint32_t deltaTotal = s_snapWindow, idle0 = s_snapIdle0, idle1 = s_snapIdle1;
     for (int i = 0; i < n2; i++) {
-        s2[i].h = s_snap[i].h;
-        safeStrncpy(s2[i].name, s_snap[i].name, configMAX_TASK_NAME_LEN);
-        s2[i].core = s_snap[i].core; s2[i].pri = s_snap[i].pri;
-        s2[i].stack = s_snap[i].stack; s2[i].stkMem = s_snap[i].stkMem;
-        s2[i].delta = s_snap[i].delta;
+        s2[i].h = src[i].h;
+        safeStrncpy(s2[i].name, src[i].name, configMAX_TASK_NAME_LEN);
+        s2[i].core = src[i].core; s2[i].pri = src[i].pri;
+        s2[i].stack = src[i].stack; s2[i].stkMem = src[i].stkMem;
+        s2[i].delta = src[i].delta;
     }
     xSemaphoreGive(s_statsMux);
+    free(localSnap);   /* no-op on the live path */
 
     /* Merge per-task heap totals into s2 by TaskHandle_t; accumulate unmatched. */
     size_t preDram = 0, preDblk = 0, preP = 0, prePblk = 0;

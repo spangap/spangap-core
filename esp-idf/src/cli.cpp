@@ -565,7 +565,7 @@ void cliRunFile(const char* path) {
           while (*ln == ' ') ln++;
           if (*ln && *ln != '#') {
             info("cli: %s\n", ln);
-            vTaskDelay(pdMS_TO_TICKS(50)); /* let log task drain under WiFi/boot burst */
+            delay(50); /* let log task drain under WiFi/boot burst */
           }
           cliProcess(buf + start);
         }
@@ -587,7 +587,7 @@ void cliRunFile(const char* path) {
         while (*ln == ' ') ln++;
         if (*ln && *ln != '#') {
           info("cli: %s\n", ln);
-          vTaskDelay(pdMS_TO_TICKS(50));
+          delay(50);
         }
         cliProcess(buf);
       }
@@ -1495,6 +1495,13 @@ static void cliEmitLogResumeGap() {
  * initializer rule). */
 extern "C" { volatile bool serialInCli = false; }
 
+/* Set by the pm layer when the USB console link drops (the `usb down` command,
+ * or a debounced unplug). Level-triggered: while true, the serial task tears
+ * down any open CLI session and returns to the blocking log read, so a session
+ * left open by the very command that dropped USB can't keep polling a
+ * disconnected console at 20 Hz. Cleared by pm when USB comes back up. */
+extern "C" { volatile bool cliUsbSerialLinkDown = false; }
+
 static void serialTaskFn(void* arg) {
 #if CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG
   /* IDF 5.5 regression: the USB Serial JTAG VFS no-driver read path can't size
@@ -1526,12 +1533,11 @@ static void serialTaskFn(void* arg) {
   itsClientInit(1);
   int cliHandle = -1;
 
-  for (;;) {
-    while (itsPoll(pdMS_TO_TICKS(50))) {}
-
-    /* Poll serial input */
-    char c;
-    while (read(STDIN_FILENO, &c, 1) == 1) {
+  /* Handle one inbound serial byte: enter CLI mode on the first keystroke,
+   * forward keys to the CLI, treat Ctrl-C as "drop back to log". Shared by the
+   * idle blocking-read path and the active drain path below so both stay in
+   * step. */
+  auto handleChar = [&](char c) {
       if (c == 0x03) {
         /* Ctrl-C on serial: abort any CLI line in flight, print a hint
          * (so the user doesn't think Ctrl-C exits the monitor — Ctrl-]
@@ -1544,7 +1550,7 @@ static void serialTaskFn(void* arg) {
         serialInCli = false;
         printf("\033[0m\r\n\r\nPress Ctrl-] to exit monitor\r\n\r\n");
         fflush(stdout); cliFlush();
-        continue;
+        return;
       }
       if (cliHandle < 0 && c != '\n' && c != '\r') {
         /* Switch to CLI mode — suppress direct-stdout log echo */
@@ -1570,7 +1576,44 @@ static void serialTaskFn(void* arg) {
          * the output-drain below for long. */
         itsSend(cliHandle, &c, 1, pdMS_TO_TICKS(50));
       }
+  };
+
+  for (;;) {
+#if CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG
+    if (cliHandle < 0) {
+      /* Idle / log mode: log fanout goes direct-to-stdout, so nothing is queued
+       * to this task over ITS until a CLI session opens — only a keystroke moves
+       * us forward, and there is nothing to poll for (the auto-resume flag only
+       * matters with a session open; USB recovery is driven by the log task's
+       * pmPollUsb, not us). So park indefinitely on the driver's ISR-fed RX ring:
+       * a keystroke wakes us at once, and an idle console adds zero wakes — this
+       * task drops off the wake path entirely so both cores can light-sleep. */
+      char c;
+      pmBoostAuto(false);
+      if (usb_serial_jtag_read_bytes(&c, 1, portMAX_DELAY) == 1) {
+        pmBoostAuto(true);
+        handleChar(c);
+      }
+      continue;
     }
+
+    /* USB console link dropped while this CLI session was open — typically the
+     * `usb down` command, which is itself typed on this console, so the session
+     * outlives the link. Tear it down and loop back to the blocking log read
+     * above instead of polling a disconnected console at 20 Hz. */
+    if (cliUsbSerialLinkDown) {
+      itsDisconnect(cliHandle);
+      cliHandle = -1;
+      serialInCli = false;
+      continue;
+    }
+#endif
+
+    while (itsPoll(pdMS_TO_TICKS(50))) {}
+
+    /* Poll serial input */
+    char c;
+    while (read(STDIN_FILENO, &c, 1) == 1) handleChar(c);
 
     /* Drain CLI → serial */
     if (cliHandle >= 0) {

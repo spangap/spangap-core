@@ -120,10 +120,46 @@ void heapDump(const char* reason);
  * residency) is derived by the reader as 100 - sleep - apbMax - cpuMax. */
 struct PmStatSample { uint8_t core0, core1, sleep, apbMax, cpuMax; };
 
+/** Add the -web CPU/PM history pre-fill responder. A consumer of the activity
+ *  data over WebRTC (-web) calls this at init; a headless node has no use for it.
+ *
+ *  It does NOT gate sampling. The 1 Hz sampler and its history ring are
+ *  flag-driven on every build: they exist only while an Activity monitor is
+ *  watching (sys.stats.web_actmon / .lcd_actmon set), and when the last watcher
+ *  leaves the task terminates and the ring is freed; the next watcher respawns it
+ *  with a fresh, zeroed ring. A headless node can therefore start sampling — and
+ *  publishing the sys.stats.avg.* figures — by setting a flag by hand. Safe to
+ *  call more than once. */
+void pmStatsRequest(void);
+
+/** Register callbacks tied to the shared CPU/PM sampler.
+ *  - tick fires once per second while the sampler runs (right after it records
+ *    its own sample), letting another straddle piggy-back 1 Hz work on the
+ *    shared cadence (e.g. -net's Wi-Fi traffic ring).
+ *  - onStart/onStop (optional) fire on the transitions in and out of the
+ *    running state — i.e. when the first watcher arrives and when the last one
+ *    leaves — so a piggy-backed sampler can allocate and free its own buffers in
+ *    lockstep with the CPU/PM ring. onStop runs on the sampler task just before
+ *    it terminates; onStart runs on the task that spawns it.
+ *  All fire only while a UI consumer is watching, never on a headless build.
+ *  A few slots; call at init. */
+void pmStatsAddSampler(void (*tick)(void), void (*onStart)(void) = nullptr,
+                       void (*onStop)(void) = nullptr);
+
 /** Copy up to `max` most-recent ring samples into out[], oldest first so
  *  out[n-1] is the latest second. Returns the count written (0 if no sample has
  *  been produced yet, the ring is disabled, or the build lacks run-time stats).
  *  Thread-safe. */
 int pmStatsHistory(PmStatSample* out, int max);
+
+/* Averaged PM-mode residency over the recent ring window, plus a rough current
+ * estimate. Percentages are integer; the current is in tenths of a milliamp
+ * (mA10 = 83 → 8.3 mA) so the whole path stays integer. */
+struct PmStatAvg { uint8_t cpuMax, apbMax, apbMin, sleep; int mA10; };
+
+/** Average the last `secs` ring samples (capped to what the ring holds; secs<=0
+ *  → 300) into *out, and fill its mA10 current estimate. Returns the number of
+ *  samples averaged (0 → *out is all-zero). Thread-safe. */
+int pmStatsAvg(PmStatAvg* out, int secs);
 
 #endif

@@ -43,6 +43,31 @@ extern "C" const char app_build_datetime[];
 
 namespace {
 
+/* esp_reset_reason() → stable short slug, persisted as s.sys.reset_reason for
+ * boot logs / telemetry. The reason is latched by the reset itself and read back
+ * on the next boot, so a crash-looping node still reports why it went down. */
+const char* resetReasonStr(esp_reset_reason_t r) {
+    switch (r) {
+        case ESP_RST_POWERON:    return "poweron";
+        case ESP_RST_EXT:        return "ext";
+        case ESP_RST_SW:         return "sw";
+        case ESP_RST_PANIC:      return "panic";
+        case ESP_RST_INT_WDT:    return "int_wdt";
+        case ESP_RST_TASK_WDT:   return "task_wdt";
+        case ESP_RST_WDT:        return "wdt";
+        case ESP_RST_DEEPSLEEP:  return "deepsleep";
+        case ESP_RST_BROWNOUT:   return "brownout";
+        case ESP_RST_SDIO:       return "sdio";
+        case ESP_RST_USB:        return "usb";
+        case ESP_RST_JTAG:       return "jtag";
+        case ESP_RST_EFUSE:      return "efuse";
+        case ESP_RST_PWR_GLITCH: return "pwr_glitch";
+        case ESP_RST_CPU_LOCKUP: return "cpu_lockup";
+        case ESP_RST_UNKNOWN:
+        default:                 return "unknown";
+    }
+}
+
 /* --- Build identity (numeric + short string for 32-byte WS notify payload) --- */
 
 void fmtEpochUtc(uint32_t epoch, char* buf, size_t len) {
@@ -206,6 +231,18 @@ extern "C" void spangapPostAppInit(void) {
     /* Mark RTC RAM valid so RTC vars survive deep-sleep wake correctly
      * (rtcRamValid() returns false after warm reboot, esp_restart, panic). */
     rtcRamSetValid();
+
+    /* Record why this boot happened (panic / int_wdt / brownout / poweron / …)
+     * and persist it right now: a node that crash-loops still leaves the last
+     * reason on disk for the next boot and for telemetry. storageSave() blocks on
+     * the persist worker, so this must run here (post-init, storage task up), not
+     * in the early spangapInit(). */
+    {
+        const char* reason = resetReasonStr(esp_reset_reason());
+        info("reset reason: %s", reason);
+        storageSet("s.sys.reset_reason", reason);
+        storageSave();
+    }
 
     /* Run boot script — last because every CLI command must already be
      * registered by this point (both platform and consumer). */

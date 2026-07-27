@@ -93,9 +93,67 @@ its own leaker.
 | `pmBoost()` / `pmBoostEnd()` | Manual sustained boost for loops that aren't notify-driven and want 240 MHz held across their own blocks (net's `select`, webrtc). Recursive; pair each call. |
 | `pmBoostHeld()` | Whether the current task holds its auto boost count. |
 
-`delay()` drops the auto boost while it sleeps and restores it after, so a delay
-inside event handling doesn't burn 240 MHz idling; manual `pmBoost()` holds are
-untouched by it.
+`delay()` (in [`compat.h`](../esp-idf/include/compat.h)) is the project's standard
+wait: it drops the auto boost while it sleeps and restores it after, so a wait
+inside event handling doesn't burn 240 MHz idling (manual `pmBoost()` holds are
+untouched). **Prefer it over a bare `vTaskDelay`**, which holds the boost — and so
+pins 240 MHz *and* blocks light sleep — for the entire wait. Waits shorter than the
+tickless-idle floor (`CONFIG_FREERTOS_IDLE_TIME_BEFORE_SLEEP`, 3 ticks) skip the
+drop, since they can't reach light sleep regardless. This is why `sleep` idles the
+device: it calls `delay()`, so `usb down; sleep 30; usb up` genuinely light-sleeps
+for the 30 s rather than spinning at 240 MHz.
+
+### Idle discipline — park, don't poll
+
+Automatic light sleep needs **both cores idle at once**, and the longest nap is
+bounded by the *soonest* wake across every task. So a task that polls on a short
+timer — even a cheap one — caps the whole chip's sleep window at its poll period
+and pays a wake each time. The rule for an event-driven task: **block on the
+actual wake source with a long or infinite timeout, not a short poll.**
+
+- The **serial console** (`cli.cpp`) parks on the USB-serial-JTAG driver's RX
+  ring (`usb_serial_jtag_read_bytes(…, portMAX_DELAY)`), so a keystroke wakes it
+  via the driver ISR and an idle console adds zero wakes — it used to poll
+  `read()` at 20 Hz. It also drops any open console CLI session when the USB link
+  goes down (see [internals §4](power-management-internals.md)), so a session left
+  open by the `usb down` command itself can't keep polling a dead console.
+- The **log task** ticks at **1 Hz** only to service `pmPollUsb()`; log fan-out
+  is `xTaskNotifyGive`-driven (every `logVprintf` notifies), so delivery stays
+  instant without a fast poll.
+- **cpuhist** blocks on `portMAX_DELAY` — the browser's connect posts an ITS
+  notification, so there's nothing to poll for.
+- The **LoRa task** reads the radio (a SPI `getIrqFlags`) only when a DIO1 IRQ
+  actually fired, not on every task wake — otherwise SPI traffic tracks *wakes*
+  rather than *packets*. See [iface-lora internals](../../iface-lora/INTERNALS.md).
+
+A corollary applies to storage: **don't publish telemetry nobody reads.** The
+periodic stat publishers (`lora`/`rnsd` `publishStats`) gate on
+`uiTelemetryWanted()` (`storage.h`) — true on an LCD build (the on-screen panes
+read the keys) or when WiFi is up (a browser can pull them over the web
+DataChannel), false otherwise. A headless, WiFi-down node therefore does no stat
+churn; a UI re-populates the keys the moment it appears.
+
+### Core placement — overlap for light sleep
+
+Because light sleep needs both cores idle simultaneously, *where* a task runs
+matters as much as how often it wakes. Two tasks whose busy windows coincide — a
+producer and the consumer it feeds — should sit on **opposite** cores, so their
+activity overlaps in time and the cores fall idle together, widening the
+both-idle gaps sleep needs. Piling both on one core serialises them and misaligns
+the idle windows.
+
+`spawnTask`'s `core` argument takes named constants from
+[`compat.h`](../esp-idf/include/compat.h) rather than bare `0`/`1`:
+
+| Constant | Core | Use |
+|---|---|---|
+| `CORE_PRIMARY` | 0 | The app core — `rnsd` and the clients that queue into it. |
+| `CORE_SECONDARY` | 1 | Housekeeping, and on an LCD build the LVGL render task. |
+| `CORE_SECONDARY_NO_LCD` | 1 without LCD, else 0 | A hot task to overlap opposite the primary — but only when core 1 is free. On an LCD build (`CONFIG_SPANGAP_LCD`) core 1 is busy rendering, so it falls back to the primary. |
+
+Example: on a no-LCD build the LoRa driver runs on `CORE_SECONDARY_NO_LCD`
+(core 1), opposite the `rnsd` it feeds on core 0 — their RX/processing bursts
+overlap instead of serialising, so both cores idle together after each burst.
 
 ### USB D+ pullup
 

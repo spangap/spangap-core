@@ -2039,6 +2039,14 @@ int storageGetInt(const char* key, int def) {
   return result;
 }
 
+bool uiTelemetryWanted() {
+#if CONFIG_SPANGAP_LCD
+  return true;                    /* on-device screen renders the stats regardless */
+#else
+  return storageGetInt("wifi.sta.up", 0) != 0 || storageGetInt("wifi.ap.up", 0) != 0;
+#endif
+}
+
 void storageGetStr(const char* key, char* out, size_t outLen, const char* def) {
   if (outLen == 0) return;
   CFG_LOCK();

@@ -96,6 +96,13 @@ re-acquires the lock first, then **resets the peripheral**
 — the reset is required because light sleep gates the USB clock and leaves the
 state machine unresponsive to bare pullup restore.
 
+**Serial CLI session vs. the link.** `usb down` is typed *inside* a serial
+console CLI session, so that session would outlive the link and keep the serial
+task polling a disconnected console at 20 Hz. `cliUsbDown()` sets the shared flag
+`cliUsbSerialLinkDown` (declared in `cli.cpp`); the serial task sees it, tears
+down its open CLI handle, and falls back to the blocking RX-ring read.
+`cliUsbUp()` clears the flag so sessions are allowed again once the link is back.
+
 **RTC persistence:** `rtcUsbDisabled` (`RTC_DATA_ATTR`) survives deep sleep. On
 wake, `pmInit()` checks it (with `rtcRamValid()`): if set, it disables the pullup
 immediately and **skips acquiring `usb`**, so a device put to `usb down` before
@@ -148,6 +155,17 @@ block): same count/stats bookkeeping as `pmLockRelease` but **skips** the
 the per-task lock but are not TLS-tracked, so they survive across blocks
 independently of the auto count.
 
+`delay(ms)` (`compat.h`) is the boost-aware wait and the project's standard sleep.
+It reads `pmBoostHeld()`, drops the auto count with `pmBoostAuto(false)` for the
+wait, then restores it with `pmBoostAuto(true)` **only if it was held** — so a task
+that wasn't boosted doesn't come out of a long `delay()` spuriously boosted. It
+gates that whole dance on `DELAY_BOOST_MIN_TICKS` (= `CONFIG_FREERTOS_IDLE_TIME_BEFORE_SLEEP`,
+3 ticks, with a fallback `#define`): a wait shorter than the tickless-idle floor
+can't reach light sleep no matter what the boost does, so below it `delay()` passes
+straight to `vTaskDelay(ticks)`. That guard matters because dropping/retaking the
+boost forces a DFS transition (240↔80 relock); doing it around a sub-floor delay in
+a tight loop would churn DFS every iteration for zero sleep gain.
+
 ## 7. WiFi and net are spangap-net's
 
 pm's `pm wifi` command sets `esp_wifi_set_ps()` directly, but everything else
@@ -167,6 +185,18 @@ duplicate it here; pm only provides the lock mechanism net plugs into.
   `cron` lock stays held, `deepSleepAllowed()` never returns true, and the device
   light-sleeps but never deep-sleeps. Deep sleep requires a [cron](cron.md) wake
   config.
+- **A raw `vTaskDelay` in a boosted task pins 240 MHz for the whole wait** — and,
+  because a `CPU_FREQ_MAX` hold forces the `CPU_MAX` mode, blocks light sleep with
+  it. The auto boost is dropped only on an `itsPoll` block; `vTaskDelay` blocks the
+  task without passing through that release, so the lock stays held for the delay's
+  full duration. Use `delay()` for any real wait; reserve raw `vTaskDelay` for
+  sub-tick yields (`vTaskDelay(1)` WDT feeds — `pdMS_TO_TICKS(1)` rounds to 0, so
+  `delay(1)` couldn't express them anyway) and the `0` / `portMAX_DELAY` sentinels.
+  A CLI command is the classic trap: the CLI task carries an auto boost in from the
+  notify-wake that delivered the command, so a command that `vTaskDelay`s (rather
+  than `delay()`s) holds 240 MHz and blocks light sleep for its entire runtime —
+  `pm -v` shows it as a multi-second `<taskname> CPU_FREQ_MAX` hold with
+  `light_sleep_counts:0`.
 - **Lock names must be static.** `pmLockCreate` stores the `name` pointer by
   reference; a stack/temporary string dangles. The boost registry copies task
   names for exactly this reason.
@@ -176,6 +206,16 @@ duplicate it here; pm only provides the lock mechanism net plugs into.
 - **Task watchdog:** `CONFIG_ESP_TASK_WDT_CHECK_IDLE_TASK_CPU1=n` — core 1 runs
   web/RTSP tasks that can starve IDLE1 during active sessions; the IDLE0 watchdog
   on core 0 stays active.
+- **A short poll caps the whole chip's sleep, and a peripheral read on every wake
+  hides as that peripheral's load.** Light sleep needs both cores idle and naps
+  only until the soonest task wake, so an idle task must block on its wake source
+  (a driver ISR, an ITS notify, a long timeout), not poll — see [the operator
+  guide](power-management.md#idle-discipline--park-dont-poll). And a task that
+  reads a peripheral on *every* wake (e.g. the LoRa task's `getIrqFlags`) makes
+  that bus's transaction count track task wakes, not real events — gate the read
+  on the actual IRQ. Task **placement** is the same tool from the other side:
+  pin producer/consumer pairs to opposite cores via the `CORE_*` constants in
+  `compat.h` so their busy windows overlap and the cores idle together.
 - **Irreducible floor:** the lwIP timer thread (~1.3 mA), started by
   `esp_netif_init()`, can't be stopped without `esp_netif_deinit()` (not cleanly
   supported in ESP-IDF 5.x) — the minimum power floor once networking is

@@ -809,7 +809,13 @@ static void logTaskFn(void* arg) {
       }
     }
 #endif
-    while (itsPoll(pdMS_TO_TICKS(200))) {}
+    /* 1 Hz idle tick: this is purely the pmPollUsb() heartbeat (which self-gates
+     * to 1 Hz anyway) — fanout does not depend on it. logVprintf notifies this
+     * task on every new line, and consumer connects / inbound bytes post their
+     * own ITS notifications, so itsPoll wakes at once on real work and log
+     * delivery stays instant. Idling at 1 s instead of 200 ms cuts core-1 wakes
+     * 5×, widening the both-cores-idle gaps that gate light sleep. */
+    while (itsPoll(pdMS_TO_TICKS(1000))) {}
 
     /* Deferred paste-back: a DC connect was just accepted (logDcConnect) and
      * the client is now past itsConnect and draining. Send the scrollback here,

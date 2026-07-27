@@ -277,7 +277,7 @@ static void cronDeepSleep() {
     pmRecordDeepSleep(sleepUs);
     printf("cron: deep sleep %ds\n", sleepSec);
     fflush(stdout);
-    vTaskDelay(pdMS_TO_TICKS(50));
+    delay(50);
     esp_sleep_enable_timer_wakeup((uint64_t)sleepUs);
     esp_deep_sleep_start();
 }

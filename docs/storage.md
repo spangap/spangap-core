@@ -75,6 +75,7 @@ Exact signatures and ownership/lifetime contracts are in
 | `storageNewTreeFile` | Register a runtime external file for a prefix. |
 | `storageSave` | Force an immediate flush, blocking until written. |
 | `storageSubscribeChanges`, `storageUnsubscribe`, `NOW_AND_ON_CHANGE` | Prefix-scoped change subscriptions. |
+| `uiTelemetryWanted` | Whether published stat keys have a plausible reader (LCD build, or WiFi up so a browser can pull them) — periodic publishers gate on it to skip churn on a headless, WiFi-down node. See [power-management](power-management.md#idle-discipline--park-dont-poll). |
 
 For threading rules, the op-list wire format, the change fan-out, and the
 browser dump/patch protocol, see [storage-internals.md](storage-internals.md).

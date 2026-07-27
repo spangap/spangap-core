@@ -61,6 +61,13 @@ void storageLoad();
 
 bool   storageExists(const char* key);
 int    storageGetInt(const char* key, int def = 0);
+
+/** Whether published UI telemetry (interface stat keys, etc.) has a plausible
+ *  reader. A browser pulls these over the web DataChannel, which needs WiFi; an
+ *  LCD build reads them for its on-screen panes regardless. On a headless,
+ *  WiFi-down node (battery/solar) nothing consumes them, so periodic publishers
+ *  can skip the churn. Cheap (RAM-tier reads); call it, don't cache it. */
+bool   uiTelemetryWanted();
 void   storageGetStr(const char* key, char* out, size_t outLen, const char* def = "");
 /** std::string overload — no fixed buffer, no truncation. */
 std::string storageGetStr(const char* key, const char* def = "");

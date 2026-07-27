@@ -33,17 +33,43 @@ static inline uint32_t millis() {
     return static_cast<uint32_t>(esp_timer_get_time() / 1000);
 }
 
+/* Delays shorter than the tickless-idle floor can't yield light sleep no matter
+ * what the boost does, so dropping it there buys nothing and, in a tight loop,
+ * only churns DFS (240↔80 relock per iteration). Gate the dance on that floor. */
+#ifdef CONFIG_FREERTOS_IDLE_TIME_BEFORE_SLEEP
+#define DELAY_BOOST_MIN_TICKS CONFIG_FREERTOS_IDLE_TIME_BEFORE_SLEEP
+#else
+#define DELAY_BOOST_MIN_TICKS 3
+#endif
+
 static inline void delay(uint32_t ms) {
-    if (!ms) { vTaskDelay(0); return; }   /* bare yield: nothing to do */
+    TickType_t ticks = pdMS_TO_TICKS(ms);
+    if (ticks < DELAY_BOOST_MIN_TICKS) { vTaskDelay(ticks); return; }  /* too short to sleep through */
     /* A delay is a timeout, not an event — but it shouldn't change whether we're
      * handling one. Drop the auto boost to the floor while we sleep (save power),
      * then restore it if we held it, so mid-event work resumes at speed. Manual
      * pmBoost() holds are untouched and stay up across the delay. */
     bool was = pmBoostHeld();
     pmBoostAuto(false);
-    vTaskDelay(pdMS_TO_TICKS(ms));
+    vTaskDelay(ticks);
     if (was) pmBoostAuto(true);
 }
+
+/** Core affinity for spawnTask()'s `core` argument. The app's heavy work lives on
+ *  the primary core; the secondary carries light housekeeping and, on an LCD
+ *  build, the LVGL render task. CORE_SECONDARY_NO_LCD moves a task to the
+ *  secondary core only when the build has no LCD — on an LCD build that core is
+ *  busy rendering, so the task stays on the primary. Splitting two hot tasks that
+ *  are busy at the same time (e.g. the LoRa driver off the Reticulum daemon it
+ *  feeds) across both cores overlaps their busy windows, widening the
+ *  both-cores-idle gaps the chip needs to drop into light sleep. */
+#define CORE_PRIMARY    0
+#define CORE_SECONDARY  1
+#if CONFIG_SPANGAP_LCD
+#define CORE_SECONDARY_NO_LCD  CORE_PRIMARY
+#else
+#define CORE_SECONDARY_NO_LCD  CORE_SECONDARY
+#endif
 
 /** Task stack location. Default PSRAM — use DRAM only when the task runs
  *  SPI-flash code paths (direct fopen/fread on LittleFS), which disable
