@@ -254,6 +254,7 @@ bool cronPoll(bool execute) {
             size_t cmdLen = strlen(cmd);
             xStreamBufferSend(cronStream, cmd, cmdLen, pdMS_TO_TICKS(100));
             xStreamBufferSend(cronStream, "\n", 1, pdMS_TO_TICKS(100));
+            cliWake();   /* the stream buffer carries no notify; wake the CLI task to drain it */
             info("%02d:%02d %s\n", tm.tm_hour, tm.tm_min, cmd);
         }
     }

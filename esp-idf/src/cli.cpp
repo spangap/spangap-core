@@ -1296,6 +1296,10 @@ static void cliHandleLoginInput(cli_slot_t& cl, const char* buf, size_t n) {
 
 static TaskHandle_t cliTaskHandle = NULL;
 
+void cliWake() {
+  if (cliTaskHandle) xTaskNotifyGive(cliTaskHandle);
+}
+
 static void cliTaskFn(void* arg) {
   /* History buffer in PSRAM, allocated in task context so heap tracking
      attributes it to cli, not the main task that spawned us. */
@@ -1332,7 +1336,18 @@ static void cliTaskFn(void* arg) {
    * terminal reach the CLI directly over ITS regardless. */
 
   for (;;) {
-    while (itsPoll(pdMS_TO_TICKS(50))) {}
+    /* Fully event-driven: ITS delivery notifies this task per session byte, and
+     * cron wakes us via cliWake() after queueing a command (its stream buffer
+     * carries no notification of its own). So park until a real event rather than
+     * polling — an idle console then adds zero wakes and both cores can light-
+     * sleep. The lone exception is a slot waiting to close once its output has
+     * drained to the peer (pendingClose): that drain-complete transition isn't a
+     * notify, so fall back to a short re-check tick only while one is pending. */
+    bool draining = false;
+    for (int s = 0; s < CLI_MAX_CLIENTS; s++)
+      if (cliSlots[s].pendingClose) { draining = true; break; }
+    itsPoll(draining ? pdMS_TO_TICKS(20) : portMAX_DELAY);
+    while (itsPoll(0)) {}
 
     /* Process each active slot. Stream and packet modes both deliver bytes
        via itsRecv — packet mode returns exactly one message body per call,

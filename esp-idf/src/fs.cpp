@@ -683,22 +683,10 @@ static void fsWorkerFn(void*) {
     itsServerInit();
     itsOnAux(FS_OP_PORT, onFsOp);
     xSemaphoreGive(fsReady);
-    uint32_t lastPulseMs = 0;
-    uint32_t lastOpCount = 0;
+    /* Op delivery is an ITS aux notify, so park until one arrives — no idle tick.
+     * fsOpCount/fsCurrentOp are still maintained by onFsOp for on-demand reads. */
     for (;;) {
-        itsPoll(pdMS_TO_TICKS(1000));
-        uint32_t now = (uint32_t)(esp_timer_get_time() / 1000);
-        if (now - lastPulseMs >= 1000) {
-            uint32_t delta = fsOpCount - lastOpCount;
-            if (fsCurrentOp >= 0) {
-                ESP_LOGD("fs", "pulse: ops/s=%u in-op=%s slot=%d",
-                         (unsigned)delta, fsOpName(fsCurrentOp), fsCurrentSlot);
-            } else if (delta > 0) {
-                ESP_LOGD("fs", "pulse: ops/s=%u idle", (unsigned)delta);
-            }
-            lastPulseMs = now;
-            lastOpCount = fsOpCount;
-        }
+        itsPoll(portMAX_DELAY);
     }
 }
 

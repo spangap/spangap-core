@@ -809,13 +809,24 @@ static void logTaskFn(void* arg) {
       }
     }
 #endif
-    /* 1 Hz idle tick: this is purely the pmPollUsb() heartbeat (which self-gates
-     * to 1 Hz anyway) — fanout does not depend on it. logVprintf notifies this
-     * task on every new line, and consumer connects / inbound bytes post their
-     * own ITS notifications, so itsPoll wakes at once on real work and log
-     * delivery stays instant. Idling at 1 s instead of 200 ms cuts core-1 wakes
-     * 5×, widening the both-cores-idle gaps that gate light sleep. */
-    while (itsPoll(pdMS_TO_TICKS(1000))) {}
+    /* Idle tick: this is purely the pmPollUsb() heartbeat (which self-gates to
+     * this cadence anyway) — fanout does not depend on it. logVprintf notifies
+     * this task on every new line, and consumer connects / inbound bytes post
+     * their own ITS notifications, so itsPoll wakes at once on real work and log
+     * delivery stays instant. The tick only bounds USB-host attach latency.
+     *
+     * Cadence tracks how much we care about every last mA: 1 Hz while WiFi is
+     * actually up (STA associated or AP active — a browser/dev session is
+     * plausible, keep USB attach snappy), but 0.2 Hz (5 s) whenever WiFi is down
+     * — the proxy for a deployed, battery-first node — so this ceases to be the
+     * wake that caps light sleep. Keyed on the real up-state (wifi.sta.up /
+     * wifi.ap.up), not the s.net.wifi.enable config flag: a node with WiFi
+     * enabled but unassociated is still battery-first. Absent keys (no
+     * networking) read 0, so a net-less build relaxes too. Matches the
+     * uiTelemetryWanted() gate the stat publishers use. */
+    bool wifiUp = storageGetInt("wifi.sta.up", 0) || storageGetInt("wifi.ap.up", 0);
+    TickType_t usbTick = wifiUp ? pdMS_TO_TICKS(1000) : pdMS_TO_TICKS(5000);
+    while (itsPoll(usbTick)) {}
 
     /* Deferred paste-back: a DC connect was just accepted (logDcConnect) and
      * the client is now past itsConnect and draining. Send the scrollback here,

@@ -28,6 +28,7 @@
 #include "hal/wdt_hal.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/event_groups.h"
 
 /* Build epoch — symbol comes from spangap_app_build_epoch.c, regenerated
  * each ninja invocation by scripts/write-build-epoch.py. */
@@ -141,7 +142,36 @@ void publishBuildTimes() {
 
 }  // namespace
 
+/* Boot-barrier events: waitForTime()/waitForFlag() block on a per-flag-key bit
+ * that the flag's setter raises via signalFlag(), so a waiter light-sleeps until
+ * the flag lands instead of polling storage at 5 Hz. Keys map to bits lazily
+ * (flag names must be static strings). Created in spangapInit(), before any
+ * straddle task can wait. */
+static EventGroupHandle_t s_bootEvents = nullptr;
+#define MAX_BOOT_FLAGS 12
+static const char*  s_flagKeys[MAX_BOOT_FLAGS];
+static int          s_flagCount = 0;
+static portMUX_TYPE s_flagMux = portMUX_INITIALIZER_UNLOCKED;
+
+/* Find, or lazily assign, the event-group bit for a flag key. Returns 0 only if
+ * the table is full, whereupon callers fall back to a slow poll. */
+static EventBits_t flagBitFor(const char* key) {
+    EventBits_t bit = 0;
+    portENTER_CRITICAL(&s_flagMux);
+    int i;
+    for (i = 0; i < s_flagCount; i++)
+        if (strcmp(s_flagKeys[i], key) == 0) break;
+    if (i == s_flagCount && s_flagCount < MAX_BOOT_FLAGS)
+        s_flagKeys[s_flagCount++] = key;
+    if (i < MAX_BOOT_FLAGS) bit = (EventBits_t)1u << i;
+    portEXIT_CRITICAL(&s_flagMux);
+    return bit;
+}
+
 extern "C" void spangapInit(void) {
+    /* The boot-barrier events must exist before any straddle task (which spawn
+     * after this) can wait on them. */
+    s_bootEvents = xEventGroupCreate();
     /* Line-buffer stdout so each \n flushes immediately (USB Serial JTAG
      * default is fully-buffered, hides log lines until full or close). */
     setvbuf(stdout, nullptr, _IOLBF, 0);
@@ -261,15 +291,26 @@ extern "C" void spangapPostAppInit(void) {
     cronPoll(true);
 }
 
+extern "C" void signalFlag(const char* key) {
+    if (s_bootEvents) xEventGroupSetBits(s_bootEvents, flagBitFor(key));
+}
+
+extern "C" void signalTimeValid(void) { signalFlag("sys.time.valid"); }
+
 extern "C" bool waitForTime(int timeout_s) {
     /* Fast path: clock already known-valid (warm boot carrying an RTC time, or
      * an SNTP/GPS sync earlier this session). */
     if (storageGetInt("sys.time.valid", 0)) return true;
 
-    /* timeout_s <= 0 → operator-tunable default. s.sys.time_wait_s = 0 on an
-     * offline node with no time source skips the wait outright. */
+    /* timeout_s <= 0 → operator-tunable default. s.sys.time_wait_s = 0 skips. */
     if (timeout_s <= 0) timeout_s = storageGetInt("s.sys.time_wait_s", 30);
     if (timeout_s <= 0) return false;
+
+    /* Nothing can set the clock without networking: NTP needs WiFi, and the
+     * browser/CLI time-set paths are post-boot user actions, not something to
+     * block boot on. So an offline node skips the wait outright instead of
+     * spinning out the full timeout for a sync that will never come. */
+    if (storageGetInt("s.net.wifi.enable", 0) == 0) return false;
 
     /* Keep a power-managed device awake for the wait. One shared recursive lock
      * across all callers — rnsd and the transports race here at boot, and the
@@ -281,17 +322,22 @@ extern "C" bool waitForTime(int timeout_s) {
     pm_lock_handle_t lock = s_lock;
     if (lock) pmLockAcquire(lock);
 
-    uint32_t start = millis();
-    bool valid = false;
-    while (!(valid = storageGetInt("sys.time.valid", 0) != 0)) {
-        if ((int)(millis() - start) >= timeout_s * 1000) break;
-        vTaskDelay(pdMS_TO_TICKS(200));
-    }
+    /* Block on the event, not a poll: signalTimeValid() (net's NTP sync
+     * callback / browser / CLI) raises the sys.time.valid bit the moment the
+     * clock is set, so this wakes within ms of sync and light-sleeps until then
+     * instead of a 5 Hz storage poll that pinned every boot task awake. The bit
+     * latches (xClearOnExit false), so a late waiter and the fast path above
+     * stay coherent. */
+    EventBits_t bit = s_bootEvents ? flagBitFor("sys.time.valid") : 0;
+    if (bit)
+        xEventGroupWaitBits(s_bootEvents, bit, pdFALSE, pdTRUE,
+                            pdMS_TO_TICKS(timeout_s * 1000));
+    bool valid = storageGetInt("sys.time.valid", 0) != 0;
 
     if (lock) pmLockRelease(lock);
 
     /* Log line is tagged with the calling task name (rnsd, tcp, lora, …). */
-    if (valid) info("waitForTime: clock valid after %u ms\n", (unsigned)(millis() - start));
+    if (valid) info("waitForTime: clock valid\n");
     else       warn("waitForTime: no valid time after %d s — proceeding (clock may read ~1970)\n", timeout_s);
     return valid;
 }
@@ -303,8 +349,8 @@ extern "C" bool waitForFlag(const char* key, int timeout_s) {
      * "check once, don't wait". Returns true iff the flag was set. Holds one
      * shared PM no-deep-sleep lock for the wait (aggregated across the several
      * boot tasks that wait in parallel) so deep sleep can't latch mid-barrier.
-     * Polls storage — a direct locked read, not an ITS round-trip — so a waiter
-     * is NOT registered as an ITS task merely by waiting. */
+     * `key` must be a static string (its bit is registered by pointer-kept name).
+     * Not an ITS round-trip, so a waiter is NOT registered as an ITS task. */
     if (storageGetInt(key, 0)) return true;
     if (timeout_s <= 0) return false;
 
@@ -313,11 +359,23 @@ extern "C" bool waitForFlag(const char* key, int timeout_s) {
     pm_lock_handle_t lock = s_lock;
     if (lock) pmLockAcquire(lock);
 
-    uint32_t start = millis();
+    /* Event-driven: the flag's setter calls signalFlag(key) right after
+     * publishing it, waking us at once — so we light-sleep here instead of the
+     * old 5 Hz storage poll that kept every boot task (and the whole chip) awake.
+     * The setter storageSet()s before it signals, and the bit latches, so the
+     * check-then-block window can't miss the signal. Table-full → slow poll. */
     bool set = false;
-    while (!(set = storageGetInt(key, 0) != 0)) {
-        if ((int)(millis() - start) >= timeout_s * 1000) break;
-        vTaskDelay(pdMS_TO_TICKS(200));
+    EventBits_t bit = s_bootEvents ? flagBitFor(key) : 0;
+    if (bit) {
+        xEventGroupWaitBits(s_bootEvents, bit, pdFALSE, pdTRUE,
+                            pdMS_TO_TICKS(timeout_s * 1000));
+        set = storageGetInt(key, 0) != 0;
+    } else {
+        uint32_t start = millis();
+        while (!(set = storageGetInt(key, 0) != 0)) {
+            if ((int)(millis() - start) >= timeout_s * 1000) break;
+            delay(pdMS_TO_TICKS(500));
+        }
     }
 
     if (lock) pmLockRelease(lock);

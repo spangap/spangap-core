@@ -154,4 +154,10 @@ void cliRunFile(const char* path);
 /** Create CLI and serial tasks. Call after logInit(). */
 void cliInit();
 
+/** Wake the CLI task. For producers that queue work the CLI task must drain but
+ *  whose delivery carries no ITS notification of its own — currently cron, which
+ *  writes commands into a raw stream buffer. Safe from any task; a no-op before
+ *  the CLI task exists. */
+void cliWake();
+
 #endif

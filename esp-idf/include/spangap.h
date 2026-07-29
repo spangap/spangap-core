@@ -87,13 +87,26 @@ void spangapPostAppInit(void);
  *  comes first. Returns true if time became valid, false on timeout.
  *
  *  `timeout_s <= 0` uses the operator-tunable default `s.sys.time_wait_s`
- *  (fallback 30 s); set that key to 0 on an offline node with no time source to
- *  skip the wait entirely (it would never sync, so the delay buys nothing).
- *  Holds a PM no-deep-sleep lock for the duration and is safe to call from any
- *  task. Intended for the RNS startup paths (rnsd + the transports) so the
- *  first announces and path-table entries aren't stamped with the pre-sync
- *  1970 epoch. */
+ *  (fallback 30 s). The wait is event-driven — signalTimeValid() wakes it the
+ *  instant the clock becomes valid, so it blocks efficiently (light sleep, no
+ *  poll) and returns within ms of an SNTP/browser/CLI time-set rather than a
+ *  poll period late. It also self-skips when no time source can arrive: with
+ *  WiFi disabled there is no NTP, so it returns immediately instead of burning
+ *  the timeout (no need to hand-set `s.sys.time_wait_s = 0`). Holds a PM
+ *  no-deep-sleep lock for the duration; safe from any task. Intended for the RNS
+ *  startup paths so the first announces aren't stamped with the pre-sync 1970
+ *  epoch. */
 bool waitForTime(int timeout_s);
+
+/** Wake every in-progress waitForTime() — the clock just became valid. Called by
+ *  whoever sets `sys.time.valid` (net's NTP sync callback, browser/CLI time-set).
+ *  Idempotent and safe from any context (including the tcpip task). */
+void signalTimeValid(void);
+
+/** Wake every waitForFlag(key, …) blocked on this boot flag — call it right
+ *  after publishing the flag (e.g. after storageSet("rns.ready", 1)). `key` must
+ *  be a static string. Idempotent; safe from any task. */
+void signalFlag(const char* key);
 
 /** Block until an ephemeral readiness flag `key` (a storage int) is non-zero,
  *  or `timeout_s` elapses (<= 0 = check once, don't wait). Returns true iff set.
