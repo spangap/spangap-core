@@ -153,6 +153,15 @@ void itsServerOnBusy(uint16_t port, its_busy_cb_t cb);
 void itsServerOnDisconnect(uint16_t port, its_disconnect_cb_t cb);
 void itsServerOnRecv(uint16_t port, its_recv_cb_t cb);
 
+/** Register `spawn` to create server task `name` on demand: the first
+ *  itsConnect() targeting `name` while no such task is running invokes it.
+ *  `spawn` must create that task (typically a one-shot that serves a blob then
+ *  killSelf()s), so the task holds a TCB only while a client is attached. ITS
+ *  serialises the call against racing connects and re-checks the task is still
+ *  absent first, so it can't double-spawn. Returns false if the table is full.
+ *  Register at init, before any client can connect. */
+bool itsRegisterOnDemand(const char* name, void (*spawn)(void));
+
 /** Number of active connections this server holds on `port`.
  *  port == -1 (default) counts across all of this task's open ports. */
 int  itsServerActive(int port = -1);

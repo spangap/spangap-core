@@ -1772,6 +1772,51 @@ int itsConnectByTaskHandle(TaskHandle_t serverTask, uint16_t port,
     return handle;
 }
 
+/* ---- On-demand server registry --------------------------------------------
+ * A server that only exists while it's actually serving registers a spawn
+ * callback here; the first itsConnect() that targets its name while no such
+ * task is running invokes the callback to create it (typically a one-shot that
+ * serves a blob then killSelf()s). The connect's own task-creation wait then
+ * covers the spawn + ITS init + handshake, so the caller sees a normal connect.
+ * Registration is boot-time; the mutex serialises the spawn against racing
+ * connects so two of them can't double-spawn the same name. */
+#define ITS_ONDEMAND_MAX   8
+static SemaphoreHandle_t s_onDemandMux = nullptr;
+static struct { char name[configMAX_TASK_NAME_LEN]; void (*spawn)(void); }
+    s_onDemand[ITS_ONDEMAND_MAX];
+static int s_onDemandCount = 0;
+
+bool itsRegisterOnDemand(const char* name, void (*spawn)(void)) {
+    if (!name || !spawn) return false;
+    if (!s_onDemandMux) s_onDemandMux = xSemaphoreCreateMutex();  /* boot-time, single-threaded */
+    if (!s_onDemandMux) return false;
+    bool ok = false;
+    xSemaphoreTake(s_onDemandMux, portMAX_DELAY);
+    if (s_onDemandCount < ITS_ONDEMAND_MAX) {
+        auto& e = s_onDemand[s_onDemandCount++];
+        snprintf(e.name, sizeof(e.name), "%s", name);
+        e.spawn = spawn;
+        ok = true;
+    }
+    xSemaphoreGive(s_onDemandMux);
+    if (!ok) ITS_LOGE("itsRegisterOnDemand: table full, dropped [%s]", name);
+    return ok;
+}
+
+/* Spawn the on-demand server for `name` if one is registered and not already
+ * running. Rechecks under the mutex so a concurrent connect that just spawned
+ * it doesn't get a second copy. */
+static void itsSpawnOnDemand(const char* name) {
+    if (!s_onDemandMux) return;
+    xSemaphoreTake(s_onDemandMux, portMAX_DELAY);
+    for (int i = 0; i < s_onDemandCount; i++) {
+        if (strcmp(s_onDemand[i].name, name) != 0) continue;
+        if (!xTaskGetHandle(name)) s_onDemand[i].spawn();
+        break;
+    }
+    xSemaphoreGive(s_onDemandMux);
+}
+
 int itsConnect(const char* serverName, uint16_t port,
                const void* data, size_t dataLen, TickType_t timeout, int ref,
                its_recv_cb_t onRecv, its_disconnect_cb_t onDisconnect) {
@@ -1782,6 +1827,7 @@ int itsConnect(const char* serverName, uint16_t port,
     const bool forever = (timeout == portMAX_DELAY);
     const TickType_t start = xTaskGetTickCount();
     TaskHandle_t task = xTaskGetHandle(serverName);
+    if (!task) { itsSpawnOnDemand(serverName); task = xTaskGetHandle(serverName); }
     while (!task) {
         if (!forever && (timeout == 0 || (xTaskGetTickCount() - start) >= timeout)) {
             ITS_LOGE("itsConnect: server task [%s] not found (not running?)", serverName);
