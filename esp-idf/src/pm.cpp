@@ -170,8 +170,13 @@ static pm_lock_handle_t boostLockEnsure() {
     if (!s_boostTasks[i].task) { s_boostTasks[i].task = t; slot = i; break; }
   portEXIT_CRITICAL(&s_boostMux);
   if (slot < 0) return nullptr;
+  /* Refresh the name in place (the lock holds it by reference, so this updates
+   * the lock's displayed name too). Reuse a reclaimed slot's lock — a prior task
+   * here released it on death — rather than leaking a fresh lock object each
+   * stop/start cycle; only create one the first time a slot is used. */
   safeStrncpy(s_boostTasks[slot].name, pcTaskGetName(t), sizeof(s_boostTasks[slot].name));
-  pmLockCreate(PM_CPU_FREQ_MAX, s_boostTasks[slot].name, &s_boostTasks[slot].lock);
+  if (!s_boostTasks[slot].lock)
+    pmLockCreate(PM_CPU_FREQ_MAX, s_boostTasks[slot].name, &s_boostTasks[slot].lock);
   return s_boostTasks[slot].lock;
 }
 
@@ -188,6 +193,23 @@ static void boostReleaseLean(pm_lock_handle_t h) {
     esp_pm_lock_release(h->esp_handle);
 }
 
+/* TLS deletion callback: fires when a task that still HOLDS its auto boost is
+ * deleted (e.g. a lifecycle task woken by a stop-notify — which boosts — then
+ * vTaskDelete). Without this its CPU_FREQ_MAX lock stays acquired for the life of
+ * the process: the CPU never drops to light sleep (a ~28 mA floor) and a
+ * re-spawned same-named task can't reclaim it (the slot is keyed by task handle).
+ * `value` is the task's boost lock, or null if it died un-boosted (nothing to do).
+ * Runs during the idle task's cleanup; the slot free is spinlock-guarded. */
+static void boostTlsDelCb(int /*idx*/, void* value) {
+  pm_lock_handle_t l = (pm_lock_handle_t)value;
+  if (!l) return;
+  boostReleaseLean(l);          /* drop the one auto count the TLS represented */
+  portENTER_CRITICAL(&s_boostMux);
+  for (int i = 0; i < BOOST_MAX_TASKS; i++)
+    if (s_boostTasks[i].lock == l) { s_boostTasks[i].task = nullptr; break; }
+  portEXIT_CRITICAL(&s_boostMux);
+}
+
 /* Per-task auto boost. TLS slot holds this task's boost lock while it holds its
  * one auto count, else nullptr — so take/drop are idempotent and balanced
  * regardless of call order. Manual pmBoost() counts share the same per-task lock
@@ -197,7 +219,8 @@ void pmBoostAuto(bool on) {
   if (on && !held) {
     pm_lock_handle_t l = boostLockEnsure();
     if (!l) return;
-    vTaskSetThreadLocalStoragePointer(NULL, TLS_PM_BOOST, l);
+    /* AndDelCallback so a task deleted while boosted releases the lock (boostTlsDelCb). */
+    vTaskSetThreadLocalStoragePointerAndDelCallback(NULL, TLS_PM_BOOST, l, boostTlsDelCb);
     pmLockAcquire(l);
   } else if (!on && held) {
     vTaskSetThreadLocalStoragePointer(NULL, TLS_PM_BOOST, nullptr);
@@ -776,7 +799,13 @@ static void statsStart() {
    Runs on the log task: either from the change subscription below, or once at
    setup to honour a flag already set at boot. */
 static void statsWatchApply() {
-  bool want = storageGetInt("sys.stats.web_actmon", 0) ||
+  /* A WEB monitor can only be watching if WiFi is up — a browser has no other
+   * path in. So gate web_actmon on the live link: a tab that vanished without
+   * clearing the flag (unclean disconnect / WiFi drop) otherwise leaves this 1 Hz
+   * sampler running forever for a viewer that's gone. An LCD monitor is local and
+   * needs no link. */
+  bool wifiUp = storageGetInt("wifi.sta.up", 0) || storageGetInt("wifi.ap.up", 0);
+  bool want = (storageGetInt("sys.stats.web_actmon", 0) && wifiUp) ||
               storageGetInt("sys.stats.lcd_actmon", 0);
   if (want) {
     if (s_statsStop)          s_statsStop = false;   /* cancel a teardown still pending */
@@ -798,6 +827,10 @@ static void pmStatsPoll() {
   storageDefault("s.sys.cpu_sample_buf", 320);   /* 320 = default screen width */
   storageSubscribeChanges("sys.stats.web_actmon", [](const char*, const char*) { statsWatchApply(); });
   storageSubscribeChanges("sys.stats.lcd_actmon", [](const char*, const char*) { statsWatchApply(); });
+  /* Re-evaluate when WiFi comes up or drops: a drop must stop a web-gated sampler
+   * even though web_actmon itself didn't change (stale-flag case). */
+  storageSubscribeChanges("wifi.sta.up", [](const char*, const char*) { statsWatchApply(); });
+  storageSubscribeChanges("wifi.ap.up",  [](const char*, const char*) { statsWatchApply(); });
   statsWatchApply();                             /* honour a flag already set at boot */
 }
 
