@@ -29,6 +29,11 @@ void pmPollUsb();
 /** Register PM CLI commands (pm, top, usb). */
 void pmRegisterCmds();
 
+/** Route the USB PHY back to the USB-Serial-JTAG controller and re-arm it.
+ *  Needed after another controller has held the PHY — they share one, and the
+ *  RX interrupt does not survive the handover. No-op on a UART console. */
+void pmUsbSerialJtagReattach(void);
+
 /** Create a named PM lock. name must be a string literal or static. */
 void pmLockCreate(pm_lock_type_t type, const char* name, pm_lock_handle_t* out);
 

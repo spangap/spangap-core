@@ -349,10 +349,23 @@ static void cliUsbUp();   /* defined below; pmPollUsb auto-recovers with it */
 
 static void pmStatsPoll();   /* start/stop the sampler off the actmon flags */
 
+/* True while `usb cdc` has the console on a TinyUSB CDC port, which owns the
+ * USB PHY the USB-Serial-JTAG controller would otherwise be driving. */
+extern "C" volatile bool consoleOnCdc;
+extern "C" const char*   consoleModeName(void);
+extern "C" int           consoleCdcPortCount(void);
+extern "C" const char*   consoleLastSwitchError(void);
+
 void pmPollUsb() {
   pmStatsPoll();             /* runs every log-loop iteration, before USB early-outs */
 #if CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG
   if (!usbLock) return;
+
+  /* While the console is on CDC the USB-Serial-JTAG controller does not own the
+   * PHY, so it reads permanently disconnected. Left to run, the recovery path
+   * below would reset that peripheral and re-enable its PHY every 60 s, fighting
+   * the OTG core for the pads. The CDC link holds its own PM lock. */
+  if (consoleOnCdc) return;
 
   /* Evaluate at ~1 Hz regardless of how often the log loop calls us.
    * usb_serial_jtag_is_connected() is SOF-based and noisy at sub-second
@@ -466,6 +479,27 @@ static void cliUsbUp() {
   dbg("usb up: re-enumerate\n");
 #else
   dbg("usb up: no-op on UART console\n");
+#endif
+}
+
+/* Point the USB PHY back at the USB-Serial-JTAG controller and re-arm it. The
+ * routing is lost whenever another controller (the OTG core, driven by
+ * TinyUSB) claims the PHY, and the RX interrupt does not survive that — same
+ * recovery the connection monitor uses, exposed for the console transport
+ * switch in usb_ports.cpp. */
+void pmUsbSerialJtagReattach(void) {
+  cliUsbUp();
+#if CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG
+  /* Drop whatever queued while this controller was off the pads. Those bytes
+   * predate the session about to resume on it, and delivering them would open
+   * a CLI nobody asked for out of keystrokes nobody typed. */
+  uint8_t sink[64];
+  for (int pass = 0; pass < 16; pass++)
+    if (usb_serial_jtag_read_bytes(sink, sizeof sink, 0) <= 0) break;
+  /* Push what is still queued rather than leave it for the next keystroke to
+   * dislodge. This is output from before the controller left the pads — a
+   * console blackout covers the gap itself, so nothing stale is waiting here. */
+  consoleFlush();
 #endif
 }
 
@@ -1131,7 +1165,18 @@ static void cmdUsb(const char* a) {
     if (strcmp(a, "up") == 0) { cliUsbUp(); return; }
     /* Bare `usb` reports status; up/down are silent. */
 #if CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG
-    cliPrintf("usb: %s\n", usb_serial_jtag_is_connected() ? "connected" : "disconnected");
+    /* Peer presence is a USB-Serial-JTAG notion — it counts SOF packets on a
+     * controller that does not own the PHY once the console has moved. */
+    if (consoleOnCdc) cliPrintf("usb: cdc attached\n");
+    else cliPrintf("usb: %s\n", usb_serial_jtag_is_connected() ? "connected" : "disconnected");
+    cliPrintf("console: %s", consoleModeName());
+    if (consoleCdcPortCount()) cliPrintf(" (%d ports, console on cdc 0)", consoleCdcPortCount());
+    cliPrintf("\n");
+    /* A failed switch reports itself during a re-enumeration, when a host is
+     * least likely to be showing anything. Repeat it here, where someone asking
+     * why the console did not move will look. */
+    const char* switchErr = consoleLastSwitchError();
+    if (switchErr && switchErr[0]) cliPrintf("last switch: %s\n", switchErr);
 #else
     cliPrintf("usb: n/a\n");
 #endif

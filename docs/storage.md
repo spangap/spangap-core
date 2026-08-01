@@ -149,6 +149,7 @@ modules subscribe to react to them.
 | `sys.buildtime.fixed` | `publishBuildTimes` | `/fixed` image source mtime. |
 | `sys.buildtime.web` | `publishBuildTimes` | Webroot CRC32 (unset when no webroot is present). |
 | `sys.going_down` | `pm.cpp` | Set to `1` ahead of sleep/shutdown so subscribers can flush. |
+| `sys.usb.serial_ports` | `usb_ports.cpp` | How many serial ports the console presents right now — `1` on USB-Serial-JTAG, `2` on `usb cdc`. A serial-port claimant subscribes to re-apply a port-1 claim across a transport switch ([usb-console](usb-console.md)). |
 | `sys.time.valid` | spangap-net (NTP) | `1` once system time is sane (≥ 2025). |
 | `sys.time.set` | browser | Browser pushes epoch seconds here; NTP adopts it if time is invalid, then clears it to `0`. |
 

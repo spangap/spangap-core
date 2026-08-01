@@ -154,10 +154,75 @@ void cliRunFile(const char* path);
 /** Create CLI and serial tasks. Call after logInit(). */
 void cliInit();
 
+/** Write straight to the serial console, bypassing both the CLI session and the
+ *  log. For output that must survive a moment when the ordinary paths cannot
+ *  carry it — notably just after a transport switch, where the log's route is
+ *  gated on a connection flag that has not caught up yet and discards whole
+ *  writes until it does. */
+void consoleWriteRaw(const char* data, size_t len);
+
+/** Push anything the console has buffered onto the wire — the stream buffer and,
+ *  on USB-Serial-JTAG, the hardware TX FIFO, which holds its contents until a
+ *  newline or an explicit flush. Needed after a transport switch, where output
+ *  written while the console was moving otherwise waits for whatever writes
+ *  next: press a key an hour later and the backlog arrives then. */
+void consoleFlush(void);
+
+/** End the serial console's CLI session and hand it back to the live log, the
+ *  way a trailing ';' does. For a command whose consequences must be visible as
+ *  log output, and which the CLI session itself cannot outlive. */
+void cliSerialResumeLog(void);
+
 /** Wake the CLI task. For producers that queue work the CLI task must drain but
  *  whose delivery carries no ITS notification of its own — currently cron, which
  *  writes commands into a raw stream buffer. Safe from any task; a no-op before
  *  the CLI task exists. */
 void cliWake();
+
+/* ---- Serial-port handlers ----
+ *
+ * A task can claim a serial port and become the endpoint for whatever attaches
+ * to it, in place of the log/CLI console. Port 0 is the console port — the
+ * USB-Serial-JTAG controller, or CDC 0 while the console runs on `usb cdc`.
+ * Port 1 is the second CDC port, which exists only while the console is on CDC;
+ * `sys.usb.serial_ports` publishes how many ports exist (1 or 2), so a claimant
+ * can re-apply its claim when the transport changes.
+ *
+ * A claim is dormant until a client actually attaches, and detection differs by
+ * transport. A CDC port sees the host raise DTR (every pyserial-class client
+ * does so on open, and drops it on close). The USB-Serial-JTAG controller
+ * exposes no line state to software at all, so port 0 there attaches in band on
+ * the first 0xC0 byte — a value no console keystroke produces — and releases
+ * only when the handler drops the session or the USB link goes down. Until a
+ * client speaks, a claimed port 0 is still an ordinary console.
+ *
+ * While a port is attached, its byte stream is connected to the handler task
+ * over ITS (serial_handler_connect_t is the connect payload) and log/CLI are
+ * detached from it; on release the console returns.
+ *
+ * A claimed CDC port does not act on the esptool reset convention. A host
+ * closing the port drops DTR before RTS, which is indistinguishable from the
+ * reset sequence, so an ordinary client exit would otherwise restart the
+ * device — at the cost of esptool auto-reset while the port is claimed.
+ */
+
+/** Claim serial port `port` for `task`, which must have an ITS server port
+ *  `itsPort` open. Returns false (and warns) for an out-of-range port, for
+ *  port 1 while only one serial port exists, or when another task already
+ *  holds the port. Re-claiming with the same task and ITS port succeeds
+ *  unchanged, so a claimant can re-apply on every config pass. */
+bool serialPortClaim(int port, const char* task, uint16_t itsPort);
+
+/** Drop a claim, ending any attached session and returning port 0 to the
+ *  console. */
+void serialPortRelease(int port);
+
+/** Connect payload the serial machinery sends a handler task. Its length is
+ *  what tells a handler this session came from a serial port rather than from
+ *  a network transport dialling the same ITS port. */
+typedef struct {
+  /** Which serial port attached: 0 = console port, 1 = second CDC port. */
+  uint8_t serialPort;
+} serial_handler_connect_t;
 
 #endif

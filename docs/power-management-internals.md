@@ -103,6 +103,16 @@ task polling a disconnected console at 20 Hz. `cliUsbDown()` sets the shared fla
 down its open CLI handle, and falls back to the blocking RX-ring read.
 `cliUsbUp()` clears the flag so sessions are allowed again once the link is back.
 
+**`pmUsbSerialJtagReattach()`** is `cliUsbUp()` plus an RX drain and a
+`consoleFlush()`, exposed for the console transport switch: the same recovery,
+needed for the same reason after the USB-OTG core has held the shared PHY. The
+drain discards what queued while this controller was off the pads (delivered
+late, those bytes open a CLI session out of keystrokes nobody typed), and the
+flush pushes output written before it left. `pmPollUsb()` early-returns while
+`consoleOnCdc`, since the controller then reads permanently disconnected and its
+60 s recovery would fight the OTG core for the pads. See
+[usb-console-internals](usb-console-internals.md).
+
 **RTC persistence:** `rtcUsbDisabled` (`RTC_DATA_ATTR`) survives deep sleep. On
 wake, `pmInit()` checks it (with `rtcRamValid()`): if set, it disables the pullup
 immediately and **skips acquiring `usb`**, so a device put to `usb down` before

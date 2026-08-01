@@ -9,6 +9,9 @@ dependencies:
     version: ">=5.5"
   espressif/mdns: "^1.5.0"
   joltwallet/littlefs: "^1.20.4"
+  # `usb cdc` runs the console on a TinyUSB composite device instead of the
+  # USB-Serial-JTAG controller.
+  espressif/esp_tinyusb: "^2.2"
   # esp_wireguard is vendored under src/esp_wireguard/ for now (waiting on
   # upstream netif->state fix to propagate). When that lands, drop the
   # vendored copy and add: trombik/esp_wireguard: ">=<fixed-version>".

@@ -6,6 +6,12 @@ on SD. Source [`src/log.cpp`](../esp-idf/src/log.cpp), header
 [`log.h`](../esp-idf/include/log.h). It comes up as part of the platform
 (`logInit`) — consumers never start it.
 
+The serial console is whichever USB controller currently drives it
+([usb-console](usb-console.md)); the log follows the switch. Two windows take
+the console mirror away without affecting any other consumer: while a straddle's
+handler owns the console serial port, and while the console is between
+transports.
+
 Logging is built on ESP-IDF's `ESP_LOGx` and its `vprintf` hook: spangap installs
 its own `vprintf` so it can capture, reformat, color, and route what the standard
 macros emit. Code uses the short macros below; the task does the rest.

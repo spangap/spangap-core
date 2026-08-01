@@ -76,13 +76,31 @@ void cliRegisterCmd(const char* cmd, cli_cmd_cb_t cb) {
 
 typedef void (*cli_write_fn)(const char* data, size_t len);
 
+/* Set by `usb cdc` while the console runs on a TinyUSB CDC port instead of
+ * the USB-Serial-JTAG controller. The two share one USB PHY, so exactly one is
+ * on the wire; every console I/O site below branches on this. */
+extern "C" volatile bool consoleOnCdc;
+extern "C" volatile bool consoleSwitchPending;
+extern "C" volatile bool consoleWriteDead;
+extern "C" void consoleCdcFlush(void);
+extern "C" int  consoleCdcRead(char* out);
+/* Block read/write on a named CDC port, for the serial-handler shuttle. The
+ * console's byte-at-a-time path cannot carry a handler's stream: a client that
+ * expects its reply within a quarter second gets nowhere at one byte per poll
+ * interval, and a handler's bytes must reach the wire unaltered (no CRLF
+ * translation, which serialEmit applies to console output). */
+extern "C" int  consoleCdcReadPort(int itf, uint8_t* out, size_t max);
+extern "C" int  consoleCdcWritePort(int itf, const uint8_t* data, size_t len);
+
 static void cliFlush() {
   fflush(stdout);
 #if CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG
   /* USB Serial JTAG echo needs a TX FIFO flush — fflush(stdout) only pushes
    * into the USB FIFO, but bytes don't actually leave until either a newline
-   * or this explicit flush. UART has no equivalent (writes leave immediately). */
-  usb_serial_jtag_ll_txfifo_flush();
+   * or this explicit flush. UART has no equivalent (writes leave immediately).
+   * CDC has the same trailing-write problem and its own flush call. */
+  if (consoleOnCdc) consoleCdcFlush();
+  else              usb_serial_jtag_ll_txfifo_flush();
 #endif
 }
 
@@ -1083,6 +1101,7 @@ extern void cliCmdSysInit();
 extern void cliCmdMountInit();
 extern void pmRegisterCmds();
 extern void logRegisterCmds();
+extern void usbPortsRegisterCmds();
 
 static void cliBuiltinInit() {
     storageRegisterCmds();
@@ -1091,6 +1110,7 @@ static void cliBuiltinInit() {
     cliCmdMountInit();
     pmRegisterCmds();
     logRegisterCmds();
+    usbPortsRegisterCmds();
     cliRegisterCmd("alias", cmdAlias);
     cliRegisterCmd("unalias", cmdUnalias);
     cliRegisterCmd("exit", [](const char* a) {
@@ -1296,6 +1316,23 @@ static void cliHandleLoginInput(cli_slot_t& cl, const char* buf, size_t n) {
 
 static TaskHandle_t cliTaskHandle = NULL;
 
+static void serialEmit(const char* p, size_t n);   /* defined with the serial task */
+
+void consoleWriteRaw(const char* data, size_t len) {
+  serialEmit(data, len);
+  fflush(stdout);
+  cliFlush();
+}
+
+void consoleFlush(void) {
+  fflush(stdout);
+  cliFlush();
+}
+
+void cliSerialResumeLog(void) {
+  cliUsbSerialAutoResumeLog = true;
+}
+
 void cliWake() {
   if (cliTaskHandle) xTaskNotifyGive(cliTaskHandle);
 }
@@ -1464,7 +1501,14 @@ static void cliTaskFn(void* arg) {
  * log session never sleeps mid-stream — only an interactive command burst
  * after the top-style spurious disconnect was exposed.) */
 static void serialEmit(const char* p, size_t n) {
+  /* Mid-move: neither transport can carry this, and the queue it would sit in
+   * is drained into the next session that attaches. Drop it. */
+  if (consoleWriteDead) return;
 #if CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG
+  /* None of the driver-level bypass below applies on CDC: the TinyUSB VFS does
+   * its own line-ending translation and has no is_connected gate to route
+   * around, so stdout is the correct path there. */
+  if (consoleOnCdc) { fwrite(p, 1, n, stdout); return; }
   auto put = [](const char* d, size_t len) {
     size_t off = 0;
     while (off < len) {
@@ -1510,6 +1554,114 @@ static void cliEmitLogResumeGap() {
  * initializer rule). */
 extern "C" { volatile bool serialInCli = false; }
 
+/* Set while a registered handler owns the console port. Suppresses the same log
+ * mirror serialInCli does, and CLI entry with it: the port is carrying a
+ * client's protocol, and console bytes pushed into that stream would corrupt
+ * it. A third variable rather than a reuse of serialInCli, which a trailing-';'
+ * command clears mid-session and which the CLI's own paths write. */
+extern "C" { volatile bool serialInHandler = false; }
+
+/* ---- Serial-port handler registry (contract in cli.h) ----
+ *
+ * Claims are posted from the claimant's task and read by the serial task
+ * through bare volatile flags — the mechanism consoleSwitchPending already
+ * uses here. Every flag is a single-writer edge the serial task clears, and
+ * the registry itself changes only when a claim is taken or dropped, so there
+ * is nothing a lock would add. */
+
+#define SERIAL_PORT_COUNT 2
+
+static struct serial_claim_t {
+    char     task[16];
+    uint16_t itsPort;
+    bool     claimed;
+} serialClaims[SERIAL_PORT_COUNT];
+
+/* A claim was taken or dropped; the serial task re-reads the registry. */
+static volatile bool serialClaimChanged = false;
+/* A host attached to / detached from a claimed CDC port (DTR edge, raised on
+ * the TinyUSB task). The USB-Serial-JTAG path has no line state and attaches in
+ * band instead — see cli.h. */
+static volatile bool serialAttachReq[SERIAL_PORT_COUNT];
+static volatile bool serialDetachReq[SERIAL_PORT_COUNT];
+
+static TaskHandle_t serialTaskHandle = NULL;
+
+extern "C" int consoleCdcPortCount(void);
+
+/* Serial ports the hardware presents right now. consoleCdcPortCount() reports 0
+ * while the console is not on CDC, which is the one-port USB-Serial-JTAG case. */
+static int serialPortCount(void) {
+    int n = consoleCdcPortCount();
+    return n > 0 ? n : 1;
+}
+
+/* Wake the serial task. Safe from any task, including the TinyUSB one. */
+extern "C" void serialPortWake(void) {
+    if (serialTaskHandle) xTaskNotifyGive(serialTaskHandle);
+}
+
+extern "C" bool serialPortIsClaimed(int port) {
+    return port >= 0 && port < SERIAL_PORT_COUNT && serialClaims[port].claimed;
+}
+
+extern "C" void serialPortHostAttached(int port) {
+    if (!serialPortIsClaimed(port)) return;
+    serialAttachReq[port] = true;
+    serialPortWake();
+}
+
+extern "C" void serialPortHostDetached(int port) {
+    if (!serialPortIsClaimed(port)) return;
+    serialDetachReq[port] = true;
+    serialPortWake();
+}
+
+bool serialPortClaim(int port, const char* task, uint16_t itsPort) {
+    if (port < 0 || port >= SERIAL_PORT_COUNT || !task || !*task) {
+        warn("serial: port %d cannot be claimed (0 = console port, 1 = second cdc port)", port);
+        return false;
+    }
+    int have = serialPortCount();
+    if (port >= have) {
+        warn("serial: port %d claim refused — this console presents %d serial port%s; "
+             "`usb cdc` presents two", port, have, have == 1 ? "" : "s");
+        return false;
+    }
+    auto& c = serialClaims[port];
+    if (c.claimed) {
+        /* Re-applying an identical claim is how a claimant reacts to a
+         * transport switch, so it must not read as a conflict. */
+        if (strcmp(c.task, task) == 0 && c.itsPort == itsPort) return true;
+        warn("serial: port %d already claimed by %s", port, c.task);
+        return false;
+    }
+    safeStrncpy(c.task, task, sizeof(c.task));
+    c.itsPort = itsPort;
+    c.claimed = true;
+    serialAttachReq[port] = false;
+    serialDetachReq[port] = false;
+    serialClaimChanged = true;
+    serialPortWake();
+    info("serial: port %d claimed by %s:%u", port, task, (unsigned)itsPort);
+    return true;
+}
+
+void serialPortRelease(int port) {
+    if (port < 0 || port >= SERIAL_PORT_COUNT || !serialClaims[port].claimed) return;
+    serialClaims[port].claimed = false;
+    serialClaimChanged = true;
+    serialPortWake();
+    info("serial: port %d released", port);
+}
+
+/* Shuttle carry: bytes read off a port that the handler's ITS stream had no
+ * room for yet. Stream-mode itsSend can accept part of a write, and a protocol
+ * framed on the wire cannot survive losing the middle of a frame — so the
+ * remainder is carried forward rather than dropped. Owned by the serial task. */
+static uint8_t serialHdlPend[SERIAL_PORT_COUNT][128];
+static size_t  serialHdlPendLen[SERIAL_PORT_COUNT];
+
 /* Set by the pm layer when the USB console link drops (the `usb down` command,
  * or a debounced unplug). Level-triggered: while true, the serial task tears
  * down any open CLI session and returns to the blocking log read, so a session
@@ -1545,14 +1697,132 @@ static void serialTaskFn(void* arg) {
   int flags = fcntl(STDIN_FILENO, F_GETFL, 0);
   fcntl(STDIN_FILENO, F_SETFL, flags | O_NONBLOCK);
 
-  itsClientInit(1);
+  /* Two client slots: a handler session on a claimed port has to coexist with
+   * the `cli:1` connection a console CLI session holds. */
+  itsClientInit(2);
   int cliHandle = -1;
+  /* Per-port handler session; -1 when the port is a console (or unclaimed). */
+  int hdlHandle[SERIAL_PORT_COUNT] = { -1, -1 };
+
+  /* Raw port I/O for the shuttle — no line-ending translation and no console
+   * gating, because what crosses here is a client's protocol, not text. */
+  auto portRead = [&](int port, uint8_t* out, size_t max) -> int {
+#if CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG
+      if (consoleOnCdc) return consoleCdcReadPort(port, out, max);
+      if (port != 0) return 0;
+      int n = usb_serial_jtag_read_bytes(out, max, 0);
+      return n > 0 ? n : 0;
+#else
+      if (port != 0) return 0;
+      int n = (int)read(STDIN_FILENO, out, max);
+      return n > 0 ? n : 0;
+#endif
+  };
+  auto portWrite = [&](int port, const uint8_t* data, size_t len) {
+#if CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG
+      if (consoleOnCdc) { consoleCdcWritePort(port, data, len); return; }
+      if (port != 0) return;
+      size_t off = 0;
+      while (off < len) {
+        int w = usb_serial_jtag_write_bytes((const char*)data + off, len - off,
+                                            pdMS_TO_TICKS(250));
+        if (w <= 0) break;
+        off += (size_t)w;
+      }
+      usb_serial_jtag_ll_txfifo_flush();
+#else
+      if (port != 0) return;
+      fwrite(data, 1, len, stdout);
+      fflush(stdout);
+#endif
+  };
+
+  /* End a handler session and, for port 0, hand the console back to the log. */
+  auto hdlDetach = [&](int port) {
+      if (hdlHandle[port] < 0) return;
+      itsDisconnect(hdlHandle[port]);
+      hdlHandle[port] = -1;
+      serialHdlPendLen[port] = 0;
+      if (port == 0) serialInHandler = false;
+  };
+
+  /* A client has appeared on a claimed port: connect it to the handler task and
+   * stop treating the port as a console. `first` is the byte that revealed the
+   * client on an in-band attach, which belongs to its stream and is forwarded.
+   * A rejected connect (the handler already has a session) leaves the port
+   * exactly as it was — on port 0, still a console. */
+  auto hdlAttach = [&](int port, const uint8_t* first, size_t nFirst) -> bool {
+      if (!serialPortIsClaimed(port) || hdlHandle[port] >= 0) return false;
+      serial_handler_connect_t hc = { (uint8_t)port };
+      int h = itsConnect(serialClaims[port].task, serialClaims[port].itsPort,
+                         &hc, sizeof(hc), pdMS_TO_TICKS(500));
+      if (h < 0) return false;
+      hdlHandle[port] = h;
+      serialHdlPendLen[port] = 0;
+      if (port == 0) {
+        /* A CLI session cannot outlive the port it runs on. Drop it silently —
+         * the banner would go to the client, not to a person. */
+        if (cliHandle >= 0) { itsDisconnect(cliHandle); cliHandle = -1; }
+        serialInCli    = false;
+        serialInHandler = true;
+      }
+      if (nFirst) itsSend(h, first, nFirst, pdMS_TO_TICKS(50));
+      return true;
+  };
+
+  /* Shuttle one port's bytes in both directions. */
+  auto hdlPump = [&](int port) {
+      int h = hdlHandle[port];
+      if (h < 0) return;
+      /* Carry first: bytes reach the handler in order or not at all. */
+      if (serialHdlPendLen[port]) {
+        size_t sent = itsSend(h, serialHdlPend[port], serialHdlPendLen[port],
+                              pdMS_TO_TICKS(20));
+        if (sent >= serialHdlPendLen[port]) {
+          serialHdlPendLen[port] = 0;
+        } else {
+          if (sent) {
+            memmove(serialHdlPend[port], serialHdlPend[port] + sent,
+                    serialHdlPendLen[port] - sent);
+            serialHdlPendLen[port] -= sent;
+          }
+          return;   /* still backed up — leave the port unread this pass */
+        }
+      }
+      uint8_t rb[128];
+      int n = portRead(port, rb, sizeof(rb));
+      if (n > 0) {
+        size_t sent = itsSend(h, rb, (size_t)n, pdMS_TO_TICKS(20));
+        if (sent < (size_t)n) {
+          size_t rem = (size_t)n - sent;
+          if (rem > sizeof(serialHdlPend[port])) rem = sizeof(serialHdlPend[port]);
+          memcpy(serialHdlPend[port], rb + sent, rem);
+          serialHdlPendLen[port] = rem;
+        }
+      }
+      uint8_t ob[256];
+      for (;;) {
+        size_t m = itsRecv(h, ob, sizeof(ob), 0);
+        if (m == 0) break;
+        portWrite(port, ob, m);
+      }
+      if (!itsConnected(h)) hdlDetach(port);
+  };
 
   /* Handle one inbound serial byte: enter CLI mode on the first keystroke,
    * forward keys to the CLI, treat Ctrl-C as "drop back to log". Shared by the
    * idle blocking-read path and the active drain path below so both stay in
    * step. */
   auto handleChar = [&](char c) {
+      /* In-band attach for a claimed console port on USB-Serial-JTAG, which
+       * offers no DTR to watch. 0xC0 is the KISS frame delimiter and opens
+       * every such client's first burst; no console keystroke produces it. The
+       * byte belongs to the client, so it is forwarded, not swallowed. */
+      if ((uint8_t)c == 0xC0 && !consoleOnCdc &&
+          serialPortIsClaimed(0) && hdlHandle[0] < 0) {
+        uint8_t b = 0xC0;
+        if (hdlAttach(0, &b, 1)) return;
+      }
       if (c == 0x03) {
         /* Ctrl-C on serial: abort any CLI line in flight, print a hint
          * (so the user doesn't think Ctrl-C exits the monitor — Ctrl-]
@@ -1567,7 +1837,21 @@ static void serialTaskFn(void* arg) {
         fflush(stdout); cliFlush();
         return;
       }
-      if (cliHandle < 0 && c != '\n' && c != '\r') {
+      if (cliHandle < 0 && (c == '\n' || c == '\r')) {
+        /* Enter is the one key that does not open a session — it is how a
+         * session is left, so treating it as the first keystroke of a new one
+         * would make leaving impossible. Say what the console is doing instead
+         * of swallowing the key, which reads as an unresponsive terminal. */
+        static const char hintCdc[] =
+            "\r\n" RESET "Spangap console on serial cdc 0. Start typing to enter CLI\r\n";
+        static const char hintJtag[] =
+            "\r\n" RESET "Spangap console on serial jtag. Start typing to enter CLI\r\n";
+        if (consoleOnCdc) serialEmit(hintCdc, sizeof(hintCdc) - 1);
+        else              serialEmit(hintJtag, sizeof(hintJtag) - 1);
+        cliFlush();
+        return;
+      }
+      if (cliHandle < 0) {
         /* Switch to CLI mode — suppress direct-stdout log echo */
         serialInCli = true;
         cli_connect_t req = { CLI_ANSI, 1, CLI_COLOR, 0, /*login*/0 };
@@ -1576,7 +1860,15 @@ static void serialTaskFn(void* arg) {
           char host[48];
           storageGetStr("s.net.hostname", host, sizeof(host), CONFIG_SPANGAP_FW_HOSTNAME);
           if (!host[0]) safeStrncpy(host, CONFIG_SPANGAP_FW_HOSTNAME, sizeof(host));
-          printf("\033[0m\r\n\r\nCLI mode, hit return on prompt to return to log\r\n\r\n%s $ ", host);
+          /* One \r\n, not two: this runs at column 0 (the log line before it
+           * ended with a newline), where each \r\n is a blank line of its own.
+           *
+           * The hostname carries the same bold green cliWritePrompt gives it —
+           * this is the one prompt that function does not draw, and spelling it
+           * plainly here is what left the first prompt of a session uncoloured
+           * while every later one was green. */
+          printf("\033[0m\r\nCLI mode, hit return on prompt to return to log\r\n\r\n"
+                 CLI_C_HOST "%s" CLI_C_RESET " $ ", host);
           fflush(stdout); cliFlush();
         } else {
           /* connect failed — abort CLI mode */
@@ -1594,18 +1886,70 @@ static void serialTaskFn(void* arg) {
   };
 
   for (;;) {
+    /* ---- serial-handler bookkeeping, ahead of every console mode ----
+     * A claimed port 1 must be shuttled whether or not the console has a CLI
+     * session open, and a claim can be taken or dropped from another task at
+     * any moment. */
+    if (hdlHandle[0] >= 0 || hdlHandle[1] >= 0) {
+      /* Keep this task's ITS inbox drained: a handler-side disconnect arrives
+       * as an inbox message, and itsConnected() only reflects it once polled. */
+      while (itsPoll(0)) {}
+    }
+    if (serialClaimChanged) {
+      serialClaimChanged = false;
+      for (int p = 0; p < SERIAL_PORT_COUNT; p++)
+        if (hdlHandle[p] >= 0 && !serialPortIsClaimed(p)) hdlDetach(p);
+    }
+    /* A port that no longer exists (`usb jtag` took the second CDC port away)
+     * cannot carry a session; the claim stays and goes dormant until the
+     * claimant re-applies it on the next `usb cdc`. */
+    for (int p = serialPortCount(); p < SERIAL_PORT_COUNT; p++) hdlDetach(p);
+    for (int p = 0; p < SERIAL_PORT_COUNT; p++) {
+      /* Detach before attach: a fast close-then-open leaves both edges posted,
+       * and the session that survives must be the newer one. */
+      if (serialDetachReq[p]) { serialDetachReq[p] = false; hdlDetach(p); }
+      if (serialAttachReq[p]) { serialAttachReq[p] = false; hdlAttach(p, nullptr, 0); }
+    }
+    /* `usb down` — level-triggered, and last, so nothing re-attaches behind it
+     * while the link is gone. */
+    if (cliUsbSerialLinkDown)
+      for (int p = 0; p < SERIAL_PORT_COUNT; p++) hdlDetach(p);
+    hdlPump(1);
+
+    if (hdlHandle[0] >= 0) {
+      /* The console port belongs to a handler: no log mirror, no CLI, and no
+       * console read — hdlPump has taken the bytes. Waited on a notification so
+       * a handler write (ITS) or CDC rx wakes us at once; the timeout is what
+       * covers USB-Serial-JTAG, whose ISR-fed ring raises none. */
+      hdlPump(0);
+      ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(10));
+      continue;
+    }
+
 #if CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG
     if (cliHandle < 0) {
       /* Idle / log mode: log fanout goes direct-to-stdout, so nothing is queued
        * to this task over ITS until a CLI session opens — only a keystroke moves
-       * us forward, and there is nothing to poll for (the auto-resume flag only
-       * matters with a session open; USB recovery is driven by the log task's
-       * pmPollUsb, not us). So park indefinitely on the driver's ISR-fed RX ring:
-       * a keystroke wakes us at once, and an idle console adds zero wakes — this
-       * task drops off the wake path entirely so both cores can light-sleep. */
+       * us forward, and there is nothing to poll for (USB recovery is driven by
+       * the log task's pmPollUsb, not us). So park indefinitely on the driver's
+       * ISR-fed RX ring: a keystroke wakes us at once, and an idle console adds
+       * zero wakes — this task drops off the wake path entirely so both cores
+       * can light-sleep. */
       char c;
       pmBoostAuto(false);
-      if (usb_serial_jtag_read_bytes(&c, 1, portMAX_DELAY) == 1) {
+      /* The auto-resume latch belongs to a session; carrying it into log mode
+       * would end the *next* session the moment it opened. cliSerialResumeLog()
+       * sets it unconditionally, and `usb cdc` calls that with no session open. */
+      cliUsbSerialAutoResumeLog = false;
+      if (consoleOnCdc || consoleSwitchPending) {
+        /* CDC has no ISR-fed ring to park on, so this path polls. It also covers
+         * the switch itself: parking on the old transport while the console is
+         * moving would strand this task on a controller that is about to lose
+         * the bus. Waited on a notification so a claimed port's rx callback (or
+         * a claim change) is serviced without waiting out the interval. */
+        if (consoleCdcRead(&c)) { pmBoostAuto(true); handleChar(c); }
+        else ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(50));
+      } else if (usb_serial_jtag_read_bytes(&c, 1, portMAX_DELAY) == 1) {
         pmBoostAuto(true);
         handleChar(c);
       }
@@ -1626,9 +1970,17 @@ static void serialTaskFn(void* arg) {
 
     while (itsPoll(pdMS_TO_TICKS(50))) {}
 
-    /* Poll serial input */
+    /* Poll serial input from the driver rather than fd 0. A console that has
+     * been through a transport switch no longer has its descriptor there —
+     * freopen() reopens stdin onto a fresh one, which also leaves the
+     * O_NONBLOCK set at task start behind on the old. */
     char c;
-    while (read(STDIN_FILENO, &c, 1) == 1) handleChar(c);
+    if (consoleOnCdc) { while (consoleCdcRead(&c)) handleChar(c); }
+#if CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG
+    else              { while (usb_serial_jtag_read_bytes(&c, 1, 0) == 1) handleChar(c); }
+#else
+    else              { while (read(STDIN_FILENO, &c, 1) == 1) handleChar(c); }
+#endif
 
     /* Drain CLI → serial */
     if (cliHandle >= 0) {
@@ -1703,5 +2055,5 @@ void cliInit() {
   /* 4096 instead of 3072 — apps linking C++ exception support (e.g.
    * reticulous + microReticulum) pay ~600B of libstdc++ unwinder stack
    * per dispatch, which the 3072 budget didn't allow for. */
-  spawnTask(serialTaskFn, "serial", 4096, nullptr, 1, 1);
+  serialTaskHandle = spawnTask(serialTaskFn, "serial", 4096, nullptr, 1, 1);
 }

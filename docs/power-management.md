@@ -63,6 +63,7 @@ server, a peripheral driver — and it shows up in `pm` alongside these):
 | Name | Type | Held while | Owner |
 |---|---|---|---|
 | `usb` | `NO_LIGHT_SLEEP` | a USB-serial host is attached (SOF detected; 5 s boot grace) | pm |
+| `usbcdc` | `NO_LIGHT_SLEEP` | the console runs on a TinyUSB CDC device (`usb cdc`) — a nap gates the USB clock and drops the link | [usb-console](usb-console.md) |
 | `cron` | `NO_DEEP_SLEEP` | cron is disabled **or** the crontab is empty | [cron](cron.md) |
 | `waittime` | `NO_DEEP_SLEEP` | a `waitForTime()` clock-sync barrier is in progress | core (`spangap_init`) |
 | `waitflag` | `NO_DEEP_SLEEP` | a `waitForFlag()` readiness barrier is in progress | core (`spangap_init`) |
@@ -165,6 +166,14 @@ pads, and restores hardware pull control. The disabled state persists across dee
 sleep (a cold power cycle restores normal USB). Details in
 [power-management-internals.md](power-management-internals.md).
 
+All of this is a USB-serial-JTAG notion. While the console runs on a TinyUSB CDC
+device the USB-serial-JTAG controller does not own the USB PHY, so `pmPollUsb()`
+early-returns rather than fight the OTG core for the pads, and the CDC link
+holds its own `usbcdc` `NO_LIGHT_SLEEP` lock instead — light sleep gates the USB
+clock, and TinyUSB has no arrangement to survive that. `pmUsbSerialJtagReattach()`
+is the hand-back the transport switch calls. See
+[usb-console](usb-console.md).
+
 ### GPIO wake sources
 
 A peripheral that must wake the CPU from light sleep on an interrupt line (LoRa
@@ -200,7 +209,7 @@ pm registers three commands (run on-device via `spangap cli "<command>"`):
 | `pm` | Current CPU/APB frequency, then (under profiling) per-mode time deltas since the last `pm` and totals since boot — deep sleep / light sleep / 80 MHz / 240 MHz as a percentage of wall time, deep sleep with its count. |
 | `pm -v` | Adds the full lock table: every esp_pm lock plus pm's own `NO_DEEP_SLEEP` rows, plus Mode and Sleep stats (the light-sleep reject count is the "why no light sleep" signal). |
 | `pm wifi [none\|min\|max]` | Read or set the WiFi modem power-save mode (`esp_wifi_set_ps`). |
-| `usb up` / `usb down` | Reconnect / disconnect the USB-serial peer (above); bare `usb` reports connection state. |
+| `usb up` / `usb down` | Reconnect / disconnect the USB-serial peer (above); bare `usb` reports connection state, the console transport, and the reason the last transport switch failed. `usb cdc` / `usb jtag` move the console between controllers — [usb-console](usb-console.md), not pm. |
 | `top` | Per-task CPU%, stack, per-task DRAM/PSRAM, per-core busy, heap, uptime. |
 
 Chain `usb down; sleep 30; usb up` on one line — the CLI splits the commands up

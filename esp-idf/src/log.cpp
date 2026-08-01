@@ -396,6 +396,18 @@ static TaskHandle_t logTaskHandle = NULL;
  * Defined in cli.cpp. */
 extern "C" volatile bool serialInCli;
 
+/* True while a registered handler owns the console port — the port is carrying
+ * a client's protocol, and log text pushed into that stream would corrupt it.
+ * Separate from serialInCli, which the CLI's own paths clear mid-session.
+ * Defined in cli.cpp. */
+extern "C" volatile bool serialInHandler;
+
+/* True while the console is between transports and no wire can carry a write.
+ * The ring, the log file and the ITS consumers below are all unaffected — only
+ * the direct-to-stdout echo is skipped, because what it queues is replayed onto
+ * whichever session attaches next. Defined in usb_ports.cpp. */
+extern "C" volatile bool consoleWriteDead;
+
 static int logVprintf(const char* fmt, va_list args) {
     if (!logInited) return 0;
 
@@ -420,7 +432,7 @@ static int logVprintf(const char* fmt, va_list args) {
     /* Always echo to stdout (USB Serial JTAG) unless serial is in CLI mode.
      * This bypasses the ITS log→serial consumer path entirely so logs reach
      * the wire even if the serial task is wedged or not yet connected. */
-    if (!serialInCli) {
+    if (!serialInCli && !serialInHandler && !consoleWriteDead) {
         fwrite(formatted.data(), 1, fmtLen, stdout);
     }
 
@@ -676,7 +688,7 @@ static void logInboundLineOut(int srcSlot, const char* line, size_t len) {
     /* Serial console isn't an ITS consumer of the log task — it sees log
      * output via logVprintf's direct fwrite(stdout). Mirror that here so
      * inbound lines also reach the serial console. */
-    if (!serialInCli) {
+    if (!serialInCli && !serialInHandler && !consoleWriteDead) {
         ensureAnsi();
         if (ansiLen > 0) fwrite(ansi, 1, ansiLen, stdout);
     }

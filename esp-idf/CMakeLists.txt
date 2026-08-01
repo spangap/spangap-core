@@ -34,6 +34,7 @@ set(_REQ
     esp_driver_spi
     esp_pm
     esp_driver_usb_serial_jtag
+    espressif__esp_tinyusb
     esp_wifi
     esp_netif
     esp_event

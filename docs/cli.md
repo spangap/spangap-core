@@ -14,7 +14,9 @@ The same command line is served on four channels simultaneously:
   build host (the everyday path).
 - **Serial console** — typing any character at the log view switches the USB
   serial console into CLI mode; an empty Enter (or `exit`) returns to the live
-  log. See [logging](logging.md) for the log/CLI mode switch.
+  log. Enter at the log view does *not* open a session — it names the transport
+  the console is on instead. See [logging](logging.md) for the log/CLI mode
+  switch and [usb-console](usb-console.md) for the transports.
 - **Raw TCP** — `nc <device> 8081` (`CLI_PORT_TCP`), exposed by
   [spangap-net](../../spangap-net); a net-less image simply has no TCP listener.
 - **Browser DataChannel** — the xterm.js terminal window over WebRTC, addressed
@@ -107,8 +109,15 @@ one-liner and a pointer. The CLI-framework's own commands are documented in full
 |---|---|
 | `pm` | power-management state and locks |
 | `top` | task CPU / stack snapshot |
-| `usb` | USB-serial peer presence |
+| `usb` | USB-serial peer presence, console transport, last switch error |
 | `bat` | battery voltage + percent |
+
+### USB console transport — see [usb-console.md](usb-console.md)
+
+| Command | |
+|---|---|
+| `usb cdc` | move the console onto a two-port TinyUSB CDC device |
+| `usb jtag` | move it back onto the USB-Serial-JTAG controller |
 
 ### Auth — see [auth.md](auth.md)
 
@@ -162,6 +171,14 @@ used by the ssh client for password prompts and pty sizing),
 the `cli_connect_t` connect payload, and the `CLI_PORT_TCP` (8081) /
 `CLI_PORT_DC` (1) port constants. The CLI starts itself at boot — consumers
 never call `cliInit`.
+
+The same header carries the serial-port surface:
+`serialPortClaim`/`serialPortRelease` and the `serial_handler_connect_t` connect
+payload ([usb-console.md](usb-console.md)), plus `consoleWriteRaw`,
+`consoleFlush` and `cliSerialResumeLog` — the console primitives a transport
+switch needs (write past both the CLI session and the log, push the hardware TX
+FIFO, and hand the serial console back to the live log the way a trailing `;`
+does).
 
 ## Owned storage keys
 

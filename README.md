@@ -24,6 +24,7 @@ with the function you need.
 | **auth** | [docs/auth.md](docs/auth.md) | The credential primitive: realm passwords and session cookies (`secrets.auth.*`). HTTP enforcement lives in spangap-web. |
 | **cron** | [docs/cron.md](docs/cron.md) | Minute-resolution, deep-sleep-aware scheduler driven by the `crontab` file. |
 | **power-management** | [docs/power-management.md](docs/power-management.md) | DFS + light/deep sleep, PM locks, notify-driven CPU boost, USB pullup, GPIO wake. |
+| **usb-console** | [docs/usb-console.md](docs/usb-console.md) | Which USB controller drives the console — the built-in USB-Serial-JTAG port or a two-port TinyUSB CDC device (`usb cdc`) — and who owns each serial port. |
 | **memory** | [docs/memory.md](docs/memory.md) | PSRAM-vs-internal-DRAM placement policy and the `gp_alloc`/`dram_alloc`/`dma_alloc` allocators. |
 | **idf-tweaks** | [docs/idf-tweaks.md](docs/idf-tweaks.md) | Guarded ESP-IDF/toolchain workarounds (heap-tracking `--wrap`, shared-SPI-bus helpers, FATFS/SD defaults). |
 
@@ -54,6 +55,7 @@ header/source pair per module.
 | Auth | `auth.h` | `auth.cpp` |
 | Cron | `cron.h` | `cron.cpp` |
 | Power management | `pm.h` | `pm.cpp` |
+| USB console transport | `cli.h` (serial ports), `pm.h` | `usb_ports.cpp` |
 | Memory | `mem.h` | `mem_new.cpp` (global `operator new`/`delete`) |
 | Compat / RTC RAM | `compat.h` | header-only (`millis`, `safeStrncpy`, `spawnTask`, fmt helpers) |
 | Shared SPI bus | `spi_helper.h` | `spi_helper.cpp` |

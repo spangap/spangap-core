@@ -95,10 +95,27 @@ transitions:
 
 | Trigger | Visible effect | Mechanism |
 |---------|----------------|-----------|
-| Any key (not bare `\n`/`\r`) in log mode | blank line, `"CLI mode, hit return on prompt to return to log"`, blank line, `<host> $ ` | serial task `itsConnect`s `cli:1`, sets `serialInCli=true`, prints the banner, forwards the keystroke. |
+| Any key (not bare `\n`/`\r`) in log mode | `"CLI mode, hit return on prompt to return to log"`, blank line, `<host> $ ` | serial task `itsConnect`s `cli:1`, sets `serialInCli=true`, prints the banner, forwards the keystroke. The banner opens with a single `\r\n` (it starts at column 0, where each `\r\n` is a blank line of its own) and spells the prompt's `CLI_C_HOST` colour itself — it is the one prompt `cliWritePrompt` does not draw. |
+| Bare `\n`/`\r` in log mode | `"Spangap console on serial cdc 0"` / `"… on serial jtag"`, `"Start typing to enter CLI"` | Enter is how a session is *left*, so it must not open one; the console names the transport it is on instead. Swallowing the key reads as an unresponsive terminal. |
 | Empty return at the prompt | blank line, `"Resuming log"`, blank line, log resumes | line editor's empty-enter branch writes the banner over the CLI connection, then `itsDisconnect`s; the serial task sees the disconnect and stays silent. |
 | Line ending in `;` | `\rResuming log\r\r`, command runs while logs already flow | line editor writes the overwrite banner, flips `serialInCli=false` *before* `cliProcess` so live log reaches the wire during the command, then sets `cliUsbSerialAutoResumeLog=true` to finalize the disconnect after draining. |
 | Ctrl-C (`0x03`) on serial | blank line, `"Press Ctrl-] to exit monitor"`, blank line, log resumes | serial task intercepts `0x03` before forwarding, aborts the CLI line by `itsDisconnect`ing the handle, prints the hint via direct `printf`. No-op if already in log mode. |
+
+**`serialInHandler` suppresses the same two mirrors** — `logVprintf`'s direct
+`stdout` echo and the inbound-line echo in §3 — while a registered handler owns
+the console port. It is a separate flag because `serialInCli` is cleared
+mid-session by the trailing-`;` transition above, and because the port is then
+carrying a client's protocol rather than a person's session: log text written
+into that stream would corrupt it. The registry, the DTR-vs-`0xC0` attach
+triggers, and the release paths are documented in
+[cli-internals §3](cli-internals.md).
+
+**`consoleWriteDead` suppresses them too**, for the window in which the console
+is between USB transports and no wire can carry a write ([usb-console](usb-console.md)).
+Only the direct-to-`stdout` mirrors are skipped: the ring, the log file and the
+ITS consumers are unaffected, so nothing is lost from the log — whereas what a
+dead-wire write queues is replayed, seconds late and truncated wherever the ring
+wrapped, over the first output of whichever session attaches next.
 
 TCP/WS CLI clients see none of this — they stay in CLI mode and just re-prompt on
 empty enter; Ctrl-C is forwarded to the line editor as an ordinary byte (ignored).

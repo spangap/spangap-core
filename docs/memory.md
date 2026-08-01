@@ -122,7 +122,7 @@ Set in `sdkconfig.defaults.spangap` (consumer values override on collision):
 |--------|-------|-----|
 | `CONFIG_SPIRAM` | `y` | The single PSRAM switch. Registers the PSRAM heap and gates every SPIRAM branch above. A no-PSRAM board sets `=n`. |
 | `CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL` | `0` | Every untagged C `malloc()` goes to PSRAM. Internal DRAM is scarce and WiFi needs it; the few control structures that must be internal are pinned explicitly, not via a size heuristic. |
-| `CONFIG_SPIRAM_MALLOC_RESERVE_INTERNAL` | `65536` | Reserves 64 KB of internal DRAM for DMA-capable allocations (WiFi static RX, the SD-on-SPI read bounce, mbedTLS/lwIP) that all peak together at boot. |
+| `CONFIG_SPIRAM_MALLOC_RESERVE_INTERNAL` | `98304` | Reserves 96 KB of internal DRAM for DMA-capable allocations (WiFi static RX, the SD-on-SPI read bounce, mbedTLS/lwIP) that all peak together at boot, plus the internal `.bss` of stacks that are linked in whether or not they are used (the TinyUSB device stack behind [`usb cdc`](usb-console.md)). The number tracks the image: every further internal-only consumer spends from here, so a boot-time alloc failure means the consumer list grew. |
 | `CONFIG_SPIRAM_ALLOW_BSS_SEG_EXTERNAL_MEMORY` | `y` | Enables `PSRAM_BSS` / `EXT_RAM_BSS_ATTR`. Opt-in per symbol — enabling it alone moves nothing. |
 
 ---

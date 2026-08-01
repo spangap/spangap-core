@@ -79,10 +79,16 @@ CONFIG_SPIRAM_ALLOW_BSS_SEG_EXTERNAL_MEMORY=y
 # opening an SD file) the 48 KB reserve was occasionally exhausted, that tiny
 # alloc returned NULL, and IDF's cleanup path NULL-derefs (memcpy from a
 # never-assigned buffer_to_rcv) → boot-loop. It was a race: most boots lost,
-# one eventually won. 64 KB gives the headroom so the read-bounce can't fail.
+# one eventually won, so the reserve has to cover the whole peak with margin.
 # (This is a *read*-path sibling of the SD-write 0x101 fix; writes were staged
 # aligned, reads go through IDF's own block_buf and can't be pre-aligned here.)
-CONFIG_SPIRAM_MALLOC_RESERVE_INTERNAL=65536
+# 96 KB is what that peak costs today: the TinyUSB device stack the console
+# transport switch needs is linked into every build and holds internal .bss
+# whether or not it is ever installed, and it eats into this reserve. Every
+# further internal-only consumer added to the image spends from here, so this
+# number tracks the image — if the boot-peak alloc failure reappears, the
+# consumer list grew, not the race.
+CONFIG_SPIRAM_MALLOC_RESERVE_INTERNAL=98304
 
 # Per-task heap ownership tracking (for heapDump on malloc failures)
 CONFIG_HEAP_TASK_TRACKING=y
@@ -216,6 +222,30 @@ CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
 # usb_serial_jtag_is_connected() returns false → vfs_read/write start
 # returning -1 → serial console dies. See esp-idf usb_serial_jtag_connection_monitor.c.
 CONFIG_USJ_NO_AUTO_LS_ON_CONNECTION=y
+
+# Hold the panic output before resetting. On a USB console the device leaves the
+# bus the moment it resets, and with no delay the backtrace is still in the TX
+# FIFO when the host loses the port — a crash then reads as a silent reboot.
+CONFIG_ESP_SYSTEM_PANIC_REBOOT_DELAY_SECONDS=5
+
+# `usb cdc` moves the console onto a TinyUSB composite device. Two CDC-ACM
+# ports is the hardware ceiling: each claims an interrupt IN endpoint plus a
+# bulk IN/OUT pair, and the OTG core has five IN endpoints past EP0.
+CONFIG_TINYUSB_CDC_ENABLED=y
+CONFIG_TINYUSB_CDC_COUNT=2
+
+# Headroom above the number of filesystems actually mounted at once (default 8,
+# which a running device fills exactly: console, uart, usbserjtag, null, lwip
+# sockets, littlefs, FAT, and the CDC console's own /dev/tusbcdc).
+#
+# The margin is not optional, because IDF's slot accounting is one-way:
+# esp_vfs_unregister() clears the table entry but leaves s_vfs_count at its
+# high-water mark, and esp_vfs_register_fs() refuses on that count before it
+# looks for a free entry. So a filesystem that comes and goes — /dev/tusbcdc,
+# each time the console moves — registers once and is then refused forever,
+# ESP_ERR_NO_MEM, with its slot sitting empty. The count settles at the peak
+# rather than climbing per cycle, so one spare slot suffices; this leaves four.
+CONFIG_VFS_MAX_COUNT=12
 
 # Main task stack — mbedTLS EC key generation needs ~10KB
 CONFIG_ESP_MAIN_TASK_STACK_SIZE=16384
