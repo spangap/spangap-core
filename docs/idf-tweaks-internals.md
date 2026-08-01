@@ -77,6 +77,22 @@ file-scope `static bool s_installed` short-circuits repeat calls; the actual
 and quiet. All callers must pass the same `ESP_INTR_FLAG_*` — the first install
 wins.
 
+*Stale-interrupt sweep.* Before installing, it walks every valid pin, and for
+each whose `int_ena` is non-zero calls `gpio_intr_disable` +
+`gpio_set_intr_type(GPIO_INTR_DISABLE)`, then clears both interrupt-status
+registers. Per-pin interrupt configuration lives in the GPIO peripheral, which
+`esp_restart()` does **not** reset (its reset list covers radio, timers, SPI,
+UART, DMA and crypto — not GPIO), so a pin armed before a soft reset is still
+armed while the handler table this service creates starts empty. Installing then
+unmasks the GPIO interrupt on its CPU, and a stale **level**-typed pin whose
+source still asserts storms it: with no handler registered there is nothing to
+quiet the source or disable the pin, the ISR clears the status, the level
+re-latches, and it never exits — interrupt watchdog, panic, and, the panic
+reboot being another soft reset, the same storm again next boot until someone
+power-cycles the board. Handlers can only be added after the service exists, so
+at this point every enabled pin is stale by definition and the blanket sweep is
+safe.
+
 This file deliberately stays minimal: per-device registration, reference-counted
 teardown, and per-board CS-pin parking are out of scope until a real second
 consumer needs them.
