@@ -198,18 +198,26 @@ string, free — only on a timezone change. The parsing and refresh logic
 
 ## CLI
 
-storage owns four verbs (run any on-device with `spangap cli "<command>"`):
+storage owns five verbs (run any on-device with `spangap cli "<command>"`):
 
 ```
-set <key>=<value>      set a config variable; s.*/secrets.* auto-flush on the save timer
-                       (`set <key> <value>` also works — a space is an equally valid separator)
+set <key>[=<value>]    set a config variable; s.*/secrets.* auto-flush on the save timer
+                       (`set <key> <value>` also works — a space is an equally valid
+                       separator; a bare `set <key>` with no value sets 1)
+reset <key>            set a config variable to 0 (shorthand for `set <key>=0`)
 show [<prefix>]        print config variables (exact key, subtree, or prefix match)
 unset <key>            delete a key or subtree
 save                   force an immediate flush to flash, blocking until written
 ```
 
-`set`, `unset`, and `save` are **silent on success**. `set fw.* …` is rejected
-(read-only identity). `set` of a `s.log.*` key also re-applies log levels.
+The key runs up to the first `=` or space, and spaces on either side of the
+separator are ignored, so `set k=v`, `set k = v`, `set k v` and `set k =v` are
+the same write. The value is everything after, and may itself contain `=` or
+spaces. `set`, `reset`, `unset`, and `save` are **silent on success**.
+`set fw.* …` is rejected (read-only identity). `set`/`reset` of a `s.log.*` key
+also re-applies log levels. `reset factory` is a different, longer verb owned by
+[fs](fs.md) — longest-prefix dispatch keeps the two apart, so `reset` never
+writes a key called `factory`.
 
 Filesystem verbs (`ls`, `cat`, `cp`, `mv`, `df`, …) and the state-store
 commands (`format flash`, `format sd`, `reset factory`) belong to [fs](fs.md);

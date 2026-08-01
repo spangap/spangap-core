@@ -2655,31 +2655,52 @@ void storageList(cli_write_fn write) {
 
 /* ---- CLI commands ---- */
 
-static void cmdSet(const char* a) {
-    if (cliWantsHelp(a)) { cliPrintf("%-*s set config variable\n", CLI_HELP_COL, "set <key>=<value>  (or: set <key> <value>)"); return; }
-    while (*a == ' ') a++;
-    /* Accept either `set key=value` or `set key value`: the T-Deck keyboard has
-     * no '=' key, so a space is an equally valid key/value separator. Whichever
-     * of '=' or ' ' appears first is the separator; the rest is the value (so a
-     * value may itself contain '=' or spaces). */
-    const char* eq = strchr(a, '=');
-    const char* sp = strchr(a, ' ');
-    const char* sep = (eq && (!sp || eq < sp)) ? eq : sp;
-    if (!sep || sep == a) { cliPrintf("usage: set <key>=<value>  (or: set <key> <value>)\n"); return; }
-    /* Generous full-key buffer (change notifies carry keys at any length).
-     * Used to be 48 — small enough that `set s.lxmf.id.0.msgs.<64-hex>.<field>=…`
-     * was rejected at the CLI before storageSet ever ran. */
-    char key[128];
-    size_t klen = sep - a;
-    while (klen > 0 && a[klen - 1] == ' ') klen--;
-    if (klen == 0 || klen >= sizeof(key)) { cliPrintf("err: key empty or too long\n"); return; }
-    memcpy(key, a, klen); key[klen] = '\0';
+/* Shared tail for `set`/`reset`: reject the read-only fw.* namespace, write the
+ * value, then re-apply log levels when a logging key changed. */
+static void setConfigVar(const char* key, const char* val) {
     if (isFw(key)) { cliPrintf("err: fw.* is read-only firmware identity (compile-time)\n"); return; }
-    const char* val = sep + 1;
-    while (*val == ' ') val++;
     storageSet(key, val);
     if (strncmp(key, "s.log", 5) == 0)
         logApplyLevels();
+}
+
+static void cmdSet(const char* a) {
+    if (cliWantsHelp(a)) { cliPrintf("%-*s set config variable (bare `set <key>` sets 1)\n", CLI_HELP_COL, "set <key>[=<value>]  (or: set <key> <value>)"); return; }
+    while (*a == ' ') a++;
+    /* The key runs up to the first separator — a space or an '='. The T-Deck
+     * keyboard has no '=' key, so a space is an equally valid separator; either
+     * character ends the key, and either may carry spaces on either side. The
+     * value is everything after, so it may itself contain '=' or spaces:
+     *   set k=v   set k = v   set k v   set k =v   →  key "k", value "v"
+     * A bare `set <key>` with no separator is shorthand for `set <key>=1`. */
+    const char* p = a;
+    while (*p && *p != ' ' && *p != '=') p++;
+    /* Generous full-key buffer (change notifies carry keys at any length): a
+     * record-store key, whose path carries a 64-hex identifier segment plus a
+     * field name, must not be rejected here. */
+    char key[128];
+    size_t klen = p - a;
+    if (klen == 0 || klen >= sizeof(key)) { cliPrintf("usage: set <key>[=<value>]  (or: set <key> <value>)\n"); return; }
+    memcpy(key, a, klen); key[klen] = '\0';
+    const char* val = "1";   /* bare `set <key>` → 1 */
+    if (*p) {
+        while (*p == ' ') p++;              /* spaces before the separator */
+        if (*p == '=') { p++; while (*p == ' ') p++; }   /* the '=', then spaces after */
+        val = p;
+    }
+    setConfigVar(key, val);
+}
+
+static void cmdReset(const char* a) {
+    if (cliWantsHelp(a)) { cliPrintf("%-*s set config variable to 0 (shorthand for set <key>=0)\n", CLI_HELP_COL, "reset <key>"); return; }
+    while (*a == ' ') a++;
+    const char* p = a;
+    while (*p && *p != ' ' && *p != '=') p++;   /* key is a single token */
+    char key[128];
+    size_t klen = p - a;
+    if (klen == 0 || klen >= sizeof(key)) { cliPrintf("usage: reset <key>\n"); return; }
+    memcpy(key, a, klen); key[klen] = '\0';
+    setConfigVar(key, "0");
 }
 
 static void cmdUnset(const char* a) {
@@ -2767,6 +2788,7 @@ static void cmdSave(const char* a) {
 
 void storageRegisterCmds() {
     cliRegisterCmd("set", cmdSet);
+    cliRegisterCmd("reset", cmdReset);
     cliRegisterCmd("unset", cmdUnset);
     cliRegisterCmd("show", cmdShow);
     cliRegisterCmd("save", cmdSave);
