@@ -24,6 +24,7 @@
 #include <cstring>
 #include <ctime>
 #include "esp_littlefs.h"
+#include "esp_mac.h"
 #include "esp_system.h"
 #include "hal/wdt_hal.h"
 #include "freertos/FreeRTOS.h"
@@ -178,6 +179,15 @@ extern "C" void spangapInit(void) {
     /* No trailing \n: this fires before logInit() installs the log task, so it
      * goes through the native ESP-IDF logger, which appends its own newline. */
     info("spangap starting");
+    /* The chip's index within its OUI block, and the same six digits that lead
+     * the USB serial string. Emitted every boot, on whatever console is
+     * attached, so a host that can read the log can identify which physical
+     * unit it is holding — USB descriptors do not reach every consumer. */
+    {
+        uint8_t mac[6] = {};
+        esp_efuse_mac_get_default(mac);
+        info("device %02x%02x%02x", mac[3], mac[4], mac[5]);
+    }
     vTaskDelay(pdMS_TO_TICKS(100));
 
     /* Filesystem first; SD mount needs fs_init; storageLoad needs the active

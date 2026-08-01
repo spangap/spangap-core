@@ -30,7 +30,13 @@ contracts that order encodes. Source: [`spangap_init.cpp`](../esp-idf/src/spanga
 Exactly this sequence, and the ordering is load-bearing:
 
 1. `setvbuf(stdout, _IOLBF)` — line-buffer stdout so each `\n` flushes (USB Serial
-   JTAG is fully-buffered by default and would hide log lines).
+   JTAG is fully-buffered by default and would hide log lines). Then two lines
+   through the native IDF logger (`logInit()` has not run yet, so neither
+   carries a trailing `\n` — IDF appends its own): `spangap starting`, and
+   `device <6 hex digits>` — the low three MAC bytes, the chip's index within
+   its OUI block. They are the same digits that lead the USB serial string
+   ([usb-console](usb-console.md)), so any consumer that can read the log can
+   identify the physical unit without reading USB descriptors.
 2. `fs_init()` — mount `/fixed` (read-only) and the on-flash `/state` (always),
    start the fs worker tasks. `statePartitionEnsure()` runs at the top of this
    (see [flash-partitions](flash-partitions.md)).
