@@ -20,6 +20,12 @@
  *  EN-pin reset clears the RTC domain and returns the PHY to USB-Serial-JTAG.
  *  A shutdown handler therefore hands the PHY back before any restart, so a
  *  reboot issued over CDC does not come back to a console nothing is driving.
+ *
+ *  All of that is built only under CONFIG_SPANGAP_USB_CDC (off by default) and
+ *  only where the console is on USB at all. Otherwise this file compiles to the
+ *  stub branch at the bottom: the transport flags stay false, `usb cdc` reports
+ *  itself unavailable, the device presents one serial port, and no TinyUSB code
+ *  or .bss reaches the image — see docs/usb-console.md.
  */
 
 #include "cli.h"
@@ -39,7 +45,9 @@
 #include "soc/soc.h"
 #include "soc/rtc_cntl_reg.h"
 
-#if CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG
+/* SPANGAP_CDC_BUILT — "the CDC transport is built" — comes from cli.h, where
+ * the serial-port contract it sizes lives. */
+#if SPANGAP_CDC_BUILT
 #include <driver/usb_serial_jtag.h>
 #include "tinyusb.h"
 #include "tusb.h"
@@ -76,7 +84,7 @@ extern "C" { volatile bool consoleSwitchPending = false; }
  * transport that is about to leave, and a host watches for it. */
 extern "C" { volatile bool consoleWriteDead = false; }
 
-#if CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG
+#if SPANGAP_CDC_BUILT
 
 /* CDC-ACM ports currently presented; 0 while the console is on USB-Serial-JTAG. */
 static int cdcPorts = 0;
@@ -558,19 +566,43 @@ static void cmdUsbJtag(const char* a) {
 static void cmdUsbCdcAlias(const char* a)  { if (cliWantsHelp(a)) return; switchConsole(true); }
 static void cmdUsbJtagAlias(const char* a) { if (cliWantsHelp(a)) return; switchConsole(false); }
 
-#else /* console is not on USB */
+#else /* the CDC transport is not built */
 
-extern "C" const char* consoleModeName(void) { return "n/a"; }
+/* The three transport flags above stay false for the life of the image, so
+ * every reader in cli.cpp / pm.cpp / log.cpp takes its USB-Serial-JTAG path and
+ * needs no guard of its own. These are the calls those paths make from the
+ * branch that is never taken; they exist so the branch links, and they must
+ * behave as "no CDC port has anything" rather than assert. */
+extern "C" int  consoleCdcRead(char*) { return 0; }
+extern "C" int  consoleCdcReadPort(int, uint8_t*, size_t) { return 0; }
+extern "C" int  consoleCdcWritePort(int, const uint8_t*, size_t) { return 0; }
+extern "C" void consoleCdcFlush(void) {}
+
+extern "C" const char* consoleModeName(void) {
+#if CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG
+  return "usb-serial-jtag";
+#else
+  return "n/a";
+#endif
+}
 extern "C" int consoleCdcPortCount(void) { return 0; }
 extern "C" const char* consoleLastSwitchError(void) { return ""; }
 
+/* Why the switch is unavailable: the console lives somewhere the OTG core
+ * cannot take over, or the transport was left out of this build. */
+#if CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG
+#define CDC_UNAVAIL "not built in — CONFIG_SPANGAP_USB_CDC is off"
+#else
+#define CDC_UNAVAIL "console is not on USB"
+#endif
+
 static void cmdUsbCdc(const char* a) {
   if (cliWantsHelp(a)) { cliPrintf("%-*s console onto a TinyUSB CDC device\n", CLI_HELP_COL, "usb cdc"); return; }
-  cliPrintf("usb cdc: n/a (console is not on USB)\n");
+  cliPrintf("usb cdc: n/a (" CDC_UNAVAIL ")\n");
 }
 static void cmdUsbJtag(const char* a) {
   if (cliWantsHelp(a)) { cliPrintf("%-*s console onto the USB-Serial-JTAG controller\n", CLI_HELP_COL, "usb jtag"); return; }
-  cliPrintf("usb jtag: n/a (console is not on USB)\n");
+  cliPrintf("usb jtag: n/a (" CDC_UNAVAIL ")\n");
 }
 static void cmdUsbCdcAlias(const char* a)  { if (!cliWantsHelp(a)) cmdUsbCdc(a); }
 static void cmdUsbJtagAlias(const char* a) { if (!cliWantsHelp(a)) cmdUsbJtag(a); }
@@ -578,9 +610,12 @@ static void cmdUsbJtagAlias(const char* a) { if (!cliWantsHelp(a)) cmdUsbJtag(a)
 #endif
 
 void usbPortsRegisterCmds() {
-#if CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG
+#if SPANGAP_CDC_BUILT
   publishSerialPorts();
 #else
+  /* One port, always: the USB-Serial-JTAG controller presents exactly one, and
+   * a UART console is a single port too. Claimants watch this key to size
+   * themselves — see cli.h. */
   storageSet("sys.usb.serial_ports", 1);
 #endif
   cliRegisterCmd("usb cdc",  cmdUsbCdc);

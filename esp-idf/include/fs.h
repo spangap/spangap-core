@@ -55,6 +55,21 @@ void fs_init();
 /** True after fs_init() if this was a first boot (factory defaults were copied). */
 bool fs_first_boot();
 
+/** The flash geometry this boot's mount produced. Any pointer may be null.
+ *
+ *    size        real chip size (SFDP)
+ *    floor       top of the on-flash partition table — the minimum chip size
+ *                this image needs
+ *    stateStart  where /state begins (the floor, 4K-aligned)
+ *    stateSize   /state size, size - stateStart
+ *
+ *  Captured during fs_init() and reported verbatim, degenerate cases included:
+ *  when SFDP fails, `size` equals `floor` and `stateSize` is 0, and a caller
+ *  must not read that `size` as a confident chip size. Published as ephemeral
+ *  `sys.flash.*` by the init chain, once storage is up. */
+void fsFlashGeometry(uint32_t* size, uint32_t* floor,
+                     uint32_t* stateStart, uint32_t* stateSize);
+
 /** Copy factory defaults from /fixed/factory_state/ to the active state
  *  store (fsStateDir()). */
 void fs_factory_reset();

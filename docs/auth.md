@@ -114,9 +114,16 @@ with an empty (unset) hash, an empty cookie array, and `enable = 1`.
 auth                          show enforcement state + realm/cookie counts
 auth realms                   list realms with set / locked / unset state
 auth passwd <realm> <newpw>   set (overwrite) a realm password, admin-only
+auth -O                       onboarding output: <realm>=set|unset|locked
 
 passwd                        set the admin password (prompts twice, echoed as stars)
 ```
+
+`auth -O` is the machine-readable form of `auth realms`: one `<realm>=<state>`
+line and nothing else, for a flasher deciding whether a device still needs a
+password. See [onboarding-output.md](onboarding-output.md) for the contract —
+in particular that a reader ignores realms it doesn't know and treats a missing
+key as unknown, so the realm set can grow without breaking anything.
 
 `auth passwd` is the administrative override: it sets a realm's password
 unconditionally, bypassing the old-password check that `authPasswd` enforces. It

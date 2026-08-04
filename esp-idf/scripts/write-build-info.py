@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Emit a tiny .c file with the `spangap build` invocation identity.
 
-Three string symbols, populated from the environment that the in-container
+String symbols, populated from the environment that the in-container
 `spangap build` (build-system/spangap-inside cmd_build) exports around the
 idf.py build it spawns:
 
@@ -9,11 +9,27 @@ idf.py build it spawns:
     app_build_version   — its straddle.yaml `version:`           (SPANGAP_BUILD_VERSION)
     app_build_args      — the full `spangap build ...` command    (SPANGAP_BUILD_ARGS)
     app_build_datetime  — a catalogue build stamp YYYYMMDDhhmmss  (SPANGAP_BUILD_DATETIME)
+    app_build_dist      — the catalogue entry's name             (SPANGAP_BUILD_DIST)
+    app_build_hw        — the board straddle, extracted from ARGS
 
 The datetime is set by flashmon's make-builds.py when it builds a catalogue
 image, so the running firmware logs the exact stamp its image is published under
 and a flasher can tell whether a newer build is available. Empty for any build
 that isn't a stamped catalogue build.
+
+The dist is that same run's catalogue entry name, and it is what identifies
+*which* image this is once there are several per board. It cannot be folded into
+the datetime: the datetime is a sortable stamp that answers "is there something
+newer", while the dist is free-format and answers "newer than what". Empty
+outside a catalogue build, exactly like the datetime.
+
+The hw is extracted here rather than read from an env var because `spangap
+build` has no notion of it — it exists only as free text inside the invocation.
+Digging it out at build time is what saves every reader from regexing an
+invocation string, and the value is emitted in the same `<org>/hw-<board>` form
+the catalogue writes its invocations in, so matching an image to a catalogue
+entry is string equality with no mapping table. Empty for a board-less build
+(the generic image), which is a real answer, not a missing one.
 
 Wired into spangap-core's CMakeLists as an ALL custom target that re-runs
 every ninja invocation (same mechanism as write-build-epoch.py), so the
@@ -27,6 +43,7 @@ symbols then fall back to "(unknown)".
 Usage: python3 write-build-info.py <output.c>
 """
 import os
+import shlex
 import sys
 
 
@@ -49,12 +66,32 @@ def c_string(s: str) -> str:
     return "".join(out)
 
 
+def board_of(invocation: str) -> str:
+    """The `--with <org>/hw-<board>` straddle in a `spangap build` invocation.
+
+    Returns the value as written, so it compares equal to the catalogue's own
+    invocation text. Empty when the build names no board."""
+    try:
+        toks = shlex.split(invocation)
+    except ValueError:
+        return ""
+    for i, tok in enumerate(toks):
+        if tok == "--with" and i + 1 < len(toks):
+            nxt = toks[i + 1]
+            if "/hw-" in nxt:
+                return nxt
+    return ""
+
+
 straddle = os.environ.get("SPANGAP_BUILD_STRADDLE") or "(unknown)"
 version = os.environ.get("SPANGAP_BUILD_VERSION") or "(unknown)"
 args = os.environ.get("SPANGAP_BUILD_ARGS") or "(unknown)"
 # Empty (not "(unknown)") when unset: the flasher matches a 14-digit stamp, so a
-# non-catalogue build simply reads as "no stamp" rather than a bogus one.
+# non-catalogue build simply reads as "no stamp" rather than a bogus one. Same
+# reasoning for the dist and the board.
 datetime = os.environ.get("SPANGAP_BUILD_DATETIME") or ""
+dist = os.environ.get("SPANGAP_BUILD_DIST") or ""
+hw = board_of(args)
 
 path = sys.argv[1]
 with open(path, "w", encoding="ascii") as f:
@@ -63,7 +100,10 @@ with open(path, "w", encoding="ascii") as f:
         'const char app_build_straddle[] = "{}";\n'
         'const char app_build_version[]  = "{}";\n'
         'const char app_build_args[]     = "{}";\n'
-        'const char app_build_datetime[] = "{}";\n'.format(
-            c_string(straddle), c_string(version), c_string(args), c_string(datetime)
+        'const char app_build_datetime[] = "{}";\n'
+        'const char app_build_dist[]     = "{}";\n'
+        'const char app_build_hw[]       = "{}";\n'.format(
+            c_string(straddle), c_string(version), c_string(args),
+            c_string(datetime), c_string(dist), c_string(hw)
         )
     )

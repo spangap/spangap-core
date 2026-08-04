@@ -56,6 +56,12 @@ Exactly this sequence, and the ordering is load-bearing:
 8. `cronWakeupHandler()` — the deep-sleep wake fast-path (below).
 9. `publishBuildTimes()` — populate the `sys.build*` / `sys.buildtime.*`
    telemetry from the linked-in `app_build_*` symbols and `/fixed/build_times`.
+10. `publishFlashGeometry()` — publish `sys.flash.*` from the geometry `fs_init()`
+   captured. It runs here rather than in `fs_init()` because storage isn't up
+   that early, and the values are *captured* rather than recomputed: the floor
+   is derived by walking the partition table before `state` is registered, and
+   `state` is external and in-memory, so a later walk would sweep it up and
+   yield the chip top instead.
 
 The storage *task* (`storageInit`) and `cronInit` are deliberately **not** here —
 they come up in the `onInit` walk like every sibling (spangap-core registers them

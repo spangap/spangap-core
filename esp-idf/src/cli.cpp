@@ -27,6 +27,7 @@
 #include <sys/stat.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
+#include <freertos/semphr.h>
 
 /* ---- CLI command registry ----
  *
@@ -166,7 +167,7 @@ struct cli_edit {
 };
 
 /* CLI ITS server: per-slot state */
-#define CLI_MAX_CLIENTS 8    /* up to 6 TCP + 2 DC (browser session + on-device CLI) */
+#define CLI_MAX_CLIENTS 10   /* up to 8 TCP + 2 DC (browser session + on-device CLI) */
 PSRAM_BSS static struct cli_slot_t {
     int itsHandle;
     cli_edit edit;
@@ -1350,11 +1351,13 @@ static void cliTaskFn(void* arg) {
   /* Two ports because the transports frame differently — TCP/serial is a byte
    * stream (packetBased=false), the WebRTC DataChannel is message-oriented
    * (packetBased=true) — and a port has one framing mode, so they can't share.
-   * Shared CLI_MAX_CLIENTS=8 slot pool — 6 TCP + 2 DC. DC has only two possible
+   * Shared CLI_MAX_CLIENTS=10 slot pool — 8 TCP + 2 DC. DC has only two possible
    * consumers (the single browser webrtc session + the on-device CLI), so it's
-   * capped at 2; the headroom goes to TCP (nc debug + sshd-in backends). The two
-   * caps sum to the pool, so DC's 2 stay guaranteed even under a TCP flood. */
-  itsServerPortOpen(CLI_PORT_TCP, /*packetBased=*/false, 6, 512, 2048);
+   * capped at 2; the headroom goes to TCP (nc debug, sshd-in backends, and the
+   * serial task's framed-RPC exec). TCP is 8 rather than 6 so a full house of
+   * ssh sessions cannot starve the RPC of a slot. The two caps sum to the pool,
+   * so DC's 2 stay guaranteed even under a TCP flood. */
+  itsServerPortOpen(CLI_PORT_TCP, /*packetBased=*/false, 8, 512, 2048);
   itsServerOnConnect(CLI_PORT_TCP, cliTcpConnect);
   itsServerOnDisconnect(CLI_PORT_TCP, cliOnDisconnect);
   itsServerPortOpen(CLI_PORT_DC,  ITS_PACKET,  2, 512, 2048, /*depth=*/0, /*maxMsg=*/2048);
@@ -1569,7 +1572,8 @@ extern "C" { volatile bool serialInHandler = false; }
  * the registry itself changes only when a claim is taken or dropped, so there
  * is nothing a lock would add. */
 
-#define SERIAL_PORT_COUNT 2
+/* SERIAL_PORT_COUNT is in cli.h: 2 where the CDC transport is built, 1 where it
+ * is not, so a one-port image carries no port-1 registry at all. */
 
 static struct serial_claim_t {
     char     task[16];
@@ -1586,6 +1590,131 @@ static volatile bool serialAttachReq[SERIAL_PORT_COUNT];
 static volatile bool serialDetachReq[SERIAL_PORT_COUNT];
 
 static TaskHandle_t serialTaskHandle = NULL;
+
+/* ---- Console write lock ----
+ *
+ * Two tasks write the console on two paths that share no ordering: the log task
+ * echoes each line straight to stdout from its own context (logVprintf), and
+ * the serial task writes framed-RPC replies through the driver. A log line
+ * landing inside a length-counted reply frame is unrecoverable for the host —
+ * it counts the log bytes as payload and shows the displaced reply bytes as
+ * garbage, and resync-on-magic cannot help once the length has been read. The
+ * echo and each whole reply frame are therefore serialised here.
+ *
+ * The direct echo itself stays: it is what lets logs reach the wire when the
+ * serial task is wedged or not yet up, and what lets the idle serial task park
+ * on the driver's RX ring instead of running a notify-and-poll loop. The cost
+ * is that the echo can stall for the duration of one frame write, bounded by
+ * the host draining the port.
+ *
+ * Created in cliInit(), before either task exists. A null handle simply does
+ * not lock, which covers the early-boot window in which no frame can exist.
+ *
+ * Recursive, because anything the frame write touches — a driver, the CDC
+ * layer — may log, and a log call re-entering this lock on the task that
+ * already holds it would deadlock the console outright. Interleaving one line
+ * into one frame is the lesser failure by far. */
+extern "C" { SemaphoreHandle_t consoleWriteMutex = NULL; }
+
+extern "C" void consoleWriteLock(void) {
+    if (consoleWriteMutex) xSemaphoreTakeRecursive(consoleWriteMutex, portMAX_DELAY);
+}
+extern "C" void consoleWriteUnlock(void) {
+    if (consoleWriteMutex) xSemaphoreGiveRecursive(consoleWriteMutex);
+}
+
+/* ---- Framed RPC: a host tool's side-channel on the console port ----
+ *
+ * One frame layout, both directions:
+ *
+ *     <magic:4> <id:1> <len:2 big-endian> <payload:len>
+ *
+ * host → device the payload is a command line; device → host it is that
+ * command's output. The magic leads with 0xF5, which cannot appear in valid
+ * UTF-8, so every byte of ordinary console traffic fails the match on byte one.
+ * Frames are never echoed, never enter the line editor and never flip the
+ * console from log into CLI mode, so a host can read device state while a
+ * person is typing at the same port.
+ *
+ * The id is opaque to the device — copied from request to reply. It identifies
+ * *what was asked*, so a host that times out may retry with the same id and
+ * take a late reply to the first attempt as an answer to the second.
+ *
+ * A zero-length reply is a real answer: it means the command printed nothing,
+ * as distinct from the device not answering at all. A command that fails still
+ * answers, with whatever it printed; the frame carries no status of its own.
+ *
+ * There is no integrity check beyond the magic. The peer on the serial console
+ * can already type `reset factory`; there is nothing to defend against here,
+ * only line noise to recover from.
+ *
+ * Frames reach this code only while port 0 is a console: once a serial handler
+ * owns the port its bytes go to hdlPump and never reach handleChar. That is
+ * deliberate — the handler mechanism exists for Reticulum clients, and a port
+ * claimed for one is not carrying a flasher. */
+static const uint8_t rpcMagic[4] = { 0xF5, 'S', 'G', 0x01 };
+
+/* The 2-byte length allows 64 KB. Frame buffers come from PSRAM at that cap;
+ * 64 KB of internal DRAM is far too much on a device where every task stack
+ * comes out of it. A board without PSRAM gets a small internal buffer instead
+ * of making PSRAM a dependency of the transport — every reply a host actually
+ * reads fits in a screenful, and truncation has defined behaviour below. */
+#define RPC_CAP_INTERNAL  (8 * 1024)
+/* No progress for this long abandons the frame and resyncs on the magic. What
+ * this guards against is a corrupted length — a flaky cable, not an adversary —
+ * leaving the device allocated and waiting for bytes that never arrive. */
+#define RPC_ASSEMBLE_MS   1000
+/* Bound on the outbound half: a command that never finishes would otherwise
+ * wedge the relay, and the console with it. */
+#define RPC_EXEC_MS       5000
+
+static char* rpcAlloc(size_t want, size_t* got) {
+#if CONFIG_SPIRAM
+    if (char* psram = (char*)heap_caps_malloc(want, MALLOC_CAP_SPIRAM)) {
+        *got = want;
+        return psram;
+    }
+#endif
+    size_t small = want < RPC_CAP_INTERNAL ? want : (size_t)RPC_CAP_INTERNAL;
+    char* p = (char*)heap_caps_malloc(small, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    *got = p ? small : 0;
+    return p;
+}
+
+/* Sniffer state. It lives out here rather than inside handleChar because
+ * handleChar is called from two places — the idle blocking-read path and the
+ * active drain path — and portRead delivers 128-byte chunks, so one frame can
+ * straddle both a chunk boundary and a change of path. Owned by the serial
+ * task; nothing else touches it. */
+static enum : uint8_t {
+    RPC_PREAMBLE,   /* matching the magic; rpcMatched bytes have agreed */
+    RPC_HEADER,     /* magic matched; collecting id + length */
+    RPC_BODY,       /* collecting the payload */
+    RPC_DISCARD,    /* no buffer for this payload — swallow it and resync */
+} rpcPhase = RPC_PREAMBLE;
+static uint8_t    rpcMatched = 0;
+static uint8_t    rpcHead[3];
+static uint8_t    rpcHeadLen = 0;
+static uint8_t    rpcId = 0;
+static uint16_t   rpcWant = 0;
+static uint16_t   rpcGot = 0;
+static char*      rpcCmd = NULL;
+static TickType_t rpcDeadline = 0;
+
+/* True while a frame is part-assembled — including a partially matched magic,
+ * whose held bytes are owed to the console. The idle read must not park
+ * forever in that state or an abandoned frame is never timed out. */
+static bool rpcAssembling(void) {
+    return rpcPhase != RPC_PREAMBLE || rpcMatched != 0;
+}
+
+static void rpcReset(void) {
+    if (rpcCmd) { free(rpcCmd); rpcCmd = NULL; }
+    rpcPhase   = RPC_PREAMBLE;
+    rpcMatched = 0;
+    rpcHeadLen = 0;
+    rpcWant = rpcGot = 0;
+}
 
 extern "C" int consoleCdcPortCount(void);
 
@@ -1619,7 +1748,10 @@ extern "C" void serialPortHostDetached(int port) {
 
 bool serialPortClaim(int port, const char* task, uint16_t itsPort) {
     if (port < 0 || port >= SERIAL_PORT_COUNT || !task || !*task) {
-        warn("serial: port %d cannot be claimed (0 = console port, 1 = second cdc port)", port);
+        warn("serial: port %d cannot be claimed (0 = console port%s)", port,
+             SERIAL_PORT_COUNT > 1 ? ", 1 = second cdc port"
+                                   : "; this build has no second port — "
+                                     "CONFIG_SPANGAP_USB_CDC is off");
         return false;
     }
     int have = serialPortCount();
@@ -1697,12 +1829,14 @@ static void serialTaskFn(void* arg) {
   int flags = fcntl(STDIN_FILENO, F_GETFL, 0);
   fcntl(STDIN_FILENO, F_SETFL, flags | O_NONBLOCK);
 
-  /* Two client slots: a handler session on a claimed port has to coexist with
-   * the `cli:1` connection a console CLI session holds. */
-  itsClientInit(2);
+  /* Three client slots, and the cap is hard — itsConnect fails past it. In the
+   * worst case all three are live: a handler session on a claimed port, the
+   * `cli:1` connection a console CLI session holds, and the framed-RPC exec. */
+  itsClientInit(3);
   int cliHandle = -1;
   /* Per-port handler session; -1 when the port is a console (or unclaimed). */
-  int hdlHandle[SERIAL_PORT_COUNT] = { -1, -1 };
+  int hdlHandle[SERIAL_PORT_COUNT];
+  for (int p = 0; p < SERIAL_PORT_COUNT; p++) hdlHandle[p] = -1;
 
   /* Raw port I/O for the shuttle — no line-ending translation and no console
    * gating, because what crosses here is a client's protocol, not text. */
@@ -1765,6 +1899,9 @@ static void serialTaskFn(void* arg) {
         if (cliHandle >= 0) { itsDisconnect(cliHandle); cliHandle = -1; }
         serialInCli    = false;
         serialInHandler = true;
+        /* Frames are dead while a handler owns the port; a part-assembled one
+         * must not survive to be completed by the client's own bytes. */
+        rpcReset();
       }
       if (nFirst) itsSend(h, first, nFirst, pdMS_TO_TICKS(50));
       return true;
@@ -1809,11 +1946,10 @@ static void serialTaskFn(void* arg) {
       if (!itsConnected(h)) hdlDetach(port);
   };
 
-  /* Handle one inbound serial byte: enter CLI mode on the first keystroke,
-   * forward keys to the CLI, treat Ctrl-C as "drop back to log". Shared by the
-   * idle blocking-read path and the active drain path below so both stay in
-   * step. */
-  auto handleChar = [&](char c) {
+  /* Handle one inbound console byte: enter CLI mode on the first keystroke,
+   * forward keys to the CLI, treat Ctrl-C as "drop back to log". Reached only
+   * for bytes the frame sniffer in handleChar() below did not claim. */
+  auto consoleChar = [&](char c) {
       /* In-band attach for a claimed console port on USB-Serial-JTAG, which
        * offers no DTR to watch. 0xC0 is the KISS frame delimiter and opens
        * every such client's first burst; no console keystroke produces it. The
@@ -1885,12 +2021,184 @@ static void serialTaskFn(void* arg) {
       }
   };
 
+  /* Write one whole reply frame, under the console lock so no log line can land
+   * inside it. Raw port I/O, not serialEmit: the payload is length-counted and
+   * must not be touched by the console's \n -> \r\n translation. */
+  auto rpcReply = [&](uint8_t id, const char* body, size_t len) {
+      uint8_t hdr[7];
+      memcpy(hdr, rpcMagic, sizeof(rpcMagic));
+      hdr[4] = id;
+      hdr[5] = (uint8_t)(len >> 8);
+      hdr[6] = (uint8_t)(len & 0xff);
+      consoleWriteLock();
+      portWrite(0, hdr, sizeof(hdr));
+      if (len) portWrite(0, (const uint8_t*)body, len);
+      consoleWriteUnlock();
+  };
+
+  /* Run one command and frame its output back.
+   *
+   * This reuses the CLI's existing one-shot exec path rather than adding one:
+   * a second client connection in LINE mode with the prompt suppressed, fed
+   * "<cmd>;\n", where the trailing ';' is the CLI's "run this and close the
+   * session" signal — exactly what ssh `exec` does. Its own ITS session means
+   * a frame arriving while someone has a console CLI session open leaves that
+   * user's line in progress untouched.
+   *
+   * Synchronous on the serial task by design: a retry that arrives mid-exec
+   * waits in the driver's buffer until this returns, so both frames get
+   * answered and the host's duplicate-reply rule absorbs the extra. An async
+   * implementation would have to choose a policy there instead. */
+  auto rpcRun = [&](uint8_t id, const char* cmd, size_t cmdLen) {
+      size_t cap = 0;
+      char* out = rpcAlloc(0xffff, &cap);
+      if (!out) { rpcReply(id, NULL, 0); return; }
+      size_t len = 0;
+      bool   cut = false;
+
+      cli_connect_t cc = { CLI_LINE, /*from_usb_serial=*/0, CLI_NO_COLOR,
+                           /*no_prompt=*/1, /*login=*/0 };
+      int h = itsConnect("cli", CLI_PORT_TCP, &cc, sizeof(cc), pdMS_TO_TICKS(500));
+      if (h >= 0) {
+          std::string line(cmd, cmdLen);
+          line += ";\n";
+          const TickType_t deadline = xTaskGetTickCount() + pdMS_TO_TICKS(RPC_EXEC_MS);
+          size_t off = 0;
+          while (off < line.size() && (int32_t)(xTaskGetTickCount() - deadline) < 0)
+              off += itsSend(h, line.data() + off, line.size() - off, pdMS_TO_TICKS(50));
+          char buf[256];
+          while ((int32_t)(xTaskGetTickCount() - deadline) < 0) {
+              itsPoll(pdMS_TO_TICKS(20));
+              size_t n = itsRecv(h, buf, sizeof(buf), 0);
+              if (n == 0) {
+                  if (!itsConnected(h)) break;
+                  continue;
+              }
+              size_t room = cap - len;
+              if (n > room) { n = room; cut = true; }
+              memcpy(out + len, buf, n);
+              len += n;
+          }
+          /* On the deadline this drops the session mid-command and answers with
+           * whatever had been printed — the console is worth more than the
+           * remainder of one runaway command's output. */
+          itsDisconnect(h);
+      }
+      /* Truncation is not signalled, so cut at the last complete line. A
+       * mid-line cut turns `state=ap` into `state=a`, which parses as a valid
+       * but wrong value; dropping the partial tail leaves only the missing-key
+       * case that every reader already treats as unknown. */
+      if (cut) while (len && out[len - 1] != '\n') len--;
+      rpcReply(id, out, len);
+      free(out);
+  };
+
+  /* Feed one byte to the frame state machine. Returns true when the byte
+   * belonged to a frame, false when it is the console's. */
+  auto rpcFeed = [&](uint8_t b) -> bool {
+      rpcDeadline = xTaskGetTickCount() + pdMS_TO_TICKS(RPC_ASSEMBLE_MS);
+      switch (rpcPhase) {
+      case RPC_PREAMBLE:
+          if (b == rpcMagic[rpcMatched]) {
+              if (++rpcMatched == sizeof(rpcMagic)) {
+                  rpcPhase   = RPC_HEADER;
+                  rpcHeadLen = 0;
+              }
+              return true;
+          }
+          /* A failed match replays, it does not drop: the bytes withheld while
+           * the magic was partially matched belong to the normal path. The
+           * 0xF5 lead makes false starts rare — it cannot occur in UTF-8 text
+           * — but pasted garbage exists. */
+          {
+              uint8_t held = rpcMatched;
+              rpcMatched = 0;
+              for (uint8_t i = 0; i < held; i++) consoleChar((char)rpcMagic[i]);
+          }
+          /* The disagreeing byte can itself open a frame (…F5 F5 53 47…). */
+          if (b == rpcMagic[0]) { rpcMatched = 1; return true; }
+          return false;
+
+      case RPC_HEADER:
+          rpcHead[rpcHeadLen++] = b;
+          if (rpcHeadLen < sizeof(rpcHead)) return true;
+          rpcId   = rpcHead[0];
+          rpcWant = (uint16_t)((rpcHead[1] << 8) | rpcHead[2]);
+          rpcGot  = 0;
+          /* An empty request is not a command; answer it empty rather than
+           * running the CLI's own idea of what a bare line means. */
+          if (rpcWant == 0) { rpcReply(rpcId, NULL, 0); rpcReset(); return true; }
+          {
+              size_t got = 0;
+              rpcCmd = rpcAlloc(rpcWant, &got);
+              /* A command that doesn't fit is a corrupted length, not a real
+               * request — swallow the payload so it can't be typed at the CLI,
+               * and let the host time out. */
+              if (rpcCmd && got < rpcWant) { free(rpcCmd); rpcCmd = NULL; }
+          }
+          rpcPhase = rpcCmd ? RPC_BODY : RPC_DISCARD;
+          return true;
+
+      case RPC_BODY:
+          rpcCmd[rpcGot++] = (char)b;
+          if (rpcGot < rpcWant) return true;
+          {
+              uint8_t  id  = rpcId;
+              char*    cmd = rpcCmd;
+              uint16_t n   = rpcWant;
+              rpcCmd = NULL;       /* ownership moves out of the state machine */
+              rpcReset();
+              rpcRun(id, cmd, n);
+              free(cmd);
+          }
+          return true;
+
+      case RPC_DISCARD:
+          if (++rpcGot >= rpcWant) rpcReset();
+          return true;
+      }
+      return false;
+  };
+
+  /* Abandon a frame whose remainder never arrived, replaying any bytes the
+   * partial magic match is holding on the console's behalf. */
+  auto rpcCheckTimeout = [&]() {
+      if (!rpcAssembling()) return;
+      if ((int32_t)(xTaskGetTickCount() - rpcDeadline) < 0) return;
+      uint8_t held = (rpcPhase == RPC_PREAMBLE) ? rpcMatched : 0;
+      rpcReset();
+      for (uint8_t i = 0; i < held; i++) consoleChar((char)rpcMagic[i]);
+  };
+
+  /* Every inbound console byte passes the frame sniffer first. It sits ahead of
+   * both the line editor and the log/CLI switch, so a frame arriving mid-line
+   * doesn't disturb the editor and one arriving in log mode doesn't flip modes.
+   * It also sits ahead of the 0xC0 attach check, so an id or length byte that
+   * happens to be 0xC0 cannot open a handler session mid-frame; idle, the 0xC0
+   * check keeps its place. */
+  auto handleChar = [&](char c) {
+      if (rpcFeed((uint8_t)c)) return;
+      consoleChar(c);
+  };
+
+  /* The sniffer is armed from here on. A host tool sends a frame only after it
+   * has seen this line, because firmware without the sniffer would take the
+   * frame as keystrokes typed at the console — opening a CLI session and
+   * suppressing the log, on a device that was never going to answer anyway. So
+   * the capability is advertised, never probed. This is a load-bearing log line
+   * and an API on both sides: one bit plus a version, emitted before anything
+   * can be in flight. */
+  info("serial: framed rpc v1\n");
+
   for (;;) {
+    rpcCheckTimeout();
     /* ---- serial-handler bookkeeping, ahead of every console mode ----
      * A claimed port 1 must be shuttled whether or not the console has a CLI
      * session open, and a claim can be taken or dropped from another task at
      * any moment. */
-    if (hdlHandle[0] >= 0 || hdlHandle[1] >= 0) {
+    bool anyHdl = false;
+    for (int p = 0; p < SERIAL_PORT_COUNT; p++) anyHdl |= hdlHandle[p] >= 0;
+    if (anyHdl) {
       /* Keep this task's ITS inbox drained: a handler-side disconnect arrives
        * as an inbox message, and itsConnected() only reflects it once polled. */
       while (itsPoll(0)) {}
@@ -1949,9 +2257,14 @@ static void serialTaskFn(void* arg) {
          * a claim change) is serviced without waiting out the interval. */
         if (consoleCdcRead(&c)) { pmBoostAuto(true); handleChar(c); }
         else ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(50));
-      } else if (usb_serial_jtag_read_bytes(&c, 1, portMAX_DELAY) == 1) {
-        pmBoostAuto(true);
-        handleChar(c);
+      } else {
+        /* Park indefinitely only when no frame is part-assembled: nothing else
+         * wakes this task, so an abandoned frame would never be timed out. */
+        TickType_t wait = rpcAssembling() ? pdMS_TO_TICKS(50) : portMAX_DELAY;
+        if (usb_serial_jtag_read_bytes(&c, 1, wait) == 1) {
+          pmBoostAuto(true);
+          handleChar(c);
+        }
       }
       continue;
     }
@@ -2034,6 +2347,9 @@ static void serialTaskFn(void* arg) {
 #define CLI_VERSION 2
 
 void cliInit() {
+  /* Before either writer task exists (see consoleWriteLock above). */
+  consoleWriteMutex = xSemaphoreCreateRecursiveMutex();
+
   int v = storageGetInt("s.cli.version", 0);
   if (v < CLI_VERSION) {
     storageBegin();

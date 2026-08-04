@@ -4,6 +4,10 @@
 #ifndef SPANGAP_CLI_H
 #define SPANGAP_CLI_H
 
+/* Not transitively: SPANGAP_CDC_BUILT below reads CONFIG_ symbols, and an
+ * undefined one silently evaluates to 0 — the wrong answer, not an error. */
+#include "sdkconfig.h"
+
 #include <stddef.h>
 #include <stdint.h>
 
@@ -179,14 +183,33 @@ void cliSerialResumeLog(void);
  *  the CLI task exists. */
 void cliWake();
 
+/** True when the `usb cdc` console transport is built (CONFIG_SPANGAP_USB_CDC,
+ *  off by default, and only meaningful where the console is on USB). It is what
+ *  puts the TinyUSB device stack in the image, and with it the second serial
+ *  port; everything below reduces to one port when it is 0. */
+#if CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG && CONFIG_SPANGAP_USB_CDC
+#define SPANGAP_CDC_BUILT 1
+#else
+#define SPANGAP_CDC_BUILT 0
+#endif
+
+/** Serial ports the image can ever present — the ceiling the registry is sized
+ *  to, not what exists right now (`sys.usb.serial_ports` is that). */
+#if SPANGAP_CDC_BUILT
+#define SERIAL_PORT_COUNT 2
+#else
+#define SERIAL_PORT_COUNT 1
+#endif
+
 /* ---- Serial-port handlers ----
  *
  * A task can claim a serial port and become the endpoint for whatever attaches
  * to it, in place of the log/CLI console. Port 0 is the console port — the
  * USB-Serial-JTAG controller, or CDC 0 while the console runs on `usb cdc`.
- * Port 1 is the second CDC port, which exists only while the console is on CDC;
- * `sys.usb.serial_ports` publishes how many ports exist (1 or 2), so a claimant
- * can re-apply its claim when the transport changes.
+ * Port 1 is the second CDC port, which exists only while the console is on CDC
+ * and only in a build with SPANGAP_CDC_BUILT; `sys.usb.serial_ports` publishes
+ * how many ports exist (1 or 2), so a claimant can re-apply its claim when the
+ * transport changes.
  *
  * A claim is dormant until a client actually attaches, and detection differs by
  * transport. A CDC port sees the host raise DTR (every pyserial-class client

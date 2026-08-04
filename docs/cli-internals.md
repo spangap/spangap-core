@@ -149,8 +149,10 @@ speaks. Which controller drives those ports, and the switch between them, is
 `serialPortClaim(port, task, itsPort)` / `serialPortRelease(port)` (`cli.h`).
 Port 0 is the console port — the USB-Serial-JTAG controller, or CDC 0 while the
 console is on `usb cdc`. Port 1 is the second CDC port, which exists only in the
-CDC case; claiming it otherwise fails with a warn and a false return. One handler
-per port; re-claiming with the same task and ITS port succeeds unchanged, so a
+CDC case, and only in a build with `CONFIG_SPANGAP_USB_CDC` (off by default —
+`SERIAL_PORT_COUNT` is then 1 and the registry has no port-1 slot at all);
+claiming it otherwise fails with a warn and a false return. One handler per
+port; re-claiming with the same task and ITS port succeeds unchanged, so a
 claimant can re-apply on every config pass.
 
 `sys.usb.serial_ports` (1 or 2) is published from `usb_ports.cpp` on every

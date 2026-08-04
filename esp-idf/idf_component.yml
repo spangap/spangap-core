@@ -10,7 +10,10 @@ dependencies:
   espressif/mdns: "^1.5.0"
   joltwallet/littlefs: "^1.20.4"
   # `usb cdc` runs the console on a TinyUSB composite device instead of the
-  # USB-Serial-JTAG controller.
+  # USB-Serial-JTAG controller. Fetched unconditionally — a dependency here
+  # cannot be conditioned on a CONFIG_ symbol — but only on the link line under
+  # CONFIG_SPANGAP_USB_CDC (see CMakeLists.txt), so a default build carries none
+  # of its code or .bss.
   espressif/esp_tinyusb: "^2.2"
   # esp_wireguard is vendored under src/esp_wireguard/ for now (waiting on
   # upstream netif->state fix to propagate). When that lands, drop the

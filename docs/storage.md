@@ -145,9 +145,15 @@ modules subscribe to react to them.
 | `sys.boot_complete` | `spangapPostAppInit` | `1` once the boot script has run and all CLI commands are registered. Modules subscribe to defer activation until customisations are in. |
 | `sys.build_time` | `publishBuildTimes` | Compact build summary string `a<app> f<fixed> w<webroot>` for the 32-byte WS notify payload. |
 | `sys.build.straddle` / `.version` / `.args` | `publishBuildTimes` | The `spangap build` invocation identity (straddle name, version, flags). |
+| `sys.build.datetime` | `publishBuildTimes` | The catalogue run stamp `YYYYMMDDhhmmss` this image was published under. Empty when the image did not come from a catalogue run — a distinct state, not a missing value, since there is then nothing to compare it against. |
+| `sys.build.dist` | `publishBuildTimes` | Which distribution this image is: the catalogue entry's name, free-format. Separate from `datetime` because the two answer different questions — *which* image this is, versus whether something newer exists. Empty outside a catalogue build. |
+| `sys.build.hw` | `publishBuildTimes` | The board straddle the image was built for, as `<org>/hw-<board>`, extracted from the invocation at build time. Empty for a board-less (generic) build. |
 | `sys.buildtime.app` | `publishBuildTimes` | Firmware (app) build epoch. |
 | `sys.buildtime.fixed` | `publishBuildTimes` | `/fixed` image source mtime. |
 | `sys.buildtime.web` | `publishBuildTimes` | Webroot CRC32 (unset when no webroot is present). |
+| `sys.flash.size` | `publishFlashGeometry` | Real chip size in bytes (SFDP). Equals `floor` when SFDP failed — not a confident chip size, so read it together with `state_size`. |
+| `sys.flash.floor` | `publishFlashGeometry` | Top of the on-flash partition table: the minimum chip size this image needs. |
+| `sys.flash.state_start` / `.state_size` | `publishFlashGeometry` | Where `/state` begins (the floor, 4K-aligned) and how big it is. `state_size` is `0` when no `/state` could be registered. |
 | `sys.going_down` | `pm.cpp` | Set to `1` ahead of sleep/shutdown so subscribers can flush. |
 | `sys.usb.serial_ports` | `usb_ports.cpp` | How many serial ports the console presents right now — `1` on USB-Serial-JTAG, `2` on `usb cdc`. A serial-port claimant subscribes to re-apply a port-1 claim across a transport switch ([usb-console](usb-console.md)). |
 | `sys.time.valid` | spangap-net (NTP) | `1` once system time is sane (≥ 2025). |

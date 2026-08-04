@@ -24,7 +24,7 @@ with the function you need.
 | **auth** | [docs/auth.md](docs/auth.md) | The credential primitive: realm passwords and session cookies (`secrets.auth.*`). HTTP enforcement lives in spangap-web. |
 | **cron** | [docs/cron.md](docs/cron.md) | Minute-resolution, deep-sleep-aware scheduler driven by the `crontab` file. |
 | **power-management** | [docs/power-management.md](docs/power-management.md) | DFS + light/deep sleep, PM locks, notify-driven CPU boost, USB pullup, GPIO wake. |
-| **usb-console** | [docs/usb-console.md](docs/usb-console.md) | Which USB controller drives the console — the built-in USB-Serial-JTAG port or a two-port TinyUSB CDC device (`usb cdc`) — and who owns each serial port. |
+| **usb-console** | [docs/usb-console.md](docs/usb-console.md) | Which USB controller drives the console — the built-in USB-Serial-JTAG port or a two-port TinyUSB CDC device (`usb cdc`, off by default: `CONFIG_SPANGAP_USB_CDC`) — and who owns each serial port. |
 | **memory** | [docs/memory.md](docs/memory.md) | PSRAM-vs-internal-DRAM placement policy and the `gp_alloc`/`dram_alloc`/`dma_alloc` allocators. |
 | **idf-tweaks** | [docs/idf-tweaks.md](docs/idf-tweaks.md) | Guarded ESP-IDF/toolchain workarounds (heap-tracking `--wrap`, shared-SPI-bus helpers, FATFS/SD defaults). |
 
@@ -35,6 +35,11 @@ in core by design (no operator/internals split):
 
 - [docs/flash-partitions.md](docs/flash-partitions.md) — the size-agnostic floor
   image, runtime-grown `state` partition, and the two-pass shrink-wrap build.
+- [docs/framed-rpc.md](docs/framed-rpc.md) — the framed side-channel on the
+  console port that lets a host tool run a command and read its output, without
+  disturbing the log or an interactive CLI session.
+- [docs/onboarding-output.md](docs/onboarding-output.md) — `-O`, the `key=value`
+  contract those queries read, and the rules that let it evolve.
 - [docs/remote-access.md](docs/remote-access.md) — how the optional
   [upnp](../upnp) / [duckdns](../duckdns) / [acme](../acme) trio combine to reach
   a device from the public internet, and the `dns.txtrecord` seam between them.

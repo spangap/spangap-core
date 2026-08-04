@@ -5,17 +5,31 @@ the console transport switch. The serial-port handler registry that rides on it
 lives in `cli.cpp` and is documented in [cli-internals §3](cli-internals.md).
 Operator view: [usb-console.md](usb-console.md).
 
-Everything here is compiled only under `CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG`; the
-`#else` half supplies stubs so `cli.cpp`, `log.cpp` and `pm.cpp` need no Kconfig
-guard of their own.
+Everything here is compiled only under `SPANGAP_CDC_BUILT` (`cli.h`) —
+`CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG && CONFIG_SPANGAP_USB_CDC`. The `#else` half
+supplies stubs, and the three transport flags (`consoleOnCdc`,
+`consoleSwitchPending`, `consoleWriteDead`) are defined either way and stay
+false, so `cli.cpp`, `log.cpp` and `pm.cpp` need no Kconfig guard of their own.
 
 ## 0. Build wiring
 
-`espressif/esp_tinyusb: "^2.2"` in `idf_component.yml`, and
-`espressif__esp_tinyusb` in `CMakeLists.txt`'s `REQUIRES` (managed components
-carry the `<namespace>__<name>` spelling). The dependency is unconditional, so
-the stack is linked into every build — see the internal-DRAM reserve in
-[memory.md](memory.md).
+`espressif/esp_tinyusb: "^2.2"` in `idf_component.yml` fetches the stack
+unconditionally — a component-manager dependency cannot be conditioned on a
+`CONFIG_` symbol. What is conditional is the link: `CMakeLists.txt` appends
+`espressif__esp_tinyusb` to `REQUIRES` only under `CONFIG_SPANGAP_USB_CDC`
+(managed components carry the `<namespace>__<name>` spelling), and an unrequired
+archive contributes no code and no `.bss`. `CONFIG_SPANGAP_USB_CDC` also
+`select`s `CONFIG_TINYUSB_CDC_ENABLED`, which is what drops `cdc.c` /
+`vfs_tinyusb.c` from the component's own source list.
+
+That `.bss` is internal DRAM, spent out of the pool the boot-peak DMA
+allocations draw on (`CONFIG_SPIRAM_MALLOC_RESERVE_INTERNAL`). The reserve is
+sized for the image's own peak and does not move with this symbol — but the
+headroom it leaves is thin, and a shortfall there shows up as a mid-boot stall
+rather than a clean failure. See [memory.md](memory.md).
+
+`SERIAL_PORT_COUNT` (`cli.h`) follows the same symbol: 2 when the transport is
+built, 1 when it is not, so a default image carries no port-1 registry.
 
 ## 1. One PHY, two controllers
 

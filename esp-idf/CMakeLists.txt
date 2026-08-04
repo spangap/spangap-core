@@ -34,7 +34,6 @@ set(_REQ
     esp_driver_spi
     esp_pm
     esp_driver_usb_serial_jtag
-    espressif__esp_tinyusb
     esp_wifi
     esp_netif
     esp_event
@@ -55,6 +54,20 @@ set(_REQ
     esp_partition
     lwip
     mbedtls)
+
+# The TinyUSB device stack is only on the link line when the `usb cdc` console
+# transport is built (src/usb_ports.cpp compiles to the stub branch otherwise).
+# The component manager still fetches it — idf_component.yml dependencies cannot
+# be conditioned on a CONFIG_ symbol — but an unrequired archive contributes no
+# code and no .bss to the image.
+#
+# Its .bss is internal DRAM held whether or not `usb cdc` is ever run, so it
+# spends from CONFIG_SPIRAM_MALLOC_RESERVE_INTERNAL. That reserve is sized for
+# the image's own boot peak rather than for this component, and does not move
+# with this switch — see sdkconfig.defaults.spangap.
+if(CONFIG_SPANGAP_USB_CDC)
+    list(APPEND _REQ espressif__esp_tinyusb)
+endif()
 
 idf_component_register(
     SRCS ${CORE_SRCS}

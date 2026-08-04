@@ -137,6 +137,8 @@ init owns the project-identity and boot/build telemetry keys.
 | `sys.build_time` | Compact `a<app> f<fixed> w<web>` build-epoch summary. |
 | `sys.buildtime.{app,fixed,web}` | Build epochs: firmware link time, `fixed` source mtime, webroot CRC32. |
 | `sys.build.{straddle,version,args}` | The `spangap build` invocation identity (build straddle, version, full argument string). |
+| `sys.build.{datetime,dist,hw}` | Catalogue identity: the run stamp this image was published under, the catalogue entry's name, and the board straddle it was built for. All empty for a build that did not come from a catalogue run. |
+| `sys.flash.{size,floor,state_start,state_size}` | What the mount made of the flash: real chip size, firmware floor, and the `/state` geometry that resulted (see [fs](fs.md)). |
 
 `CONFIG_SPANGAP_SDCARD` gates whether `spangapInit()` mounts an SD card during
 bring-up (see [fs](fs.md) for the state-store choice that follows).

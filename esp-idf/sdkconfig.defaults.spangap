@@ -82,12 +82,17 @@ CONFIG_SPIRAM_ALLOW_BSS_SEG_EXTERNAL_MEMORY=y
 # one eventually won, so the reserve has to cover the whole peak with margin.
 # (This is a *read*-path sibling of the SD-write 0x101 fix; writes were staged
 # aligned, reads go through IDF's own block_buf and can't be pre-aligned here.)
-# 96 KB is what that peak costs today: the TinyUSB device stack the console
-# transport switch needs is linked into every build and holds internal .bss
-# whether or not it is ever installed, and it eats into this reserve. Every
-# further internal-only consumer added to the image spends from here, so this
-# number tracks the image — if the boot-peak alloc failure reappears, the
-# consumer list grew, not the race.
+# 96 KB is what that peak costs today, and it is the IMAGE's peak, not any one
+# feature's: a full build (WiFi + LCD + LoRa + SD + the Reticulum stack) does not
+# boot reliably at 64 KB, independently of what the console transport is doing.
+# It was first raised to 96 KB alongside the TinyUSB device stack and read as
+# that stack's cost; dropping back to 64 KB with TinyUSB unlinked reproduced the
+# boot stall, so the stack was the straw, not the load.
+#
+# The number tracks the image: every internal-only consumer added to it spends
+# from here — including the .bss of a stack linked in whether or not it is used,
+# which is what CONFIG_SPANGAP_USB_CDC adds. If the boot-peak alloc failure
+# reappears, the consumer list grew, not the race, and this is the dial.
 CONFIG_SPIRAM_MALLOC_RESERVE_INTERNAL=98304
 
 # Per-task heap ownership tracking (for heapDump on malloc failures)
@@ -228,15 +233,17 @@ CONFIG_USJ_NO_AUTO_LS_ON_CONNECTION=y
 # FIFO when the host loses the port — a crash then reads as a silent reboot.
 CONFIG_ESP_SYSTEM_PANIC_REBOOT_DELAY_SECONDS=5
 
-# `usb cdc` moves the console onto a TinyUSB composite device. Two CDC-ACM
-# ports is the hardware ceiling: each claims an interrupt IN endpoint plus a
-# bulk IN/OUT pair, and the OTG core has five IN endpoints past EP0.
-CONFIG_TINYUSB_CDC_ENABLED=y
+# Port count for the TinyUSB composite device CONFIG_SPANGAP_USB_CDC builds.
+# Inert without it: TINYUSB_CDC_COUNT depends on TINYUSB_CDC_ENABLED, which that
+# symbol selects. Two CDC-ACM ports is the hardware ceiling — each claims an
+# interrupt IN endpoint plus a bulk IN/OUT pair, and the OTG core has five IN
+# endpoints past EP0.
 CONFIG_TINYUSB_CDC_COUNT=2
 
 # Headroom above the number of filesystems actually mounted at once (default 8,
-# which a running device fills exactly: console, uart, usbserjtag, null, lwip
-# sockets, littlefs, FAT, and the CDC console's own /dev/tusbcdc).
+# which a running device with CONFIG_SPANGAP_USB_CDC fills exactly: console,
+# uart, usbserjtag, null, lwip sockets, littlefs, FAT, and the CDC console's own
+# /dev/tusbcdc).
 #
 # The margin is not optional, because IDF's slot accounting is one-way:
 # esp_vfs_unregister() clears the table entry but leaves s_vfs_count at its

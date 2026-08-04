@@ -1036,11 +1036,24 @@ void fsSelectStateStore(void) {
  * start moves with it, its old LittleFS superblock is no longer found, and the
  * first mount reformats it (format_if_mount_failed) — a clean factory reset the
  * builder is expected to have warned users about. */
+/* Flash geometry as it came out of the mount, captured here and published as
+ * ephemeral sys.flash.* by fsPublishFlashInfo() below.
+ *
+ * Captured rather than recomputed: the floor is derived by walking the on-flash
+ * partition table BEFORE `state` is registered. `state` is external, in-memory,
+ * and never written to that table, so anything that walks it the same way
+ * afterwards sweeps `state` up and gets the chip top instead of the firmware
+ * floor. */
+static uint32_t flashPhys = 0, flashFloor = 0;
+static uint32_t flashStateStart = 0, flashStateSize = 0;
+
 static void statePartitionEnsure() {
-    /* Already present (a board could pin `state` in its table)? Then do nothing. */
-    if (esp_partition_find_first(ESP_PARTITION_TYPE_DATA,
-                                 ESP_PARTITION_SUBTYPE_ANY, "state"))
-        return;
+    /* A board can pin `state` in its own table; then there is nothing to
+     * register. The geometry is computed on that path too — the same questions
+     * are asked of such a board, and returning early before computing it would
+     * leave those boards with no keys at all. */
+    const esp_partition_t* pinned = esp_partition_find_first(
+        ESP_PARTITION_TYPE_DATA, ESP_PARTITION_SUBTYPE_ANY, "state");
 
     /* The floor = the top of the on-flash partition table. The `reserved` region
      * (emitted by gen-partitions) carries the table up to the builder's max
@@ -1052,6 +1065,9 @@ static void statePartitionEnsure() {
         ESP_PARTITION_TYPE_ANY, ESP_PARTITION_SUBTYPE_ANY, nullptr);
     for (; it != nullptr; it = esp_partition_next(it)) {
         const esp_partition_t* p = esp_partition_get(it);
+        /* A pinned `state` is the runtime data region, not firmware — counting
+         * it would yield the chip top rather than the floor. */
+        if (strcmp(p->label, "state") == 0) continue;
         uint32_t pend = p->address + p->size;
         if (pend > floor) floor = pend;
     }
@@ -1062,13 +1078,24 @@ static void statePartitionEnsure() {
     if (esp_flash_get_physical_size(nullptr, &phys) != ESP_OK || phys == 0)
         phys = floor;     /* SFDP unknown → assume floor → no room above it */
 
+    flashFloor = floor;
+    flashPhys  = phys;
+
+    if (pinned) {
+        flashStateStart = pinned->address;
+        flashStateSize  = pinned->size;
+        return;
+    }
+
     /* Unlock the upper region for the partition/flash layer. */
     esp_flash_default_chip->size = phys;
     g_rom_flashchip.chip_size = phys;
 
     const uint32_t ALIGN = 0x1000;               /* LittleFS 4K */
     uint32_t start = (floor + ALIGN - 1) & ~(ALIGN - 1);
+    flashStateStart = start;
     if (start >= phys) {
+        /* flashStateSize stays 0 — the honest report that no /state exists. */
         warn("state: flash %#" PRIx32 " not above firmware floor %#" PRIx32
              " — no state partition", phys, floor);
         return;
@@ -1079,11 +1106,21 @@ static void statePartitionEnsure() {
     esp_err_t e = esp_partition_register_external(
         esp_flash_default_chip, start, size, "state",
         ESP_PARTITION_TYPE_DATA, ESP_PARTITION_SUBTYPE_DATA_SPIFFS, &out);
-    if (e != ESP_OK)
+    if (e != ESP_OK) {
         err("state: register_external failed: %s", esp_err_to_name(e));
-    else
+    } else {
+        flashStateSize = size;
         info("state: flash %#" PRIx32 ", floor %#" PRIx32 ", /state at %#" PRIx32
              " size %#" PRIx32, phys, floor, start, size);
+    }
+}
+
+void fsFlashGeometry(uint32_t* size, uint32_t* floor,
+                     uint32_t* stateStart, uint32_t* stateSize) {
+    if (size)       *size       = flashPhys;
+    if (floor)      *floor      = flashFloor;
+    if (stateStart) *stateStart = flashStateStart;
+    if (stateSize)  *stateSize  = flashStateSize;
 }
 
 void fs_init() {

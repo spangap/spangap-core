@@ -16,9 +16,17 @@ PHY, shared between the USB-Serial-JTAG controller and the USB-OTG core that
 TinyUSB drives. Switching moves the PHY, so the host sees a disconnect and then
 a fresh enumeration — a monitor attached across the switch must reopen the port.
 
-It is part of spangap-core, so the verbs exist on every device whose console is
-USB (`CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG`). On a UART console they report `n/a`
-and do nothing.
+**Off by default.** The CDC transport is built only under
+`CONFIG_SPANGAP_USB_CDC`, because the TinyUSB device stack it links in holds
+internal `.bss` whether or not a device ever runs `usb cdc`, on a chip where
+internal DRAM is the scarce resource (see [memory](memory.md)). Without it the
+device presents one serial port, the verbs report
+`n/a — CONFIG_SPANGAP_USB_CDC is off`, and no TinyUSB code reaches the image. See
+[enabling it](#enabling-it) below.
+
+Even enabled, the verbs are meaningful only where the console is on USB
+(`CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG`). On a UART console they report `n/a` and
+do nothing.
 
 ## CLI
 
@@ -121,9 +129,30 @@ does, via `CONFIG_USJ_NO_AUTO_LS_ON_CONNECTION`) — a nap would drop the CDC li
 and the host would have to replug. `pm` shows the lock; see
 [power-management](power-management.md).
 
-The TinyUSB device stack is linked into every build and holds internal `.bss`
-whether or not it is ever installed, which is paid for out of the internal-DRAM
-reserve regardless of whether a device ever runs `usb cdc`.
+The TinyUSB device stack is linked in for the whole life of an image that has
+it, holding internal `.bss` whether or not `usb cdc` is ever run — which is what
+the extra reserve below pays for, and why the feature is off by default.
+
+## Enabling it
+
+One line:
+
+```
+CONFIG_SPANGAP_USB_CDC=y
+```
+
+Where to put it:
+
+- **For a straddle that needs the second port always** — its `straddle.yaml`
+  `kconfig:` block, which is how a straddle hands Kconfig values to the shared
+  sdkconfig.
+- **For a one-off build** — append it to the buildable's
+  `esp-idf/sdkconfig.defaults` and build. `bootstrap.cmake` hashes every
+  `SDKCONFIG_DEFAULTS` file and reseeds `sdkconfig` when one changes, so no
+  clean is needed; deleting the line again reverts the same way.
+- **Interactively** — `spangap menuconfig`, under *spangap: spangap-core*. This
+  marks `sdkconfig` hand-managed, so it stops being reseeded from
+  `sdkconfig.defaults` until `spangap autoconfig`.
 
 ## sdkconfig contract
 
@@ -132,9 +161,10 @@ a board that overrides sdkconfig must keep them.
 
 | Option | Why |
 |---|---|
-| `CONFIG_TINYUSB_CDC_ENABLED=y`, `CONFIG_TINYUSB_CDC_COUNT=2` | Two CDC-ACM ports is the hardware ceiling: each claims an interrupt IN endpoint plus a bulk IN/OUT pair, and the OTG core has five IN endpoints past EP0. |
-| `CONFIG_VFS_MAX_COUNT=12` | The CDC console registers `/dev/tusbcdc` as a filesystem, and IDF's slot accounting never gives a slot back (see the internals). |
-| `CONFIG_SPIRAM_MALLOC_RESERVE_INTERNAL=98304` | Covers the boot-peak internal-DRAM demand, which the linked-in TinyUSB stack raises. |
+| `CONFIG_SPANGAP_USB_CDC` | Builds the transport at all. Default `n`; `select`s `CONFIG_TINYUSB_CDC_ENABLED` and puts the TinyUSB component on the link line. |
+| `CONFIG_TINYUSB_CDC_COUNT=2` | Two CDC-ACM ports is the hardware ceiling: each claims an interrupt IN endpoint plus a bulk IN/OUT pair, and the OTG core has five IN endpoints past EP0. Inert while the transport is off. |
+| `CONFIG_VFS_MAX_COUNT=12` | The CDC console registers `/dev/tusbcdc` as a filesystem, and IDF's slot accounting never gives a slot back (see the internals). Harmless headroom otherwise. |
+| `CONFIG_SPIRAM_MALLOC_RESERVE_INTERNAL=98304` | Covers the image's boot-peak internal-DRAM demand. Does **not** move with this feature — a full build needs 96 KB either way ([memory](memory.md)) — but the TinyUSB `.bss` does spend from it, so enabling the transport eats headroom that was already thin. |
 | `CONFIG_ESP_SYSTEM_PANIC_REBOOT_DELAY_SECONDS=5` | On a USB console the device leaves the bus the moment it resets; without the delay the backtrace is still in the TX FIFO when the host loses the port, and a crash reads as a silent reboot. |
 
 ## See also
@@ -142,5 +172,8 @@ a board that overrides sdkconfig must keep them.
 - [usb-console-internals.md](usb-console-internals.md) — the PHY hand-over
   sequence, stream redirection, teardown ordering, descriptors, and pitfalls.
 - [cli-internals §3](cli-internals.md) — the serial-port handler registry.
+- [framed-rpc.md](framed-rpc.md) — the host tool's framed side-channel on the
+  console port, which rides above both transports (unlike the `0xC0` attach) and
+  goes dead while a handler owns port 0.
 - [power-management.md](power-management.md) — `usb up`/`usb down`, the D+
   pullup, and the lock model.

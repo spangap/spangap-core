@@ -116,7 +116,7 @@ one-liner and a pointer. The CLI-framework's own commands are documented in full
 
 | Command | |
 |---|---|
-| `usb cdc` | move the console onto a two-port TinyUSB CDC device |
+| `usb cdc` | move the console onto a two-port TinyUSB CDC device (`CONFIG_SPANGAP_USB_CDC`; `n/a` without it) |
 | `usb jtag` | move it back onto the USB-Serial-JTAG controller |
 
 ### Auth — see [auth.md](auth.md)
@@ -124,6 +124,7 @@ one-liner and a pointer. The CLI-framework's own commands are documented in full
 | Command | |
 |---|---|
 | `auth [...]` | enforcement state, realms, force-set a realm password |
+| `auth -O` | [onboarding output](onboarding-output.md): `<realm>=set\|unset\|locked` |
 | `passwd` | set the admin password (prompts twice) |
 
 ### System & power

@@ -408,6 +408,13 @@ extern "C" volatile bool serialInHandler;
  * whichever session attaches next. Defined in usb_ports.cpp. */
 extern "C" volatile bool consoleWriteDead;
 
+/* Serialises this task's direct echo against the serial task's framed-RPC
+ * reply writes — the two share the wire and nothing else. Defined in cli.cpp;
+ * a no-op until cliInit() creates the mutex, which is before any frame can
+ * exist. */
+extern "C" void consoleWriteLock(void);
+extern "C" void consoleWriteUnlock(void);
+
 static int logVprintf(const char* fmt, va_list args) {
     if (!logInited) return 0;
 
@@ -431,9 +438,15 @@ static int logVprintf(const char* fmt, va_list args) {
 
     /* Always echo to stdout (USB Serial JTAG) unless serial is in CLI mode.
      * This bypasses the ITS log→serial consumer path entirely so logs reach
-     * the wire even if the serial task is wedged or not yet connected. */
+     * the wire even if the serial task is wedged or not yet connected.
+     *
+     * Under the console write lock: the serial task writes framed-RPC replies
+     * to the same wire from its own context, and a log line landing inside a
+     * length-counted frame is unrecoverable for the host. */
     if (!serialInCli && !serialInHandler && !consoleWriteDead) {
+        consoleWriteLock();
         fwrite(formatted.data(), 1, fmtLen, stdout);
+        consoleWriteUnlock();
     }
 
     return rawLen;

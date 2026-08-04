@@ -42,6 +42,8 @@ extern "C" const char app_build_straddle[];
 extern "C" const char app_build_version[];
 extern "C" const char app_build_args[];
 extern "C" const char app_build_datetime[];
+extern "C" const char app_build_dist[];
+extern "C" const char app_build_hw[];
 
 namespace {
 
@@ -132,13 +134,39 @@ void publishBuildTimes() {
     storageSet("sys.build.version", app_build_version);
     storageSet("sys.build.args", app_build_args);
     storageSet("sys.build.datetime", app_build_datetime);
+    /* Which distribution this image is (the catalogue entry name) and which
+     * board it was built for. A flasher matches on the pair: same dist, newer
+     * datetime. Both are empty for a build that didn't come from a catalogue
+     * run, which is a distinct state rather than a missing value. */
+    storageSet("sys.build.dist", app_build_dist);
+    storageSet("sys.build.hw", app_build_hw);
     storageEnd();
     info("build: straddle %s v%s\n", app_build_straddle, app_build_version);
     info("build: invocation %s\n", app_build_args);
-    /* The catalogue build stamp, when this image is one. A flasher tails this to
-     * decide whether the catalogue holds a newer build than what's running. */
+    /* The catalogue build stamp, when this image is one — for a person reading
+     * the boot log. Tooling reads `show sys.build`, which carries this and the
+     * dist and board alongside it. */
     if (app_build_datetime[0])
         info("build: datetime %s\n", app_build_datetime);
+}
+
+/* What the mount made of the flash, as ephemeral `sys.flash.*`. A booted device
+ * knows more here than host-side chip detection does: not just the chip size,
+ * but the floor of the image actually on it, the /state geometry that resulted,
+ * and — implicitly — that this image boots at all.
+ *
+ * Ephemeral by prefix: keys outside the persisted ones are in-memory only and
+ * recomputed every boot, which is exactly what these are. Published from here
+ * rather than from fs_init(), which runs before storage is up. */
+void publishFlashGeometry() {
+    uint32_t size = 0, floor = 0, stateStart = 0, stateSize = 0;
+    fsFlashGeometry(&size, &floor, &stateStart, &stateSize);
+    storageBegin();
+    storageSet("sys.flash.size",        (int)size);
+    storageSet("sys.flash.floor",       (int)floor);
+    storageSet("sys.flash.state_start", (int)stateStart);
+    storageSet("sys.flash.state_size",  (int)stateSize);
+    storageEnd();
 }
 
 }  // namespace
@@ -247,6 +275,7 @@ extern "C" void spangapInit(void) {
     cronWakeupHandler();
 
     publishBuildTimes();
+    publishFlashGeometry();
 
     /* That's the lot for core's eager foundations. The storage task, cron, and
      * every sibling straddle come up next in the generated serviceRunInit() walk

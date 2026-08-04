@@ -217,6 +217,22 @@ static void authCliCmd(const char* args) {
         cliPrintf("%-*s show enabled + realm state\n", CLI_HELP_COL, "auth");
         cliPrintf("%-*s list realms with set/locked/unset state\n", CLI_HELP_COL, "auth realms");
         cliPrintf("%-*s set (overwrite) a realm password\n", CLI_HELP_COL, "auth passwd <realm> <newpw>");
+        cliPrintf("%-*s onboarding output: <realm>=set|unset|locked\n", CLI_HELP_COL, "auth -O");
+        return;
+    }
+    /* Onboarding output — the machine-readable contract, one `<realm>=<state>`
+     * line and nothing else. A flasher reads `admin` to decide whether the
+     * device still needs a password; every realm is reported, so the set can
+     * grow without breaking a reader that ignores keys it doesn't know. */
+    if (strcmp(args, "-O") == 0) {
+        int n = realmCount();
+        for (int i = 0; i < n; i++) {
+            char name[32], hash[128];
+            if (!realmGet(i, name, sizeof(name), hash, sizeof(hash))) continue;
+            cliPrintf("%s=%s\n", name, hash[0] == '\0' ? "unset"
+                                     : strcmp(hash, "--") == 0 ? "locked"
+                                     : "set");
+        }
         return;
     }
     if (args[0] == '\0') {
