@@ -68,9 +68,14 @@ finishes so scripted one-liners don't race the format.
 
 Dynamic `std::string buf` with an insert-at-cursor cursor (no fixed cap),
 plus a saved line for history browsing. `cliEditChar` is the state machine:
-printable insert, backspace/DEL erase, `^A`/`^E` home/end, `^D` end-of-input,
-arrow keys via the ESC `[` state machine (left/right move; up/down browse
-history), and Tab completion. Cursor math is **wrap-aware** — `cliMoveCursor`
+printable insert, backspace (`0x7f`/`0x08`) erase, `^A`/`^E` home/end, `^D`
+end-of-input, escape sequences, and Tab completion. The escape parser decodes
+both CSI (`ESC [` params final) and SS3 (`ESC O` final), accumulating the first
+numeric parameter, so multi-byte keys are consumed whole instead of spilling
+their tail into the line: arrows move / browse history, Home and End (`ESC [ H`,
+`ESC [ F`, `ESC [ 1~`/`7~`, `ESC [ 4~`/`8~`) jump, Del (`ESC [ 3~`) erases the
+character under the cursor, and anything else recognised as a sequence (PgUp,
+PgDn, bracketed-paste markers) is discarded. Cursor math is **wrap-aware** — `cliMoveCursor`
 and `cliEditRefresh` reckon in terminal rows using the client's reported width,
 so a line that wraps redraws and clears correctly. History is a shared
 `std::deque<std::string>` (`HIST_SIZE = 20`, newest front, consecutive dups

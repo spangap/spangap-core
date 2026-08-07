@@ -35,6 +35,9 @@ in core by design (no operator/internals split):
 
 - [docs/flash-partitions.md](docs/flash-partitions.md) — the size-agnostic floor
   image, runtime-grown `state` partition, and the two-pass shrink-wrap build.
+- [docs/safe-mode.md](docs/safe-mode.md) — the recovery boot that backs the state
+  store up, restores one, or factory-resets the device: a normal boot that stops
+  after the web band so nothing else is touching the store while it works.
 - [docs/framed-rpc.md](docs/framed-rpc.md) — the framed side-channel on the
   console port that lets a host tool run a command and read its output, without
   disturbing the log or an interactive CLI session.
@@ -53,6 +56,7 @@ header/source pair per module.
 |---|---|---|
 | Init | `spangap.h` | `spangap_init.cpp` |
 | Storage | `storage.h` | `storage.cpp` |
+| Streaming tar.gz | `targz.h` | `targz.cpp` |
 | FS workers | `fs.h` | `fs.cpp` |
 | ITS | `its.h` | `its.cpp` |
 | Log | `log.h` | `log.cpp` |

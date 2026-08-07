@@ -30,6 +30,7 @@
 #include "esp_ota_ops.h"
 #include "esp_partition.h"
 #include "esp_flash.h"
+#include "esp_random.h"      /* esp_fill_random — the factory-reset overwrite */
 #include "esp_rom_spiflash.h"
 #include "esp_vfs_fat.h"
 #include "ff.h"
@@ -964,6 +965,87 @@ bool fsSdInfo(uint64_t* totalBytes, uint64_t* usedBytes) {
 #endif
 }
 
+/* ---- Safe-mode state-store operations ----
+ *
+ * A restore's crash-safety artifact and the two destructive operations. All of
+ * them run on a DRAM stack and only from a safe-mode boot, where nothing else
+ * holds a file under the state store — that is the whole reason safe mode
+ * exists, and it is why none of this needs a lock, a seal, or a caller
+ * exemption table. */
+
+/* Written right after the store is emptied, removed only once the archive's
+ * checksum verifies. Its presence on the next boot means "a restore started
+ * here and did not finish". A dotfile, so the first-boot emptiness probe below
+ * still reads a store containing only this as empty. */
+#define RESTORE_MARKER "/.restore-active"
+
+void fsSetRestoreMarker(bool active) {
+    /* Through the fs_ API, not fopen: the caller is the restore task, which is
+     * PSRAM-stacked, and /state is flash. */
+    std::string path = fsStatePath(RESTORE_MARKER);
+    if (!active) { fs_remove(path.c_str()); return; }
+    int f = fs_open(path.c_str(), "wb");
+    if (f < 0) { err("could not write %s\n", path.c_str()); return; }
+    static const char note[] = "restore in progress\n";
+    fs_write(note, 1, sizeof(note) - 1, f);
+    fs_close(f);
+}
+
+/** Recursively delete a directory's contents; the directory itself stays. */
+static void clearTree(const char* dir) {
+    DIR* d = opendir(dir);
+    if (!d) return;
+    struct dirent* ent;
+    while ((ent = readdir(d)) != nullptr) {
+        if (strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0) continue;
+        char child[512];
+        snprintf(child, sizeof(child), "%s/%s", dir, ent->d_name);
+        if (ent->d_type == DT_DIR) {
+            clearTree(child);
+            rmdir(child);
+        } else {
+            unlink(child);
+        }
+    }
+    closedir(d);
+}
+
+bool fsClearSdState(void) {
+    if (!sdReady) return false;
+    clearTree(FS_SDCARD "/state");
+    mkdir(FS_SDCARD "/state", 0777);   /* keep the store's identity for next boot */
+    return true;
+}
+
+/* fsFormatFlash() must run on a DRAM stack (esp_littlefs_format disables the
+ * PSRAM cache during its SPI-flash writes), and one of this function's callers
+ * is the PSRAM-stacked restore task. Own the discipline here rather than
+ * publishing it as a caller obligation — there is exactly one way to get it
+ * wrong and it is a crash. */
+struct FormatCtx { SemaphoreHandle_t done; bool ok; };
+
+static void formatStateWorker(void* arg) {
+    auto* c = (FormatCtx*)arg;
+    fsFormatFlash();
+    struct stat st;
+    c->ok = stat(FS_STATE, &st) == 0;
+    xSemaphoreGive(c->done);
+    killSelf();
+}
+
+bool fsFormatStateStore(void) {
+    if (fsStateOnSd()) return fsClearSdState();
+    FormatCtx c{ xSemaphoreCreateBinary(), false };
+    if (!c.done) return false;
+    if (!spawnTask(formatStateWorker, "sfmt", 3072, &c, 1, 0, STACK_DRAM)) {
+        vSemaphoreDelete(c.done);
+        return false;
+    }
+    xSemaphoreTake(c.done, portMAX_DELAY);
+    vSemaphoreDelete(c.done);
+    return c.ok;
+}
+
 /* Choose the active state store for this boot and seed it on first boot.
  * Call ONCE from spangapInit(), AFTER fs_mount_sd() and BEFORE storageLoad():
  *   - if the SD mounted and /sdcard/state is a directory, that becomes the
@@ -990,6 +1072,22 @@ void fsSelectStateStore(void) {
     } else {
         info("spangap active user state store is partition 'state' (%" PRIu32
              " kB) in flash, mounted at %s", stateKb, FS_STATE);
+    }
+
+    /* A restore that started and did not finish left its marker behind, so what
+     * is in the store now is a partial expansion of somebody's archive: some
+     * files from it, none of the ones that had not arrived yet, and no way to
+     * tell which is which. Treat it as suspect — empty the store and let the
+     * first-boot path below repopulate it from the factory seeds. This is what
+     * makes every restore failure land in a clean factory store rather than a
+     * plausible-looking corrupt one. */
+    {
+        struct stat ms;
+        if (stat(fsStatePath(RESTORE_MARKER).c_str(), &ms) == 0) {
+            warn("restore did not complete — clearing %s and starting from "
+                 "factory defaults", fsStateDir());
+            fsFormatStateStore();
+        }
     }
 
     /* First boot: the active store has no non-dot entries. We can't probe a
@@ -1046,6 +1144,11 @@ void fsSelectStateStore(void) {
  * floor. */
 static uint32_t flashPhys = 0, flashFloor = 0;
 static uint32_t flashStateStart = 0, flashStateSize = 0;
+/* True when the board named `state` in its own on-flash table rather than
+ * leaving it to be computed above the floor. The distinction is only visible
+ * here, before the runtime registration makes the two look alike — and a
+ * factory reset needs it to know whether there is filler to fold in. */
+static bool flashStatePinned = false;
 
 static void statePartitionEnsure() {
     /* A board can pin `state` in its own table; then there is nothing to
@@ -1082,8 +1185,9 @@ static void statePartitionEnsure() {
     flashPhys  = phys;
 
     if (pinned) {
-        flashStateStart = pinned->address;
-        flashStateSize  = pinned->size;
+        flashStatePinned = true;
+        flashStateStart  = pinned->address;
+        flashStateSize   = pinned->size;
         return;
     }
 
@@ -1121,6 +1225,106 @@ void fsFlashGeometry(uint32_t* size, uint32_t* floor,
     if (floor)      *floor      = flashFloor;
     if (stateStart) *stateStart = flashStateStart;
     if (stateSize)  *stateSize  = flashStateSize;
+}
+
+void fsFactoryWipeExtent(uint32_t* start, uint32_t* size) {
+    uint32_t s = 0, n = 0;
+    if (flashStatePinned) {
+        /* The board named `state` in its own table: no filler, no ambiguity —
+         * that partition and nothing else. */
+        s = flashStateStart;
+        n = flashStateSize;
+    } else {
+        /* The end of the last FIRMWARE partition. `reserved` is skipped along
+         * with the runtime `state`: it is inert filler this firmware placed
+         * below its own state floor, and it is precisely where a predecessor
+         * with a lower floor may have left a live store that reflashing did
+         * not touch. Anchoring above it would leave that one behind. */
+        uint32_t top = 0;
+        esp_partition_iterator_t it = esp_partition_find(
+            ESP_PARTITION_TYPE_ANY, ESP_PARTITION_SUBTYPE_ANY, nullptr);
+        for (; it != nullptr; it = esp_partition_next(it)) {
+            const esp_partition_t* p = esp_partition_get(it);
+            if (strcmp(p->label, "state") == 0) continue;
+            if (strcmp(p->label, "reserved") == 0) continue;
+            uint32_t pend = p->address + p->size;
+            if (pend > top) top = pend;
+        }
+        esp_partition_iterator_release(it);
+        /* Never round the start down — that would clobber the firmware table.
+         * Rounding a (never yet seen) unaligned top up costs at most one sector
+         * of data left behind, which is the only safe direction. */
+        const uint32_t SECTOR = 4096;
+        top = (top + SECTOR - 1) & ~(SECTOR - 1);
+        if (top && flashPhys > top) { s = top; n = flashPhys - top; }
+    }
+    if (start) *start = s;
+    if (size)  *size  = n;
+}
+
+bool fsWipeFlashState(void (*progress)(uint32_t done, uint32_t total)) {
+    uint32_t start = 0, total = 0;
+    fsFactoryWipeExtent(&start, &total);
+    if (!total) {
+        warn("factory reset: no flash region above the firmware to wipe\n");
+        return false;
+    }
+
+    /* The source of the random bytes must be INTERNAL DRAM: a flash program
+     * disables the PSRAM cache, so reading the source out of PSRAM mid-write
+     * faults. Bigger buffers mean fewer, longer erase/program windows; take
+     * what we can get. */
+    const uint32_t SECTOR = 4096;
+    uint32_t bufLen = 64 * 1024;
+    uint8_t* buf = nullptr;
+    while (bufLen >= SECTOR &&
+           !(buf = (uint8_t*)heap_caps_malloc(bufLen, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT)))
+        bufLen /= 4;
+    if (!buf) {
+        err("factory reset: no DRAM for the wipe buffer\n");
+        return false;
+    }
+
+    /* LittleFS must not be reading a filesystem being erased under it. */
+    esp_vfs_littlefs_unregister("state");
+
+    info("factory reset: wiping %#" PRIx32 "..%#" PRIx32 " (%" PRIu32 " kB)\n",
+           start, start + total, total / 1024);
+
+    uint32_t off = start, end = start + total;
+    bool ok = true;
+    while (off < end) {
+        /* Walk LOW TO HIGH: block 0's superblock is destroyed first, so an
+         * interrupted wipe leaves a store that cannot mount — which the next
+         * boot turns into a clean empty one via format_if_mount_failed. That
+         * is why factory reset needs no marker and no recovery path. */
+        uint32_t chunk = bufLen - (off % bufLen);
+        if (chunk > end - off) chunk = end - off;
+        chunk &= ~(SECTOR - 1);
+        if (!chunk) break;
+
+        esp_err_t e = esp_flash_erase_region(nullptr, off, chunk);
+        if (e == ESP_OK) {
+            esp_fill_random(buf, chunk);
+            e = esp_flash_write(nullptr, buf, off, chunk);
+        }
+        if (e != ESP_OK) {
+            err("factory reset: flash op failed at %#" PRIx32 ": %s\n",
+                   off, esp_err_to_name(e));
+            ok = false;
+            break;
+        }
+        off += chunk;
+        if (progress) progress(off - start, total);
+        vTaskDelay(1);   /* feed the task watchdog; let the network task breathe */
+    }
+
+    heap_caps_free(buf);
+    info("factory reset: %s (%" PRIu32 " kB written)\n",
+           ok ? "done" : "FAILED", (off - start) / 1024);
+    /* /state is deliberately left unmounted — the caller reboots, and the next
+     * boot places a fresh store wherever this firmware computes it belongs. */
+    return ok;
 }
 
 void fs_init() {

@@ -1,5 +1,6 @@
 /** CLI commands: reboot, reset, format, sleep, run, its, bat. */
 #include "cli.h"
+#include "spangap.h"
 #include "storage.h"
 #include "pm.h"
 #include "log.h"
@@ -29,28 +30,79 @@ static void cmdReboot(const char* a) {
     esp_restart();
 }
 
-/* All three tasks run on a DRAM stack — esp_littlefs_format disables the
- * PSRAM cache during SPI-flash writes; SD format serializes DMA likewise. */
-
-static void resetFactoryTask(void*) {
-    fsFormatFlash();           /* format flash; on reboot it repopulates */
-    delay(100);
+/* Enter safe mode: persist the flag, then reboot into it.
+ *
+ * Done inline rather than by writing the key and leaving it to the flag watcher
+ * (spangapWatchSafeModeFlags). The watcher exists for writers that cannot
+ * reboot the device themselves — the browser, an rnsh `set`, a boot script — and
+ * it rides a storage subscription delivered to the cron task, which is one more
+ * moving part than a command that is already running on a task that can simply
+ * do it. Here we are that task: set, flush, restart. */
+[[noreturn]] static void enterSafeMode(const char* key, int value) {
+    fflush(stdout);
+    storageSet(key, value);
+    storageSave();          /* the flag must be on disk before the restart */
+    delay(200);
     esp_restart();
+    for (;;) {}             /* unreachable */
 }
 
-static void cmdResetFactory(const char* a) {
-    if (cliWantsHelp(a)) { cliPrintf("%-*s factory reset: format flash state, reboot\n", CLI_HELP_COL, "reset factory"); return; }
-    if (fsStateOnSd()) {
-        cliPrintf("You've booted with an SDcard present: 'reset factory' is "
-                  "only for wiping all user state in device flash. Boot "
-                  "without SDcard and try again if that is what you want. To "
-                  "delete all user information on an sdcard, type:\n\n");
-        cliPrintf("format sd; mkdir /sdcard/state; reboot\n");
+static void cmdBackup(const char* a) {
+    if (cliWantsHelp(a)) {
+        cliPrintf("%-*s reboot into safe mode and stream the state store out\n",
+                  CLI_HELP_COL, "backup");
         return;
     }
-    cliPrintf("factory reset: formatting flash state, rebooting...\n");
-    fflush(stdout);
-    spawnTask(resetFactoryTask, "rfact", 3072, nullptr, 1, 0, STACK_DRAM);
+    cliPrintf("rebooting into safe mode to back up; fetch it from "
+              "https://<device>/ when it comes back\n");
+    enterSafeMode("s.sys.backup", 1);
+}
+
+static void cmdRestore(const char* a) {
+    if (cliWantsHelp(a)) {
+        cliPrintf("%-*s reboot into safe mode to take a backup archive back in\n",
+                  CLI_HELP_COL, "restore");
+        return;
+    }
+    cliPrintf("rebooting into safe mode to restore; upload the archive at "
+              "https://<device>/ when it comes back. Everything on the state "
+              "store is erased first.\n");
+    enterSafeMode("s.sys.restore", 1);
+}
+
+/* A factory reset does not happen here. It sets the safe-mode flag and reboots:
+ * the wipe overwrites the whole flash region above the firmware — including
+ * whatever a lower-floored predecessor left there — with random bytes, and that
+ * cannot be done under a live system with /state mounted and every straddle
+ * writing to it. The next boot comes up in safe mode, wipes, and reboots again.
+ *
+ * This is also why the old "booted from SD, refusing" guard is gone: the target
+ * is explicit now (`flash`, `sd`, or `both`) instead of implied by which store
+ * happens to be active. */
+static void cmdResetFactory(const char* a) {
+    if (cliWantsHelp(a)) {
+        cliPrintf("%-*s wipe user state and reboot; default target flash\n",
+                  CLI_HELP_COL, "reset factory [flash|sd|both]");
+        return;
+    }
+    while (*a == ' ') a++;
+    int target = SAFE_WIPE_FLASH;
+    if (*a) {
+        if      (strncmp(a, "flash", 5) == 0) target = SAFE_WIPE_FLASH;
+        else if (strncmp(a, "both",  4) == 0) target = SAFE_WIPE_FLASH | SAFE_WIPE_SD;
+        else if (strncmp(a, "sd",    2) == 0) target = SAFE_WIPE_SD;
+        else { cliPrintf("reset factory: target must be flash, sd, or both\n"); return; }
+    }
+    if ((target & SAFE_WIPE_SD) && !sdAvailable()) {
+        cliPrintf("reset factory: no SD card mounted\n");
+        return;
+    }
+    cliPrintf("factory reset (%s): rebooting to wipe, which takes about a "
+              "minute per 12 MB. The device comes back on its own access "
+              "point.\n",
+              target == SAFE_WIPE_SD ? "sd"
+                : target == SAFE_WIPE_FLASH ? "flash" : "flash + sd");
+    enterSafeMode("s.sys.factory_reset", target);
 }
 
 /* format flash/sd run on a DRAM-stack worker (esp_littlefs_format disables
@@ -147,6 +199,8 @@ static void cmdBat(const char* a) {
 
 void cliCmdSysInit() {
     cliRegisterCmd("reboot", cmdReboot);
+    cliRegisterCmd("backup", cmdBackup);
+    cliRegisterCmd("restore", cmdRestore);
     cliRegisterCmd("reset factory", cmdResetFactory);
     cliRegisterCmd("format flash", cmdFormatFlash);
     cliRegisterCmd("format sd", cmdFormatSd);

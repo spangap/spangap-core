@@ -64,6 +64,48 @@ extern "C" {
  *  don't pass it. */
 void spangapInit(void);
 
+/* ---- Safe mode ---- */
+
+/** Which state-store operation this boot exists to perform.
+ *
+ *  A storage flag names the operation, so there is no mode menu and no landing
+ *  page — the device boots and does the thing:
+ *
+ *      set s.sys.backup=1          → stream the state store out as a .tgz
+ *      set s.sys.restore=1         → take such an archive back in
+ *      set s.sys.factory_reset=N   → 1 = flash, 2 = SD, 3 = both
+ *
+ *  Setting any of them from a running system saves and reboots at once; the
+ *  next boot reads the flag, clears it (so a crash inside safe mode comes back
+ *  into a normal boot), and reports it here. */
+typedef enum {
+    SAFE_MODE_NONE = 0,
+    SAFE_MODE_BACKUP,
+    SAFE_MODE_RESTORE,
+    SAFE_MODE_FACTORY_RESET,
+} safe_mode_t;
+
+/** The operation this boot was asked to perform, or SAFE_MODE_NONE for an
+ *  ordinary boot. Valid from the moment spangapInit() has read the flags —
+ *  i.e. everywhere a service, a CLI command, or a web handler can run. Constant
+ *  for the lifetime of the boot. */
+safe_mode_t spangapSafeMode(void);
+
+/** What `s.sys.factory_reset` asked to destroy: bit 0 = the on-flash `state`
+ *  extent, bit 1 = /sdcard/state. Zero unless spangapSafeMode() is
+ *  SAFE_MODE_FACTORY_RESET. */
+#define SAFE_WIPE_FLASH 1
+#define SAFE_WIPE_SD    2
+int spangapFactoryResetTarget(void);
+
+/** Watch the three safe-mode flags on the CALLING task and, when one is set on
+ *  a running system, save and reboot into it. Called once, from the cron task's
+ *  body: a storage subscription is delivered to the task that registered it, so
+ *  it has to live on a task that outlives boot — and cron is core's own
+ *  long-lived housekeeping actor (it already watches s.cron there). Never
+ *  called in safe mode, where cron does not come up. */
+void spangapWatchSafeModeFlags(void);
+
 /* Boot participation is a Service (service.h), not a free-function dispatcher.
  * The generated app_main constructs every staged straddle's Service and walks
  * the registry: serviceRunStart() (onStart, bare hardware, before spangapInit)

@@ -132,16 +132,28 @@ one-liner and a pointer. The CLI-framework's own commands are documented in full
 | Command | |
 |---|---|
 | `reboot` | flush pending settings, then restart the device |
-| `reset factory` | format the flash `state` partition and reboot |
+| `backup` | reboot into safe mode and stream the state store out |
+| `restore` | reboot into safe mode to take a backup archive back in |
+| `reset factory [flash\|sd\|both]` | wipe user state and reboot; default target flash |
 | `sleep <seconds>` | block the session for N seconds |
 | `its` | ITS connection + stream-pool snapshot |
 
 `reboot` calls `storageSave()` before `esp_restart()` so no setting is lost.
-`reset factory` wipes all user state in device flash and reboots (flash
-repopulates defaults on the next boot); it is **refused when the device booted
-from an SD card** — it prints how to wipe SD state instead (`format sd; mkdir
-/sdcard/state; reboot`), since it is only meant for flash state (see
-[fs.md](fs.md)). `its` prints `itsStatus`.
+
+`backup`, `restore` and `reset factory` all do the same thing: persist the
+matching `s.sys.*` flag and reboot into a [safe-mode](safe-mode.md) boot, which
+performs the operation with nothing else touching the state store and reboots
+again. `reset factory` wipes rather than transfers — it overwrites the flash
+region above the firmware with random bytes, about a minute per 12 MB, and the
+device comes back on its own access point. Its target is explicit, so booting
+from SD no longer refuses the command.
+
+These three set the flag and restart **inline**, on the CLI's own task. Writing
+the key by hand (`set s.sys.restore=1`) reaches the same place by a different
+road: a watcher on the cron task notices and reboots for you. That watcher is
+there for writers that cannot restart the device themselves — the browser, an
+rnsh session, a `/state/boot` line — and the commands above deliberately do not
+depend on it. `its` prints `itsStatus`.
 
 ### Scripting & aliases
 

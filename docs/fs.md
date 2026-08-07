@@ -82,7 +82,7 @@ them and never hard-codes `FS_STATE`:
 - `std::string fsStatePath(const char* sub)` — `fsStateDir() + sub` (sub starts
   with `/`).
 - `bool fsStateOnSd()` — derived predicate, for the few callers that need it
-  (e.g. the `reset factory` guard).
+  (e.g. choosing between a LittleFS format and a recursive clear).
 
 `format flash` is **label-based** (`esp_littlefs_format("state")`) and always
 means the on-flash partition, even when the active store is on SD.
@@ -125,17 +125,32 @@ state-store-level, so it is documented here — the command registration is
 cross-referenced by the cli/init doc):
 
 ```
-format flash           unmount, format, remount the on-flash `state` partition
-format sd [KB]         reformat the SD card (FAT) in place, kept mounted; optional cluster size (default per Kconfig, 1-128 KB)
-reset factory          format the flash `state` partition + reboot (next boot factory-repopulates)
+format flash              unmount, format, remount the on-flash `state` partition
+format sd [KB]            reformat the SD card (FAT) in place, kept mounted; optional cluster size (default per Kconfig, 1-128 KB)
+reset factory [flash|sd|both]   wipe user state and reboot; default target flash
 ```
 
 `format flash` and `format sd` are synchronous — the command blocks on a
 DRAM-stack worker until done, so scripted one-liners like
-`format sd; mkdir /sdcard/state; reboot` run strictly in order. `reset factory`
-is **refused when booted from SD** (it would wipe the inactive flash copy, not
-the running SD store) and instead prints the SD-wipe recipe
-(`format sd; mkdir /sdcard/state; reboot`).
+`format sd; mkdir /sdcard/state; reboot` run strictly in order.
+
+`reset factory` is a different animal: it does not format anything here. It sets
+`s.sys.factory_reset` and reboots into a [safe-mode](safe-mode.md) boot, which
+overwrites the whole flash region above the firmware with **random bytes** — a
+format would leave every key and identity past the superblock readable from a
+flash dump, and could not move a store an older, lower-floored firmware had left
+low. That takes about a minute per 12 MB, and the device comes back on its own
+access point. The target is explicit (`flash`, `sd`, or `both`), which is why
+booting from SD no longer refuses the command.
+
+### Restoring a state store, and getting one out
+
+`s.sys.backup=1` and `s.sys.restore=1` reboot into the same mode to stream the
+active store out as a `.tgz` or take one back in. Both are described in
+[safe-mode.md](safe-mode.md); what matters at this layer is that a restore
+**formats first** and marks the store with `.restore-active` until the archive's
+checksum verifies — so `fsSelectStateStore()` turns any interrupted restore into
+a clean factory store on the next boot, never a half-populated one.
 
 For the worker model internals, the mount table, the state-partition self-grow,
 and the FAT rename trap, see [fs-internals.md](fs-internals.md).

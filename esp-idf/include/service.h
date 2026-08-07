@@ -56,18 +56,40 @@ public:
     virtual void onInit() {}
 };
 
-/** Append `s` to the ordered service registry. Called by generated code only,
- *  from spangapRegisterServices(), once per service, in boot order. Boot order
- *  IS call order. Not thread-safe (runs single-threaded at the top of
- *  app_main). */
-void serviceRegister(Service* s);
+/** Which bring-up band a service belongs to.
+ *
+ *  The generator already knows this: init_order() puts spangap's own platform
+ *  components first (core, net, web, lcd) and every other straddle after them.
+ *  SERVICE_BAND_SAFE is the prefix of that order up to and including web —
+ *  storage, the IP stack, TLS, and the HTTP server, i.e. exactly what a
+ *  recovery boot needs to talk to an operator. SERVICE_BAND_FULL is everything
+ *  beyond: lcd and the whole straddle band.
+ *
+ *  A safe-mode boot (spangapSafeMode() != SAFE_MODE_NONE) runs the SAFE band
+ *  only, so nothing else is touching the state store while a backup, restore,
+ *  or factory reset runs. There is no per-service opt-in and no default for a
+ *  future straddle to get wrong — the band is a property of where the straddle
+ *  sits in the one registration order. */
+enum service_band_t {
+    SERVICE_BAND_SAFE = 0,   /* core, net, web — up in every boot */
+    SERVICE_BAND_FULL = 1,   /* lcd + straddle band — skipped in safe mode */
+};
+
+/** Append `s` to the ordered service registry, in `band`. Called by generated
+ *  code only, from spangapRegisterServices(), once per service, in boot order.
+ *  Boot order IS call order. Not thread-safe (runs single-threaded at the top
+ *  of app_main). */
+void serviceRegister(Service* s, service_band_t band = SERVICE_BAND_FULL);
 
 /** Walk the registry in registration order, calling onStart() on each. Called
- *  once from the generated app_main, before spangapInit(). */
+ *  once from the generated app_main, before spangapInit(). Every band runs:
+ *  onStart is board bring-up the platform itself depends on (power an SD rail,
+ *  register a display HAL), and a recovery boot needs the same hardware. */
 void serviceRunStart(void);
 
 /** Walk the registry in registration order, calling onInit() on each. Called
- *  once from the generated app_main, after spangapInit(). */
+ *  once from the generated app_main, after spangapInit(). In a safe-mode boot
+ *  only SERVICE_BAND_SAFE services are run. */
 void serviceRunInit(void);
 
 #endif /* __cplusplus */

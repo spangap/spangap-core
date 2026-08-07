@@ -732,7 +732,20 @@ static void writeSettingsFileOnly() {
   cJSON_free(text);
 }
 
+/* One-way flush stop (storageStopFlushing). A safe-mode restore or factory
+ * reset raises it the moment it commits: the store on disk is about to be
+ * replaced or erased, and the in-RAM tree must not be written back on top of
+ * the restored files or into a partition mid-wipe. Checked at the single choke
+ * point every flush passes through. */
+static volatile bool flushStopped = false;
+
+void storageStopFlushing() {
+  flushStopped = true;
+  info("storage: flushing stopped for the rest of this boot\n");
+}
+
 static void writeSettingsFile() {
+  if (flushStopped) return;
   /* Order is load-bearing for crash safety: write dirty externals, then
      root.json, and only THEN remove pendingDelete files — data must never be
      deleted before its replacement is durable. The lxmf monolith split leans
@@ -814,6 +827,10 @@ static void saveWorkerFn(void*) {
   }
 }
 
+/* Poke the persist worker. Before storageInit() spawns it this is a no-op by
+ * design: early dirt stays marked and storageInit's own kick flushes it once
+ * the worker exists. Nothing here may do fs I/O — the save timer fires this
+ * from the esp_timer task. */
 static void requestSave() {
   if (saveWorkerHandle) xTaskNotifyGive(saveWorkerHandle);
 }
@@ -2285,6 +2302,10 @@ void storageSave() {
     warn("storage: storageSave from the storage task is unsupported\n");
     return;
   }
+  /* No persist worker yet: storageInit() spawns it, and the early spangapInit()
+   * foundations run before that. Flush inline on the caller — a SAVE op would
+   * queue a semaphore nobody can ever give and time out after 30 s. */
+  if (!saveWorkerHandle) { writeSettingsFile(); return; }
   SemaphoreHandle_t sem = xSemaphoreCreateBinary();
   if (!sem) return;
   std::string buf;

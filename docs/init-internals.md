@@ -45,18 +45,26 @@ Exactly this sequence, and the ordering is load-bearing:
    first boot. **Must sit between the SD mount and `storageLoad()`**: it decides
    which directory `storageLoad()` reads `storage/root.json` from.
 5. `storageLoad()` — read the persisted config tree.
-6. **Project-mismatch factory reset.** Read `s.sys.project`; if non-empty and
+6. **Safe-mode flags.** `readSafeModeFlags()` reads `s.sys.backup` /
+   `s.sys.restore` / `s.sys.factory_reset`, unsets whichever are set, and
+   flushes once — *before anything else happens*, so a crash inside safe mode
+   comes back into a normal boot. The flush cannot go through the persist worker
+   (it does not exist until `storageInit()` in the `onInit` walk), which is why
+   `storageSave()` falls back to an inline `writeSettingsFile()` when
+   `saveWorkerHandle` is null. Everything downstream asks `spangapSafeMode()`.
+   See [safe-mode.md](safe-mode.md).
+7. **Project-mismatch factory reset.** Read `s.sys.project`; if non-empty and
    `!= CONFIG_SPANGAP_PROJECT_NAME`, `esp_littlefs_format("state")` + `esp_restart()`
    (runs *before any module reads the polluted tree*). If empty, install the
    compile-time value.
-7. `logInit()`, `cliInit()`, `pmInit()`, `authInit()` — the foundation tasks.
+8. `logInit()`, `cliInit()`, `pmInit()`, `authInit()` — the foundation tasks.
    `authInit()` comes up before sibling straddles (sshd, web) because they need
    `authLogin`/`authCheck`; the HTTP face is wired later by spangap-web's
    `authWebInit()` inside `webInit()`.
-8. `cronWakeupHandler()` — the deep-sleep wake fast-path (below).
-9. `publishBuildTimes()` — populate the `sys.build*` / `sys.buildtime.*`
+9. `cronWakeupHandler()` — the deep-sleep wake fast-path (below).
+10. `publishBuildTimes()` — populate the `sys.build*` / `sys.buildtime.*`
    telemetry from the linked-in `app_build_*` symbols and `/fixed/build_times`.
-10. `publishFlashGeometry()` — publish `sys.flash.*` from the geometry `fs_init()`
+11. `publishFlashGeometry()` — publish `sys.flash.*` from the geometry `fs_init()`
    captured. It runs here rather than in `fs_init()` because storage isn't up
    that early, and the values are *captured* rather than recomputed: the floor
    is derived by walking the partition table before `state` is registered, and
@@ -78,6 +86,13 @@ and **registration order is boot order** — both walks (`serviceRunStart`,
    only if staged.
 2. every other staged straddle in dependency-topological order (`require:`
    relationships).
+
+Each registration also carries the `service_band_t` that order implies —
+`SERVICE_BAND_SAFE` for core/net/web, `SERVICE_BAND_FULL` for lcd and every
+band-2 straddle. `serviceRunInit()` is the only walk that reads it, and only on a
+[safe-mode](safe-mode.md) boot, where it runs the SAFE band and stops. There is
+no per-service opt-in: the band is a property of position, so a new straddle
+cannot get it wrong.
 
 The contract band-2 code relies on: storage/cron, the IP stack, the web stack,
 and the LCD shell are **already up** by the time a band-2 service's `onInit`
@@ -124,8 +139,20 @@ built-in is simply a `Service` that never registers; its boot virtuals never fir
 5. `logApplyLevels()`, then `cronPoll(true)` — run any cron entries that fall in
    the current minute (a deep-sleep wake may already have moved time past a
    scheduled minute).
+6. On a [safe-mode](safe-mode.md) factory-reset boot: `storageStopFlushing()` and
+   spawn the DRAM-stack wipe task. It lives here, not in the web straddle, so the
+   wipe happens on a headless node and even when net or web failed to come up.
+
+Steps 3 and 5 are skipped in safe mode — a recovery boot must not run a boot
+script that customises straddles which are not up, nor fire scheduled commands.
+Step 4 still publishes.
 
 IDF's `main_task` auto-deletes after this returns — no explicit `vTaskDelete`.
+That is why the safe-mode flag watcher (`spangapWatchSafeModeFlags`, which turns
+a *runtime* write to one of the three keys into a save-and-reboot) is registered
+from the **cron task's** body rather than from any `onInit`: a storage
+subscription is delivered to the task that registered it, and a subscription made
+on `main_task` dies with it.
 
 ## 5. Boot barriers
 

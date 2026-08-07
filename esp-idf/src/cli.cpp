@@ -161,7 +161,10 @@ struct cli_edit {
     std::string buf;            /* current line (dynamic, no fixed cap) */
     std::string saved;          /* saved current line when browsing history */
     int cursor = 0;
+    /* 0 = normal, 1 = ESC seen, 2 = in CSI (first param), 3 = in SS3,
+     * 4 = in CSI past the first parameter */
     int escState = 0;
+    int escParam = 0;   /* first numeric CSI parameter (0 = none given) */
     int histIdx = -1;   /* -1 = not browsing, 0 = newest, 1 = next older... */
     bool savedValid = false;
 };
@@ -782,25 +785,28 @@ static void cliTabComplete(cli_edit& e, cli_write_fn write) {
 
 /* ---- Line editor ---- */
 
-static void cliEditChar(cli_edit& e, char c, cli_write_fn write) {
-  bool ansi = cliIsAnsi();
+/* Move the input cursor to `to` (already clamped) and pick the cursor shape:
+ * a bar while inside the line, the terminal default once at the end. */
+static void cliEditGoto(cli_edit& e, int to, cli_write_fn write) {
+  if (to == e.cursor) return;
+  cliMoveCursor(e.cursor, to, write);
+  e.cursor = to;
+  write(e.cursor < (int)e.buf.size() ? "\033[2 q" : "\033[0 q", 5);
+}
 
-  /* Escape sequence state machine (arrow keys) */
-  if (e.escState == 1) {
-    e.escState = (c == '[') ? 2 : 0;
-    return;
-  }
-  if (e.escState == 2) {
-    e.escState = 0;
-    if (c == 'D' && e.cursor > 0) {
-      cliMoveCursor(e.cursor, e.cursor - 1, write);
-      e.cursor--;
-      write("\033[2 q", 5);
-    } else if (c == 'C' && e.cursor < (int)e.buf.size()) {
-      cliMoveCursor(e.cursor, e.cursor + 1, write);
-      e.cursor++;
-      if (e.cursor == (int)e.buf.size()) write("\033[0 q", 5);
-    } else if (c == 'A') {
+/* Act on a decoded escape sequence: `final` is the terminating byte, `param` the
+ * first numeric parameter (0 when the sequence carried none). Shared by CSI
+ * (ESC [ …) and SS3 (ESC O …, which cursor keys use in application mode). */
+static void cliEditEscKey(cli_edit& e, char final, int param, cli_write_fn write) {
+  bool ansi = cliIsAnsi();
+  switch (final) {
+    case 'D':                                     /* left */
+      if (e.cursor > 0) cliEditGoto(e, e.cursor - 1, write);
+      return;
+    case 'C':                                     /* right */
+      if (e.cursor < (int)e.buf.size()) cliEditGoto(e, e.cursor + 1, write);
+      return;
+    case 'A': {                                   /* up — older history */
       int next = e.histIdx + 1;
       const char* h = histGet(next);
       if (h) {
@@ -811,7 +817,9 @@ static void cliEditChar(cli_edit& e, char c, cli_write_fn write) {
         e.histIdx = next;
         cliEditReplace(e, h, write);
       }
-    } else if (c == 'B') {
+      return;
+    }
+    case 'B':                                     /* down — newer history */
       if (e.histIdx > 0) {
         e.histIdx--;
         const char* h = histGet(e.histIdx);
@@ -821,7 +829,69 @@ static void cliEditChar(cli_edit& e, char c, cli_write_fn write) {
         cliEditReplace(e, e.savedValid ? e.saved.c_str() : "", write);
         e.savedValid = false;
       }
+      return;
+    case 'H':                                     /* Home (xterm/SS3 form) */
+      cliEditGoto(e, 0, write);
+      return;
+    case 'F':                                     /* End (xterm/SS3 form) */
+      cliEditGoto(e, (int)e.buf.size(), write);
+      return;
+    case '~':
+      /* Numbered keypad forms. 3 = DEL: delete the character under the cursor,
+       * leaving the cursor put. Everything else (PgUp/PgDn, bracketed-paste
+       * markers 200/201, …) is swallowed rather than typed into the line. */
+      if (param == 3 && e.cursor < (int)e.buf.size()) {
+        e.buf.erase((size_t)e.cursor, 1);
+        if (e.buf.empty() && ansi) {
+          cliColorWrite(write, RESET, sizeof(RESET) - 1);
+          write("\033[J", 3);
+          write("\033[0 q", 5);
+        } else {
+          cliEditRefresh(e, e.cursor, write);     /* terminal cursor hasn't moved */
+          if (e.cursor == (int)e.buf.size()) write("\033[0 q", 5);
+        }
+      } else if (param == 1 || param == 7) {      /* Home */
+        cliEditGoto(e, 0, write);
+      } else if (param == 4 || param == 8) {      /* End */
+        cliEditGoto(e, (int)e.buf.size(), write);
+      }
+      return;
+    default:
+      return;
+  }
+}
+
+static void cliEditChar(cli_edit& e, char c, cli_write_fn write) {
+  bool ansi = cliIsAnsi();
+
+  /* Escape sequence state machine: CSI (ESC [ params final) and SS3 (ESC O
+   * final). Parameter bytes are accumulated so multi-byte keys such as DEL
+   * (ESC [ 3 ~) are decoded whole instead of spilling their tail into the
+   * line as text. */
+  if (e.escState == 1) {
+    e.escParam = 0;
+    e.escState = (c == '[') ? 2 : (c == 'O') ? 3 : 0;
+    return;
+  }
+  if (e.escState == 2 || e.escState == 4) {
+    if (c >= 0x30 && c <= 0x3f) {                 /* parameter / private bytes */
+      if (e.escState == 2) {
+        if (c >= '0' && c <= '9') {
+          if (e.escParam < 10000) e.escParam = e.escParam * 10 + (c - '0');
+        } else {
+          e.escState = 4;   /* ';' or a private marker — only param 1 matters */
+        }
+      }
+      return;
     }
+    if (c >= 0x20 && c <= 0x2f) return;           /* intermediate bytes */
+    e.escState = 0;
+    if (c >= 0x40 && c <= 0x7e) cliEditEscKey(e, c, e.escParam, write);
+    return;
+  }
+  if (e.escState == 3) {                          /* SS3 — single final byte */
+    e.escState = 0;
+    cliEditEscKey(e, c, 0, write);
     return;
   }
   if (c == '\033') { e.escState = 1; return; }
@@ -841,23 +911,8 @@ static void cliEditChar(cli_edit& e, char c, cli_write_fn write) {
   }
 
   /* ^A / ^E — beginning / end of line (readline) */
-  if (c == 0x01) {
-    if (e.cursor > 0) {
-      cliMoveCursor(e.cursor, 0, write);
-      e.cursor = 0;
-      write("\033[0 q", 5);
-    }
-    return;
-  }
-  if (c == 0x05) {
-    int len = (int)e.buf.size();
-    if (e.cursor < len) {
-      cliMoveCursor(e.cursor, len, write);
-      e.cursor = len;
-      write("\033[0 q", 5);
-    }
-    return;
-  }
+  if (c == 0x01) { cliEditGoto(e, 0, write); return; }
+  if (c == 0x05) { cliEditGoto(e, (int)e.buf.size(), write); return; }
 
   if (c == '\t') {
     cliTabComplete(e, write);
@@ -2180,6 +2235,31 @@ static void serialTaskFn(void* arg) {
       if (rpcFeed((uint8_t)c)) return;
       consoleChar(c);
   };
+
+  /* Console input that predates the console. The USB-Serial-JTAG controller
+   * survives the reset that starts this firmware — that is what holds the USB
+   * link up across a restart — so its receive path still holds whatever a host
+   * wrote while the ROM loader, or a RAM-loaded image, was the thing on the
+   * chip. flashmon's peripheral detection is exactly that shape: it uploads a
+   * detector to RAM, talks to the port around it, then resets into the real
+   * firmware. Handed to consoleChar those bytes read as keystrokes — a CLI
+   * session opens on a character nobody typed and the boot log disappears
+   * behind it. Nothing that arrived before this point was addressed to this
+   * firmware, so drop it. Bounded, so a host that streams continuously cannot
+   * hold the task here. */
+  {
+    const TickType_t until = xTaskGetTickCount() + pdMS_TO_TICKS(50);
+    char drop[64];
+    while ((int32_t)(xTaskGetTickCount() - until) < 0) {
+#if CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG
+      /* One blocking pass: the driver's ISR has to move the hardware FIFO into
+       * its ring before there is anything to read. */
+      if (usb_serial_jtag_read_bytes(drop, sizeof(drop), pdMS_TO_TICKS(10)) <= 0) break;
+#else
+      if (read(STDIN_FILENO, drop, sizeof(drop)) <= 0) break;
+#endif
+    }
+  }
 
   /* The sniffer is armed from here on. A host tool sends a frame only after it
    * has seen this line, because firmware without the sniffer would take the

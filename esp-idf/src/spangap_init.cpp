@@ -166,10 +166,146 @@ void publishFlashGeometry() {
     storageSet("sys.flash.floor",       (int)floor);
     storageSet("sys.flash.state_start", (int)stateStart);
     storageSet("sys.flash.state_size",  (int)stateSize);
+    /* Where this boot's state actually lives, and whether there is a card at
+     * all. A factory reset has to be told what to destroy, and that question
+     * only has more than one answer on a device with an SD card — so the UI
+     * asking it needs to know before it asks. */
+    storageSet("sys.state.on_sd", fsStateOnSd() ? 1 : 0);
+    storageSet("sys.sd.present",  sdAvailable() ? 1 : 0);
     storageEnd();
 }
 
+/* ---- Safe mode ----
+ *
+ * Three device operations — back the state store up, restore one, factory-reset
+ * — all need the same thing: a running system that is not doing anything else
+ * to the state store. Safe mode is that boot. A storage flag names the
+ * operation, so there is no mode menu and no landing page.
+ *
+ * The flag is read, cleared and flushed HERE, before anything else happens, so
+ * a crash anywhere inside safe mode comes back into a normal boot. This one
+ * flush is the only write safe mode makes to the store outside the operation
+ * the operator asked for. */
+
+const char* const SAFE_KEY_BACKUP  = "s.sys.backup";
+const char* const SAFE_KEY_RESTORE = "s.sys.restore";
+const char* const SAFE_KEY_FACTORY = "s.sys.factory_reset";
+
+safe_mode_t s_safeMode  = SAFE_MODE_NONE;
+int         s_wipeTarget = 0;
+
+/* Read the three flags, clear whichever are set, flush once. Called from
+ * spangapInit() immediately after storageLoad() — before the project-identity
+ * check, before logInit(), before any module can read the tree.
+ *
+ * CLEARING IS THE POINT, not bookkeeping. These flags are edge-triggered
+ * commands carried in a value, and the storage actor dedups a SET whose value
+ * already equals the committed one — no change, no notification. A flag left at
+ * 1 therefore swallows every later write of 1, so a stale flag is not merely
+ * untidy: it is a state in which the operation can never be requested again.
+ * The clear here is what guarantees no boot ever leaves one behind.
+ *
+ * More than one set (an operator queueing two, or a crash between two writes)
+ * resolves by destructiveness, most destructive first: a factory reset makes
+ * the other two meaningless, and a restore supersedes a backup of the store it
+ * is about to replace. */
+void readSafeModeFlags() {
+    int backup  = storageGetInt(SAFE_KEY_BACKUP, 0);
+    int restore = storageGetInt(SAFE_KEY_RESTORE, 0);
+    int factory = storageGetInt(SAFE_KEY_FACTORY, 0);
+    if (!backup && !restore && !factory) return;
+
+    if (factory) {
+        s_safeMode = SAFE_MODE_FACTORY_RESET;
+        /* 1 = flash, 2 = SD, 3 = both. Anything else means a caller wrote a
+         * value we don't know; the flash store is the one every board has. */
+        s_wipeTarget = factory & (SAFE_WIPE_FLASH | SAFE_WIPE_SD);
+        if (!s_wipeTarget) s_wipeTarget = SAFE_WIPE_FLASH;
+    } else if (restore) {
+        s_safeMode = SAFE_MODE_RESTORE;
+    } else {
+        s_safeMode = SAFE_MODE_BACKUP;
+    }
+    if ((backup ? 1 : 0) + (restore ? 1 : 0) + (factory ? 1 : 0) > 1)
+        warn("safe mode: several operations requested, taking the most destructive");
+
+    storageBegin();
+    if (backup)  storageUnset(SAFE_KEY_BACKUP);
+    if (restore) storageUnset(SAFE_KEY_RESTORE);
+    if (factory) storageUnset(SAFE_KEY_FACTORY);
+    storageEnd();
+    /* The persist worker does not exist yet (storageInit runs in the
+     * serviceRunInit walk), so this flushes inline on this task. It must be
+     * durable before we go any further: the flag has to be gone from disk even
+     * if the operation below panics. */
+    storageSave();
+
+    /* No trailing \n on either line: this runs before logInit() installs the
+     * log task, so both go through the native ESP-IDF logger, which appends
+     * its own — same convention as the two lines at the top of spangapInit(). */
+    const char* what = s_safeMode == SAFE_MODE_BACKUP  ? "backup"
+                     : s_safeMode == SAFE_MODE_RESTORE ? "restore"
+                                                       : "factory reset";
+    info("safe mode: %s", what);
+}
+
+/* The wipe itself. Runs on a DRAM stack — an SPI-flash erase disables the PSRAM
+ * cache, so both the task's stack and the random source buffer have to be
+ * internal. Nothing waits on it and nothing can stop it. */
+void factoryResetTask(void*) {
+    int target = s_wipeTarget;
+    if (target & SAFE_WIPE_SD) {
+        if (fsClearSdState()) info("factory reset: /sdcard/state cleared\n");
+        else                  warn("factory reset: no SD card to clear\n");
+    }
+    if (target & SAFE_WIPE_FLASH) {
+        fsWipeFlashState([](uint32_t done, uint32_t total) {
+            /* Roughly every 10%, so a minute of flash work isn't a minute of
+             * silence on the console. */
+            static uint32_t lastPct = 0;
+            uint32_t pct = total ? done * 100 / total : 100;
+            if (pct >= lastPct + 10 || pct == 100) {
+                lastPct = pct - (pct % 10);
+                info("factory reset: %u%%\n", (unsigned)pct);
+            }
+        });
+    }
+    delay(200);
+    esp_restart();
+}
+
 }  // namespace
+
+extern "C" safe_mode_t spangapSafeMode(void) { return s_safeMode; }
+extern "C" int spangapFactoryResetTarget(void) { return s_wipeTarget; }
+
+extern "C" void spangapWatchSafeModeFlags(void) {
+    /* Setting a flag on a RUNNING system means "do it now": persist it and
+     * reboot, so the operator's next contact with the device is already the
+     * safe-mode boot. That is what makes the browser button, an rnsh `set`, and
+     * a `/state/boot` line all one mechanism — the write IS the request.
+     *
+     * `s.sys.*` scope, not the individual keys: one subscription, and the
+     * handler is the only thing that decides what counts. The clearing writes
+     * readSafeModeFlags() makes arrive as val="" and are ignored; they also
+     * happen long before this subscription exists, and never at all in safe
+     * mode, where cron does not come up. */
+    storageSubscribeChanges("s.sys.", ON_CHANGE {
+        /* Every `s.sys.*` change this watcher is handed, before any filtering
+         * — at debug level, because it is the one thing that tells "the button
+         * did nothing" apart from "the write never arrived", and those look
+         * identical from the browser. */
+        dbg("safe-mode watch: %s=%s\n", key, val ? val : "(null)");
+        if (!val || atoi(val) == 0) return;
+        if (strcmp(key, SAFE_KEY_BACKUP)  != 0 &&
+            strcmp(key, SAFE_KEY_RESTORE) != 0 &&
+            strcmp(key, SAFE_KEY_FACTORY) != 0) return;
+        info("%s=%s — rebooting into safe mode\n", key, val);
+        storageSave();
+        delay(200);
+        esp_restart();
+    });
+}
 
 /* Boot-barrier events: waitForTime()/waitForFlag() block on a per-flag-key bit
  * that the flag's setter raises via signalFlag(), so a waiter light-sleeps until
@@ -228,6 +364,11 @@ extern "C" void spangapInit(void) {
     fsSelectStateStore();
     storageLoad();
 
+    /* Safe mode, before anything else can read or write the tree: read the
+     * operation flag, clear it, flush. Everything after this point asks
+     * spangapSafeMode() what kind of boot this is. */
+    readSafeModeFlags();
+
     /* Project-mismatch factory reset.
      *
      * `s.sys.project` is the immutable project identity (CONFIG_SPANGAP_PROJECT_NAME
@@ -271,8 +412,10 @@ extern "C" void spangapInit(void) {
      * spangap-web's authWebInit() inside webInit(). */
     authInit();
 
-    /* Deep-sleep wake decision (may go straight back to sleep) + build IDs. */
-    cronWakeupHandler();
+    /* Deep-sleep wake decision (may go straight back to sleep) + build IDs.
+     * Skipped in safe mode: an operator is waiting on the other end of a
+     * transfer, and the one thing this call may do is go back to sleep. */
+    if (s_safeMode == SAFE_MODE_NONE) cronWakeupHandler();
 
     publishBuildTimes();
     publishFlashGeometry();
@@ -314,20 +457,37 @@ extern "C" void spangapPostAppInit(void) {
     }
 
     /* Run boot script — last because every CLI command must already be
-     * registered by this point (both platform and consumer). */
-    cliRunFile(fsStatePath("/boot").c_str());
+     * registered by this point (both platform and consumer). Skipped in safe
+     * mode: the script customises a system whose straddles aren't running, and
+     * a broken boot script is one of the things a restore exists to repair. */
+    if (spangapSafeMode() == SAFE_MODE_NONE)
+        cliRunFile(fsStatePath("/boot").c_str());
 
     /* Boot-complete signal — modules subscribe via
      *   storageSubscribeChanges("sys.boot_complete", cb)
-     * to defer activation until the boot script's customisations are in. */
+     * to defer activation until the boot script's customisations are in.
+     * Published in safe mode too: what is up is up, and web's own readiness
+     * hangs off it. */
     storageSet("sys.boot_complete", 1);
 
     logApplyLevels();
     info("spangap ready\n");
 
+    /* A factory reset starts here and needs no client: bring up the band, start
+     * wiping, and serve the estimate page to whoever turns up. That is what
+     * makes it work on a headless or LoRa-only node — and what makes it still
+     * happen when net or web failed to come up at all. Flushing stops first:
+     * the in-RAM tree must not land in a partition being erased. */
+    if (spangapSafeMode() == SAFE_MODE_FACTORY_RESET) {
+        storageStopFlushing();
+        spawnTask(factoryResetTask, "wipe", 4096, nullptr, 1, 0, STACK_DRAM);
+    }
+
     /* Run any cron entries that fall in the current minute (deep-sleep wake
-     * may already have moved time forward through a scheduled minute). */
-    cronPoll(true);
+     * may already have moved time forward through a scheduled minute). Not in
+     * safe mode — firing scheduled commands in a recovery mode is wrong, and
+     * cron is not up there to run them anyway. */
+    if (spangapSafeMode() == SAFE_MODE_NONE) cronPoll(true);
 }
 
 extern "C" void signalFlag(const char* key) {

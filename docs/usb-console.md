@@ -91,6 +91,24 @@ The transport is a runtime switch, not a persisted setting: nothing re-applies
 `usb cdc` after a restart. Put it in the `/state/boot` script if a device should
 always come up on CDC.
 
+### Input that predates the console
+
+Keeping the USB link up across a restart means the USB-Serial-JTAG controller is
+*not* reset with the rest of the chip, and neither is its receive path. So bytes
+a host wrote while something other than this firmware was on the chip — the ROM
+loader, or an image running out of RAM, neither of which reads the console — are
+still queued when the console task comes up, and would be handed to the line
+editor as keystrokes: a CLI session opening on a character nobody typed, with
+the boot log suppressed behind it. A flasher that RAM-loads a peripheral
+detector and then resets into the real firmware (flashmon's hardware detection
+does exactly this) hits it every time it writes to the port around the detector.
+
+Nothing that arrived before the console existed was addressed to it, so the
+serial task drains its receive path once, immediately before arming the frame
+sniffer and printing the `serial: framed rpc v1` marker. Keystrokes are live
+from the marker on; the drain is bounded (~50 ms) so a host that streams
+continuously cannot hold the task in it.
+
 ## Serial ports and handlers
 
 `sys.usb.serial_ports` publishes how many serial ports exist right now — `1` on

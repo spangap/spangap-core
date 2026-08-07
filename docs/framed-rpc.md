@@ -97,6 +97,13 @@ A host that sees that line uses frames from then on, at no cost and with no
 guessing. That is the fast path, and for a host that watched the device boot —
 flash, then watch it come up — it is the only path ever taken.
 
+The marker is also the line under which console input starts counting: the
+serial task drains whatever its receive path was already holding immediately
+before arming, because on USB-Serial-JTAG that is bytes from before this
+firmware was running (see
+[usb-console](usb-console.md#input-that-predates-the-console)). A frame sent in
+answer to the marker is never in that window.
+
 **The marker alone is not enough**, because it is printed once and very early.
 A host that attaches to an already-running device never sees it, and that is the
 ordinary case: opening a monitor deliberately does not reset the device. Gating

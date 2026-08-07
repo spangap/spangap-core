@@ -67,6 +67,12 @@ phase purely by overriding that phase's virtual:
   log levels, and fires the first cron poll. IDF's `main_task` deletes itself
   after this returns.
 
+**Bands.** Each registration also carries a `service_band_t`: core, net and web
+register `SERVICE_BAND_SAFE`, lcd and every straddle `SERVICE_BAND_FULL`. The
+generator knows which from a straddle's position in `init_order()`, so there is
+nothing to declare. It matters in exactly one case — a **safe-mode** boot runs
+the SAFE band only, and stops. See [safe-mode.md](safe-mode.md).
+
 **Ecosystem-free constructors.** Every service is constructed at the very top of
 `app_main` — before `serviceRunStart` and `spangapInit` — so a `Service`
 constructor must do **member init only**: heap/PSRAM are up, but
@@ -125,6 +131,9 @@ init owns the project-identity and boot/build telemetry keys.
 |---|---|---|
 | `s.sys.project` | `CONFIG_SPANGAP_PROJECT_NAME` (compile-time, e.g. `spangap`) | Immutable project identity, written once on first boot. On every later boot `spangapInit()` compares the stored value to the compile-time one and **factory-resets `/state` + reboots** if they differ — so flashing a different spangap project over the same chip starts clean. Not user-editable. |
 | `s.sys.time_wait_s` | `30` (inline fallback; not seeded) | Default budget for `waitForTime()`. `0` skips the wait on an offline node. |
+| `s.sys.backup` | unset | Set to `1` to reboot into a safe-mode boot that streams the state store out. Cleared and flushed by the next `spangapInit()` before anything else runs. See [safe-mode.md](safe-mode.md). |
+| `s.sys.restore` | unset | Set to `1` to reboot into a safe-mode boot that takes an archive back in. Erases the store first; there is no undo. |
+| `s.sys.factory_reset` | unset | Set to `1` (flash), `2` (SD) or `3` (both) to reboot into a safe-mode boot that overwrites the state region with random bytes. |
 
 ### Telemetry (ephemeral, written at boot)
 

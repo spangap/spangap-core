@@ -104,6 +104,71 @@ bool fsStateOnSd();
  *  stack. Used by `format flash` and `reset factory` (which reboots after). */
 void fsFormatFlash(void);
 
+/* ---- Safe-mode state-store operations ----
+ *
+ * Only ever called from a safe-mode boot, where nothing else holds a file under
+ * the state store — that is what lets them be this blunt. */
+
+/** Empty the ACTIVE state store, leaving it mounted and writable, so an
+ *  extraction can start immediately. On flash that is a LittleFS format; on SD
+ *  it is a recursive clear of /sdcard/state (the card itself is untouched —
+ *  recordings and logs live outside the store). Returns false if the store
+ *  could not be emptied. This is a restore's point of no return.
+ *
+ *  Safe from any stack: the flash format is dispatched to a DRAM-stack worker
+ *  and waited on. */
+bool fsFormatStateStore(void);
+
+/** Write/remove the restore-in-progress marker in the active state store.
+ *  Written immediately after fsFormatStateStore() and removed only once the
+ *  archive's checksum verifies, so any crash, stall or truncation in between
+ *  leaves it behind — and fsSelectStateStore() then treats the store as
+ *  suspect, formats it, and repopulates from the factory seeds. Every restore
+ *  failure therefore lands in a clean factory store rather than a
+ *  plausible-looking corrupt one. */
+void fsSetRestoreMarker(bool active);
+
+/** The flash region a factory reset destroys: from the end of the last
+ *  FIRMWARE partition to the end of the physical chip. Either pointer may be
+ *  null; both are 0 when no such region exists.
+ *
+ *  This is deliberately not "where /state is now". `reserved` is inert filler
+ *  the current table places below the state floor, and it is exactly where a
+ *  predecessor firmware with a lower floor may have left a whole live store
+ *  that reflashing never wrote over. Anchoring at the last firmware partition
+ *  folds that region in. When a board pins `state` in its own table there is no
+ *  filler and no ambiguity: the region is that partition and nothing else. */
+void fsFactoryWipeExtent(uint32_t* start, uint32_t* size);
+
+/** Overwrite the whole fsFactoryWipeExtent() region with random bytes, low
+ *  address first. Not a format: formatting rewrites a findable LittleFS
+ *  superblock at whatever offset THIS firmware computes and leaves every key,
+ *  password and identity past it readable from a flash dump — a factory reset
+ *  has to make a device safe to hand on. Low-to-high is what makes it
+ *  crash-safe: block 0's superblock dies first, so an interrupted wipe leaves a
+ *  store that fails to mount and is reformatted empty on the next boot.
+ *
+ *  Takes ~5 s per MB. `progress` (may be null) is called with bytes done and
+ *  the total after each block. Returns false if the region is empty or a
+ *  flash op failed. Reboot afterwards: /state is left unmounted, and the next
+ *  boot places a fresh store wherever this firmware thinks it belongs.
+ *
+ *  MUST run on a DRAM stack, and its random source buffer is internal DRAM for
+ *  the same reason: a flash program disables the PSRAM cache, so anything read
+ *  out of PSRAM mid-write faults. */
+bool fsWipeFlashState(void (*progress)(uint32_t done, uint32_t total));
+
+/** Measured cost of the wipe, in milliseconds per MB — what a served progress
+ *  estimate should be computed from. */
+#define FS_WIPE_MS_PER_MB 5000
+
+/** Recursively delete /sdcard/state, leaving the (empty) directory in place so
+ *  the next boot still chooses the SD store. Plain unlinks, not an overwrite:
+ *  an SD controller does its own wear levelling, so writing over a file's
+ *  logical blocks says nothing about the physical ones. Returns false when no
+ *  card is mounted. */
+bool fsClearSdState(void);
+
 /** Reformat the SD card in place (FAT); it stays mounted at /sdcard.
  *  allocKb is the FAT cluster size in KB; <=0 uses CONFIG_SPANGAP_SDCARD_ALLOC_KB.
  *  Returns false if no card is mounted or SD support is compiled out.

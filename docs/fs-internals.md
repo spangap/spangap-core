@@ -135,11 +135,25 @@ duplicate the layout reasoning here.
   Must run on a DRAM stack.
 - `fsFormatSd()` reformats the card in place (FAT) with the chosen cluster size
   and keeps it mounted; returns false if no card or SD is compiled out.
-- The CLI verbs (`format flash`, `format sd`, `reset factory`) run their format
-  on a **DRAM-stack worker** and block the (PSRAM-stacked) CLI task on a
-  semaphore until done — so a scripted `format sd; mkdir …; reboot` can't race
-  the format. `reset factory` refuses when `fsStateOnSd()` and reboots after the
-  flash format.
+- The CLI verbs (`format flash`, `format sd`) run their format on a **DRAM-stack
+  worker** and block the (PSRAM-stacked) CLI task on a semaphore until done — so
+  a scripted `format sd; mkdir …; reboot` can't race the format.
+- `fsFormatStateStore()` empties the **active** store: `fsFormatFlash()` on
+  flash, `fsClearSdState()` (recursive unlink, directory kept) on SD. It owns the
+  DRAM-worker hop internally rather than publishing it as a caller obligation,
+  because one of its callers is the PSRAM-stacked restore task and getting it
+  wrong is a fault, not a bug.
+- `fsWipeFlashState()` is the factory reset: `esp_flash_erase_region` +
+  `esp_flash_write` of a DRAM-resident random buffer, low address first, over
+  `fsFactoryWipeExtent()` — end of the last **firmware** partition (so inert
+  `reserved` filler, where a lower-floored predecessor may have left a whole live
+  store, is folded in) to the end of the chip. `reset factory` no longer formats
+  anything itself; it sets the flag and reboots. See [safe-mode.md](safe-mode.md)
+  for why random-overwrite rather than format, and why low-to-high.
+- `.restore-active` in the active store means a restore started and did not
+  finish. `fsSelectStateStore()` treats it as suspect: empty the store and let
+  the first-boot path repopulate from the factory seeds. It is a dotfile, so a
+  store holding only the marker still reads as empty to that same probe.
 
 ## 7. Pitfalls
 

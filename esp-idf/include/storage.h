@@ -118,7 +118,23 @@ void   storageUnset(const char* key);
  *  (see storageNewTreeFile), that file is removed and unregistered on the
  *  next flush — so deleting a contact/identity also drops its own .json. */
 void   storageDeleteTree(const char* keyOrPrefix);
-void   storageSave();                   /** Force immediate JSON write. */
+/** Force an immediate flush of every dirty file and block until it lands.
+ *  Before storageInit() has spawned the persist worker (i.e. from the early
+ *  spangapInit() foundations) there is nobody to hand the work to, so the
+ *  flush runs inline on the caller — same durability, no blocking wait on a
+ *  task that does not exist yet. Never call it from the storage task itself. */
+void   storageSave();
+
+/** Stop persisting, permanently — the on-disk store is about to be replaced or
+ *  destroyed and the in-RAM tree must not land on top of it. One-way: nothing
+ *  clears it but a reboot. Every later flush (timer, storageSave, the
+ *  storageInit kick) returns without touching the filesystem.
+ *
+ *  Called by a safe-mode restore or factory reset the moment it commits. It
+ *  needs no enforcement in the fs worker and no caller exemption table because
+ *  in safe mode nothing else is writing to the state store — see
+ *  spangapSafeMode(). */
+void   storageStopFlushing();
 
 /** Register a dedicated on-disk file for the subtree at `prefix`, so writes
  *  under it persist to <stateDir>/storage/external/<prefix>.json instead of

@@ -89,6 +89,22 @@ bytes, and otherwise blocks on `ulTaskNotifyTake`. A task wakes on an inbox
 message OR on a connection's incoming buffer reaching its trigger level (§6) OR
 on an ISR's `vTaskNotifyGiveFromISR`.
 
+**A connection's direction is resolved from the CALLING task handle.**
+`sendBufWithPool` / `recvBufWithPool` match `xTaskGetCurrentTaskHandle()` against
+the connection's `clientTask` and `serverTask` and pick the outgoing or incoming
+ring from that. A task that is *neither* gets no buffer, so `itsSend` and
+`itsRecv` return **0 with no error and no log line** — which reads exactly like
+"the peer sent nothing" / "the buffer is full".
+
+This makes a tempting pattern silently wrong: accepting a connection in
+`onConnect` and handing the handle to a freshly spawned worker task to do the
+request/response on. The worker is neither end, so it reads nothing and writes
+nothing, and the client hangs until it gives up. Serve the connection **on the
+task that owns it** (record the handle in `onConnect`, do the work after
+`itsPoll` returns), or, if a worker genuinely must push bytes, use `itsInject`
+with `asServer=true` — which exists for that case precisely because it is the one
+entry point that skips the caller-identity check. There is no receiving twin.
+
 **Pickup semaphore is per-task** (`its_task_t.pickupSem`, one binary semaphore),
 not a global pool. A task is single-threaded, so it can have only one outstanding
 `ITS_WAIT_PICKUP` send at a time; one semaphore per task suffices and avoids the
@@ -280,6 +296,10 @@ the Kconfig-tunable defaults (see [its.md](its.md#configuration)).
 
 - **No ITS from an ISR.** §5. The symptom of breaking this is a sporadic crash
   that only manifests during a concurrent flash write (OTA, LittleFS commit).
+- **Only the two endpoints of a connection may `itsSend`/`itsRecv` on it.** §2.
+  A worker task spawned to service a connection is neither, and both calls then
+  return 0 in silence — no error, no log, just a client that hangs at zero bytes
+  for ever. Serve on the owning task.
 - **FreeRTOS sync objects (queues, stream buffers, semaphores) stay in internal
   RAM, never PSRAM.** The `S32C1I` spinlock embedded in their control blocks trips
   on external PSRAM. Large *data* (payloads, recv buffers, the pool's byte rings)

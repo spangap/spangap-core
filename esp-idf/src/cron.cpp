@@ -6,6 +6,7 @@
  * Enabled/disabled via s.cron.enable config. Subscribes via storageSubscribeChanges.
  */
 #include "cron.h"
+#include "spangap.h"
 #include "mem.h"
 #include "fs.h"
 #include "log.h"
@@ -314,6 +315,11 @@ static void cronTaskFn(void*) {
     cronUpdateLock();
 
     storageSubscribeChanges("s.cron", ON_CHANGE { cronUpdateLock(); });
+    /* Safe-mode flag watcher. It has to live on a task that outlives boot (a
+     * storage subscription is delivered to its registering task), and this one
+     * is core's long-lived housekeeping actor — the same reason the deep-sleep
+     * watcher below was written here. */
+    spangapWatchSafeModeFlags();
     /* Deep sleep is not supported at the moment (see cronDeepSleep above) —
      * and going_down must not sleep the device even if set by hand. */
     // storageSubscribeChanges("sys.going_down", ON_CHANGE {
@@ -330,6 +336,15 @@ static void cronTaskFn(void*) {
 #define CRON_VERSION 1
 
 void cronInit() {
+    /* cron registers in the safe band (it is core's), but a recovery boot must
+     * not fire scheduled commands: they assume straddles that aren't running,
+     * and one of them may be the very thing being restored away. Nothing else
+     * gates on cron, so simply not coming up is the whole skip. */
+    if (spangapSafeMode() != SAFE_MODE_NONE) {
+        info("cron: not started in safe mode\n");
+        return;
+    }
+
     int v = storageGetInt("s.cron.version", 0);
     if (v < CRON_VERSION) {
         storageBegin();

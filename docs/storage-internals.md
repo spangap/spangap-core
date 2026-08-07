@@ -302,6 +302,17 @@ data is never deleted before its replacement is durable. `root.json` is
 skipped there, so its content persists via `root.json`) minus ephemerals (only
 `s` and `secrets` are serialized).
 
+Two guards sit at the ends of that path. `writeSettingsFile` returns immediately
+once `storageStopFlushing()` has been called — a one-way boolean a
+[safe-mode](safe-mode.md) restore or factory reset raises the moment it commits,
+because the on-disk store is about to be replaced or erased and the stale in-RAM
+tree must not land on top of it. And `storageSave()` flushes **inline on the
+caller** when `saveWorkerHandle` is still null: the persist worker does not exist
+until `storageInit()` runs in the `onInit` walk, so the early `spangapInit()`
+foundations would otherwise queue a semaphore nobody can give and block for the
+30 s timeout. `requestSave()` keeps its plain null check instead — the save timer
+fires it from the `esp_timer` task, which must never do fs I/O.
+
 Both writers follow the dump-builder lock shape: only the `cJSON_Duplicate`
 snapshot holds `CFG_LOCK`; `cJSON_PrintUnformatted` runs lock-free. Printing a
 large conversation external under the lock blocked the actor's
@@ -401,6 +412,14 @@ deadlocks the ack (client gives up after 3 s) and freezes the inbox drain.
 
 ## 7. Pitfalls
 
+- **A command flag must be written as a `0→1` edge, not as a `1`.** Dedup (§3)
+  means a SET of the value already committed produces no notification at all, so
+  a trigger left at `1` by an attempt that did not complete swallows every later
+  request — silently, and for good, since nothing will ever clear it. Either the
+  consumer resets it to `0` as part of acting (the pattern in §3), or the writer
+  clears it first. spangap-core's safe-mode flags do both: the writer clears then
+  sets, and `readSafeModeFlags()` clears at boot. Getting this wrong looks
+  exactly like a dead button — the key reads `1` in `show`, and nothing happens.
 - **`storageDefault*` are silent.** They install seeds without firing change
   subscriptions. A handler that must run on the seeded value won't — use
   `NOW_AND_ON_CHANGE`, which subscribes *and* applies the current value once.
@@ -412,6 +431,30 @@ deadlocks the ack (client gives up after 3 s) and freezes the inbox drain.
   deployed devices holding an older schema to migrate, so the version gate is pure
   ceremony. To add a new default, call `storageDefault(...)` directly in the
   module's init — no version check, no companion `storageSet(..._version, N)`.
+- **Drive ROM `tdefl` with an explicit output buffer.** `tdefl_init(comp,
+  nullptr, nullptr, flags)` + `tdefl_compress(..., outBuf, &outLen, flush)` — the
+  shape `gzDeflate()` uses here and the only one this platform's ROM miniz is
+  known good for. The `put_buf` callback shape (`tdefl_init` with a sink
+  function, then `tdefl_compress_buffer`) accepts input and emits nothing, and
+  fails silently: no error status at the call site, just a stream that never
+  produces a byte. Streaming producers loop `tdefl_compress` instead — see
+  spangap-core `targz.cpp`.
+- **`TINFL_FLAG_HAS_MORE_INPUT` must be CLEAR on the last `tinfl_decompress`
+  call.** With it set, miniz's byte fetch returns `NEEDS_MORE_INPUT` whenever it
+  runs dry instead of finishing — and closing a final deflate block can need a
+  few more bits. So a complete, valid stream fed entirely under that flag may
+  never report `TINFL_STATUS_DONE`: it parks waiting for bytes that do not
+  exist, and the caller is left holding an unconsumed gzip footer with no state
+  to accept it. Whether it parks depends on where the last block ends within a
+  byte — i.e. on the data — so it reproduces on some archives and not others of
+  the same size. A streaming reader must make one final pass with the flag clear
+  once the input really has ended; `gzInflate()` here sidesteps it by being
+  one-shot.
+- **Do not expect `tinfl` to hand back the gzip footer.** It draws bytes into
+  its bit buffer before it knows the stream is over and reports them consumed,
+  so "whatever it did not take" is empty exactly when you need it. Withhold the
+  trailing 8 bytes by position instead — they are the footer by definition. See
+  `targz.cpp`'s `hold`.
 - **Secrets never leave the device.** `isSecret()` gates the dump, per-key
   patches, and inbound merges. Keep any new "must not reach the browser" key
   under `secrets.*`; do not add a second filtering path.

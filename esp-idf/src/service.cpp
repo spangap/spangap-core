@@ -9,26 +9,36 @@
  * serviceRegister() — no static-init-order dependency on any other TU. Objects
  * are immortal (never removed), so the registry only ever grows during the
  * single-threaded registration pass at the top of app_main.
+ *
+ * Each entry carries the band the generator assigned it (service.h). The onInit
+ * walk is the only phase that filters on it: a safe-mode boot stops after the
+ * platform band's web entry, leaving lcd and every straddle down.
  */
-#include "service.h"
+#include "spangap.h"
 
 #include <vector>
 
 namespace {
-std::vector<Service*>& registry() {
-    static std::vector<Service*> reg;
+struct entry_t { Service* svc; service_band_t band; };
+
+std::vector<entry_t>& registry() {
+    static std::vector<entry_t> reg;
     return reg;
 }
 }  // namespace
 
-void serviceRegister(Service* s) {
-    if (s) registry().push_back(s);
+void serviceRegister(Service* s, service_band_t band) {
+    if (s) registry().push_back({s, band});
 }
 
 void serviceRunStart(void) {
-    for (Service* s : registry()) s->onStart();
+    for (const entry_t& e : registry()) e.svc->onStart();
 }
 
 void serviceRunInit(void) {
-    for (Service* s : registry()) s->onInit();
+    bool safe = spangapSafeMode() != SAFE_MODE_NONE;
+    for (const entry_t& e : registry()) {
+        if (safe && e.band != SERVICE_BAND_SAFE) continue;
+        e.svc->onInit();
+    }
 }

@@ -73,7 +73,8 @@ Exact signatures and ownership/lifetime contracts are in
 | `storageCopy`, `storageCopyNoNotify` | Prefix-copy a subtree (optionally only over existing target keys). |
 | `storageForEach`, `storageList`, `storageArrayCount` | Iterate / dump / count numbered entries. |
 | `storageNewTreeFile` | Register a runtime external file for a prefix. |
-| `storageSave` | Force an immediate flush, blocking until written. |
+| `storageSave` | Force an immediate flush, blocking until written. Before `storageInit()` has spawned the persist worker it flushes inline on the caller, so the early boot foundations can persist too. |
+| `storageStopFlushing` | Stop persisting for the rest of this boot, one-way. For a [safe-mode](safe-mode.md) restore or factory reset, whose on-disk store is about to be replaced or erased and must not receive the stale in-RAM tree on top. |
 | `storageSubscribeChanges`, `storageUnsubscribe`, `NOW_AND_ON_CHANGE` | Prefix-scoped change subscriptions. |
 | `uiTelemetryWanted` | Whether published stat keys have a plausible reader (LCD build, or WiFi up so a browser can pull them) — periodic publishers gate on it to skip churn on a headless, WiFi-down node. See [power-management](power-management.md#idle-discipline--park-dont-poll). |
 
