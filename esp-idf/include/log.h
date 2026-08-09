@@ -52,6 +52,11 @@ bool logIsDebug();
  *  output for a specific component. */
 bool logIsDebug(const char* tag);
 
+/** True iff this tag's effective log level is at verbose. Same resolution as
+ *  logIsDebug, one level finer — for a trace that would otherwise drown the
+ *  decisions a component logs at debug. */
+bool logIsVerbose(const char* tag);
+
 /** Apply all log levels from cfg store (global + per-tag). Call on boot and level changes. */
 void logApplyLevels();
 

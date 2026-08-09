@@ -36,11 +36,16 @@ static volatile uint32_t logRingHead = 0; /* write position (writers) */
 static volatile uint32_t logRingTail = 0; /* read position (log task only) */
 static portMUX_TYPE logSpinlock = portMUX_INITIALIZER_UNLOCKED;
 
+/* Bytes the ring could not take (writers outran the drain). Surfaced by the
+ * drain as one marker line once space frees — a log that drops silently is a
+ * log that can't be trusted during exactly the bursts worth reading. */
+static volatile uint32_t logRingDropped = 0;
+
 static size_t logRingWrite(const char* data, size_t len) {
   taskENTER_CRITICAL(&logSpinlock);
   uint32_t h = logRingHead, t = logRingTail;
   uint32_t free = LOG_RING_SIZE - (h - t);
-  if (len > free) len = free;
+  if (len > free) { logRingDropped += (uint32_t)(len - free); len = free; }
   for (size_t i = 0; i < len; i++)
     logRing[(h + i) % LOG_RING_SIZE] = data[i];
   logRingHead = h + len;
@@ -884,6 +889,20 @@ static void logTaskFn(void* arg) {
       continue;
     }
 
+    /* Ring overflow marker, ahead of the next drained chunk: the loss already
+     * happened, but an unmarked gap reads as "nothing was logged" — and the
+     * bytes lost are always the tail of a burst, the part worth reading. */
+    if (logRingDropped) {
+      uint32_t d;
+      taskENTER_CRITICAL(&logSpinlock);
+      d = logRingDropped; logRingDropped = 0;
+      taskEXIT_CRITICAL(&logSpinlock);
+      char mark[64];
+      int mn = snprintf(mark, sizeof mark,
+                        "\nW [log] ring overflow: %u bytes dropped\n", (unsigned)d);
+      if (mn > 0) logRingWrite(mark, (size_t)mn);
+    }
+
     /* Drain input stream → fan out to ITS consumers + log file */
     for (;;) {
       size_t n = logRingRead(buf, sizeof(buf) - 1);
@@ -1040,6 +1059,10 @@ bool logIsDebug(const char* tag) {
    * global `s.log.level`. So this resolves "rnsd-specific first,
    * then global" in one call. */
   return tag && esp_log_level_get(tag) >= ESP_LOG_DEBUG;
+}
+
+bool logIsVerbose(const char* tag) {
+  return tag && esp_log_level_get(tag) >= ESP_LOG_VERBOSE;
 }
 
 const char* cfd(int fd) {
