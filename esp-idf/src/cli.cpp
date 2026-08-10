@@ -61,6 +61,11 @@ bool cliWantsHelp(const char* args) {
     return strcmp(args, "help") == 0 || strcmp(args, "-h") == 0 || strcmp(args, "--help") == 0;
 }
 
+bool cliVerbIs(const char* tok, const char* full, size_t minLen) {
+    size_t n = strlen(tok);
+    return n >= minLen && n <= strlen(full) && strncmp(tok, full, n) == 0;
+}
+
 void cliRegisterCmd(const char* cmd, cli_cmd_cb_t cb) {
     auto& cmds = cliCmds();
     /* Insert sorted alphabetically (keeps `help` output ordered). */

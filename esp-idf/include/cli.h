@@ -79,6 +79,14 @@ void cliRegisterCmd(const char* cmd, cli_cmd_cb_t cb);
 /** True for "help", "-h", or "--help" — any help request. */
 bool cliWantsHelp(const char* args);
 
+/** True when `tok` is an abbreviation of `full`: a prefix of it, at least
+ *  `minLen` characters long. This is how a verb takes a short form — `a` for
+ *  `announce` — and `minLen` is what keeps a one-letter form from reaching a
+ *  verb that shares its first letters with another. A longer word that merely
+ *  starts the same way (`announces` against `announce`) is not a prefix and
+ *  does not match, so the two stay distinct commands. */
+bool cliVerbIs(const char* tok, const char* full, size_t minLen);
+
 /** Column width for help alignment. Usage: cliPrintf("%-*s description\n", CLI_HELP_COL, "cmd [args]"); */
 #define CLI_HELP_COL 23
 

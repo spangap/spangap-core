@@ -41,6 +41,13 @@ s.net.hostname=lab1
   - `<cmd> -h` / `<cmd> --help` → fuller per-command help.
   - `<cmd>` with no args → status (there is no separate `status` verb).
   - `cliWantsHelp(args)` covers all three help spellings in one guard.
+- **Verb abbreviation** is `cliVerbIs(tok, full, minLen)`: a verb matches on any
+  prefix of itself at least `minLen` characters long, so `lora a` and `lxmf a`
+  reach `announce`, and `minLen` is what stops a one-letter form from reaching a
+  verb whose neighbours share its opening letters (`lora supe` needs all four
+  against `sf` and `sync`). A longer word that merely starts the same way —
+  `announces` against `announce` — is not a prefix, so the two remain distinct
+  commands and only their dispatch order decides which a full spelling reaches.
 - **Output** is flush-left and **silent on success** — a command that worked
   prints nothing (or just its requested data). Use `cliPrintf`/`cliWrite`; color
   is emitted only when `cliWantsColor()` is true.
@@ -176,7 +183,7 @@ alias is **not** re-expanded recursively.
 ## Public surface
 
 Declared in [`include/cli.h`](../esp-idf/include/cli.h):
-`cliRegisterCmd`, `cliWantsHelp`, `cliPrintf`/`cliWrite`/`cliWantsColor`,
+`cliRegisterCmd`, `cliWantsHelp`, `cliVerbIs`, `cliPrintf`/`cliWrite`/`cliWantsColor`,
 `cliReadLine`/`cliReadRaw`/`cliTermSize` (interactive input + terminal geometry,
 used by the ssh client for password prompts and pty sizing),
 `cliGetCwd`/`cliSetCwd`/`cliCdToStartDir`/`cliResolveFsPath`,
