@@ -434,6 +434,29 @@ static int logVprintf(const char* fmt, va_list args) {
     int fmtLen = logReformat(buf.c_str(), formatted.data(), formatted.size(), true);
     if (fmtLen <= 0) return rawLen;
 
+    /* Terminal-state backstop. A single 0x0E (Shift Out) anywhere in any line
+     * switches an attached terminal to the DEC line-drawing charset, and from
+     * there EVERY line the device emits — other tasks', the timestamps, the
+     * prompt — renders as box glyphs until something sends 0x0F. It breaks
+     * xterm.js in the browser log view the same way it breaks a serial
+     * terminal. One stray byte from one straddle logging something a stranger
+     * sent it therefore takes out the whole log surface, which is exactly the
+     * moment logs matter most.
+     *
+     * So the C0 controls that carry terminal state are folded to '.' here, at
+     * the one point every ESP_LOGx passes through. Kept: \t \n \r (framing we
+     * emit), ESC (our own colouring is CSI SGR), and everything >= 0x80 (UTF-8
+     * must survive — a log line is allowed to contain a name).
+     *
+     * This is a backstop, not the defence. A straddle rendering bytes from the
+     * network still filters them itself (rnsd's logSafe), because by the time
+     * they reach here the only thing left to do is make them harmless. */
+    for (int i = 0; i < fmtLen; i++) {
+        uint8_t c = (uint8_t)formatted[i];
+        if (c == '\t' || c == '\n' || c == '\r' || c == 0x1B) continue;
+        if (c < 0x20 || c == 0x7F) formatted[i] = '.';
+    }
+
     /* Write to ring buffer — spinlock serializes concurrent writers.
      * Safe from any task context (spinlock disables interrupts briefly). */
     logRingWrite(formatted.data(), fmtLen);

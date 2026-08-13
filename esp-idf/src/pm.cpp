@@ -41,8 +41,7 @@
    (freeing the ring) when the last watcher leaves. This is flag-driven on every
    build, so a headless node with the flag never set never allocates the ring nor
    wakes the sampler — yet can still be started by hand for its published
-   averages. pmStatsRequest() only adds the -web pre-fill responder. `top` samples
-   inline when the background sampler isn't running. */
+   averages. `top` samples inline when the background sampler isn't running. */
 
 /* ---- Central RTC RAM validity ---- */
 #define RTC_APP_MAGIC 0x5ECC0001
@@ -732,7 +731,7 @@ static void statsTick(bool driveSamplers = true) {
   free(old);
 
   /* Drive any piggy-backed samplers (e.g. -net traffic) on the same 1 Hz beat.
-     They run every tick for ring pre-fill and self-gate their own publishing.
+     They run every tick to keep their own rings filled and self-gate publishing.
      Skipped on the `top` fallback path, which is a private point-in-time read
      that must not allocate or advance another straddle's ring. */
   if (driveSamplers)
@@ -1003,58 +1002,6 @@ int pmStatsAvg(PmStatAvg* out, int secs) {
 }
 static void pmStatsPoll() {}
 #endif  /* run-time stats */
-
-#if CONFIG_FREERTOS_USE_TRACE_FACILITY && CONFIG_FREERTOS_GENERATE_RUN_TIME_STATS
-/* cpuhist: an ITS server that hands a browser the whole CPU/PM ring in one shot
- * on connect, then disconnects — so a freshly-opened web monitor pre-fills its
- * graphs instead of accumulating one sample a second. The browser opens a
- * DataChannel labelled "cpuhist:1"; the on-device monitor reads the ring
- * directly and needs none of this. Spawned on demand by that connect (see
- * itsRegisterOnDemand in pmStatsRequest) and gone again once the blob is out,
- * so it holds a TCB only while it's actually serving. */
-static constexpr uint16_t CPUHIST_PORT = 1;
-static constexpr int      HIST_MAX = 320;            /* one screen-width of samples */
-static int s_cpuHistClient = -1;
-
-static int cpuHistOnConnect(int handle, const void*, size_t) { s_cpuHistClient = handle; return 0; }
-
-static void cpuHistTask(void*) {
-  itsServerInit();
-  itsServerPortOpen(CPUHIST_PORT, ITS_PACKET, 1, 0, 4096, 0, 4096);
-  itsServerOnConnect(CPUHIST_PORT, cpuHistOnConnect);
-  /* The itsConnect that spawned us is already handshaking; poll long enough to
-     accept it (its side has a 3 s connect budget), hand over the ring, exit. */
-  itsPoll(pdMS_TO_TICKS(3000));
-  while (itsPoll(0)) {}
-  if (s_cpuHistClient >= 0) {
-    int h = s_cpuHistClient; s_cpuHistClient = -1;
-    auto* tmp = (PmStatSample*)gp_alloc((size_t)HIST_MAX * sizeof(PmStatSample));
-    if (tmp) {
-      int n = pmStatsHistory(tmp, HIST_MAX);
-      if (n > 0) itsSend(h, tmp, (size_t)n * sizeof(PmStatSample), pdMS_TO_TICKS(1000));
-      free(tmp);                 /* n == 0 (ring still empty at boot): nothing to send */
-    }
-    itsDisconnect(h);            /* one-shot: blob then close */
-  }
-  killSelf();
-}
-#endif
-
-void pmStatsRequest(void) {
-#if CONFIG_FREERTOS_USE_TRACE_FACILITY && CONFIG_FREERTOS_GENERATE_RUN_TIME_STATS
-  /* The sampler itself is flag-driven on every build (see pmStatsPoll). This only
-     registers the web pre-fill responder, which a headless node has no use for.
-     cpuhist is spawned on demand by the browser's DataChannel connect, not a
-     sampler, so a freshly-opened web monitor gets its blob without a start-up
-     race; the ring is empty (blob skipped) while nothing has been sampled yet. */
-  static bool histUp = false;
-  if (histUp) return;                             /* idempotent: -web + -lcd both call it */
-  histUp = true;
-  itsRegisterOnDemand("cpuhist", [] {
-    spawnTask(cpuHistTask, "cpuhist", 4096, nullptr, 1, 0, STACK_PSRAM);
-  });
-#endif
-}
 
 /* ---- GPIO wake source ---- */
 

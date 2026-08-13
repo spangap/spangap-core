@@ -183,6 +183,34 @@ config SPANGAP_SDCARD_ALLOC_KB
         large cards; raise it for fewer/larger files, lower it to trim waste
         further at the cost of a bigger FAT.
 
+config SPANGAP_I2C_INTERNAL_PULLUP
+    bool "Enable the SoC's internal pull-ups on I2C buses"
+    default y
+    help
+        Whether every I2C master bus the platform brings up asks the SoC to
+        pull SDA/SCL up itself. A wiring property of the board rather than of
+        any one peripheral, which is why it lives here: a bus carries several
+        chips (touch, keyboard, RTC, PMU, an OLED) whose drivers each open
+        their own bus object but share the same two lines, and they must agree.
+
+        The internal pull-ups are weak — of the order of 45 kOhm. That is
+        enough to meet the rise-time budget at 100 kHz on short traces, and
+        NOT enough at 400 kHz, which wants a few kOhm. A board that carries
+        its own pull-up resistors (most OLED and sensor breakouts do, at
+        4.7 kOhm) is driven by those; the internal ones sit in parallel and
+        are harmless, so leaving this on is the safe default and matches how
+        every board is wired today.
+
+        Turn it off for a board whose external pull-ups are strong enough on
+        their own and where the extra parallel path is unwanted — the leakage
+        is paid continuously while a line is held low, which shows up in deep
+        sleep. Turning it off on a board with NO external pull-ups leaves the
+        bus floating and nothing will answer.
+
+        Symptoms of relying on the internal pull-ups alone at 400 kHz are
+        marginal rather than total: most transfers land, the occasional one
+        does not. Halving the bus clock is the other lever.
+
 config SPANGAP_USB_CDC
     bool "USB CDC console transport (TinyUSB) + second serial port"
     depends on ESP_CONSOLE_USB_SERIAL_JTAG

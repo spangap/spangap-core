@@ -488,45 +488,45 @@ static bool appendRecord(sdb_store* s, const std::string& key, const std::string
   return true;
 }
 
-/* Rewrite the block keeping only live records (arena order), optionally dropping
- * the oldest `dropOldest` of them (ephemeral cap). Rebuilds the index. */
+/* Drop the oldest `dropOldest` live records (arena order) and reclaim every
+ * tombstone.
+ *
+ * Tombstoning the victims first and then streaming the survivors through
+ * sdbCompactInPlace patches each moved record's index entry as it goes, so
+ * nothing rebuilds the key index. That rebuild was the expensive half on a store
+ * with thousands of records — a full teardown and repopulate of the map, two
+ * heap ops per key for the node and its (non-SSO) key string — and it sat on top
+ * of a whole second copy of the arena in a temp buffer. Neither is needed to
+ * remove bytes from the front of an arena. */
 static void compact(sdb_store* s, size_t dropOldest) {
   uint16_t hs = s->schema->hdr_size;
-  /* Collect live record offsets in arena order. */
-  std::vector<uint32_t> live;
+  size_t oldUsed = s->used;
+  size_t dropped = 0;
   size_t off = SDB_FILE_HDR;
-  while (off < s->used) {
+  while (dropped < dropOldest && off < s->used) {
     uint32_t rlen = rdU32(s->block + off + SDB_REC_LEN_OFF);
     if (rlen < hs || off + rlen > s->used) break;
-    if (!(s->block[off + SDB_FLAGS_OFF] & SDB_FLAG_DELETED)) live.push_back((uint32_t)off);
+    if (!(s->block[off + SDB_FLAGS_OFF] & SDB_FLAG_DELETED)) {
+      /* Erase at tombstone time — sdbCompactInPlace only repoints live keys. */
+      const uint8_t* tp = s->block + off + hs;
+      uint16_t klen = rdU16(tp);
+      s->index.erase(std::string((const char*)tp + 2, klen));
+      s->block[off + SDB_FLAGS_OFF] |= SDB_FLAG_DELETED;
+      dropped++;
+    }
     off += rlen;
   }
-  size_t start = dropOldest < live.size() ? dropOldest : live.size();
-  /* Build the new block in a temp buffer, then swap in. */
-  std::string nb;
-  nb.resize(SDB_FILE_HDR, '\0');
-  uint32_t kept = 0;
-  for (size_t i = start; i < live.size(); i++) {
-    uint32_t o = live[i];
-    uint32_t rlen = rdU32(s->block + o + SDB_REC_LEN_OFF);
-    nb.append((const char*)s->block + o, rlen);
-    kept++;
-  }
-  if (!ensureCap(s, nb.size())) return;
-  size_t oldUsed = s->used;
-  memcpy(s->block, nb.data(), nb.size());
-  s->used = nb.size();
-  writeFileHeader(s, kept);
-  rebuildIndex(s);
-  /* drop-oldest fires on every insert past a full ephemeral cap — verbose;
-   * the flush/serialize compaction (dropOldest==0) is occasional — debug. */
+  sdbCompactInPlace(s);
+  /* drop-oldest fires when an ephemeral cap overflows — verbose; the
+   * flush/serialize compaction (dropOldest==0) is occasional — debug. */
   const char* label = s->path.empty() ? "(ram)" : s->path.c_str();
   if (dropOldest)
     verb("storage_db[%s]: cap compact %u->%u B, dropped %u, kept %u\n",
-         label, (unsigned)oldUsed, (unsigned)s->used, (unsigned)dropOldest, kept);
+         label, (unsigned)oldUsed, (unsigned)s->used, (unsigned)dropped,
+         (unsigned)s->index.size());
   else
     dbg("storage_db[%s]: flush compact %u->%u B, kept %u\n",
-        label, (unsigned)oldUsed, (unsigned)s->used, kept);
+        label, (unsigned)oldUsed, (unsigned)s->used, (unsigned)s->index.size());
 }
 
 /* ---- lifecycle ---- */
@@ -869,9 +869,17 @@ void sdbSetField(sdb_store* s, const char* key, const char* field, const char* v
     if (!appendRecord(s, key, rec)) return;
     off = findRec(s, key);
     if (off == SIZE_MAX) return;
-    /* Enforce an ephemeral cap by dropping the oldest live records. */
+    /* Enforce an ephemeral cap by dropping the oldest live records. Trim a batch,
+     * not the single record that breached the cap: a compaction costs a pass over
+     * the whole arena whatever it drops, so trimming one per insert makes EVERY
+     * insert past the cap pay for one — and at the cap, a mesh firehose of
+     * first-heard destinations is nothing but inserts. Dropping an eighth of the
+     * cap amortizes that pass over the next cap/8 arrivals, at the price of
+     * holding 7/8 cap instead of exactly cap. */
     if (s->cap_records && s->index.size() > s->cap_records) {
-      compact(s, s->index.size() - s->cap_records);
+      size_t drop = (s->index.size() - s->cap_records) + s->cap_records / 8;
+      if (drop >= s->index.size()) drop = s->index.size() - 1;   /* never the new record */
+      compact(s, drop);
       off = findRec(s, key);
       if (off == SIZE_MAX) { s->dirty = true; return; }
     }
@@ -898,7 +906,14 @@ void sdbSetField(sdb_store* s, const char* key, const char* field, const char* v
     case SDB_TEXT: {
       std::string k; std::vector<std::string> texts;
       readRecordText(s, off, k, texts);
-      if (fd->off < texts.size() && texts[fd->off] == val) break;   /* no change */
+      /* Unchanged text: return, do NOT break. `break` leaves the switch and
+       * falls into `s->dirty = true` below, which schedules a deflate + flash
+       * write of the whole store for a value that did not change. That is the
+       * common case, not a corner: a peer re-announces the same display_name
+       * every announce interval, so a handful of contacts on a busy link kept
+       * the store permanently dirty and the flash permanently busy — and a
+       * flash write disables the cache on both cores, stalling every task. */
+      if (fd->off < texts.size() && texts[fd->off] == val) return;
       if (fd->off < texts.size()) texts[fd->off] = val;
       /* Rebuild: copy the fixed header (in-place fields preserved), reserialize.
        * If the size is unchanged we overwrite in place; else tombstone + append. */

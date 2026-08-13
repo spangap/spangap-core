@@ -39,6 +39,19 @@ serial console is in log mode — mirrors the line straight to `stdout` with a
 direct `fwrite`. The static DRAM ring means logging never depends on the heap
 being intact, so a line about heap corruption still reaches the wire.
 
+Before anything is written, `logVprintf` folds the **terminal-state control
+bytes** in the formatted line to `.`. A single `0x0E` (Shift Out) switches an
+attached terminal to the DEC line-drawing charset, and from there every line the
+device emits — other tasks', the timestamps, the prompt — renders as box glyphs
+until something sends `0x0F`; it breaks xterm.js in the browser log view exactly
+as it breaks a serial console. One stray byte from one straddle logging
+something a stranger sent it takes out the whole log surface, at the moment logs
+matter most. Kept through the filter: `\t` `\n` `\r`, `ESC` (our own colouring is
+CSI SGR), and everything `>= 0x80`, because a log line is allowed to contain a
+name. It is a **backstop** — a straddle rendering bytes off the network still
+filters them at the source (rnsd's `logSafe`); by the time they reach here the
+only thing left to do is make them harmless.
+
 The log task drains the ring each loop pass, runs `logReformat` (timestamp +
 level char + `[task]` prefix, color per `s.log.colors.*` for ANSI consumers), and
 fans each line out to:

@@ -410,6 +410,33 @@ deadlocks the ack (client gives up after 3 s) and freezes the inbox drain.
   worker, otherwise `mergeIncomingPatch` (null = silent delete, values =
   `storageSet`; `secrets.*` and `fw.*` skipped).
 
+**A write that changes nothing must dirty nothing.** `SDB_TEXT` compares the
+incoming value against the stored one and skips rebuilding the record — and
+that check must `return`, not `break`: `break` only leaves the switch and falls
+into `s->dirty = true`, scheduling a deflate + atomic flash write of the whole
+store for a value that did not change. This is the common case rather than a
+corner. A peer re-announces the same `display_name` every announce interval, so
+lxmf's per-announce contact-name refresh kept the contacts store permanently
+dirty and the flash permanently busy — and a flash write disables the cache on
+both cores, stalling every task on the device. Fixed-width fields have no such
+check by design: they carry things like `last`/`hops`, which genuinely change
+on every write.
+
+**Stall forensics.** The actor's stall warning names the *victim*, not the
+culprit: `applyPoll=5848(ops=30)` says thirty op batches took 5.8 s between
+them, which on its own cannot distinguish "one batch did something expensive"
+from "the actor was frozen by someone else's flash write burst" (a flash write
+disables the cache for both cores). So `storageApplyOps` times each batch, and
+any batch over `SLOW_OP_US` (20 ms) leaves its first key and duration in a
+small ring the warning appends: `… s.lxmf.id.0.contacts.abc=612ms(7op)`. The
+worst offenders are kept rather than the first ones, since a stall is usually
+one dominant batch and a tail of ordinary ones. Two timer reads per batch when
+nothing is slow, and nothing recorded at all below the threshold.
+
+**An empty slow list is itself the finding**: no batch crossed 20 ms, so the
+actor was not doing the work — it was blocked, and the cause is outside its op
+path.
+
 ## 7. Pitfalls
 
 - **A command flag must be written as a `0→1` edge, not as a `1`.** Dedup (§3)

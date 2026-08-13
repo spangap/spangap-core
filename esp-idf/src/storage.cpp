@@ -40,6 +40,9 @@
 #include <vector>
 #include <deque>
 #include <set>
+#include <unordered_set>
+#include <unordered_map>
+#include <iterator>
 #include <atomic>
 #include <algorithm>
 #include <functional>
@@ -117,7 +120,14 @@ static TaskHandle_t saveWorkerHandle = nullptr;
  * persist worker: the actor never blocks on a subscriber again. */
 static TaskHandle_t notifyWorkerHandle = nullptr;
 static int dcHandle = -1;               /* single packet-mode DC client */
-static cJSON* dcPendingPatch = nullptr; /* outgoing coalescing */
+/* Outgoing coalescing: the keys changed since the last patch the browser took.
+ * A change event only records its key here; values are resolved and the JSON
+ * built once per loop pass in dcFlushPatch (see the browser-mirror section). */
+static std::unordered_set<std::string> dcDirtyKeys;
+/* The dirty set outgrew its ceiling while the browser was not draining, so the
+ * incremental mirror is no longer a complete account of what changed. Cleared by
+ * the re-dump dcFlushPatch triggers once the client has room again. */
+static bool dcMirrorLost = false;
 /* The structured-DB instance prefix the single client currently has "open"
  * (set by a {"fetch":...} request). Record bodies never ride the connect dump
  * (they aren't in cfgRoot); on fetch we ship the instance's records once, then
@@ -685,6 +695,17 @@ static void withExternalsDetached(std::function<void()> fn) {
  *  port-44 op drain and the browser ping→pong — for the whole serialize.
  *  Unformatted: nothing on-device reads these files by eye, and the compact
  *  form shrinks the flash write (fewer PSRAM-cache-disable windows). */
+/* Slowest single file of the current flush — what turns "the flush took 400ms"
+ * into a path you can act on. */
+static char     g_flushWorstPath[72];
+static uint32_t g_flushWorstMs;
+static void flushNoteFile(const char* path, int64_t us) {
+  uint32_t ms = (uint32_t)(us / 1000);
+  if (ms <= g_flushWorstMs) return;
+  g_flushWorstMs = ms;
+  snprintf(g_flushWorstPath, sizeof(g_flushWorstPath), "%s", path ? path : "?");
+}
+
 static void writeExternalFile(const external_t& ext) {
   int64_t t0 = esp_timer_get_time();
   CFG_LOCK();
@@ -698,7 +719,11 @@ static void writeExternalFile(const external_t& ext) {
   char* text = cJSON_PrintUnformatted(snap);
   cJSON_Delete(snap);
   if (!text) return;
-  atomicWriteJsonGz(ext.path.c_str(), text);
+  {
+    int64_t t0 = esp_timer_get_time();
+    atomicWriteJsonGz(ext.path.c_str(), text);
+    flushNoteFile(ext.path.c_str(), esp_timer_get_time() - t0);
+  }
   cJSON_free(text);
 }
 
@@ -728,7 +753,11 @@ static void writeSettingsFileOnly() {
   char* text = cJSON_PrintUnformatted(out);
   cJSON_Delete(out);
   if (!text) return;
-  atomicWriteJsonGz(fsStatePath(ROOT_JSON_PATH).c_str(), text);
+  {
+    int64_t t0 = esp_timer_get_time();
+    atomicWriteJsonGz(fsStatePath(ROOT_JSON_PATH).c_str(), text);
+    flushNoteFile(ROOT_JSON_PATH, esp_timer_get_time() - t0);
+  }
   cJSON_free(text);
 }
 
@@ -811,13 +840,41 @@ static void writeSettingsFile() {
   /* savePending was cleared at the top so mid-flush changes re-arm the timer. */
 }
 
+static void writePendingBlobs();
+
 /* Persist worker loop: block until poked, then flush. ulTaskNotifyTake(pdTRUE)
  * coalesces any pokes that arrived during a flush into one extra pass. Not an
  * ITS task — blocking on fs I/O here harms nothing. */
+/* A flush is the other half of the actor's stall report. The actor can only
+ * ever say "I was blocked and it was not my op path"; this says by what.
+ *
+ * Read the figure as an UPPER BOUND on a freeze, never a measurement of one.
+ * Only the flash erase/program windows inside a flush suspend both cores'
+ * cache; the rest is LittleFS bookkeeping and VFS overhead running normally on
+ * this worker, which blocks nobody. "flush 300ms" does not mean the device
+ * stopped for 300 ms, and reading it that way turns routine writes into
+ * suspects.
+ *
+ * Threshold matches the actor's own warn level: below it a flush cannot
+ * account for a reported stall even if every microsecond of it were a freeze,
+ * so warning about it is noise. */
+#define FLUSH_SLOW_MS 250
+
 static void saveWorkerFn(void*) {
   for (;;) {
     ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+    int64_t flushT0 = esp_timer_get_time();
+    g_flushWorstMs = 0; g_flushWorstPath[0] = '\0';
+    writePendingBlobs();
+    int64_t flushBlobs = esp_timer_get_time();
     writeSettingsFile();
+    int64_t flushEnd = esp_timer_get_time();
+    if ((flushEnd - flushT0) / 1000 >= FLUSH_SLOW_MS)
+      warn("flush %lldms (blobs=%lldms files=%lldms) worst=%s@%ums — flash "
+           "windows within it suspend both cores' cache\n",
+           (flushEnd - flushT0) / 1000, (flushBlobs - flushT0) / 1000,
+           (flushEnd - flushBlobs) / 1000,
+           g_flushWorstPath[0] ? g_flushWorstPath : "-", (unsigned)g_flushWorstMs);
     /* Release any save-now semaphores queued by SAVE ops while we flushed. */
     CFG_LOCK();
     std::vector<SemaphoreHandle_t> sems = std::move(pendingSaveSems);
@@ -833,6 +890,48 @@ static void saveWorkerFn(void*) {
  * from the esp_timer task. */
 static void requestSave() {
   if (saveWorkerHandle) xTaskNotifyGive(saveWorkerHandle);
+}
+
+/* ---- opaque blob persistence ----
+ *
+ * Snapshots handed over by storagePersistBlob, written on the persist worker.
+ * One pending snapshot per path: a newer one replaces an unwritten older one,
+ * which is what makes a debouncing producer safe to leave unthrottled. */
+struct blob_job_t { std::string path; void* data; size_t len; };
+static std::vector<blob_job_t> pendingBlobs;   /* guarded by CFG_LOCK */
+
+bool storagePersistBlob(const char* path, void* data, size_t len) {
+  if (!path || !data) return false;
+  CFG_LOCK();
+  bool replaced = false;
+  for (auto& j : pendingBlobs) {
+    if (j.path == path) {
+      free(j.data);
+      j.data = data;
+      j.len  = len;
+      replaced = true;
+      break;
+    }
+  }
+  if (!replaced) pendingBlobs.push_back({ path, data, len });
+  CFG_UNLOCK();
+  requestSave();
+  return true;
+}
+
+static void writePendingBlobs() {
+  std::vector<blob_job_t> jobs;
+  CFG_LOCK();
+  jobs = std::move(pendingBlobs);
+  pendingBlobs.clear();
+  CFG_UNLOCK();
+  for (auto& j : jobs) {
+    int64_t t0 = esp_timer_get_time();
+    if (!atomicWriteFile(j.path.c_str(), j.data, j.len))
+      warn("storage: blob write %s failed\n", j.path.c_str());
+    flushNoteFile(j.path.c_str(), esp_timer_get_time() - t0);
+    free(j.data);
+  }
 }
 
 static void saveTimerCb(void* /*arg*/) {
@@ -1426,7 +1525,10 @@ static bool sdbApplyOpLocked(char op, const char* key, const std::string& vs, bo
     if (op == 'd' && have && !cur.empty()) return true;   /* DEFAULT: keep existing */
     if (have && cur == vs) return true;          /* dedup (load-bearing vs notify floods) */
     sdbSetField(st, rec, field, vs.c_str());
-    routedDirty = true;
+    /* Only a persisting store has anything for the save timer to write. A
+     * RAM-only store (the announce catalogue) would otherwise arm a flush cycle
+     * on every announce, waking the persist worker to find nothing dirty. */
+    if (m.reg->persist) routedDirty = true;
     if (!silent) changes.emplace_back(key, vs);
     return true;
   }
@@ -1435,7 +1537,7 @@ static bool sdbApplyOpLocked(char op, const char* key, const std::string& vs, bo
     sdb_store* st = sdbResolveLoaded(m);
     if (op == 'D') {
       sdbDeleteRecord(st, m.tail[0].c_str());
-      routedDirty = true;
+      if (m.reg->persist) routedDirty = true;
       if (!silent) changes.emplace_back(key, "");   /* record subtree gone */
     }
     return true;
@@ -1449,7 +1551,7 @@ static bool sdbApplyOpLocked(char op, const char* key, const std::string& vs, bo
     if (!st->path.empty()) g_sdbPendingDeletes.push_back(st->path);  /* unlink on the worker */
     delete st;
     m.reg->insts.erase(joinBinds(m.binds));
-    routedDirty = true;
+    if (m.reg->persist) routedDirty = true;   /* only a file needs the flush */
     if (!silent) changes.emplace_back(key, "");
   }
   return true;
@@ -1485,7 +1587,9 @@ static void storageDbFlushDirty() {
     free(j.raw);
     if (!gz) { warn("storage_db: deflate %s failed\n", j.path.c_str()); continue; }
     std::string tmp = j.path + ".new";
+    int64_t t0 = esp_timer_get_time();
     if (atomicWriteFile(tmp.c_str(), gz, gzLen)) fs_rename(tmp.c_str(), j.path.c_str());
+    flushNoteFile(j.path.c_str(), esp_timer_get_time() - t0);
     free(gz);
   }
 }
@@ -1493,16 +1597,68 @@ static void storageDbFlushDirty() {
 /* True if any resident instance needs a flush (arms the boot save kick). */
 static bool storageDbAnyDirty() {
   if (!g_sdbPendingDeletes.empty()) return true;
-  for (auto* r : g_sdbRegs)
+  for (auto* r : g_sdbRegs) {
+    if (!r->persist) continue;   /* a RAM-only store is never written */
     for (auto& kv : r->insts)
       if (kv.second->dirty) return true;
+  }
   return false;
 }
 
 /* The apply pipeline — runs on the storage task (aux handler) and on the D1
  * fast path. `sender` owns any SUB/UNSUB registered by this message. */
+/* ---- slow-op forensics ----
+ *
+ * "30 ops took 5.8 s" names a victim, not a culprit. Each applied batch is
+ * timed, and any that runs long enough to matter leaves its first key and its
+ * duration in a small ring that the stall warning prints. Costs two timer
+ * reads per batch when nothing is slow, and nothing at all is recorded until
+ * something crosses the threshold — so the common path pays microseconds and
+ * the rare path explains itself instead of needing a second reproduction. */
+#define SLOW_OP_US        20000   /* 20 ms: below this a batch is not the story */
+#define SLOW_OP_SLOTS     6
+struct slow_op_t { char key[40]; uint32_t us; int ops; };
+static slow_op_t slowOps[SLOW_OP_SLOTS];
+static int       slowOpCount = 0;
+
+static void slowOpsReset() { slowOpCount = 0; }
+
+static void slowOpRecord(const char* key, uint32_t us, int ops) {
+  /* Keep the worst offenders, not the first ones: a stall usually has one
+     dominant batch and a tail of ordinary ones. */
+  int slot = slowOpCount;
+  if (slowOpCount >= SLOW_OP_SLOTS) {
+    slot = 0;
+    for (int i = 1; i < SLOW_OP_SLOTS; i++) if (slowOps[i].us < slowOps[slot].us) slot = i;
+    if (slowOps[slot].us >= us) return;
+  } else {
+    slowOpCount++;
+  }
+  snprintf(slowOps[slot].key, sizeof(slowOps[slot].key), "%s", key ? key : "?");
+  slowOps[slot].us  = us;
+  slowOps[slot].ops = ops;
+}
+
+/** Format the recorded slow batches as " slow: <key> 1234ms(3op) …" — empty
+ *  when nothing crossed the threshold, which is itself the finding: the actor
+ *  was blocked by something outside its own op path (a flash write burst
+ *  disables the cache for both cores). */
+static std::string slowOpsReport() {
+  std::string out;
+  for (int i = 0; i < slowOpCount; i++) {
+    char buf[80];
+    snprintf(buf, sizeof(buf), " %s=%ums(%dop)", slowOps[i].key,
+             (unsigned)(slowOps[i].us / 1000), slowOps[i].ops);
+    out += buf;
+  }
+  return out;
+}
+
 static void storageApplyOps(const uint8_t* p, size_t len, TaskHandle_t sender) {
   if (len < 1) return;
+  int64_t applyT0 = esp_timer_get_time();
+  const char* firstKey = nullptr;
+  int opCount = 0;
   bool silent = (p[0] & OP_F_SILENT);
   size_t pos = 1;
 
@@ -1520,6 +1676,8 @@ static void storageApplyOps(const uint8_t* p, size_t len, TaskHandle_t sender) {
       if (klen >= len - pos) { bad = true; break; }   /* no NUL within bounds */
       pos += klen + 1;
       ParsedOp po{op, std::string(key, klen), nullptr, nullptr};
+      if (!firstKey) firstKey = key;   /* borrowed from the op buffer, alive for this call */
+      opCount++;
       if (op != 'D') {
         if (pos >= len) { bad = true; break; }
         char vt = (char)p[pos++];
@@ -1648,6 +1806,9 @@ static void storageApplyOps(const uint8_t* p, size_t len, TaskHandle_t sender) {
     CFG_UNLOCK();
     requestSave();
   }
+
+  int64_t applyUs = esp_timer_get_time() - applyT0;
+  if (applyUs >= SLOW_OP_US) slowOpRecord(firstKey, (uint32_t)applyUs, opCount);
 }
 
 /* Aux handler on the storage task: one op message arrived. */
@@ -2028,7 +2189,50 @@ void storageLoad() {
   fs_remove(fsStatePath(ROOT_JSON_PATH ".gz.new").c_str());
 }
 
+/* ---- read-through providers ----
+ *
+ * Dispatch happens AHEAD of CFG_LOCK, deliberately. storageGetInt, storageGetStr
+ * and storageExists all take the recursive config mutex first and only then
+ * consult the structured-DB router; a provider hook placed inside that path
+ * would inherit exactly the contention it exists to escape. So this is a branch
+ * before the lock, not an addition to sdbRoute.
+ *
+ * Fixed table, appended only during init: a reader walks it with no lock, so
+ * it must never reallocate under one. */
+#define STORAGE_MAX_PROVIDERS 4
+struct provider_reg_t { const char* prefix; size_t plen; const storage_provider_t* p; };
+static provider_reg_t providers[STORAGE_MAX_PROVIDERS];
+static int providerCount = 0;
+
+bool storageRegisterProvider(const char* prefix, const storage_provider_t* provider) {
+  if (!prefix || !*prefix || !provider || !provider->get) return false;
+  if (providerCount >= STORAGE_MAX_PROVIDERS) {
+    warn("storage: provider table full, dropping '%s'\n", prefix);
+    return false;
+  }
+  providers[providerCount++] = { prefix, strlen(prefix), provider };
+  return true;
+}
+
+/* Returns the provider owning `key`, with `key` advanced past its prefix. */
+static const storage_provider_t* providerFor(const char*& key) {
+  if (!key) return nullptr;
+  for (int i = 0; i < providerCount; i++) {
+    if (strncmp(key, providers[i].prefix, providers[i].plen) == 0) {
+      key += providers[i].plen;
+      return providers[i].p;
+    }
+  }
+  return nullptr;
+}
+
 bool storageExists(const char* key) {
+  const char* pk = key;
+  if (const storage_provider_t* pv = providerFor(pk)) {
+    if (pv->exists) return pv->exists(pk);
+    char tmp[160];
+    return pv->get(pk, tmp, sizeof(tmp));
+  }
   CFG_LOCK();
   bool exists;
   if (!sdbExistsLocked(key, exists)) {
@@ -2040,6 +2244,11 @@ bool storageExists(const char* key) {
 }
 
 int storageGetInt(const char* key, int def) {
+  const char* pk = key;
+  if (const storage_provider_t* pv = providerFor(pk)) {
+    char tmp[32];
+    return pv->get(pk, tmp, sizeof(tmp)) ? atoi(tmp) : def;
+  }
   CFG_LOCK();
   int result = def;
   std::string sv;
@@ -2066,6 +2275,11 @@ bool uiTelemetryWanted() {
 
 void storageGetStr(const char* key, char* out, size_t outLen, const char* def) {
   if (outLen == 0) return;
+  const char* pk = key;
+  if (const storage_provider_t* pv = providerFor(pk)) {
+    if (!pv->get(pk, out, outLen)) safeStrncpy(out, def, outLen);
+    return;
+  }
   CFG_LOCK();
   std::string sv;
   if (sdbGetLocked(key, sv)) { safeStrncpy(out, sv.c_str(), outLen); CFG_UNLOCK(); return; }
@@ -2078,6 +2292,11 @@ void storageGetStr(const char* key, char* out, size_t outLen, const char* def) {
 }
 
 std::string storageGetStr(const char* key, const char* def) {
+  const char* pk = key;
+  if (const storage_provider_t* pv = providerFor(pk)) {
+    char tmp[256];
+    return pv->get(pk, tmp, sizeof(tmp)) ? std::string(tmp) : std::string(def ? def : "");
+  }
   CFG_LOCK();
   std::string out;
   if (sdbGetLocked(key, out)) { CFG_UNLOCK(); return out; }
@@ -2634,6 +2853,13 @@ int storageArrayCount(const char* prefix) {
 }
 
 void storageForEach(const char* prefix, void (*cb)(const char* key, const char* val)) {
+  {
+    const char* pk = prefix;
+    if (const storage_provider_t* pv = providerFor(pk)) {
+      if (pv->forEach) pv->forEach(pk, cb);
+      return;
+    }
+  }
   std::string pre = stripDots(prefix);
   /* A prefix that lands in a record store iterates its instance(s) instead of
    * cfgRoot — collect under the lock, then invoke cb after releasing it (a cb
@@ -2997,145 +3223,278 @@ static void dumpBuilderFn(void*) {
     vTaskDelete(nullptr);
 }
 
-/** Accumulate a changed key into dcPendingPatch for coalesced output. */
+/* ---- browser mirror ----
+ *
+ * A change event does one thing here: record the KEY. Resolving its value and
+ * folding it into a JSON tree happens in dcFlushPatch, once per loop pass.
+ *
+ * That split is load-bearing, not tidiness. dcAccumulateChange runs inline on
+ * the actor for every changed key (the "" subscription is owned by the storage
+ * task, so notifyChange calls it directly), which puts it in the middle of the
+ * op-apply drain. Building the patch tree there cost a CFG_LOCK, an sdbRoute
+ * (with its splitDots allocations) and a navigateOrCreate walk PER CHANGE — and
+ * cJSON object lookup is a linear scan of the child list, so the walk grew with
+ * the number of distinct keys already pending. Under a TCP announce firehose
+ * (seven keys per announce, hundreds of announces between flushes) that is
+ * quadratic, and it is paid on the actor's hot path even while the browser is
+ * back-pressured and nothing can be sent. Now the hot path is one hash insert,
+ * the tree is built once per flush from distinct keys, and a stuck browser
+ * costs nothing but set inserts. Values resolved late are the CURRENT values,
+ * which is what a coalesced merge patch is supposed to carry anyway. */
+
+/* Ceiling on the dirty set while the browser takes nothing. Past it the delta
+ * stream has failed and the mirror resyncs from a snapshot instead (see
+ * dcQueueReload) — bounded RAM, instead of an unbounded set nobody is draining. */
+static constexpr size_t DC_DIRTY_MAX = 4096;
+
+/** Note a changed key for the browser mirror. Hot path: keep it O(1). */
 static void dcAccumulateChange(const char* key, const char* val) {
     (void)val;
     if (dcHandle < 0) return;
     if (isSecret(key)) return;
-
-    CFG_LOCK();
-
-    /* Structured-DB bodies aren't in cfgRoot. Mirror a body change only for the
-     * instance the client currently has open (record-scoped, per the plan) — its
-     * value comes from the store, not cfgRoot. Changes to other conversations
-     * are represented to the browser only by their maintained directory entry. */
-    sdb_match sm;
-    if (sdbRoute(key, sm)) {
-        bool open = !dcOpenPrefix.empty() &&
-                    strncmp(key, dcOpenPrefix.c_str(), dcOpenPrefix.size()) == 0 &&
-                    key[dcOpenPrefix.size()] == '.';
-        /* A body (message conversation) only mirrors while it is the open instance;
-         * a browser-mirrored store (contacts directory, announce catalogue) mirrors
-         * every change, exactly as the equivalent cfgRoot subtree used to. */
-        if (!open && !sm.reg->browserMirror) { CFG_UNLOCK(); return; }
-        std::string sv;
-        bool has = sdbGetLocked(key, sv);
-        if (!dcPendingPatch) dcPendingPatch = cJSON_CreateObject();
-        char leaf[96];
-        cJSON* parent = navigateOrCreate(dcPendingPatch, key, leaf, sizeof(leaf));
-        if (parent) {
-            cJSON_DeleteItemFromObject(parent, leaf);
-            if (has) cJSON_AddStringToObject(parent, leaf, sv.c_str());
-            else     cJSON_AddNullToObject(parent, leaf);
-        }
-        CFG_UNLOCK();
+    if (dcMirrorLost) return;
+    if (dcDirtyKeys.size() >= DC_DIRTY_MAX) {
+        warn("storage: mirror backlog %u keys, will re-dump\n", (unsigned)dcDirtyKeys.size());
+        dcDirtyKeys.clear();
+        dcMirrorLost = true;
         return;
     }
-
-    /* The key may be gone (storageUnset / storageDeleteTree removed it
-       before firing callbacks). Previously we skipped — so deletions were
-       never echoed and a deleted conversation lingered in open clients
-       until a full reload. Instead echo an explicit null at the key: the
-       coalesced patch is retried under back-pressure (never dropped), so
-       the browser reliably drops the (sub)tree. */
-    cJSON* node = navigatePath(cfgRoot, key);
-
-    if (!dcPendingPatch) dcPendingPatch = cJSON_CreateObject();
-
-    char leaf[96];  /* see navigatePath */
-    cJSON* parent = navigateOrCreate(dcPendingPatch, key, leaf, sizeof(leaf));
-    if (!parent) { CFG_UNLOCK(); return; }
-
-    cJSON_DeleteItemFromObject(parent, leaf);
-    if (!node) {
-        cJSON_AddNullToObject(parent, leaf);          /* deletion */
-    } else {
-        bool deep = cJSON_IsObject(node) || cJSON_IsArray(node);
-        cJSON_AddItemToObject(parent, leaf, cJSON_Duplicate(node, deep));
-    }
-    CFG_UNLOCK();
+    dcDirtyKeys.insert(key);
 }
 
-/* Ship a structured-DB instance's records to the browser as one merge patch,
- * placed at the instance's dot-path so the browser merges them into its mirror
- * exactly where its message-reading code already looks. Called on {"fetch":...}.
- * Runs on the storage task. */
-static void dcShipStorePrefix(const char* prefix) {
+/* Queue a full reload of `prefix`: one message clearing the subtree, then its
+ * entire current contents packed into DC_DUMP_MAX chunks.
+ *
+ * This is a resync, not an optimisation — a snapshot is never fewer bytes than a
+ * patch carrying only what changed, so it belongs where the delta stream has
+ * failed rather than anywhere a batch merely looks big. Two places qualify: a
+ * client asking for an instance it has not mirrored before, and a backlog that
+ * overran DC_DIRTY_MAX with nobody draining it. It is also the only form that
+ * can express an eviction — the ephemeral cap drops the oldest records silently
+ * and a merge patch has no way to say "these are gone" — so a resync is what
+ * clears destinations the device has already forgotten. The client sees the
+ * subtree briefly empty between the clear and the first chunk.
+ *
+ * Chunks ride dcDumpQueue, so they stream paced to buffer space and patches are
+ * held behind them (dcDumpInProgress) — the snapshot can never be overtaken by
+ * an older leaf write. Runs on the storage task. */
+static void dcQueueReload(const char* prefix) {
     std::vector<std::string> kv;
     CFG_LOCK();
-    if (!sdbForEachUnderLocked(prefix, kv)) { CFG_UNLOCK(); return; }
+    bool routed = sdbForEachUnderLocked(prefix, kv);
+    CFG_UNLOCK();
+    if (!routed) return;
+
+    /* Everything pending under the prefix is superseded by the snapshot. */
+    size_t plen = strlen(prefix);
+    for (auto it = dcDirtyKeys.begin(); it != dcDirtyKeys.end(); ) {
+        bool under = it->size() >= plen && it->compare(0, plen, prefix) == 0 &&
+                     (it->size() == plen || (*it)[plen] == '.');
+        it = under ? dcDirtyKeys.erase(it) : std::next(it);
+    }
+
+    char leaf[96];
+    cJSON* clear = cJSON_CreateObject();
+    cJSON* parent = clear ? navigateOrCreate(clear, prefix, leaf, sizeof(leaf)) : nullptr;
+    if (parent) {
+        cJSON_AddNullToObject(parent, leaf);
+        char* t = cJSON_PrintUnformatted(clear);
+        if (t) { dcDumpQueue.emplace_back(t); cJSON_free(t); }
+    }
+    cJSON_Delete(clear);
+
+    /* Pack into chunks the pump can actually send. Records arrive in arena
+     * order, so a chunk's objects stay shallow and navigateOrCreate's scans stay
+     * short — the batch is reset every DC_DUMP_MAX bytes. The budget is an
+     * over-estimate (it counts each full path, while the tree shares prefixes),
+     * which only makes chunks smaller than the cap. */
+    cJSON* batch = cJSON_CreateObject();
+    size_t est = 0;
+    size_t chunks = 0;
+    auto emit = [&]() {
+        if (!batch || !batch->child) return;
+        char* t = cJSON_PrintUnformatted(batch);
+        if (t) { dcDumpQueue.emplace_back(t); cJSON_free(t); chunks++; }
+        cJSON_Delete(batch);
+        batch = cJSON_CreateObject();
+        est = 0;
+    };
+    for (size_t i = 0; i + 1 < kv.size() && batch; i += 2) {
+        cJSON* p = navigateOrCreate(batch, kv[i].c_str(), leaf, sizeof(leaf));
+        if (!p) continue;
+        cJSON_DeleteItemFromObject(p, leaf);
+        cJSON_AddStringToObject(p, leaf, kv[i + 1].c_str());
+        est += kv[i].size() + kv[i + 1].size() + 8;
+        if (est >= DC_DUMP_MAX) emit();
+    }
+    emit();
+    cJSON_Delete(batch);
+    verb("storage: reload %s (%u leaves, %u chunks)\n",
+         prefix, (unsigned)(kv.size() / 2), (unsigned)chunks);
+}
+
+/* Queue a reload of every store subtree the client mirrors: each resident
+ * instance of a browserMirror store, plus the conversation body it has open.
+ *
+ * Pair this with any mid-session re-dump. Records live outside cfgRoot, so a
+ * dump does not carry them, and the browser only issues its {"fetch"} requests
+ * when the stream transitions to synced — which a re-dump on an already-synced
+ * session never does. Without this the config tree resyncs and the directory,
+ * catalogue and open conversation silently do not. */
+static void dcReloadMirroredStores() {
+    std::vector<std::string> prefixes;
+    CFG_LOCK();
+    for (auto* r : g_sdbRegs) {
+        if (!r->browserMirror) continue;
+        for (auto& kv : r->insts) {
+            /* Rebuild the instance's dot-path: pattern literals, with each
+             * wildcard filled from the joined binds this instance is keyed by. */
+            const std::string& ik = kv.first;
+            std::string pre;
+            size_t pos = 0;
+            for (size_t i = 0; i < r->patLen; i++) {
+                if (i) pre += '.';
+                if (r->pat[i] != "$") { pre += r->pat[i]; continue; }
+                size_t sep = ik.find('\x1f', pos);
+                pre += ik.substr(pos, sep == std::string::npos ? std::string::npos : sep - pos);
+                pos = (sep == std::string::npos) ? ik.size() : sep + 1;
+            }
+            prefixes.push_back(pre);
+        }
+    }
+    CFG_UNLOCK();
+    if (!dcOpenPrefix.empty()) prefixes.push_back(dcOpenPrefix);
+    for (auto& p : prefixes) dcQueueReload(p.c_str());
+}
+
+/* Ship a structured-DB instance's records to the browser, placed at the
+ * instance's dot-path so the browser merges them into its mirror exactly where
+ * its message-reading code already looks. Called on {"fetch":...}. Runs on the
+ * storage task. */
+static void dcShipStorePrefix(const char* prefix) {
+    sdb_match sm;
+    CFG_LOCK();
+    bool routed = sdbRoute(prefix, sm);
+    bool mirror = routed && sm.reg->browserMirror;
+    CFG_UNLOCK();
+    if (!routed) return;
     /* Track the open instance only for on-demand bodies (conversations). A
      * browser-mirrored store is fetched once and then kept live by the change
      * mirror, so it must not displace the open conversation here. */
-    sdb_match sm;
-    if (!(sdbRoute(prefix, sm) && sm.reg->browserMirror)) dcOpenPrefix = prefix;
-    if (!dcPendingPatch) dcPendingPatch = cJSON_CreateObject();
-    for (size_t i = 0; i + 1 < kv.size(); i += 2) {
-        char leaf[96];
-        cJSON* parent = navigateOrCreate(dcPendingPatch, kv[i].c_str(), leaf, sizeof(leaf));
-        if (parent) {
-            cJSON_DeleteItemFromObject(parent, leaf);
-            cJSON_AddStringToObject(parent, leaf, kv[i + 1].c_str());
-        }
-    }
-    CFG_UNLOCK();
+    if (!mirror) dcOpenPrefix = prefix;
+    dcQueueReload(prefix);
 }
 
-/** Flush accumulated changes to the browser as one DC packet. On back-
- *  pressure leave the patch intact and retry next pass — never drop.
- *
- *  The per-patch ceiling now derives from the packet link's per-message size
- *  guard (itsSendBufSize == the port's maxMsg, 64 KB), not a fixed 15.5 KB ring
- *  budget — so a 15-32 KB Nomad page reaches the browser instead of being
- *  silently dropped one layer below Nomad's own cap. The drop-and-warn arm
- *  stays as a final backstop but should be unreachable below the guard. */
-static void dcFlushPatch() {
-    if (!dcPendingPatch || dcHandle < 0) return;
+/* Resolve one dirty key to the node the browser should receive. Returns false
+ * if the key must not be mirrored at all — a store body whose instance the
+ * client does not have open. `*out` is a fresh node the caller owns; a cJSON
+ * null for a key that no longer exists (storageUnset / storageDeleteTree ran
+ * before the flush), so the browser reliably drops the subtree instead of
+ * lingering on a stale copy. Caller holds CFG_LOCK. */
+static bool dcResolveKey(const char* key, cJSON** out) {
+    sdb_match sm;
+    if (sdbRoute(key, sm)) {
+        /* Structured-DB bodies aren't in cfgRoot. A body (message conversation)
+         * mirrors only while it is the open instance; a browser-mirrored store
+         * (contacts directory, announce catalogue) mirrors every change, exactly
+         * as the equivalent cfgRoot subtree used to. */
+        bool open = !dcOpenPrefix.empty() &&
+                    strncmp(key, dcOpenPrefix.c_str(), dcOpenPrefix.size()) == 0 &&
+                    key[dcOpenPrefix.size()] == '.';
+        if (!open && !sm.reg->browserMirror) return false;
+        std::string sv;
+        *out = sdbGetLocked(key, sv) ? cJSON_CreateString(sv.c_str()) : cJSON_CreateNull();
+        return true;
+    }
+    cJSON* node = navigatePath(cfgRoot, key);
+    if (!node) { *out = cJSON_CreateNull(); return true; }
+    bool deep = cJSON_IsObject(node) || cJSON_IsArray(node);
+    *out = cJSON_Duplicate(node, deep);
+    return true;
+}
 
-    /* Cheap gate BEFORE serializing: if the DC send link has no room right now
-       (a slow or mid-teardown browser has back-pressured us up to the byte
-       window), don't pay for cJSON_PrintUnformatted of the whole pending patch
-       — which can be a 128 KB Nomad page — on every 10 ms loop pass. A stuck
-       browser would otherwise pin the storage actor in repeated large prints,
-       starving the STORAGE_OP_PORT drain and the ping→pong reply enough to trip
-       the browser's 2 s liveness check (flap) and back up every task's config
-       write. The patch stays intact and coalesces further changes; we retry
-       once the browser drains or reconnects (a reconnect re-dumps anyway).
-       itsSpacesAvailable==0 means no descriptor slot or the window is exhausted;
-       a live browser draining normally always reports the full maxMsg here. */
+/** Build the dirty set into one merge patch and send it as one DC packet. The
+ *  set is cleared only once the bytes are gone, so back-pressure costs a rebuild
+ *  next pass and never a lost change.
+ *
+ *  The per-patch ceiling is the packet link's per-message size guard
+ *  (itsSendBufSize == the port's maxMsg), so a 15-32 KB Nomad page rides one
+ *  message. A patch over that guard means a single value too large to carry;
+ *  the mirror resyncs rather than leave the client silently stale. */
+static void dcFlushPatch() {
+    if (dcHandle < 0) return;
+    if (dcDirtyKeys.empty() && !dcMirrorLost) return;
+
+    /* Cheap gate BEFORE building: if the DC send link has no room right now (a
+       slow or mid-teardown browser has back-pressured us up to the byte window),
+       pay for neither the tree build nor the cJSON_PrintUnformatted — which can
+       be a 128 KB Nomad page — on every 10 ms loop pass. A stuck browser would
+       otherwise pin the storage actor in repeated large prints, starving the
+       STORAGE_OP_PORT drain and the ping→pong reply enough to trip the browser's
+       2 s liveness check (flap) and back up every task's config write. The dirty
+       set keeps coalescing meanwhile; we retry once the browser drains or
+       reconnects (a reconnect re-dumps anyway). itsSpacesAvailable==0 means no
+       descriptor slot or the window is exhausted; a live browser draining
+       normally always reports the full maxMsg here. */
     if (itsSpacesAvailable(dcHandle) == 0) return;
 
-    char* text = cJSON_PrintUnformatted(dcPendingPatch);
-    if (!text) return;
+    /* The client has room again but we stopped tracking changes — nothing short
+     * of a fresh snapshot is honest about the current state. */
+    if (dcMirrorLost) {
+        dcMirrorLost = false;
+        dcDirtyKeys.clear();
+        dcDumpPending = true;
+        dcReloadMirroredStores();
+        return;
+    }
+
+    cJSON* patch = cJSON_CreateObject();
+    if (!patch) return;
+    char kleaf[96];   /* see navigatePath */
+    CFG_LOCK();
+    for (auto& k : dcDirtyKeys) {
+        cJSON* val = nullptr;
+        if (!dcResolveKey(k.c_str(), &val)) continue;
+        cJSON* parent = navigateOrCreate(patch, k.c_str(), kleaf, sizeof(kleaf));
+        if (!parent) { cJSON_Delete(val); continue; }
+        cJSON_DeleteItemFromObject(parent, kleaf);
+        cJSON_AddItemToObject(parent, kleaf, val);
+    }
+    CFG_UNLOCK();
+
+    if (!patch->child) { cJSON_Delete(patch); dcDirtyKeys.clear(); return; }
+
+    char* text = cJSON_PrintUnformatted(patch);
+    if (!text) { cJSON_Delete(patch); return; }
     size_t len = strlen(text);
 
     size_t dcPatchMax = itsSendBufSize(dcHandle);   /* the port's maxMsg guard */
 
-    /* Patch outgrew the per-message guard: drop and warn (now unreachable in
-       practice). Incremental UI state may become stale until the next change
-       forces a fresh patch; full re-dumps from the storage task would blow the
-       stack (cJSON_Duplicate of cfgRoot is deeply recursive). */
+    /* Patch outgrew the per-message guard (a single value that large — the
+       instance-reload collapse above already handles breadth). Drop it and
+       resync from a fresh dump rather than leave the client silently stale. */
     if (len > dcPatchMax) {
-        warn("storage: patch %u > %u, dropping (clients may need reload)\n",
-             (unsigned)len, (unsigned)dcPatchMax);
+        warn("storage: patch %u > %u, re-dumping\n", (unsigned)len, (unsigned)dcPatchMax);
         cJSON_free(text);
-        cJSON_Delete(dcPendingPatch);
-        dcPendingPatch = nullptr;
+        cJSON_Delete(patch);
+        dcDirtyKeys.clear();
+        dcDumpPending = true;
+        dcReloadMirroredStores();
         return;
     }
 
     /* Non-blocking packet send: require the whole body + 4-byte packet
-       header to fit. Retry next pass on back-pressure. */
+       header to fit. The dirty set is only cleared once the bytes are gone, so
+       back-pressure costs a rebuild next pass and never a lost change. */
     if (itsSpacesAvailable(dcHandle) < len) {
         cJSON_free(text);
+        cJSON_Delete(patch);
         return;
     }
     size_t sent = itsSend(dcHandle, text, len, 0);
     cJSON_free(text);
-    if (sent == len) {
-        cJSON_Delete(dcPendingPatch);
-        dcPendingPatch = nullptr;
-    }
+    cJSON_Delete(patch);
+    if (sent == len) dcDirtyKeys.clear();
 }
 
 /** True while a full dump is queued or mid-stream. Patches are held until it
@@ -3167,8 +3526,19 @@ static void dcPumpDump() {
     if (s_dumpBuilding.load(std::memory_order_acquire) &&
         s_dumpDone.load(std::memory_order_acquire)) {
         if (s_dumpBuildGen == s_dumpGen.load(std::memory_order_relaxed) && dcHandle >= 0) {
-            dcDumpQueue = std::move(s_dumpStaging);   /* adopt */
-            dcDumpPos = 0;
+            /* Adopt behind anything already queued — a reload can be enqueued
+             * while a dump is still building (a {"fetch"} on a fresh session),
+             * and assigning over the queue would swallow it. The two carry
+             * disjoint key spaces (cfgRoot vs a store instance), so which lands
+             * first does not matter; that neither is truncated does. */
+            if (dcDumpQueue.empty()) {
+                dcDumpQueue = std::move(s_dumpStaging);
+                dcDumpPos = 0;
+            } else {
+                dcDumpQueue.insert(dcDumpQueue.end(),
+                                   std::make_move_iterator(s_dumpStaging.begin()),
+                                   std::make_move_iterator(s_dumpStaging.end()));
+            }
             dcDumpPending = false;
         }                                             /* else: stale build — discard */
         s_dumpStaging.clear();
@@ -3297,10 +3667,9 @@ static void storageItsDisconnect(int ref) {
     dcDumpQueue.clear();
     dcDumpQueue.shrink_to_fit();
     dcDumpPos = 0;
-    if (dcPendingPatch) {
-        cJSON_Delete(dcPendingPatch);
-        dcPendingPatch = nullptr;
-    }
+    dcDirtyKeys.clear();
+    dcDirtyKeys.rehash(0);   /* return the backlog's RAM, not just its contents */
+    dcMirrorLost = false;
 }
 
 /* ---- Task function ---- */
@@ -3367,6 +3736,7 @@ static void storageTaskFn(void* arg) {
                                                poll and would read as a false stall */
         TickType_t timeout = dc_active ? pdMS_TO_TICKS(10) : portMAX_DELAY;
         int drained = 0;
+        slowOpsReset();
         while (itsPoll(timeout)) { timeout = 0; drained++; }
         int64_t t_poll = esp_timer_get_time();
         dcPollConfig();
@@ -3383,10 +3753,10 @@ static void storageTaskFn(void* arg) {
          * for the ones long enough to actually hurt. */
         if (dc_active && (t_end - it0) > ACTOR_STALL_WARN_US) {
             if ((t_end - it0) > ACTOR_STALL_LOUD_US)
-                warn("actor stall %lldms: applyPoll=%lld(ops=%d) cfgPoll=%lld dump=%lld patch=%lld\n",
+                warn("actor stall %lldms: applyPoll=%lld(ops=%d) cfgPoll=%lld dump=%lld patch=%lld%s\n",
                      (t_end - it0) / 1000, (t_poll - it0) / 1000, drained,
                      (t_cfg - t_poll) / 1000, (t_dump - t_cfg) / 1000,
-                     (t_end - t_dump) / 1000);
+                     (t_end - t_dump) / 1000, slowOpsReport().c_str());
             else
                 dbg("actor stall %lldms: applyPoll=%lld(ops=%d) cfgPoll=%lld dump=%lld patch=%lld\n",
                     (t_end - it0) / 1000, (t_poll - it0) / 1000, drained,

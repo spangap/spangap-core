@@ -120,22 +120,17 @@ void pmRecordDeepSleep(int64_t durationUs);
 void heapDump(const char* reason);
 
 /* ---- CPU / PM activity ring (1 Hz history for the on-device activity graph) ----
- * pmInit spawns a background sampler that records one sample per second. Each
- * holds integer-percent figures; apbMin (the 80 MHz APB-locked-but-not-boosted
- * residency) is derived by the reader as 100 - sleep - apbMax - cpuMax. */
-struct PmStatSample { uint8_t core0, core1, sleep, apbMax, cpuMax; };
-
-/** Add the -web CPU/PM history pre-fill responder. A consumer of the activity
- *  data over WebRTC (-web) calls this at init; a headless node has no use for it.
+ * A background sampler records one sample per second. Each holds integer-percent
+ * figures; apbMin (the 80 MHz APB-locked-but-not-boosted residency) is derived by
+ * the reader as 100 - sleep - apbMax - cpuMax.
  *
- *  It does NOT gate sampling. The 1 Hz sampler and its history ring are
- *  flag-driven on every build: they exist only while an Activity monitor is
- *  watching (sys.stats.web_actmon / .lcd_actmon set), and when the last watcher
- *  leaves the task terminates and the ring is freed; the next watcher respawns it
- *  with a fresh, zeroed ring. A headless node can therefore start sampling — and
- *  publishing the sys.stats.avg.* figures — by setting a flag by hand. Safe to
- *  call more than once. */
-void pmStatsRequest(void);
+ * The sampler and its ring are flag-driven on every build: they exist only while
+ * an Activity monitor is watching (sys.stats.web_actmon / .lcd_actmon set), and
+ * when the last watcher leaves the task terminates and the ring is freed; the next
+ * watcher respawns it with a fresh, zeroed ring. A headless node can therefore
+ * start sampling — and publishing the sys.stats.avg.* figures — by setting a flag
+ * by hand. */
+struct PmStatSample { uint8_t core0, core1, sleep, apbMax, cpuMax; };
 
 /** Register callbacks tied to the shared CPU/PM sampler.
  *  - tick fires once per second while the sampler runs (right after it records

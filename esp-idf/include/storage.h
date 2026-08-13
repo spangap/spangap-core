@@ -232,6 +232,47 @@ int    storageArrayCount(const char* prefix);
 
 void   storageForEach(const char* prefix, void (*cb)(const char* key, const char* val));
 
+/* ---- read-through providers ----
+ *
+ * A key namespace answered by a module instead of by the config tree. Use it
+ * when a module owns a structure too large, too volatile, or too
+ * lock-sensitive to mirror into storage: the reader asks for one key and the
+ * module answers it, instead of the module publishing everything ahead of
+ * time against the chance that someone asks.
+ *
+ * Provider namespaces live outside cfgRoot entirely, so they are never saved
+ * and never appear in a dump — a provider pages, it does not mirror.
+ *
+ * Contract on the provider: safe to call from any task, never blocks, never
+ * allocates on behalf of the caller. Keys reach it with the registered prefix
+ * already removed. */
+typedef struct {
+    bool (*get)    (const char* key, char* out, size_t outLen);
+    bool (*exists) (const char* key);
+    void (*forEach)(const char* prefix, void (*cb)(const char*, const char*));
+} storage_provider_t;
+
+/** Claim `prefix` (e.g. "rnsd.dir.") for `provider`. `provider` must have
+ *  static storage duration. Call once, during init. Returns false if the table
+ *  is full or an argument is missing. */
+bool storageRegisterProvider(const char* prefix, const storage_provider_t* provider);
+
+/** Hand a raw snapshot to the persist worker, which writes it to `path`
+ *  atomically (`<path>.new` + rename) and frees the buffer.
+ *
+ *  This exists for the task boundary, not for convenience: a flash write stalls
+ *  its task for as long as the program windows take, and the tasks that own
+ *  large in-RAM structures worth snapshotting (transport, radio) cannot afford
+ *  that. Snapshot on your own task — where the structure is consistent by
+ *  construction — then hand the bytes here.
+ *
+ *  `data` must come from gp_alloc/malloc; ownership transfers on success, and
+ *  the caller must not touch it afterwards. A second snapshot for the same path
+ *  supersedes an unwritten earlier one, so a debouncing caller cannot queue a
+ *  backlog. Parent directories are not created. Returns false (and does not
+ *  take ownership) only on a null argument. */
+bool   storagePersistBlob(const char* path, void* data, size_t len);
+
 /** Output function type for CLI output routing. */
 typedef void (*cli_write_fn)(const char* data, size_t len);
 

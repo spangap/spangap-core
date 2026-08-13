@@ -121,8 +121,6 @@ actual wake source with a long or infinite timeout, not a short poll.**
 - The **log task** ticks at **1 Hz** only to service `pmPollUsb()`; log fan-out
   is `xTaskNotifyGive`-driven (every `logVprintf` notifies), so delivery stays
   instant without a fast poll.
-- **cpuhist** blocks on `portMAX_DELAY` — the browser's connect posts an ITS
-  notification, so there's nothing to poll for.
 - The **LoRa task** reads the radio (a SPI `getIrqFlags`) only when a DIO1 IRQ
   actually fired, not on every task wake — otherwise SPI traffic tracks *wakes*
   rather than *packets*. See [iface-lora internals](../../iface-lora/INTERNALS.md).
