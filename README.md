@@ -15,7 +15,7 @@ with the function you need.
 
 | Function | Guide | What it is |
 |---|---|---|
-| **init** | [docs/init.md](docs/init.md) | Platform bring-up: the four-call boot sequence, the generated init dispatcher, boot barriers (`waitForTime`/`waitForFlag`), firmware identity. |
+| **init** | [docs/init.md](docs/init.md) | Platform bring-up: the four-call boot sequence, the generated init dispatcher, boot barriers (`waitForTime`/`waitForFlag`), the board check that halts a wrong-board image, firmware identity. |
 | **storage** | [docs/storage.md](docs/storage.md) | The in-memory cJSON config tree and its prefixes (`s.*`, `secrets.*`, bare, read-only `fw.*`, telemetry `sys.*`), browser sync, persistence, defaults. |
 | **fs** | [docs/fs.md](docs/fs.md) | DRAM-stack file-I/O workers for LittleFS + FAT/SD, the POSIX API, streaming, and the flash-or-SD state store. |
 | **its** | [docs/its.md](docs/its.md) | Inter-Task Streaming — the platform's only inter-task IPC: socket-style connections, ports, and aux messages between FreeRTOS tasks. |
@@ -68,6 +68,7 @@ header/source pair per module.
 | Memory | `mem.h` | `mem_new.cpp` (global `operator new`/`delete`) |
 | Compat / RTC RAM | `compat.h` | header-only (`millis`, `safeStrncpy`, `spawnTask`, fmt helpers) |
 | Shared SPI bus | `spi_helper.h` | `spi_helper.cpp` |
+| Board probe vocabulary | `detect_probe.h` | header-only (the board straddle writes its own `detect_hw()` against it) |
 | IDF heap-tracking bypass | — | `heap_track_stub.c` (`--wrap` no-ops) |
 
 ## What it does NOT own

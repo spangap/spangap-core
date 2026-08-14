@@ -32,6 +32,12 @@ void serviceRegister(Service* s, service_band_t band) {
 }
 
 void serviceRunStart(void) {
+    /* Before the first onStart, because this is the last moment the hardware is
+     * untouched. The board check probes buses itself, and a board's onStart is
+     * exactly what claims them (hw-lilygo-tdeck creates the shared I2C0 bus
+     * there) — so it goes first or it does not work at all. It never returns on
+     * a wrong board. */
+    spangapConfirmBoard();
     for (const entry_t& e : registry()) e.svc->onStart();
 }
 

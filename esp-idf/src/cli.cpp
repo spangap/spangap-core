@@ -4,6 +4,7 @@
 #include "cli.h"
 #include "auth.h"
 #include "fs.h"
+#include "spangap.h"   /* humanDetected — a keystroke is a person at the controls */
 #include "log.h"
 #include "its.h"
 #include "storage.h"
@@ -1459,6 +1460,10 @@ static void cliTaskFn(void* arg) {
       if (h < 0 || !itsConnected(h)) continue;
       size_t n = itsRecv(h, buf, sizeof(buf), 0);
       if (n == 0) continue;
+      /* Bytes on a console session are somebody typing — on serial, over the
+       * network, at the password prompt. Ahead of the auth gate deliberately:
+       * an attempt at the password is a person either way. */
+      humanDetected("console");
       cliActiveSlot = s;
       auto& cl = cliSlots[s];
       if (cl.loginRequired && !cl.authed) {
@@ -2037,13 +2042,30 @@ static void serialTaskFn(void* arg) {
         /* Enter is the one key that does not open a session — it is how a
          * session is left, so treating it as the first keystroke of a new one
          * would make leaving impossible. Say what the console is doing instead
-         * of swallowing the key, which reads as an unresponsive terminal. */
-        static const char hintCdc[] =
-            "\r\n" RESET "Spangap console on serial cdc 0. Start typing to enter CLI\r\n";
-        static const char hintJtag[] =
-            "\r\n" RESET "Spangap console on serial jtag. Start typing to enter CLI\r\n";
-        if (consoleOnCdc) serialEmit(hintCdc, sizeof(hintCdc) - 1);
-        else              serialEmit(hintJtag, sizeof(hintJtag) - 1);
+         * of swallowing the key, which reads as an unresponsive terminal.
+         *
+         * The hostname is in the line because Enter is what people press to find
+         * out which device they are talking to, and otherwise the only way to
+         * learn that is to open a CLI session and read it off the prompt. Same
+         * source as the prompt (cliPromptBuild), so the two never disagree. */
+        {
+          char host[48];
+          storageGetStr("s.net.hostname", host, sizeof(host), CONFIG_SPANGAP_FW_HOSTNAME);
+          if (!host[0]) safeStrncpy(host, CONFIG_SPANGAP_FW_HOSTNAME, sizeof(host));
+          char hint[160];
+          int n = snprintf(hint, sizeof hint,
+                           "\r\n" RESET "Spangap console on serial %s of '%s'. "
+                           "Start typing to enter CLI\r\n",
+                           consoleOnCdc ? "cdc 0" : "jtag", host);
+          if (n > 0) serialEmit(hint, (size_t)n < sizeof hint ? (size_t)n : sizeof hint - 1);
+        }
+        /* …and say who we are. A bare Enter is how something announces itself on
+         * the other end of the wire, and this is the one moment we know someone
+         * is listening — the boot log said all this already, to an empty room.
+         * Repeating it here is what lets a flasher identify the board without
+         * asking a question, without opening a CLI session, and above all
+         * without resetting the device to read it off the chip. */
+        spangapLogBuildIdentity();
         cliFlush();
         return;
       }

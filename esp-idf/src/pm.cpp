@@ -5,6 +5,7 @@
 #include "pm.h"
 #include "mem.h"
 #include "log.h"
+#include "spangap.h"   /* humanDetected — a USB host is a person with a cable */
 #include "cli.h"
 #include "storage.h"
 #include "compat.h"
@@ -396,6 +397,10 @@ void pmPollUsb() {
     downStreak = 0;
     lastRecoverMs = 0;
     if (!held) pmLockAcquire(usbLock);
+    /* A host enumerating on the USB console is someone at a desk with a cable
+     * in hand — not the unattended device the long holds are there to protect.
+     * Not during the boot grace window, which asserts nothing about a host. */
+    if (connected) humanDetected("usb");
     /* Rising edge after a real outage: the host is back (fresh plug-in or a
      * recovery that took). Log once here, not per 60 s retry. */
     if (connected && wasDown) { info("usb up\n"); wasDown = false; }

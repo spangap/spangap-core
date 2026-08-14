@@ -189,6 +189,37 @@ target_link_options(${COMPONENT_LIB} INTERFACE
     "-Wl,--wrap=heap_caps_update_per_task_info_free"
     "-Wl,--wrap=heap_caps_update_per_task_info_realloc")
 
+# Keep the board straddle's detect_hw() on the link line.
+#
+# spangapInit() calls it through a WEAK declaration, so a build with no board
+# straddle links a null and skips the check. But a weak UNDEFINED reference does
+# not extract an archive member: the board's detect.cpp compiles into
+# libhw-<board>.a, nothing else in the image references it, and the linker
+# leaves it there. The symbol then resolves to null on a board that defines it
+# perfectly well, and the check is inert while looking enforced — the worst
+# possible failure mode for a safety check.
+#
+# `-u` makes the linker want the symbol, which is what extracts the member —
+# and it is asked for ONLY when a board straddle is staged, because `-u` enters
+# a STRONG undefined symbol that overrides the weak reference: on the generic
+# image, which has nothing to define it, the link would fail outright rather
+# than resolve to null. A staged board component is the exact condition under
+# which a definition exists. Declared here rather than as WHOLE_ARCHIVE on each
+# board, so the platform states the requirement once and a board author only has
+# to define the function.
+#
+# Written as one comma-separated -Wl token on purpose: a LINK_OPTIONS entry
+# reaches the compiler driver as a SINGLE argument, so "-u detect_hw" arrives as
+# one token whose symbol name is " detect_hw" — no match, no extraction, and no
+# error either. This form hands the linker `-u` and `detect_hw` separately.
+idf_build_get_property(_all_comps BUILD_COMPONENTS)
+foreach(_c IN LISTS _all_comps)
+    if(_c MATCHES "(^|__)hw-")
+        idf_build_set_property(LINK_OPTIONS "-Wl,-u,detect_hw" APPEND)
+        break()
+    endif()
+endforeach()
+
 # `idf.py reallyclean` is registered as an idf.py Python action via the
 # consumer's idf_ext.py — NOT as a ninja custom target. ninja invocation
 # deadlocks with the script's build/ deletion (ninja keeps writing logs

@@ -33,6 +33,7 @@
 #include "log.h"
 #include "cli.h"
 #include "its.h"
+#include "spangap.h"   /* signalFlagIfWaited — flag waiters woken by any writer */
 #include "compat.h"
 #include "mem.h"
 
@@ -3722,9 +3723,12 @@ static void storageTaskFn(void* arg) {
     itsServerOnConnect(STORAGE_CONFIG_PORT, storageItsConnect);
     itsServerOnDisconnect(STORAGE_CONFIG_PORT, storageItsDisconnect);
 
-    /* Subscribe to all config changes for DC coalescing */
+    /* Subscribe to all config changes for DC coalescing, and to wake anything
+     * blocked in waitForFlag() on a key that was just written by a party with
+     * no signalFlag() to call — a browser patch, a CLI `set`. */
     storageSubscribeChanges("", ON_CHANGE {
         dcAccumulateChange(key, val);
+        signalFlagIfWaited(key);
     });
 
     info("ready\n");

@@ -43,7 +43,133 @@ extern "C" const char app_build_version[];
 extern "C" const char app_build_args[];
 extern "C" const char app_build_datetime[];
 extern "C" const char app_build_dist[];
+extern "C" const char app_build_catalogue[];
 extern "C" const char app_build_hw[];
+
+/* The staged board straddle's one self-assertion: its own `hw-<straddle>` string
+ * when the hardware under us is that board, NULL when it is not. Weak, so a
+ * build with no board straddle — the generic image — links a null here and the
+ * check below simply does not apply. See spangap-core/include/detect_probe.h. */
+extern "C" const char* detect_hw(void) __attribute__((weak));
+
+/* What detect_hw() answered this boot, for publishBuildTimes() to surface as
+ * sys.hw. The probe runs before storage exists, so the answer is held rather
+ * than published where it is found. Empty when no board straddle is staged. */
+static const char* s_detectedHw = "";
+
+/* Who this device is, in three lines, emitted whenever something might be
+ * listening.
+ *
+ *     build: hw hw-lilygo-tdeck
+ *     build: catalogue stable
+ *     build: datetime 20260814130700
+ *
+ * The board, the catalogue that published this image, and the stamp of that
+ * run — everything a flasher needs to decide whether it holds something newer,
+ * and everything a person reading a console needs to know what they are looking
+ * at.
+ *
+ * Printed at boot, and again whenever a console attaches (cli.cpp answers a bare
+ * Enter with it). That second call is the point of factoring this out: a boot
+ * happens once and almost nobody watches it, so a tool that opens the port five
+ * minutes later used to have to INTERROGATE the device for facts it had already
+ * announced to an empty room. Saying it again when someone shows up costs three
+ * lines and removes the need for a query channel entirely.
+ *
+ * One fact per line, each self-describing, because the reader is a line parser
+ * on the other side of a stream it does not control — it may join mid-line, and
+ * a line it does not recognise must cost it nothing.
+ *
+ * Lines are omitted rather than emitted empty when the fact does not exist: a
+ * generic image claims no board, and an image that did not come from a catalogue
+ * run has no catalogue and no stamp. Absent is the honest answer, and it is what
+ * tells a flasher to go and look for itself. */
+extern "C" void spangapLogBuildIdentity(void) {
+    if (s_detectedHw[0])        info("build: hw %s\n", s_detectedHw);
+    if (app_build_catalogue[0]) info("build: catalogue %s\n", app_build_catalogue);
+    if (app_build_datetime[0])  info("build: datetime %s\n", app_build_datetime);
+}
+
+/* Confirm the image is on the board it was built for, and halt if it is not.
+ *
+ * `app_build_hw` is the board straddle baked in at build time, as the
+ * `<org>/hw-<board>` the invocation named; detect_hw() is that same board
+ * straddle reading the hardware it is actually sitting on. When the two
+ * disagree, every pin map in this image describes some other board — the LoRa
+ * CS is someone's power enable, the display reset is someone's radio — so the
+ * only safe thing left to do is stop touching the hardware.
+ *
+ * Halting is this task blocking forever, awake. The device stops without going
+ * dark: the console peripheral stays powered, so the port stays enumerated and
+ * the verdict stays readable — which matters, because the message IS the whole
+ * value of stopping. A reboot loop would be worse than useless, re-driving the
+ * same wrong pins every few seconds forever on hardware nobody is watching, and
+ * deep sleep would take the explanation down with the port.
+ *
+ * Both halves must be present for the check to mean anything:
+ *   * No detect_hw (the generic image, which stages no board straddle) — there
+ *     is nothing to ask, and a generic image is by definition not claiming a
+ *     board.
+ *   * No app_build_hw (a build that named no board, or one that did not come
+ *     from `spangap build`) — there is no claim to check the answer against.
+ *
+ * WHERE THIS RUNS is load-bearing: serviceRunStart(), before the first
+ * onStart() — so before ANY straddle has touched the hardware. The probe opens
+ * an I2C bus and the SPI host itself, and a board's own onStart is exactly what
+ * takes those: hw-lilygo-tdeck creates the shared I2C0 bus there, so anything
+ * later than this fails with "I2C bus id(0) has already been acquired" and reads
+ * as a board it does not recognise. It does not need the board's bring-up
+ * either — a probe drives the power rail it needs itself.
+ *
+ * That is also before storage and the log task exist, so the verdict goes
+ * straight to the console through the native ESP-IDF logger, and the answer is
+ * held in s_detectedHw until publishBuildTimes() can surface it as sys.hw.
+ */
+extern "C" void spangapConfirmBoard(void) {
+    /* `app_build_hw` carries the org (`spangap/hw-lilygo-tdeck`); detect_hw()
+     * answers the bare straddle name. Compare on the part after the slash, which
+     * is the board — the org says who publishes the straddle, not what the
+     * hardware is. */
+    const char* claim = strrchr(app_build_hw, '/');
+    claim = claim ? claim + 1 : app_build_hw;
+
+    if (!detect_hw) {
+        /* No board straddle staged (the generic image) is the ordinary case and
+         * says nothing. A build that NAMES a board and still has no detect_hw
+         * is not: either the straddle does not define it, or it does and the
+         * linker did not extract the object holding it (see the `-u detect_hw`
+         * in spangap-core's CMakeLists). Both leave the weak symbol null and
+         * this check inert, and a safety check that looks enforced and is not is
+         * worse than none — so it is stated out loud. */
+        if (claim[0]) warn("no detect_hw for %s — cannot confirm this is the right board", claim);
+        return;
+    }
+    const char* found = detect_hw();
+    s_detectedHw = found ? found : "";
+
+    if (claim[0] == '\0') return;              // board-less build: nothing claimed
+
+    if (found && strcmp(found, claim) == 0) {
+        info("board confirmed: %s", found);
+        return;
+    }
+    err("WRONG BOARD: this image is built for %s, but the hardware reads as %s",
+        claim, found ? found : "no board this straddle knows");
+    err("halting — every pin map in this image belongs to a different board");
+    fflush(stdout);
+    /* Stop here, awake. Deep sleep would power down the console peripheral, so
+     * the port drops off the host in the same breath as the message explaining
+     * why — leaving someone holding a device that is simply dead, with the one
+     * line that would have told them why already gone. Blocking this task
+     * instead keeps the port enumerated and the verdict on screen for as long as
+     * the device is plugged in.
+     *
+     * Blocking forever is the point, not an oversight: nothing else has started
+     * yet (this runs ahead of the first onStart), so there is no state machine
+     * to return to and nothing else that could touch the wrong board's pins.
+     * Only a reset or a power cycle leaves this. */
+    for (;;) vTaskDelay(portMAX_DELAY);
+}
 
 namespace {
 
@@ -134,20 +260,25 @@ void publishBuildTimes() {
     storageSet("sys.build.version", app_build_version);
     storageSet("sys.build.args", app_build_args);
     storageSet("sys.build.datetime", app_build_datetime);
-    /* Which distribution this image is (the catalogue entry name) and which
-     * board it was built for. A flasher matches on the pair: same dist, newer
-     * datetime. Both are empty for a build that didn't come from a catalogue
-     * run, which is a distinct state rather than a missing value. */
+    /* Which distribution this image is (the catalogue entry name), which
+     * catalogue published it (`stable`, `dev`, …) and which board it was built
+     * for. A flasher matches on the set: same catalogue, same dist, newer
+     * datetime. All three are empty for a build that didn't come from a
+     * catalogue run, which is a distinct state rather than a missing value. */
     storageSet("sys.build.dist", app_build_dist);
+    storageSet("sys.build.catalogue", app_build_catalogue);
     storageSet("sys.build.hw", app_build_hw);
+    /* Which board this actually IS, as the staged straddle's own detect_hw()
+     * read it off the hardware at the top of this boot (confirmBoard). A device
+     * that is running has already proved the two agree — it would have halted
+     * otherwise — so this is the one key a tool can ask instead of probing the
+     * chip itself. Empty for the generic image, which stages no board straddle
+     * and so has nothing to read. */
+    storageSet("sys.hw", s_detectedHw);
     storageEnd();
     info("build: straddle %s v%s\n", app_build_straddle, app_build_version);
     info("build: invocation %s\n", app_build_args);
-    /* The catalogue build stamp, when this image is one — for a person reading
-     * the boot log. Tooling reads `show sys.build`, which carries this and the
-     * dist and board alongside it. */
-    if (app_build_datetime[0])
-        info("build: datetime %s\n", app_build_datetime);
+    spangapLogBuildIdentity();
 }
 
 /* What the mount made of the flash, as ephemeral `sys.flash.*`. A booted device
@@ -494,7 +625,44 @@ extern "C" void signalFlag(const char* key) {
     if (s_bootEvents) xEventGroupSetBits(s_bootEvents, flagBitFor(key));
 }
 
+extern "C" void signalFlagIfWaited(const char* key) {
+    /* Every storage change passes through here, so this must never register a
+     * bit: only a key some task is already blocked on has one, and the table is
+     * a handful of slots. A waiter registers its bit before it blocks, so a flag
+     * written from off-device after the wait began always finds it. */
+    if (!s_bootEvents) return;
+    EventBits_t bit = 0;
+    portENTER_CRITICAL(&s_flagMux);
+    for (int i = 0; i < s_flagCount; i++)
+        if (strcmp(s_flagKeys[i], key) == 0) { bit = (EventBits_t)1u << i; break; }
+    portEXIT_CRITICAL(&s_flagMux);
+    if (bit) xEventGroupSetBits(s_bootEvents, bit);
+}
+
 extern "C" void signalTimeValid(void) { signalFlag("sys.time.valid"); }
+
+/* Coalescing window for humanDetected(): a person types faster than any waiter
+ * needs to hear about, and each publish is a config write plus a browser patch. */
+#define HUMAN_PUBLISH_MIN_MS 30000
+
+extern "C" void humanDetected(const char* source) {
+    /* Plain statics, no lock: call sites are several tasks (console, screen,
+     * USB poll), and the worst a race can do is publish the same truth twice. */
+    static bool     s_announced   = false;
+    static uint32_t s_lastPublish = 0;
+    uint32_t now = millis();
+    if (s_announced && (now - s_lastPublish) < HUMAN_PUBLISH_MIN_MS) return;
+    s_lastPublish = now;
+    if (!s_announced) {
+        s_announced = true;
+        info("human detected (%s)\n", source ? source : "?");
+    }
+    storageBegin();
+    storageSet("sys.human_detected", 1);
+    storageSet("sys.human_last_s", (int)(now / 1000));
+    storageEnd();
+    signalFlag("sys.human_detected");
+}
 
 extern "C" bool waitForTime(int timeout_s) {
     /* Fast path: clock already known-valid (warm boot carrying an RTC time, or

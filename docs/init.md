@@ -49,7 +49,9 @@ phase purely by overriding that phase's virtual:
   `spangapInit()`. For board bring-up the platform itself depends on: powering a
   peripheral rail before the SD bus is touched, registering the display/touch HAL
   before the LCD straddle wants it. An `onStart` runs with **no** `info()`,
-  storage, `fs_*`, or ITS available — raw peripherals only.
+  storage, `fs_*`, or ITS available — raw peripherals only. `spangapConfirmBoard()`
+  runs at the very top of this walk, ahead of the first `onStart` (see [Board
+  identity](#board-identity)).
 
 - **`spangapInit()`** — brings up the core foundations only: filesystem mounts,
   the active state-store choice, the config tree, then the log / CLI / power /
@@ -104,12 +106,92 @@ Both hold a shared power-management no-deep-sleep lock for the duration (so a
 boot barrier can't latch the device into deep sleep mid-wait) and are safe from
 any task.
 
+A flag's publisher wakes its waiters with `signalFlag(key)` right after the
+`storageSet`. A flag written by someone with no such call to make — a browser
+config patch, a CLI `set` — wakes them too: the storage change dispatcher runs
+`signalFlagIfWaited(key)` on every change, which signals a key only if some task
+is already blocked on it. So any barrier flag is settable from off-device.
+
+### Human presence
+
+`humanDetected(source)` publishes `sys.human_detected = 1` (sticky for the boot)
+and stamps `sys.human_last_s` with the uptime seconds of the latest interaction,
+then signals the flag. Call it from anything that means a person is at the
+controls; core calls it for a keystroke on any console session and for a USB host
+enumerating on the console, spangap-lcd for a screen leaving standby, and the web
+UI writes the key over the config channel on the first click, key, scroll or
+touch in the tab.
+
+A hold that only exists to protect an *unattended* device waits on it:
+
+```cpp
+// Serve the floor, then drop the rest of the hold as soon as anyone shows up.
+waitForFlag("sys.human_detected", remaining_s);
+```
+
+The first call publishes and logs its `source`; later ones coalesce to at most
+one write per 30 s, so per-keystroke call sites are fine.
+
 A straddle that wants to defer activation until the `boot` script's
 customisations are in subscribes to the boot-complete signal instead of polling:
 
 ```cpp
 storageSubscribeChanges("sys.boot_complete", onBootComplete);
 ```
+
+## Board identity
+
+Which board the hardware **is**, checked against the board the image was built
+for, at the top of every boot:
+
+```
+serviceRunStart()
+  spangapConfirmBoard()      detect_hw() vs app_build_hw → sys.hw, or halt
+  onStart() … onStart()
+```
+
+`detect_hw()` is the staged board straddle's one self-assertion — it returns its
+own `hw-<straddle>` string when the hardware under it is that board and NULL when
+it is not, written in the vocabulary of
+[`detect_probe.h`](../esp-idf/include/detect_probe.h). spangap-core declares it
+**weak**, so the generic image (which stages no board straddle) links a null and
+the check does not apply; a build that names a board and still has no `detect_hw`
+warns, because a safety check that looks enforced and is not is worse than none.
+
+It runs **before the first `onStart()`** and that placement is the requirement,
+not a preference: the probe opens an I2C bus and the SPI host itself, and a
+board's own `onStart` is exactly what claims them (hw-lilygo-tdeck creates the
+shared I2C0 bus there). Anything later fails to open the bus and reads as a board
+nothing recognises. Nothing needs to be up first — a probe drives the power rail
+it needs.
+
+A mismatch **halts the chip awake**: the task blocks forever, so the console
+stays enumerated and the verdict stays readable. Every pin map in a wrong-board
+image belongs to someone else's hardware, so a reboot loop would re-drive those
+pins forever and deep sleep would take the explanation down with the port. Only a
+reset or a power cycle leaves that state.
+
+The confirmed answer is published as `sys.hw`, and **announced** rather than left
+to be queried — `spangapLogBuildIdentity()` prints it at boot and again whenever a
+console attaches (the CLI answers a bare Enter with it):
+
+```
+build: hw hw-lilygo-tdeck
+build: catalogue stable
+build: datetime 20260814130700
+```
+
+A line is omitted when its fact does not exist, so a generic image names no board
+and an image from outside a catalogue run carries no stamp — absent is the honest
+answer, and it is what tells a tool to go and look for itself. Saying it again to
+whoever turns up is what lets a flasher learn the board without a query channel
+and without resetting the device to probe the chip.
+
+Each board's anchor peripheral, and the rule that a probe which drives a rail
+releases it on failure, are in
+[flashmon's `docs/detect.md`](../../flashmon/docs/detect.md) — its standalone
+detector carries a hand-kept copy of every `detect_hw()`, for chips whose
+firmware is unknown or absent.
 
 ## Firmware identity
 
@@ -143,10 +225,13 @@ init owns the project-identity and boot/build telemetry keys.
 | `sys.time.valid` | `1` once a time source has synced (published by the time source; read by `waitForTime`). |
 | `sys.time.set` | Browser pushes epoch seconds here; the time source accepts it when the clock is invalid. |
 | `sys.going_down` | Set when the last power lock releases — cron acts on it to enter deep sleep (see [power-management](power-management.md)). |
+| `sys.human_detected` | `1` once somebody has interacted with the device this boot — console keystroke, USB host, screen wake, click in the web UI. Waited on by holds that only protect an unattended node. |
+| `sys.human_last_s` | Uptime seconds of the most recent such interaction (uptime, so it means something before the clock syncs). |
 | `sys.build_time` | Compact `a<app> f<fixed> w<web>` build-epoch summary. |
 | `sys.buildtime.{app,fixed,web}` | Build epochs: firmware link time, `fixed` source mtime, webroot CRC32. |
 | `sys.build.{straddle,version,args}` | The `spangap build` invocation identity (build straddle, version, full argument string). |
-| `sys.build.{datetime,dist,hw}` | Catalogue identity: the run stamp this image was published under, the catalogue entry's name, and the board straddle it was built for. All empty for a build that did not come from a catalogue run. |
+| `sys.build.{datetime,dist,catalogue,hw}` | Catalogue identity: the run stamp this image was published under, the catalogue entry's name, the catalogue that published it, and the board straddle it was built for. All empty for a build that did not come from a catalogue run. |
+| `sys.hw` | Which board this **is**, as `hw-<straddle>`, read off the hardware by the staged board straddle's `detect_hw()` (see [Board identity](#board-identity)). Empty for the generic image. |
 | `sys.flash.{size,floor,state_start,state_size}` | What the mount made of the flash: real chip size, firmware floor, and the `/state` geometry that resulted (see [fs](fs.md)). |
 
 `CONFIG_SPANGAP_SDCARD` gates whether `spangapInit()` mounts an SD card during

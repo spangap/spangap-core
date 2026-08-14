@@ -123,6 +123,40 @@ void spangapWatchSafeModeFlags(void);
  *  itself — no explicit vTaskDelete needed. */
 void spangapPostAppInit(void);
 
+/** Confirm this image is on the board it was built for, and halt the chip if it
+ *  is not — the staged board straddle's detect_hw() read against the board baked
+ *  into the image. A mismatch stops the device where it stands — this task
+ *  blocks forever, awake, so the console stays enumerated and the reason stays
+ *  readable — because every pin map in a wrong-board image belongs to someone
+ *  else's hardware. Only a reset or a power cycle leaves that state.
+ *
+ *  Called by serviceRunStart(), BEFORE the first onStart(). That is the whole
+ *  requirement: the probe opens an I2C bus and the SPI host itself, and a
+ *  board's own onStart is what takes them — anything later loses the bus and
+ *  reads as an unrecognised board. Nothing needs to have been brought up first;
+ *  a probe drives the power rail it needs. */
+void spangapConfirmBoard(void);
+
+/** Say who this device is, on whatever console is attached:
+ *
+ *      build: hw hw-lilygo-tdeck
+ *      build: catalogue stable
+ *      build: datetime 20260814130700
+ *
+ *  The board (as the staged board straddle read it off the hardware this boot),
+ *  the catalogue the image was published from, and the stamp of that run. A line
+ *  is omitted when its fact does not exist — a generic image claims no board, an
+ *  image from outside a catalogue run has no catalogue and no stamp — because
+ *  absent is the honest answer and it is what tells a tool to go and look for
+ *  itself.
+ *
+ *  Called at boot, and again by the console whenever one attaches (a bare Enter
+ *  is answered with it). A boot happens once and is almost never watched, so a
+ *  device that only announced itself then forced every tool to interrogate it
+ *  afterwards for facts it had already stated; saying it again when someone
+ *  shows up is what makes that query channel unnecessary. */
+void spangapLogBuildIdentity(void);
+
 /** Block the calling task until the platform clock is known-valid — the storage
  *  key `sys.time.valid` flips to 1 when a time source syncs (SNTP in
  *  spangap-net, GPS/RTC in hw-lilygo-tdeck) — or until `timeout_s` elapses, whichever
@@ -157,6 +191,32 @@ void signalFlag(const char* key);
  *  (clock valid, network up if configured, minimum settle elapsed). Safe from
  *  any task; holds a shared PM no-deep-sleep lock for the wait. */
 bool waitForFlag(const char* key, int timeout_s);
+
+/** Wake every waitForFlag(key, …) blocked on a flag that was just written by
+ *  someone who never called signalFlag() — a browser config patch, a CLI `set`.
+ *  Lookup-only: a key nobody is waiting on is ignored rather than claiming one
+ *  of the few flag slots. Called by the storage change dispatcher for every
+ *  change, so any flag becomes settable from off-device without its waiter
+ *  falling back to the timeout. */
+void signalFlagIfWaited(const char* key);
+
+/** Report that a person is interacting with this device — a keystroke on a
+ *  console, a screen woken by a touch, a click in the browser UI. Publishes the
+ *  ephemeral flag `sys.human_detected` = 1 (sticky for the boot) and stamps
+ *  `sys.human_last_s` with the uptime seconds of the most recent interaction
+ *  (uptime, not wall clock, so it is meaningful before the clock syncs), then
+ *  signals the flag.
+ *
+ *  Long holds that only exist to protect an unattended device — a startup
+ *  quiet period, a slow retry ladder — wait on the flag with
+ *  waitForFlag("sys.human_detected", …) and cut themselves short the moment
+ *  somebody is at the controls. The browser writes the same key over the config
+ *  channel, which reaches waiters through the storage change dispatcher.
+ *
+ *  Cheap enough for per-keystroke call sites: the first call publishes and logs
+ *  the source, later ones coalesce to at most one write per 30 s. Any task, not
+ *  from an ISR. `source` is a short static tag naming the input, for the log. */
+void humanDetected(const char* source);
 
 #ifdef __cplusplus
 }

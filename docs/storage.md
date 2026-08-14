@@ -150,6 +150,8 @@ modules subscribe to react to them.
 | `sys.build.straddle` / `.version` / `.args` | `publishBuildTimes` | The `spangap build` invocation identity (straddle name, version, flags). |
 | `sys.build.datetime` | `publishBuildTimes` | The catalogue run stamp `YYYYMMDDhhmmss` this image was published under. Empty when the image did not come from a catalogue run — a distinct state, not a missing value, since there is then nothing to compare it against. |
 | `sys.build.dist` | `publishBuildTimes` | Which distribution this image is: the catalogue entry's name, free-format. Separate from `datetime` because the two answer different questions — *which* image this is, versus whether something newer exists. Empty outside a catalogue build. |
+| `sys.build.catalogue` | `publishBuildTimes` | Which catalogue published this image — the directory name `spangap make-builds` ran in (`stable`, `dev`, a personal one). The channel, one level above `dist`: two catalogues share a stamp series but not a meaning, so a comparison against `datetime` only means something within one of them. Empty outside a catalogue build. |
+| `sys.hw` | `publishBuildTimes` | Which board this **is**, as `hw-<straddle>` — the staged board straddle's own `detect_hw()` reading the hardware at the top of this boot. A running device has already proved this equals `sys.build.hw`: `confirmBoard()` halts the chip when they disagree, so the two cannot be seen apart. The device also *announces* it — `spangapLogBuildIdentity()` prints `build: hw <board>` at boot and again whenever a console attaches — so a tool learns the board without querying anything, and without resetting the device to probe the chip. Empty for the generic image, which stages no board straddle. |
 | `sys.build.hw` | `publishBuildTimes` | The board straddle the image was built for, as `<org>/hw-<board>`, extracted from the invocation at build time. Empty for a board-less (generic) build. |
 | `sys.buildtime.app` | `publishBuildTimes` | Firmware (app) build epoch. |
 | `sys.buildtime.fixed` | `publishBuildTimes` | `/fixed` image source mtime. |
@@ -158,6 +160,7 @@ modules subscribe to react to them.
 | `sys.flash.floor` | `publishFlashGeometry` | Top of the on-flash partition table: the minimum chip size this image needs. |
 | `sys.flash.state_start` / `.state_size` | `publishFlashGeometry` | Where `/state` begins (the floor, 4K-aligned) and how big it is. `state_size` is `0` when no `/state` could be registered. |
 | `sys.going_down` | `pm.cpp` | Set to `1` ahead of sleep/shutdown so subscribers can flush. |
+| `sys.human_detected` / `.human_last_s` | `humanDetected()` | A person is at the controls: sticky `1` for the boot, plus the uptime seconds of the latest interaction. Also written by the browser on first interaction in the tab. See [init](init.md). |
 | `sys.usb.serial_ports` | `usb_ports.cpp` | How many serial ports the console presents right now — `1` on USB-Serial-JTAG, `2` on `usb cdc`. A serial-port claimant subscribes to re-apply a port-1 claim across a transport switch ([usb-console](usb-console.md)). |
 | `sys.time.valid` | spangap-net (NTP) | `1` once system time is sane (≥ 2025). |
 | `sys.time.set` | browser | Browser pushes epoch seconds here; NTP adopts it if time is invalid, then clears it to `0`. |
