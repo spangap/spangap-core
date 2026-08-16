@@ -33,3 +33,16 @@ platforms: [idf]
 init:
   - call: storageInit
   - call: cronInit
+# Two top-level Settings menus, named and ordered here and left empty. No node
+# is owned, so this is not a claim on them: it is the platform stating what the
+# main menus are called and what order they come in, once, at the bottom of
+# every dependency tree — and an empty menu does not render, so a build where
+# nothing contributes to one simply does not show it. Apps is where a straddle
+# shipping an on-device program puts that program's settings, one sub-menu per
+# program; System holds the device-wide ones — the board's own hardware and
+# display rows, hostname and time from spangap-net, backup and reset from
+# spangap-web — as sections of one page rather than sub-menus, because none of
+# them is a thing you launch.
+settings:
+  - at: [ { id: apps,   label: "Apps",   order: 20 } ]
+  - at: [ { id: system, label: "System", short: "System", order: 30 } ]

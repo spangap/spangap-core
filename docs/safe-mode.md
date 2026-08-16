@@ -38,9 +38,13 @@ newline, exactly like the two lines at the top of `spangapInit()`. Nothing here
 `printf`s to the console directly.
 
 Setting any of them on a running system **saves and reboots at once** — the write
-is the request. That is what makes the CLI, the browser's Settings → System
-buttons, an rnsh session and a `/state/boot` line all one mechanism: no new
-transport, no new credential, no endpoint.
+is the request. That is what makes the CLI, the Settings → System buttons, an
+rnsh session and a `/state/boot` line all one mechanism: no new transport, no new
+credential, no endpoint. Backup and restore carry `when_surface: web` in
+spangap-web's `settings:` block, so their two buttons are browser-only — the
+archive moves between the device and the machine that pressed the button, and a
+display has nobody on the other end of that. Factory reset asks for no file and
+sits on both surfaces.
 
 There are two roads to that reboot, and the difference matters when one of them
 misbehaves. The CLI verbs `backup`, `restore` and `reset factory [flash|sd|both]`
