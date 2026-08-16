@@ -22,7 +22,7 @@ extern "C" void app_main() {
     spangapInit();                 // core foundations (fs, storage, log, cli, pm, auth)
     spangapSettingsGenDefaults();  // declarative settings: seed storage defaults
     serviceRunInit();              // onInit walk: every service, with the ecosystem up
-    spangapSettingsGenRegister();  // declarative settings: register LCD panes (if spangap-lcd staged)
+    spangapSettingsGenRegister();  // declarative settings: contribute the LCD tree (if spangap-lcd staged)
     spangapPostAppInit();          // finalise: boot script, sys.boot_complete, first cron poll
 }
 ```
