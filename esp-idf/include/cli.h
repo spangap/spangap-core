@@ -185,6 +185,14 @@ void consoleFlush(void);
  *  log output, and which the CLI session itself cannot outlive. */
 void cliSerialResumeLog(void);
 
+/** The same, but before this call returns rather than after the command does.
+ *  For a command that restarts the device: the deferred form is acted on by the
+ *  CLI task once the command returns, and `reboot` / `reset factory` never do —
+ *  so the session ends by the chip going away, leaving the host terminal in
+ *  whatever colour the CLI set and the entire boot log that follows wearing it.
+ *  Call it before esp_restart(). */
+void cliSerialResumeLogNow(void);
+
 /** Wake the CLI task. For producers that queue work the CLI task must drain but
  *  whose delivery carries no ITS notification of its own — currently cron, which
  *  writes commands into a raw stream buffer. Safe from any task; a no-op before

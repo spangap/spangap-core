@@ -77,7 +77,7 @@ than one key is set it takes `factory_reset` > `restore` > `backup` and says so.
 
 `serviceRegister()` carries a **band** (`service_band_t`, [service.h]
 (../esp-idf/include/service.h)) that the generator already knows from
-`init_order()`: core, net and web register `SERVICE_BAND_SAFE`, lcd and every
+`init_order()`: core, net, web and lcd register `SERVICE_BAND_SAFE`, every
 straddle `SERVICE_BAND_FULL`. Safe mode runs the SAFE band only. No per-service
 virtual, no per-straddle opt-in, no default for a future straddle to get wrong —
 one argument on the registration and one `if` in the walk.
@@ -87,7 +87,7 @@ one argument on the registration and one `if` in the walk.
 | `serviceRunStart()` | unchanged — board HAL, bare hardware |
 | `spangapInit()` | unchanged — fs mounts, state-store choice, `storageLoad`, log, CLI, pm, auth — except the eager `cronWakeupHandler()`, skipped |
 | `spangapSettingsGenDefaults()` | skipped |
-| `serviceRunInit()` | the SAFE band: storage, net, web. **cron** and **webrtc** additionally skip themselves |
+| `serviceRunInit()` | the SAFE band: storage, net, web, lcd. **cron** and **webrtc** additionally skip themselves; **net keeps the radio down in a factory reset** |
 | `spangapSettingsGenRegister()` | skipped |
 | `spangapPostAppInit()` | boot script and first cron poll skipped; `sys.boot_complete` still published |
 
@@ -99,9 +99,37 @@ Three things opt out inside the band. **cron** does not start: firing scheduled
 commands in a recovery mode is wrong, and one of them may be the thing being
 restored away. **webrtc** does not start: its storage DataChannel is a config
 write path into a store that is about to be replaced, and the SPA it exists to
-serve is not what safe mode serves. **lcd** is a band below, so a T-Deck goes
-dark — bringing the screen up would add a hardware-verification dependency for a
-mode the operator drives from a browser anyway.
+serve is not what safe mode serves. **net keeps the radio down in a factory
+reset** — see below.
+
+**The screen comes up.** A board with a panel brings the shell up as usual and
+spangap-lcd covers it with what this boot is doing
+([safe_screen.cpp](../../spangap-lcd/esp-idf/src/lcd_ui/safe_screen.cpp)):
+`WIPING FLASH` in the largest type the panel takes, over a progress bar, with
+`Do not power off`; `BACKING UP` / `RESTORING` for the other two. The layer is
+opaque and clickable on `lv_layer_top`, so the shell behind it is never
+reachable. It reads one ephemeral key and draws — it touches no store, which is
+what makes it safe in the one boot whose whole purpose is that nothing else
+touches the store.
+
+The bar advances in steps, not smoothly: an SPI-flash erase disables the flash
+cache, so every task running from flash is stopped for the length of each erase
+op and runs again between them. A bar that moves at all is the answer to "is it
+stuck?", and a smooth one is not available at any price here.
+
+### The radio stays down in a factory reset
+
+A factory-reset boot exists to erase the store and restart. Everything a radio
+would be for — joining the network this device is configured for, standing its AP
+up, answering for a hostname — describes a device that is about to stop existing,
+so `netInit` leaves `rtcWantUp` false for that mode. The stack still comes up (the
+console, the log and the socket relay ride it); only the radio does not.
+
+Backup and restore are the other way round and keep it: those modes are *reached*
+over the network. This is also the one thing a factory reset trades away — the
+served estimate page below has nobody to serve on a headless node — which is the
+price of the panel report above and of not putting a device that is being erased
+back on the air to do it.
 
 ## What is suppressed
 
@@ -153,7 +181,7 @@ doing about it.
 |---|---|---|
 | `BACKUP` | "Stand by as your data is gathered and sent to your browser as `<name>`", then fetches and saves it | "You should have the file in your download folder now. Rebooting back to normal operation", then hands back |
 | `RESTORE` | "Select or drop file to upload"; picking one reveals the red **DELETE state and restore from this file.** button, which uploads via `fetch('/backup/' + name, {method:'POST', body: file})` | "Restored N entries", a hostname warning, then hands back |
-| `FACTORY_RESET` | a client-side bar over a served estimate | "the device has restarted as a new one" — no hand-back |
+| `FACTORY_RESET` | nothing is served: the radio is down for this boot (above). A board with a panel reports there — `WIPING FLASH` over a real progress bar; a headless one reports on the console | the device restarts as a new one — no hand-back |
 
 The backup page is served **with the archive's name already in it**, and the
 name is computed once per boot: the operator is told the filename before there
@@ -213,9 +241,10 @@ already-dead transfers. A power-management lock is held for the window so nothin
 deep-sleeps mid-transfer.
 
 **A factory reset ignores all of this and starts at boot regardless of any
-client** — `spangapPostAppInit()` kicks it off, so it works on a headless or
-LoRa-only node reached over rnsh, and it still happens if net or web failed to
-come up at all.
+client** — `spangapPostAppInit()` kicks it off, so it happens on a headless node,
+and it happens with the radio deliberately down and nothing served. There is
+nobody to wait for: the operator asked for it on the boot before this one, and
+this boot's only job is to carry it out.
 
 ---
 
@@ -469,20 +498,28 @@ overwrite is real there and pointless here.
   runs on a DRAM-stack worker: a flash program disables the PSRAM cache, so
   reading the source out of PSRAM mid-write faults.
 - Per block: `esp_flash_erase_region` then `esp_flash_write` of a DRAM-resident
-  buffer refreshed from `esp_fill_random()`. WiFi is up in safe mode, so the
-  hardware RNG is properly seeded.
+  buffer refreshed from `esp_fill_random()`. The radio is down for this boot, so
+  that RNG is running on its non-RF entropy — which does not matter here: what
+  makes the wipe safe is that every byte is overwritten, not that the bytes are
+  unpredictable. A perfectly guessable pattern recovers nothing of what was
+  there. Do not reuse this buffer for anything that needs real randomness.
 - Never round the region's start down — that clobbers the firmware table.
 - Feed the task watchdog between blocks.
 
 ### Timing
 
-`FS_WIPE_MS_PER_MB` in [`fs.h`](../esp-idf/include/fs.h) is what the served
-progress estimate is computed from. The starting value is a datasheet-typical
+`FS_WIPE_MS_PER_MB` in [`fs.h`](../esp-idf/include/fs.h) is what
+spangap-web's `factoryPage()` estimate is computed from. It is a datasheet-typical
 figure for the W25Q/GD25Q-class parts these boards carry — erase plus random
 overwrite at roughly 4.5–5 s/MB, so about a minute for a 12 MB region.
-**Measure on hardware and correct it**: a minute of unexplained silence reads as
-a crash, so the estimate-driven bar is not optional, and the bar is only as
-honest as that constant.
+
+That page is now unreachable during the operation it describes: the radio is down
+for a factory-reset boot (above), so nothing connects to be served it. It is left
+in place rather than deleted — it costs nothing, and it is what a build that
+brings the radio back up would serve. **The reports that do reach an operator are
+the panel's bar and the console's `factory reset: N%`, and both are real
+progress** (`sys.wipe.percent`, published per block from bytes actually written),
+not an estimate — so neither depends on that constant being right.
 
 ---
 
@@ -543,4 +580,4 @@ is a few hundred KB, so extraction is 1–3 s and the upload dominates.
 | A size-fit precheck on the filename's `<x>kB` | `ENOSPC` mid-extraction lands in the same clean-factory path. |
 | A factory-reset progress endpoint | A client-side bar over a served estimate says the same thing with no endpoint and no polling through a janky mid-wipe HTTP stack. |
 | A progress-extended deadline | One fixed 10-minute timer covers every live transfer; extension plumbing serves only dead ones. |
-| LCD in the safe-mode band | A hardware dependency to verify, for a screen the operator is not looking at. Revisit if dark-screen recovery matters. |
+| A factory-reset progress key polled by the browser | `sys.wipe.percent` exists for the panel, which is on the same chip as the writer. Feeding it back out to a client would rebuild the endpoint rejected above, through the same mid-wipe HTTP stack, for a page the radio is now down for anyway. |

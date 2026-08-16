@@ -275,3 +275,11 @@ Missing file is silently fine. `run <file>` shares the same `cliRunFile`.
   belongs to a session; the log-mode idle branch clears it, or a call made with
   no session open (as `switchConsole` does) ends the *next* session the moment it
   opens.
+- **A command that restarts the device must call `cliSerialResumeLogNow()`.** The
+  latch above is read by the CLI task once the command returns, and `reboot` /
+  `reset factory` / a safe-mode flag write never return — so the session would end
+  by the chip going away, and every line of the boot log that follows arrives in
+  the colour the CLI session was using. The `Now` form writes the same reset and
+  banner the trailing-`;` path writes and flushes them first; it is a no-op when
+  no serial session is open, which is why the safe-mode flag watcher can call it
+  unconditionally for a request that came from the browser.

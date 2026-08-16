@@ -200,6 +200,13 @@ switch needs (write past both the CLI session and the log, push the hardware TX
 FIFO, and hand the serial console back to the live log the way a trailing `;`
 does).
 
+`cliSerialResumeLogNow()` is the same hand-back, done **before the call returns**
+rather than after the command does. A command that restarts the device (`reboot`,
+`reset factory`, anything writing a safe-mode flag) never returns, so the deferred
+form is never acted on: the session ends by the chip going away, leaving the host
+terminal in whatever colour the CLI set and the whole boot log that follows
+wearing it. Call it before `esp_restart()`.
+
 ## Owned storage keys
 
 | Key | Default | Meaning |

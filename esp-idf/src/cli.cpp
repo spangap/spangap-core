@@ -1379,6 +1379,7 @@ static void cliHandleLoginInput(cli_slot_t& cl, const char* buf, size_t n) {
 static TaskHandle_t cliTaskHandle = NULL;
 
 static void serialEmit(const char* p, size_t n);   /* defined with the serial task */
+static void cliEmitLogResumeGap();                 /* likewise */
 
 void consoleWriteRaw(const char* data, size_t len) {
   serialEmit(data, len);
@@ -1393,6 +1394,19 @@ void consoleFlush(void) {
 
 void cliSerialResumeLog(void) {
   cliUsbSerialAutoResumeLog = true;
+}
+
+void cliSerialResumeLogNow(void) {
+  if (!serialInCli) return;
+  /* The deferred flag above is read by the CLI task after the command returns.
+   * A command that restarts the device never returns, so the session would end
+   * by the chip going away underneath it — leaving the terminal in whatever
+   * colour the CLI had set, which the whole boot log that follows then inherits.
+   * Ending it here writes the same reset and the same banner the trailing-';'
+   * path writes, and flushes them before the caller pulls the floor out. */
+  if (cliOut) cliReturnToLog(cliOut);
+  cliEmitLogResumeGap();
+  serialInCli = false;
 }
 
 void cliWake() {

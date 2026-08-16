@@ -25,6 +25,10 @@ static void cmdReboot(const char* a) {
     if (cliWantsHelp(a)) { cliPrintf("%-*s restart device\n", CLI_HELP_COL, "reboot"); return; }
     storageSave();  /* flush pending settings before reboot */
     cliPrintf("rebooting...\n");
+    /* Hand the console back to the log before the chip goes: the session cannot
+     * end itself across a restart, and everything the boot prints would come up
+     * wearing the CLI's colour. */
+    cliSerialResumeLogNow();
     fflush(stdout);
     delay(100);
     esp_restart();
@@ -39,6 +43,10 @@ static void cmdReboot(const char* a) {
  * moving part than a command that is already running on a task that can simply
  * do it. Here we are that task: set, flush, restart. */
 [[noreturn]] static void enterSafeMode(const char* key, int value) {
+    /* Same as `reboot`: the safe-mode boot's own output — the wipe's progress
+     * among it — must not arrive in the colour of the session that asked for
+     * it, and that session ends here or not at all. */
+    cliSerialResumeLogNow();
     fflush(stdout);
     storageSet(key, value);
     storageSave();          /* the flag must be on disk before the restart */

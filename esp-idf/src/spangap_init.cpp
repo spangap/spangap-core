@@ -395,6 +395,12 @@ void factoryResetTask(void*) {
              * silence on the console. */
             static uint32_t lastPct = 0;
             uint32_t pct = total ? done * 100 / total : 100;
+            /* Published every callback, not every tenth: this is what a screen
+             * draws a progress bar from, and a bar that moves in ten steps is a
+             * worse answer to "is it stuck?" than one that moves. Ephemeral
+             * (bare `sys.` prefix), so it is an in-RAM write — nothing reaches
+             * the partition being erased, and flushing has already stopped. */
+            storageSet("sys.wipe.percent", (int)pct);
             if (pct >= lastPct + 10 || pct == 100) {
                 lastPct = pct - (pct % 10);
                 info("factory reset: %u%%\n", (unsigned)pct);
@@ -432,6 +438,10 @@ extern "C" void spangapWatchSafeModeFlags(void) {
             strcmp(key, SAFE_KEY_RESTORE) != 0 &&
             strcmp(key, SAFE_KEY_FACTORY) != 0) return;
         info("%s=%s — rebooting into safe mode\n", key, val);
+        /* A console CLI session may be open even though this request came from
+         * somewhere else — end it here, or the safe-mode boot's output arrives
+         * in the colour that session was using. A no-op when there is none. */
+        cliSerialResumeLogNow();
         storageSave();
         delay(200);
         esp_restart();
