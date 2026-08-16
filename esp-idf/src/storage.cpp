@@ -965,7 +965,11 @@ static void startSaveTimer() {
 
 /* ---- Config change subscriptions ---- */
 
-#define STORAGE_MAX_SUBS     128
+/* Sized for the whole-kitchen-sink build: a full mesh + IP + LCD image registers
+ * ~135 subscriptions before the settings UI binds a single row, so the table has
+ * to clear that with room for the per-widget binds a settings page adds. One row
+ * is ~32 B, so the headroom is a few KB of DRAM. */
+#define STORAGE_MAX_SUBS     256
 /* STORAGE_CHANGE_PORT in storage.h */
 
 struct storage_sub_t {
@@ -1052,8 +1056,38 @@ static op_accum_t* accumFindOrCreate(TaskHandle_t t) {
 }
 
 /* ---- subscription table mutation (storage-task-owned; under CFG_LOCK) ---- */
+
+/* Vacate row i by swapping the last row down over it, then release what the
+ * vacated tail slot holds — a swapped-out std::string keeps its heap buffer
+ * otherwise, so the table would hoard one allocation per scope it has ever
+ * carried. Row i now holds what was the last row, so a caller scanning forward
+ * must re-examine i rather than advance past it. */
+static void subDrop(int i) {
+  if (i != subCount - 1) subs[i] = subs[subCount - 1];
+  subCount--;
+  subs[subCount].task = nullptr;
+  subs[subCount].cb   = nullptr;
+  std::string().swap(subs[subCount].scope);
+}
+
+/* Reclaim every row whose owner task is gone (handle nulled by
+ * storageOnTaskDeath, which may not free anything itself). Runs on the storage
+ * task, so freeing the scope string here is safe. Called before every append,
+ * which is what makes a dead owner's slot free capacity instead of a permanent
+ * hole: without it a task that subscribes, dies and is respawned — an lcd page
+ * task, a per-connection worker, anything subscribing from main_task before
+ * app_main returns — burns a slot per generation until the table fills and
+ * whichever module inits last silently loses all of its subscriptions. */
+static void subReap() {
+  for (int i = 0; i < subCount; ) {
+    if (!subs[i].task) subDrop(i);
+    else i++;
+  }
+}
+
 static void subAdd(TaskHandle_t task, storage_change_cb_t cb, const char* scope) {
   const char* sc = scope ? scope : "";
+  subReap();   /* the table holds live owners only */
   /* Idempotent: re-subscribing the same (task, scope, cb) is a no-op, not a new
    * row. A captureless ON_CHANGE lambda has a stable function pointer per site,
    * so this triple identifies one subscription exactly. Without this, any caller
@@ -1061,10 +1095,20 @@ static void subAdd(TaskHandle_t task, storage_change_cb_t cb, const char* scope)
    * after eviction, a handler re-entered on wake — appends a duplicate every
    * time until the table fills and real subscriptions are silently dropped
    * ("subscription table full"). Generalises the hand-rolled !have guard in
-   * lcd_settings.cpp so no caller has to remember it. */
+   * lcd_settings.cpp so no caller has to remember it. Reaping first is what
+   * keeps this exact: a dead row's handle is null, so it can never match a live
+   * task — but a respawned task can be handed the freed TCB's address, and the
+   * row it would have matched is gone by here. */
   for (int i = 0; i < subCount; i++)
     if (subs[i].task == task && subs[i].cb == cb && subs[i].scope == sc) return;
-  if (subCount >= STORAGE_MAX_SUBS) { warn("storage: subscription table full\n"); return; }
+  if (subCount >= STORAGE_MAX_SUBS) {
+    /* Name the scope and the count: a dropped subscription is otherwise
+     * indistinguishable from a module that never subscribed at all — the
+     * feature is simply inert for the rest of the boot. */
+    warn("storage: subscription table full (%d/%d) — dropped \"%s\"\n",
+         subCount, STORAGE_MAX_SUBS, sc);
+    return;
+  }
   subs[subCount].task = task; subs[subCount].cb = cb; subs[subCount].scope = sc;
   subCount++;
 }
@@ -1073,7 +1117,7 @@ static void subRemove(TaskHandle_t task, storage_change_cb_t cb, const char* sco
     bool match = subs[i].task == task &&
                  (scope == nullptr || subs[i].scope == scope) &&
                  (cb == nullptr || subs[i].cb == cb);
-    if (match) subs[i] = subs[--subCount];   /* swap-with-last; scope is a std::string move */
+    if (match) subDrop(i);
     else i++;
   }
 }
@@ -1084,8 +1128,9 @@ static void subRemove(TaskHandle_t task, storage_change_cb_t cb, const char* sco
  * owner handle of any subscription on the dead task so notifyChange stops trying
  * to deliver to a freed TCB: a notify into a dead handle is a UAF, and reading
  * its name for the warn() reads freed memory ("notify drop → [garbage]"). The
- * slot + its scope string stay allocated but inert (compacted by a later matching
- * subRemove), mirroring the ITS s_tasks table's append-only discipline. Canonical
+ * null handle is the only thing this hook may do: freeing the row's scope string
+ * here would allocate inside a critical section. The row is reclaimed by the
+ * next subAdd's subReap(), on the storage task where freeing is safe. Canonical
  * case: a module that subscribed from main_task during init, which then
  * self-deletes when app_main returns. */
 extern "C" void storageOnTaskDeath(void* tcb) {

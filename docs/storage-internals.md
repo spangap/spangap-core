@@ -162,7 +162,9 @@ cached wire instead of re-packing + re-stamping); drafts are already transient
 | `CONFIG_SPANGAP_STORAGE_OP_MSG_MAX` | `196608` (192 KB) | Per-message size guard: the largest single op a foreign task can send (a big `storageSetTree`/`storageCopy` subtree, or the largest published value — Nomad page bodies run to ~128 KB). |
 
 **Compile-time constants**: `STORAGE_NOTIFY_VAL_MAX = 512` (a cross-task CHANGED
-message carries at most 512 B of the value — see §4), `STORAGE_MAX_SUBS = 128`,
+message carries at most 512 B of the value — see §4), `STORAGE_MAX_SUBS = 256`
+(a full mesh + IP + LCD image registers ~135 subscriptions before the settings
+UI binds a row, and one row is ~32 B),
 `STORAGE_MAX_ACCUM = 24` (per-task bracket accumulators), `DC_DUMP_MAX = 14000`
 (browser dump chunk body budget), `DC_DUMP_DEPTH = 32`. The browser DataChannel
 port opens with toCap 64 KB / fromCap 256 KB / maxMsg 256 KB.
@@ -279,8 +281,16 @@ event does not leak rows until the table fills. Task death is handled by
 `storageOnTaskDeath` (called from ITS's global `vTaskPreDeletionHook` in a
 scheduler critical section — no locks/alloc/logging there): it nulls the owner
 handle of any sub on the dead task so `notifyChange` stops delivering into a
-freed TCB. The slot stays allocated-but-inert until a later matching `subRemove`
-compacts it.
+freed TCB. Nulling is all that hook may do — freeing the row's scope string
+would allocate inside a critical section — so the row is reclaimed by the next
+`subAdd`, which runs `subReap()` (drop every row with a null owner) before it
+dedupes or appends. That reap is what makes the table's capacity a *live*
+subscriber count: a task that subscribes, dies and is respawned reuses its slot
+instead of burning one per generation, and a respawned task handed the freed
+TCB's address can never collide with the dead row's entry. Overflow is reported
+with the scope and the count, because a dropped subscription is otherwise
+indistinguishable from a module that never subscribed — the feature is simply
+inert for the rest of the boot.
 
 ## 5. Persistence
 
