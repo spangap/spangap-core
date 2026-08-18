@@ -21,6 +21,37 @@ macros, levels, and CLI; this document is for changing the implementation. Sourc
 - Level management (`logApplyLevels` / `logSetGlobal` / `logSetTag`) over the
   `s.log.*` storage tree, with live subscriptions for `s.log.file.*` and
   `s.log.colors.*`.
+- Message-prefix rules (`logRule`), the per-*line* counterpart to those per-tag
+  levels — see below.
+
+### Message-prefix rules
+
+`logRule(prefix, level)` adds an entry to a fixed 12-slot list. A prefix
+without a colon is matched against the start of each line's **message body**
+(the text after the tag). A prefix **with** a colon is read as
+`"tag: body-prefix"`: the tag must match exactly, and the remainder — possibly
+empty — matches the body, so `"NimBLE: "` covers every tagged line of a chatty
+library whose body prefixes differ per line. `level` is a
+level letter — `'E'`/`'W'`/`'I'`/`'D'`/`'V'`, or `'N'` to drop the line. It exists
+because a level is per tag, and the problem is usually one line: a library that
+shouts a single expected condition at `E`, or repeats what the owning module
+already reports itself. Silencing the tag to kill that line throws away
+everything else it says. (The tag-form is for a library whose *every* line is
+the problem yet whose warnings should keep their tag-level dial — unlike a
+plain per-tag level, a demoted line can still be recovered per rule.)
+
+Matching happens inside `logReformat`, so every sink — ring buffer, SD file,
+serial — sees one decision, and it matches what you would read on screen rather
+than a format string the caller can't see. Both of `logReformat`'s paths apply
+the rules: the tagged one, and the continuation path a library reaches when it
+splits its tag from its body (ESP wifi does, so the text a body rule matches on
+arrives there). A tag-form rule can only match the tagged path — a
+continuation line carries no tag to compare.
+
+A demoted line is **re-filtered** against its tag's threshold (the global one for
+a continuation line), because it only reached the hook by clearing its original
+level: demoting below the level in force drops it, exactly as the library logging
+it at the new level would have been dropped.
 - The `log`, `logfile`, and `logrotate` CLI commands (`logRegisterCmds`).
 - Default install (`logInstallDefaults`, versioned by `s.log.version`) seeding the
   `s.log` tree and a daily `logrotate 7` cron entry.

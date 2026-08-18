@@ -292,8 +292,18 @@ typedef void (*storage_change_cb_t)(const char* key, const char* val);
 void storageSubscribeChanges(const char* scope, storage_change_cb_t cb);
 
 /** Remove all subscriptions on `scope` registered by the calling task.
- *  Exact-string scope match; pair with storageSubscribeChanges. */
+ *  Exact-string scope match; pair with storageSubscribeChanges.
+ *  A task may hold several subscriptions on one scope — one per module that
+ *  watches it — and this drops every one of them, including a module's own
+ *  live watch that the caller knows nothing about. Only use it where the
+ *  calling task is the scope's sole watcher; otherwise unsubscribe the exact
+ *  callback with storageUnsubscribeCb(). */
 void storageUnsubscribe(const char* scope);
+
+/** Remove only the subscription on `scope` registered by the calling task with
+ *  this exact callback, leaving every other watcher of the scope alone.
+ *  Exact-string scope match; pair with storageSubscribeChanges. */
+void storageUnsubscribeCb(const char* scope, storage_change_cb_t cb);
 
 /** Convenience: lambda-friendly callback type */
 #define ON_CHANGE [](const char* key, const char* val)

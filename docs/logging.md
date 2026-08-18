@@ -126,5 +126,6 @@ Beyond the macros, [`log.h`](../esp-idf/include/log.h) exposes:
 | `logApplyLevels()` | Re-read global + per-tag levels from storage and apply (boot + on change). |
 | `logSetGlobal(level)` | Set the global level (writes storage + applies). |
 | `logSetTag(tag, level)` | Set a per-tag override (`-` = inherit). |
+| `logRule(prefix, level)` | Re-level or drop library lines (`'N'` = drop). A prefix without a colon matches how the message body starts; `"tag: body-prefix"` (colon form) matches the tag exactly plus an optional body prefix — `"NimBLE: "` covers a whole library. |
 | `cfd(fd)` | Returns `"{fd} "` when at debug level, `""` otherwise — prefix per-connection messages with a handle. |
 </content>

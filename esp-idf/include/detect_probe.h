@@ -71,6 +71,11 @@ const char* detect_hw(void);
  *  underscores (hw_lilygo_tdeck), matching the function that found it. */
 #define detect_found(name)    ESP_LOGI(DETECT_TAG, "%s found", name)
 
+/** A failing stage on the way to a NULL. Warn, not debug: in the firmware a
+ *  NULL halts the boot, and which stage said no is the one trace the person
+ *  reading that halt needs. */
+#define detect_miss(fmt, ...) ESP_LOGW(DETECT_TAG, fmt, ##__VA_ARGS__)
+
 /* ── the extras ──────────────────────────────────────────────────────────────
  * Some parts a probe can read identify nothing: the T-Deck's touch, RTC and
  * GNSS are fitted or not on the same straddle, the Nibble Zero's environmental

@@ -71,13 +71,13 @@ Exact signatures and ownership/lifetime contracts are in
 | `storageSetTree` | Set an arbitrary cJSON node (array/object) at a key. |
 | `storageBegin` / `storageEnd` | Bracket several writes into one atomic op-list message. |
 | `storageCopy`, `storageCopyNoNotify` | Prefix-copy a subtree (optionally only over existing target keys). |
-| `storageForEach`, `storageList`, `storageArrayCount` | Iterate / dump / count numbered entries. |
+| `storageForEach`, `storageList`, `storageArrayCount` | Iterate / dump / count numbered entries. A numbered list is an array or an object keyed `"0"`, `"1"`, … — which one depends on whether a default tree seeded it as `[]` before the first indexed write — and these count either. Seed the `[]` where the shape has a reader outside this API: the browser mirrors the tree verbatim, so a list built only from indexed writes arrives there as an object. |
 | `storageNewTreeFile` | Register a runtime external file for a prefix. |
 | `storageRegisterProvider` | Claim a key namespace and answer reads from your own module instead of the config tree. For structures too large, too volatile, or too lock-sensitive to mirror: the reader asks for one key and you answer it, rather than publishing everything against the chance someone asks. Dispatch happens ahead of the config mutex, so a provider read never queues behind a write. Provider namespaces live outside the config tree, so they are never saved and never appear in a dump. |
 | `storagePersistBlob` | Hand a raw snapshot to the persist worker for an atomic write. For the task boundary, not convenience: a flash write stalls its task for the length of the program windows, so snapshot on your own task (where your structure is consistent) and hand over the bytes. A newer snapshot for the same path supersedes an unwritten earlier one, so a debouncing producer cannot build a backlog. |
 | `storageSave` | Force an immediate flush, blocking until written. Before `storageInit()` has spawned the persist worker it flushes inline on the caller, so the early boot foundations can persist too. |
 | `storageStopFlushing` | Stop persisting for the rest of this boot, one-way. For a [safe-mode](safe-mode.md) restore or factory reset, whose on-disk store is about to be replaced or erased and must not receive the stale in-RAM tree on top. |
-| `storageSubscribeChanges`, `storageUnsubscribe`, `NOW_AND_ON_CHANGE` | Prefix-scoped change subscriptions. |
+| `storageSubscribeChanges`, `storageUnsubscribe`, `storageUnsubscribeCb`, `NOW_AND_ON_CHANGE` | Prefix-scoped change subscriptions. A task may hold several subscriptions on one scope, one per module watching it; `storageUnsubscribe(scope)` drops all of them, so a module sharing a task with others (anything on the lcd task) drops its own callback with `storageUnsubscribeCb(scope, cb)` instead. |
 | `uiTelemetryWanted` | Whether published stat keys have a plausible reader (LCD build, or WiFi up so a browser can pull them) — periodic publishers gate on it to skip churn on a headless, WiFi-down node. See [power-management](power-management.md#idle-discipline--park-dont-poll). |
 
 For threading rules, the op-list wire format, the change fan-out, and the
@@ -199,15 +199,14 @@ flush. An external only changes *where the file is*: the subtree is still fully
 resident in the in-RAM tree and still syncs to the browser, so it is not a
 substitute for a true out-of-tree store for unbounded data.
 
-## Timezone map (a loose factory file, not a storage blob)
+## Timezone map (compiled in, not a storage blob)
 
-The IANA→POSIX timezone map `timezones.json` is platform-owned but ships as a
-*loose* factory file at the root of the state store (`<stateDir>/timezones.json`,
-not under `storage/`), so the ~15 KB map never attaches to the config tree or
-costs steady-state RAM. It is parsed transiently — cJSON parse, read one POSIX
-string, free — only on a timezone change. The parsing and refresh logic
-(`ntpApplyTimezone`, the build-time `make timezones` step) belong to
-**spangap-net**; see the ntp/net docs for specifics.
+The IANA→POSIX timezone map is platform-owned and compiled into the firmware:
+two strcmp-sorted rodata arrays (`include/timezones.h`, generated
+`src/timezones_gen.c`, refreshed by the release-time `make timezones` step).
+It never attaches to the config tree, costs no RAM, and is looked up with a
+binary search (`tzLookup`). The application logic (`ntpApplyTimezone`, the
+`ntp.tz.set` sentinel) belongs to **spangap-net**; see the ntp docs.
 
 ## CLI
 

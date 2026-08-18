@@ -252,6 +252,75 @@ static size_t stripAnsi(char* buf, size_t len) {
     return out;
 }
 
+/* Message-prefix rules (logRule): a short list checked against the start of each
+ * line's message body, turning one specific library line into a quieter level or
+ * nothing at all. It sits here rather than in the level machinery because a level
+ * is per tag: silencing a tag to kill its one shouted line also throws away
+ * everything else it says. Applied inside logReformat, so every sink — ring,
+ * file, serial — sees the same decision, and applied to what you would read on
+ * screen, not a format the caller can't see: a prefix WITHOUT a colon matches
+ * the message body; one WITH a colon matches "tag: body", so "NimBLE: " covers
+ * every line of a chatty library in one rule while its body prefixes differ
+ * per line. tagLen is the split — 0 for a body-only rule. */
+struct LogRule { const char* prefix; size_t len; size_t tagLen; char level; };
+static LogRule logRules[12];
+static int     logRuleCount = 0;
+
+static esp_log_level_t levelOfChar(char c) {
+    switch (c) {
+        case 'E': return ESP_LOG_ERROR;
+        case 'W': return ESP_LOG_WARN;
+        case 'I': return ESP_LOG_INFO;
+        case 'D': return ESP_LOG_DEBUG;
+        case 'V': return ESP_LOG_VERBOSE;
+        default:  return ESP_LOG_NONE;
+    }
+}
+
+void logRule(const char* prefix, char level) {
+    if (!prefix || !*prefix) return;
+    if (level >= 'a' && level <= 'z') level -= 32;   /* toupper */
+    if (level != 'N' && levelOfChar(level) == ESP_LOG_NONE) {
+        warn("log: rule '%s' has no level '%c'\n", prefix, level);
+        return;
+    }
+    if (logRuleCount >= (int)(sizeof(logRules) / sizeof(logRules[0]))) {
+        warn("log: rule list full, '%s' left as-is\n", prefix);
+        return;
+    }
+    const char* colon = strchr(prefix, ':');
+    logRules[logRuleCount++] = { prefix, strlen(prefix),
+                                 colon ? (size_t)(colon - prefix) : 0, level };
+}
+
+/* Match a line's message body against the rules. Returns the level letter to
+ * emit it at (`cur` when no rule matched), or 0 to drop it. `tag` may be null
+ * for a continuation line, whose threshold is then the global one. */
+static char logRuleApply(const char* msg, size_t msgLen, const char* tag, char cur) {
+    for (int i = 0; i < logRuleCount; i++) {
+        const LogRule& r = logRules[i];
+        if (r.tagLen) {
+            /* "tag: body" form. The tag must match exactly; whatever follows
+             * the colon (one conventional space skipped) is a body prefix,
+             * empty meaning "every line of this tag". */
+            if (!tag || strncmp(tag, r.prefix, r.tagLen) != 0 || tag[r.tagLen] != '\0')
+                continue;
+            const char* rem    = r.prefix + r.tagLen + 1;
+            size_t      remLen = r.len - r.tagLen - 1;
+            if (remLen && *rem == ' ') { rem++; remLen--; }
+            if (msgLen < remLen || strncmp(msg, rem, remLen) != 0) continue;
+        }
+        else if (msgLen < r.len || strncmp(msg, r.prefix, r.len) != 0) continue;
+        if (r.level == 'N') return 0;
+        /* Re-filter: the line cleared its ORIGINAL level to reach us, so a
+         * demotion below what is in force has to drop it, exactly as it would
+         * have been dropped had the library logged it at the new level. */
+        if (esp_log_level_get(tag) < levelOfChar(r.level)) return 0;
+        return r.level;
+    }
+    return cur;
+}
+
 /* Reformat ESP-IDF log line: "I (12345) tag: msg" → "[taskname] I tag: msg"
  * Input may have ANSI color prefix/suffix. We strip those and add our own.
  * When ESP tag equals the FreeRTOS task name, we omit the tag from the output line.
@@ -287,6 +356,11 @@ static int logReformat(const char* src, char* dst, size_t dstSize, bool ansi) {
         { const char* ck = p; size_t cl = msgLen;
           while (cl > 0 && (*ck == ' ' || *ck == '\t')) { ck++; cl--; }
           if (cl == 0) return 0;
+          /* Rules apply here too: a library that splits its tag from its body
+           * (ESP wifi does) delivers the text a rule matches on as one of these. */
+          char lvl = logRuleApply(ck, cl, nullptr, lastLevel);
+          if (!lvl) return 0;
+          lastLevel = lvl;
         }
         char color[24] = "";
         const char* reset = "";
@@ -362,6 +436,10 @@ static int logReformat(const char* src, char* dst, size_t dstSize, bool ansi) {
         }
         if (msgLen == 0) return 0;
     }
+
+    level = logRuleApply(msgStart, msgLen, tag[0] ? tag : nullptr, level);
+    if (!level) return 0;
+    lastLevel = level;
 
     /* ANSI color by level */
     char color[24] = "";

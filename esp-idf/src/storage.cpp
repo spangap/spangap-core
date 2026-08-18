@@ -1928,6 +1928,15 @@ void storageUnsubscribe(const char* scope) {
   storageSubmit(std::move(buf), /*sync=*/true);
 }
 
+void storageUnsubscribeCb(const char* scope, storage_change_cb_t cb) {
+  if (!scope) return;
+  if (!cb) { storageUnsubscribe(scope); return; }
+  std::string buf;
+  buf.push_back(0);
+  buf.push_back('-'); opPutStr(buf, scope); opPutPtr(buf, (void*)cb);
+  storageSubmit(std::move(buf), /*sync=*/true);
+}
+
 /* ---- Type inference ---- */
 
 static cfg_type_t inferType(const char* val) {

@@ -255,6 +255,17 @@ static size_t fsSdFwrite(const void* buf, size_t size, size_t nmemb, FILE* fp, b
 }
 
 static void handleOp(fs_op_t* req) {
+    /* Tripwire, not a fix: a caller once handed a path pointer of 0x24 (a
+     * small integer where a pointer belongs — the shape of an unchecked
+     * failed alloc upstream) and the worker took the whole device down inside
+     * the VFS. A pointer below the memory map is refused with a loud log
+     * naming the op, so the culprit shows itself instead of a corpse. */
+    if ((uintptr_t)req->path != 0 && (uintptr_t)req->path < 0x3C000000) {
+        err("fs op %s: bogus path pointer %p — refusing",
+            fsOpName((int)req->op), (const void*)req->path);
+        req->result = -1;
+        return;
+    }
     /* No path rewriting: "/state" and "/sdcard/state" are both real, always-
      * mounted locations. Callers already pass whichever one is active. */
     switch (req->op) {

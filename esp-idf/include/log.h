@@ -66,6 +66,24 @@ void logSetGlobal(const char* level);
 /** Set per-tag log level (updates cfg + applies). level="-" means inherit from global. */
 void logSetTag(const char* tag, const char* level);
 
+/** Rewrite one noisy library line, matched by what it starts with. A `prefix`
+ *  without a colon is compared against the start of the message body (the text
+ *  after the tag), so a few characters settle it and nothing else that tag
+ *  emits is touched. A prefix WITH a colon is read as "tag: body-prefix" — the
+ *  tag must match exactly and the (possibly empty) remainder matches the body,
+ *  so "NimBLE: " covers every tagged line of a chatty library whose body
+ *  prefixes differ per line. `level`
+ *  is the level letter to re-emit it at — 'E'/'W'/'I'/'D'/'V', or 'N' to drop the
+ *  line entirely. A demotion is re-filtered against that tag's own threshold, so
+ *  demoting below the level in force drops it too.
+ *
+ *  For a library line whose severity is wrong for this device, or that
+ *  duplicates what the owning module reports itself. Prefer it to a per-tag
+ *  level: it takes out the one line and leaves everything else that tag says at
+ *  whatever the settings ask for. `prefix` must outlive the process (use a
+ *  literal). Bounded set; a full one warns and no-ops. */
+void logRule(const char* prefix, char level);
+
 /** Returns "{fd} " when log level is debug, "" otherwise.
  *  Use to prefix per-connection log messages. */
 const char* cfd(int fd);
