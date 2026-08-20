@@ -5,7 +5,6 @@
 #include "log.h"
 #include "pm.h"
 #include "cli.h"
-#include "cron.h"
 #include "its.h"
 #include "storage.h"
 #include "compat.h"
@@ -1044,8 +1043,12 @@ static void logTaskFn(void* arg) {
 
 /* ---- Init ---- */
 
-/* Module config version. Bump when adding/changing defaults. See duckdns.cpp. */
-#define LOG_VERSION 1
+/* Module config version. Bump when adding/changing defaults that must install
+ * on existing devices (storageDefault alone is set-if-absent, so brand-new
+ * keys need no bump — the gate is for re-installing something a user may have
+ * changed or removed; here it lets a user delete the logrotate cron entry and
+ * have it stay gone). */
+#define LOG_VERSION 2
 
 static void logInstallDefaults() {
   int v = storageGetInt("s.log.version", 0);
@@ -1060,7 +1063,7 @@ static void logInstallDefaults() {
                "debug":"0;37", "verbose":"0;90", "timestamp":"0;90"}
   })");
 
-  cronDefault("0 0 * * * A", "logrotate 7");
+  storageDefault("s.cron.tab.logrotate", "0 0 * * * A logrotate 7");
   storageSet("s.log.version", LOG_VERSION);
 }
 

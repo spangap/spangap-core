@@ -65,7 +65,28 @@ const char* detect_hw(void);
  * probe trace on and nothing else. Everything a probe learns on the way is
  * debug; the single line that says which board this is, is info. */
 #define DETECT_TAG "detect"
+
+/* The trace's level is a build choice, because the two callers want opposite
+ * things from it. In the firmware it is debug: the same probes run on every
+ * boot, and a board that identifies itself has nothing to say. In flashmon's
+ * standalone detector the trace IS the product — a board that was NOT found is
+ * as informative as the one that was — so it runs at info, which is what
+ * DETECT_TRACE_AT_INFO=1 selects.
+ *
+ * A level, not a runtime call: `esp_log_level_set(DETECT_TAG, ESP_LOG_DEBUG)`
+ * cannot resurrect a macro the compiler removed, and CONFIG_LOG_MAXIMUM_LEVEL
+ * defaults to info. Raising that ceiling instead would work, but it compiles in
+ * every OTHER component's debug strings too — some 6 KB of them — to carry the
+ * dozen lines below. */
+#ifndef DETECT_TRACE_AT_INFO
+#define DETECT_TRACE_AT_INFO 0
+#endif
+
+#if DETECT_TRACE_AT_INFO
+#define detect_dbg(fmt, ...)  ESP_LOGI(DETECT_TAG, fmt, ##__VA_ARGS__)
+#else
 #define detect_dbg(fmt, ...)  ESP_LOGD(DETECT_TAG, fmt, ##__VA_ARGS__)
+#endif
 
 /** The one line a successful probe prints. `name` is the straddle name with
  *  underscores (hw_lilygo_tdeck), matching the function that found it. */
@@ -457,11 +478,15 @@ static inline bool detect_busy_low(int busy)
         if (gpio_get_level((gpio_num_t)busy) == 0) return true;
         esp_rom_delay_us(100);
     }
+    /* Worth its own line: every probe below except SX127x is gated on this, so a
+     * BUSY that never drops skips all of them and the header reads as empty when
+     * the part may be sitting there perfectly well, unpowered or unreset. */
+    detect_dbg("busy(%d) stayed high for 100 ms", busy);
     return false;
 }
 
 /** Which LoRa modem is on this header, as a short slug ("sx1262", "sx1276",
- *  "sx1280", "lr1121"), or NULL if none answers. Fills `slug` (>= 8 bytes) when
+ *  "sx1280", "lr1121", "lr2021"), or NULL if none answers. Fills `slug` (>= 8 bytes) when
  *  given. Order is most-specific first: SX127x has a real version register,
  *  the rest are identified by a command exchange over BUSY. */
 static inline const char* detect_radio(int sck, int mosi, int miso, int cs,
@@ -507,6 +532,10 @@ static inline const char* detect_radio(int sck, int mosi, int miso, int cs,
         detect_busy_low(busy);
         uint8_t stx[2] = { 0xC0, 0x00 }, srx[2] = {0};                     /* GetStatus */
         detect_spi_xfer(h, stx, srx, 2);
+        /* The most telling read on the header: a live bus echoes the scratch
+         * byte back and answers GetStatus with something that is neither all
+         * ones nor all zeros. 00/FF on both is a bus with nothing driving it. */
+        detect_dbg("sx126x readback %02x (want a5), status %02x", rrx[4], srx[1]);
         if (ok && rrx[4] == 0xA5 && srx[1] != 0x00 && srx[1] != 0xFF) found = "sx1262";
     }
 
@@ -520,6 +549,37 @@ static inline const char* detect_radio(int sck, int mosi, int miso, int cs,
         detect_busy_low(busy);
         uint16_t fw = (uint16_t)((rrx[4] << 8) | rrx[5]);
         if (ok && fw != 0x0000 && fw != 0xFFFF) found = "sx1280";
+    }
+
+    /* LR2021 — same GetVersion opcode as the LR11x0 above, and told apart by
+     * the reply's shape: the LR11x0 prefixes it with ONE status byte and names
+     * itself in a device byte, the LR2021 prefixes it with TWO and offers only
+     * a firmware version. So there is no positive device id to match, and this
+     * runs LAST — every part that can identify itself has already had its turn,
+     * and what reaches here is something that speaks the LR command framing and
+     * is none of them. What is checked is the status field both families share:
+     * bits 3:1 of the first byte read back as "command successfully processed".
+     */
+    if (!found && busy >= 0 && detect_busy_low(busy)) {
+        uint8_t cmd[2] = { 0x01, 0x01 };            /* GetVersion */
+        detect_spi_xfer(h, cmd, NULL, 2);
+        detect_busy_low(busy);
+        uint8_t rtx[4] = {0}, rrx[4] = {0};         /* stat, stat, fw_maj, fw_min */
+        bool ok = detect_spi_xfer(h, rtx, rrx, 4);
+        detect_dbg("lr2021 GetVersion -> %02x %02x %02x %02x (xfer %s)",
+                   rrx[0], rrx[1], rrx[2], rrx[3], ok ? "ok" : "failed");
+        /* Bits 3:1 of the first status byte. TWO of its four codes mean the
+         * command was processed: 2 is "ok" and 3 is "ok, data is being
+         * transmitted" — and a command that RETURNS something, as GetVersion
+         * does, reports the latter. Accepting only 2 rejects every part that
+         * actually answered.
+         *
+         * 0xFF is excluded because an unconnected MISO floats high and would
+         * otherwise read as code 3 — a dead header claiming to be a radio. An
+         * absent part reads 0x00, which is code 0 ("could not be executed") and
+         * fails anyway. */
+        uint8_t st = (uint8_t)((rrx[0] >> 1) & 0x03);
+        if (ok && rrx[0] != 0xFF && (st == 0x02 || st == 0x03)) found = "lr2021";
     }
 
     detect_spi_close(h);

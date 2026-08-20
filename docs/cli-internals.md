@@ -172,26 +172,40 @@ has a single writer; the registry itself only changes on claim and release.
 
 ### Attach and release
 
-Detection differs by transport, and the reason is a hardware fact:
+How a client is detected is the claimant's choice, made at claim time:
 
-- **CDC (either port):** the host's DTR rise. Every pyserial-class client asserts
-  DTR on open and drops it on close. `cdcLineStateCb` is installed on **both**
-  ACM ports and keeps `prevRts`/`prevDtr` **per port** — one shared copy turns
-  the host settling port 1's lines into a phantom edge on port 0.
-- **USB-Serial-JTAG (port 0 only):** in band, on the first received `0xC0`. The
-  peripheral **exposes no line state to software at all** — there is no DTR or
-  RTS in the S3 driver, the LL, or the register struct; `usb_serial_jtag_is_-`
-  `connected()` is SOF-derived and says nothing about a host opening a port.
-  `0xC0` is the frame delimiter of KISS (the framing serial terminal-node
-  controllers use), never a console keystroke, and the first byte such a client
-  sends. It is forwarded, not swallowed. So a claimed port 0 on USB-Serial-JTAG
-  is still an ordinary console until a client speaks.
+- **In-band trigger** (a claim made with `trigger`/`triggerLen`, ≤ 8 bytes):
+  the port attaches when the trigger byte sequence arrives in the input
+  stream, on any transport. On the console port the matcher runs ahead of the
+  framed-RPC sniffer (but yields while an RPC frame is mid-assembly, whose
+  binary payload may contain the trigger); bytes extending a partial match are
+  withheld and replayed on a mismatch, so console typing is unaffected. On a
+  non-console port a `trigScan` pass consumes the pre-attach stream, matching
+  and otherwise discarding — nothing else reads that port. The matched trigger
+  opens the client's stream and is forwarded, not swallowed. DTR is ignored
+  for attach (a host merely opening the port is not a client — which is what
+  lets a terminal inspect the port, and what makes the trigger the only
+  detection that survives a relay forwarding bytes but not line state), while
+  a DTR **drop** on CDC still releases an attached session. This is also the
+  only detection possible on USB-Serial-JTAG, whose peripheral **exposes no
+  line state to software at all** — there is no DTR or RTS in the S3 driver,
+  the LL, or the register struct; `usb_serial_jtag_is_connected()` is
+  SOF-derived and says nothing about a host opening a port. There, release
+  comes only from the handler's own disconnect or `usb down`.
+- **DTR** (a claim without a trigger; CDC ports only): the host's DTR rise
+  attaches, its drop releases. Every pyserial-class client asserts DTR on open
+  and drops it on close — and so does every terminal, so any open is an
+  attach. `cdcLineStateCb` is installed on **both** ACM ports and keeps
+  `prevRts`/`prevDtr` **per port** — one shared copy turns the host settling
+  port 1's lines into a phantom edge on port 0.
 
-**A claimed CDC port has its esptool reset arming disabled.** The arming pattern
-is `prevRts && !prevDtr` followed by a falling RTS, and a normal pyserial close
-drops DTR before RTS — indistinguishable from the reset sequence. Without the
-suppression a clean client exit reboots the device. The trade-off is that esptool
-auto-reset is unavailable on a claimed port.
+**Esptool reset arming on CDC 0 is suppressed while a session is attached**
+(`serialPortIsAttached`), and for a DTR claim for as long as the claim exists.
+The arming pattern is `prevRts && !prevDtr` followed by a falling RTS, and a
+normal pyserial close drops DTR before RTS — indistinguishable from the reset
+sequence, so without the suppression a clean client exit reboots the device. A
+dormant trigger claim keeps auto-reset armed: until a client speaks, the port is
+fully a console.
 
 On attach the serial task drops any CLI session on port 0, sets `serialInHandler`,
 and `itsConnect`s the claimant with a `serial_handler_connect_t{serialPort}`. A
@@ -218,8 +232,14 @@ the console has a CLI session open. The CDC idle branch waits on
 `ulTaskNotifyTake` with a timeout rather than a plain `delay(50)`; TinyUSB's
 `callback_rx` on a claimed port gives the serial task a notification, so a
 client's bytes are not paced by the poll interval. The USB-Serial-JTAG idle
-branch still parks indefinitely on the driver's ISR-fed RX ring — a keystroke or
-a client's first `0xC0` wakes it, and an idle console costs no wakes.
+branch parks on the driver's ISR-fed RX ring — a keystroke or a client's first
+trigger byte wakes it at once — **bounded at two seconds**, because nothing can
+interrupt that read from outside: not `serialPortWake`'s notification and not
+`consoleSwitchPending`, so a `usb cdc` issued over the network (no console byte
+ever arrives) would otherwise strand the task forever on a controller that has
+lost the pads, deaf to the new console and to every claimed port. The bound is
+the cap on how stale the task's view may get; an idle console costs one wake
+per period.
 
 Shuttle reads are **block** reads (`consoleCdcReadPort` → `tinyusb_cdcacm_read`,
 or `usb_serial_jtag_read_bytes`), not the console's one-byte `consoleCdcRead`

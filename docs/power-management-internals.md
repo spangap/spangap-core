@@ -191,7 +191,7 @@ duplicate it here; pm only provides the lock mechanism net plugs into.
 - **Deep sleep is never initiated in pm.** It is always the downstream effect of
   the last lock releasing: `pmLockRelease` → `sys.going_down` → cron sleeps. Don't
   add a direct sleep call here.
-- **`usb down` alone reaches only light sleep.** With no crontab wake entry the
+- **`usb down` alone reaches only light sleep.** With no cron wake entry the
   `cron` lock stays held, `deepSleepAllowed()` never returns true, and the device
   light-sleeps but never deep-sleeps. Deep sleep requires a [cron](cron.md) wake
   config.

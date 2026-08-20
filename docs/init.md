@@ -165,11 +165,21 @@ shared I2C0 bus there). Anything later fails to open the bus and reads as a boar
 nothing recognises. Nothing needs to be up first — a probe drives the power rail
 it needs.
 
-A mismatch **halts the chip awake**: the task blocks forever, so the console
-stays enumerated and the verdict stays readable. Every pin map in a wrong-board
-image belongs to someone else's hardware, so a reboot loop would re-drive those
-pins forever and deep sleep would take the explanation down with the port. Only a
-reset or a power cycle leaves that state.
+A mismatch **halts the chip awake**: the task parks on a slow loop, so the
+console stays enumerated and the verdict stays readable. Every pin map in a
+wrong-board image belongs to someone else's hardware, so a reboot loop would
+re-drive those pins forever and deep sleep would take the explanation down with
+the port. Only a reset or a power cycle leaves that state.
+
+Two details make that true rather than merely intended. The halt **disables the
+RTC watchdog** first: the bootloader arms it and `spangapPostAppInit` normally
+disables it at the far end of a boot this one never reaches, so left alone it
+resets the chip `CONFIG_BOOTLOADER_WDT_TIME_MS` after boot — turning the halt
+into the reboot loop it exists to avoid, with the port re-enumerating under
+whoever is trying to flash it. And the verdict is **re-stated every few seconds**
+rather than printed once, because the reason someone attaches a console after a
+halt is to find out why it halted; saying it only at the moment of failure
+answers everyone except the person asking.
 
 The confirmed answer is published as `sys.hw`, and **announced** rather than left
 to be queried — `spangapLogBuildIdentity()` prints it at boot and again whenever a

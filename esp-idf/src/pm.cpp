@@ -354,6 +354,12 @@ static void pmStatsPoll();   /* start/stop the sampler off the actmon flags */
 extern "C" volatile bool consoleOnCdc;
 extern "C" const char*   consoleModeName(void);
 extern "C" int           consoleCdcPortCount(void);
+extern "C" void          consoleCdcPortStats(int itf, uint32_t* rx, uint32_t* tx,
+                                             uint32_t* rxEvt, uint32_t* dtrEvt);
+extern "C" bool          serialPortIsClaimed(int port);
+extern "C" bool          serialPortClaimTriggered(int port);
+extern "C" bool          serialPortIsAttached(int port);
+extern "C" void          serialTaskStats(uint32_t* loops, uint32_t* scans, uint32_t* scanBytes);
 extern "C" const char*   consoleLastSwitchError(void);
 
 void pmPollUsb() {
@@ -1124,6 +1130,26 @@ static void cmdUsb(const char* a) {
     cliPrintf("console: %s", consoleModeName());
     if (consoleCdcPortCount()) cliPrintf(" (%d ports, console on cdc 0)", consoleCdcPortCount());
     cliPrintf("\n");
+    /* Per-port shuttle state: the first question about a silent claimed port
+     * is whether bytes move at all. rx = drained by a reader, tx = queued out,
+     * both since boot; the claim/attach state comes from the serial registry. */
+    for (int i = 0; i < consoleCdcPortCount(); i++) {
+        uint32_t rx, tx, rxEvt, dtrEvt;
+        consoleCdcPortStats(i, &rx, &tx, &rxEvt, &dtrEvt);
+        cliPrintf("cdc %d: rx %u (%u events) tx %u dtr-edges %u%s%s\n", i,
+                  (unsigned)rx, (unsigned)rxEvt, (unsigned)tx, (unsigned)dtrEvt,
+                  serialPortIsClaimed(i)
+                      ? (serialPortClaimTriggered(i) ? ", claimed (in-band trigger)"
+                                                     : ", claimed (dtr)")
+                      : "",
+                  serialPortIsAttached(i) ? ", client attached" : "");
+    }
+    if (consoleCdcPortCount()) {
+        uint32_t loops, scans, scanBytes;
+        serialTaskStats(&loops, &scans, &scanBytes);
+        cliPrintf("serial task: %u loops, %u spare-port scans, %u bytes scanned\n",
+                  (unsigned)loops, (unsigned)scans, (unsigned)scanBytes);
+    }
     /* A failed switch reports itself during a re-enumeration, when a host is
      * least likely to be showing anything. Repeat it here, where someone asking
      * why the console did not move will look. */

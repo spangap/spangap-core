@@ -136,9 +136,10 @@ built-in is simply a `Service` that never registers; its boot virtuals never fir
 3. `cliRunFile(fsStatePath("/boot"))` — the boot script runs **last** so every CLI
    command (platform and consumer) is already registered.
 4. `storageSet("sys.boot_complete", 1)` — fires `sys.boot_complete` subscribers.
-5. `logApplyLevels()`, then `cronPoll(true)` — run any cron entries that fall in
-   the current minute (a deep-sleep wake may already have moved time past a
-   scheduled minute).
+5. `logApplyLevels()`, then `cronReschedule()` + `cronPoll()` — resync cron with
+   the `s.cron.tab.*` entries the walk's onInits installed, and run any that
+   fall in the current minute (a deep-sleep wake may already have moved time
+   past a scheduled minute).
 6. On a [safe-mode](safe-mode.md) factory-reset boot: `storageStopFlushing()` and
    spawn the DRAM-stack wipe task. It lives here, not in the web straddle, so the
    wipe happens on a headless node and even when net or web failed to come up.
@@ -170,9 +171,9 @@ must name the same handle the call saw.
 `cronWakeupHandler()` runs inside `spangapInit()` (step 8), early enough that a
 timer wake with no cron work this minute can go **straight back to sleep without
 fully booting**. See [cron-internals](cron-internals.md) for the wake-decision
-logic; the only init-side fact is its position — it must run after `fs_init()`
-(it reads the crontab) and before the heavyweight foundation work that a
-back-to-sleep wake would waste.
+logic; the only init-side fact is its position — before the heavyweight
+foundation work that a back-to-sleep wake would waste (its wake decision is a
+clock compare against RTC RAM, so it needs nothing else up).
 
 ## 7. Build identity
 

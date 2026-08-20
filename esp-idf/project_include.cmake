@@ -66,7 +66,7 @@ function(spangap_create_factory_image)
     add_custom_target(spangap_data_merge ALL
         COMMAND ${CMAKE_COMMAND} -E rm -rf "${_data_merged}"
         COMMAND ${CMAKE_COMMAND} -E make_directory "${_data_merged}"
-        # 1. Spangap static defaults (factory_state/{boot,crontab,net_up,
+        # 1. Spangap static defaults (factory_state/{boot,net_up,
         #    storage/external/s.time.zones.json, ...})
         COMMAND ${CMAKE_COMMAND} -E copy_directory "${_spangap_data}" "${_data_merged}"
         COMMENT "Merging spangap defaults + straddle data/ + ${PROJECT_NAME} data/ (consumer wins)"

@@ -227,30 +227,51 @@ void cliWake();
  * how many ports exist (1 or 2), so a claimant can re-apply its claim when the
  * transport changes.
  *
- * A claim is dormant until a client actually attaches, and detection differs by
- * transport. A CDC port sees the host raise DTR (every pyserial-class client
- * does so on open, and drops it on close). The USB-Serial-JTAG controller
- * exposes no line state to software at all, so port 0 there attaches in band on
- * the first 0xC0 byte — a value no console keystroke produces — and releases
- * only when the handler drops the session or the USB link goes down. Until a
- * client speaks, a claimed port 0 is still an ordinary console.
+ * A claim is dormant until a client actually attaches, and how a client is
+ * detected is the claimant's choice:
+ *
+ * - **In-band trigger** (a claim made with `trigger`/`triggerLen`): the port
+ *   attaches when the trigger byte sequence arrives in the input stream, on
+ *   any transport. On the console port, bytes extending a partial match are
+ *   withheld and replayed on a mismatch, so console typing is unaffected; the
+ *   matched trigger belongs to the client's stream and is forwarded to the
+ *   handler. DTR is ignored for attach (a host merely opening the port is not
+ *   a client) but a DTR drop on CDC still releases an attached session; on
+ *   USB-Serial-JTAG, which has no line state at all, release comes from the
+ *   handler's own disconnect or the USB link going down. This is the only
+ *   detection that works on the console port of USB-Serial-JTAG, and the only
+ *   one that works through a relay that forwards bytes but not line state.
+ *
+ * - **DTR** (a claim without a trigger, CDC ports only): the host's DTR rise
+ *   attaches, its drop releases — every pyserial-class client raises DTR on
+ *   open and drops it on close. Any terminal that opens the port is treated
+ *   as a client.
  *
  * While a port is attached, its byte stream is connected to the handler task
  * over ITS (serial_handler_connect_t is the connect payload) and log/CLI are
  * detached from it; on release the console returns.
  *
- * A claimed CDC port does not act on the esptool reset convention. A host
- * closing the port drops DTR before RTS, which is indistinguishable from the
- * reset sequence, so an ordinary client exit would otherwise restart the
- * device — at the cost of esptool auto-reset while the port is claimed.
+ * The esptool reset convention on CDC 0 is suppressed while a session is
+ * attached (a client close drops DTR before RTS, which is the reset
+ * sequence's own shape) and, for DTR claims, while the claim exists at all.
+ * A dormant trigger claim leaves it armed: until a client speaks, the port is
+ * fully an ordinary console, auto-reset included.
  */
 
 /** Claim serial port `port` for `task`, which must have an ITS server port
- *  `itsPort` open. Returns false (and warns) for an out-of-range port, for
- *  port 1 while only one serial port exists, or when another task already
- *  holds the port. Re-claiming with the same task and ITS port succeeds
- *  unchanged, so a claimant can re-apply on every config pass. */
-bool serialPortClaim(int port, const char* task, uint16_t itsPort);
+ *  `itsPort` open. `trigger`/`triggerLen` (≤ 8 bytes) select in-band attach
+ *  detection — see above; without them a CDC port attaches on DTR and a
+ *  USB-Serial-JTAG console port can never attach. Returns false (and warns)
+ *  for an out-of-range port, for port 1 while only one serial port exists, or
+ *  when another task already holds the port. Re-claiming with the same task,
+ *  ITS port and trigger succeeds unchanged, so a claimant can re-apply on
+ *  every config pass. */
+bool serialPortClaim(int port, const char* task, uint16_t itsPort,
+                     const uint8_t* trigger = nullptr, size_t triggerLen = 0);
+
+/** True while a client session is attached on `port` (between the handler
+ *  connect and the release). Safe from any task. */
+extern "C" bool serialPortIsAttached(int port);
 
 /** Drop a claim, ending any attached session and returning port 0 to the
  *  console. */

@@ -973,9 +973,10 @@ static void startSaveTimer() {
 /* STORAGE_CHANGE_PORT in storage.h */
 
 struct storage_sub_t {
-  TaskHandle_t        task;
+  TaskHandle_t        task;    /* nullptr for direct rows (and for dead owners) */
   storage_change_cb_t cb;
   std::string         scope;   /* unbounded — lxmf's 64-hex segments fit now */
+  bool                direct;  /* run cb inline at dispatch instead of messaging a task */
 };
 
 /* The subscription table is OWNED BY THE STORAGE ACTOR: it is only ever mutated
@@ -1000,6 +1001,7 @@ static int           subCount = 0;
  *   'D' DELETE  key\0                        'S': u32 len + bytes (string)
  *   'd' DEFAULT key\0 vtype value            'J': u32 len + printed JSON (subtree)
  *   '+' SUB     scope\0 cb(void*)
+ *   '#' SUBD    scope\0 cb(void*)      direct: cb runs inline at dispatch
  *   '-' UNSUB   scope\0 cb(void*)      cb NULL = all of sender's subs on scope
  *   'W' SAVE    sem(SemaphoreHandle_t)
  * Keys/scopes are NUL-terminated and unbounded. The whole list is validated
@@ -1065,8 +1067,9 @@ static op_accum_t* accumFindOrCreate(TaskHandle_t t) {
 static void subDrop(int i) {
   if (i != subCount - 1) subs[i] = subs[subCount - 1];
   subCount--;
-  subs[subCount].task = nullptr;
-  subs[subCount].cb   = nullptr;
+  subs[subCount].task   = nullptr;
+  subs[subCount].cb     = nullptr;
+  subs[subCount].direct = false;
   std::string().swap(subs[subCount].scope);
 }
 
@@ -1080,12 +1083,12 @@ static void subDrop(int i) {
  * whichever module inits last silently loses all of its subscriptions. */
 static void subReap() {
   for (int i = 0; i < subCount; ) {
-    if (!subs[i].task) subDrop(i);
+    if (!subs[i].task && !subs[i].direct) subDrop(i);   /* direct rows have no owner task */
     else i++;
   }
 }
 
-static void subAdd(TaskHandle_t task, storage_change_cb_t cb, const char* scope) {
+static void subAdd(TaskHandle_t task, storage_change_cb_t cb, const char* scope, bool direct) {
   const char* sc = scope ? scope : "";
   subReap();   /* the table holds live owners only */
   /* Idempotent: re-subscribing the same (task, scope, cb) is a no-op, not a new
@@ -1100,7 +1103,8 @@ static void subAdd(TaskHandle_t task, storage_change_cb_t cb, const char* scope)
    * task — but a respawned task can be handed the freed TCB's address, and the
    * row it would have matched is gone by here. */
   for (int i = 0; i < subCount; i++)
-    if (subs[i].task == task && subs[i].cb == cb && subs[i].scope == sc) return;
+    if (subs[i].task == task && subs[i].cb == cb && subs[i].scope == sc &&
+        subs[i].direct == direct) return;
   if (subCount >= STORAGE_MAX_SUBS) {
     /* Name the scope and the count: a dropped subscription is otherwise
      * indistinguishable from a module that never subscribed at all — the
@@ -1110,11 +1114,16 @@ static void subAdd(TaskHandle_t task, storage_change_cb_t cb, const char* scope)
     return;
   }
   subs[subCount].task = task; subs[subCount].cb = cb; subs[subCount].scope = sc;
+  subs[subCount].direct = direct;
   subCount++;
 }
 static void subRemove(TaskHandle_t task, storage_change_cb_t cb, const char* scope) {
   for (int i = 0; i < subCount; ) {
-    bool match = subs[i].task == task &&
+    /* Direct rows have no owner task; they are removable only by explicit cb
+     * (per-site-unique function pointer), never by a cb=NULL scope sweep —
+     * that would nuke other modules' direct watches on the same scope. */
+    bool owner = subs[i].direct ? (cb != nullptr) : (subs[i].task == task);
+    bool match = owner &&
                  (scope == nullptr || subs[i].scope == scope) &&
                  (cb == nullptr || subs[i].cb == cb);
     if (match) subDrop(i);
@@ -1266,10 +1275,10 @@ static void notifyWorkerFn(void*) {
 
 static void notifyChange(const char* key, const char* val) {
   for (int i = 0; i < subCount; i++) {
-    if (!subs[i].task) continue;   /* owner died — nulled by storageOnTaskDeath */
+    if (!subs[i].task && !subs[i].direct) continue;   /* owner died — nulled by storageOnTaskDeath */
     size_t sl = subs[i].scope.size();
     if (sl != 0 && strncmp(key, subs[i].scope.c_str(), sl) != 0) continue;
-    if (subs[i].task == storageHandle) {
+    if (subs[i].direct || subs[i].task == storageHandle) {
       if (subs[i].cb) subs[i].cb(key, val);
       continue;
     }
@@ -1741,7 +1750,7 @@ static void storageApplyOps(const uint8_t* p, size_t len, TaskHandle_t sender) {
         } else { bad = true; break; }
       }
       ops.push_back(std::move(po));
-    } else if (op == '+' || op == '-') {
+    } else if (op == '+' || op == '#' || op == '-') {
       const char* sc = (const char*)(p + pos);
       size_t scl = strnlen(sc, len - pos);
       if (scl >= len - pos) { bad = true; break; }
@@ -1770,7 +1779,7 @@ static void storageApplyOps(const uint8_t* p, size_t len, TaskHandle_t sender) {
 
   CFG_LOCK();
   for (auto& o : ops) {
-    if (o.op == '+' || o.op == '-') continue;
+    if (o.op == '+' || o.op == '#' || o.op == '-') continue;
 
     /* Route structured-DB keys to their record store instead of cfgRoot. The
      * store applies the op and appends the synthesized change to `changes`, so
@@ -1834,7 +1843,8 @@ static void storageApplyOps(const uint8_t* p, size_t len, TaskHandle_t sender) {
 
   /* SUB/UNSUB: mutate the actor-owned table under the lock (race-free). */
   for (auto& o : ops) {
-    if (o.op == '+')      subAdd(sender, (storage_change_cb_t)o.ptr, o.key.c_str());
+    if (o.op == '+')      subAdd(sender, (storage_change_cb_t)o.ptr, o.key.c_str(), false);
+    else if (o.op == '#') subAdd(nullptr, (storage_change_cb_t)o.ptr, o.key.c_str(), true);
     else if (o.op == '-') subRemove(sender, (storage_change_cb_t)o.ptr, o.key.c_str());
   }
   CFG_UNLOCK();
@@ -1909,14 +1919,15 @@ static void storageChangeDispatch(TaskHandle_t /*sender*/, const void* data, siz
   if (cb) cb(key, val);
 }
 
-void storageSubscribeChanges(const char* scope, storage_change_cb_t cb) {
+void storageSubscribeChanges(const char* scope, storage_change_cb_t cb, bool onStorageTask) {
   /* Register the receive handler on THIS task, then send a SUB op so the actor
    * adds us to its table. Sync, so the subscription is live on return (an
-   * immediate NOW_AND_ON_CHANGE read then sees consistent state). */
-  itsOnAux(STORAGE_CHANGE_PORT, storageChangeDispatch);
+   * immediate NOW_AND_ON_CHANGE read then sees consistent state).
+   * onStorageTask rows need no receive handler: the actor calls cb inline. */
+  if (!onStorageTask) itsOnAux(STORAGE_CHANGE_PORT, storageChangeDispatch);
   std::string buf;
   buf.push_back(0);
-  buf.push_back('+'); opPutStr(buf, scope); opPutPtr(buf, (void*)cb);
+  buf.push_back(onStorageTask ? '#' : '+'); opPutStr(buf, scope); opPutPtr(buf, (void*)cb);
   storageSubmit(std::move(buf), /*sync=*/true);
 }
 

@@ -157,18 +157,47 @@ extern "C" void spangapConfirmBoard(void) {
         claim, found ? found : "no board this straddle knows");
     err("halting — every pin map in this image belongs to a different board");
     fflush(stdout);
+
     /* Stop here, awake. Deep sleep would power down the console peripheral, so
      * the port drops off the host in the same breath as the message explaining
      * why — leaving someone holding a device that is simply dead, with the one
-     * line that would have told them why already gone. Blocking this task
-     * instead keeps the port enumerated and the verdict on screen for as long as
-     * the device is plugged in.
+     * line that would have told them why already gone. Parking this task instead
+     * keeps the port enumerated and the verdict readable for as long as the
+     * device is plugged in.
      *
-     * Blocking forever is the point, not an oversight: nothing else has started
-     * yet (this runs ahead of the first onStart), so there is no state machine
-     * to return to and nothing else that could touch the wrong board's pins.
+     * Two things are needed for that to actually hold.
+     *
+     * The RTC watchdog the bootloader armed is normally disabled by
+     * spangapPostAppInit, at the far end of a boot this one never reaches — so
+     * it has to be disabled here or it fires CONFIG_BOOTLOADER_WDT_TIME_MS after
+     * boot and resets the chip. A halt that reboots every few seconds is worse
+     * than no halt at all: the message scrolls past in a loop and the port
+     * re-enumerates under whoever is trying to talk to it, which is exactly when
+     * a flasher needs the device to hold still. */
+#if CONFIG_BOOTLOADER_WDT_DISABLE_IN_USER_CODE
+    {
+        wdt_hal_context_t rwdt = RWDT_HAL_CONTEXT_DEFAULT();
+        wdt_hal_write_protect_disable(&rwdt);
+        wdt_hal_disable(&rwdt);
+        wdt_hal_write_protect_enable(&rwdt);
+    }
+#endif
+
+    /* And the verdict is re-stated on a slow beat rather than said once into a
+     * console nobody was attached to yet. The reason someone plugs in after a
+     * halt is to find out why it halted; printing only at the moment of failure
+     * answers that question for everyone except the person asking it.
+     *
+     * The delay is what makes this gentle: the task yields, the idle task feeds
+     * the task watchdog, and the console keeps servicing the port. Nothing else
+     * has started (this runs ahead of the first onStart), so there is no state
+     * machine to return to and nothing that could touch the wrong board's pins.
      * Only a reset or a power cycle leaves this. */
-    for (;;) vTaskDelay(portMAX_DELAY);
+    for (;;) {
+        vTaskDelay(pdMS_TO_TICKS(5000));
+        err("WRONG BOARD: image built for %s, hardware reads as %s — halted",
+            claim, found ? found : "no board this straddle knows");
+    }
 }
 
 namespace {
@@ -624,11 +653,17 @@ extern "C" void spangapPostAppInit(void) {
         spawnTask(factoryResetTask, "wipe", 4096, nullptr, 1, 0, STACK_DRAM);
     }
 
-    /* Run any cron entries that fall in the current minute (deep-sleep wake
-     * may already have moved time forward through a scheduled minute). Not in
-     * safe mode — firing scheduled commands in a recovery mode is wrong, and
-     * cron is not up there to run them anyway. */
-    if (spangapSafeMode() == SAFE_MODE_NONE) cronPoll(true);
+    /* Resync cron with everything boot wrote (owners install their
+     * s.cron.tab.* entries during the serviceRunInit walk, possibly before the
+     * cron task's own subscription was registered), then run any entries that
+     * fall in the current minute (deep-sleep wake may already have moved time
+     * forward through a scheduled minute). Not in safe mode — firing scheduled
+     * commands in a recovery mode is wrong, and cron is not up there to run
+     * them anyway. */
+    if (spangapSafeMode() == SAFE_MODE_NONE) {
+        cronReschedule();
+        cronPoll();
+    }
 }
 
 extern "C" void signalFlag(const char* key) {

@@ -77,7 +77,7 @@ Exact signatures and ownership/lifetime contracts are in
 | `storagePersistBlob` | Hand a raw snapshot to the persist worker for an atomic write. For the task boundary, not convenience: a flash write stalls its task for the length of the program windows, so snapshot on your own task (where your structure is consistent) and hand over the bytes. A newer snapshot for the same path supersedes an unwritten earlier one, so a debouncing producer cannot build a backlog. |
 | `storageSave` | Force an immediate flush, blocking until written. Before `storageInit()` has spawned the persist worker it flushes inline on the caller, so the early boot foundations can persist too. |
 | `storageStopFlushing` | Stop persisting for the rest of this boot, one-way. For a [safe-mode](safe-mode.md) restore or factory reset, whose on-disk store is about to be replaced or erased and must not receive the stale in-RAM tree on top. |
-| `storageSubscribeChanges`, `storageUnsubscribe`, `storageUnsubscribeCb`, `NOW_AND_ON_CHANGE` | Prefix-scoped change subscriptions. A task may hold several subscriptions on one scope, one per module watching it; `storageUnsubscribe(scope)` drops all of them, so a module sharing a task with others (anything on the lcd task) drops its own callback with `storageUnsubscribeCb(scope, cb)` instead. |
+| `storageSubscribeChanges`, `storageUnsubscribe`, `storageUnsubscribeCb`, `NOW_AND_ON_CHANGE`, `NOW_AND_ON_CHANGE_DIRECT` | Prefix-scoped change subscriptions. The callback is delivered to the registering task — which therefore must outlive boot (never subscribe from an `onInit`: app_main deletes itself). A module with no long-lived task passes `onStorageTask=true` (or uses `NOW_AND_ON_CHANGE_DIRECT`) instead: the callback then runs inline at change dispatch on the storage machinery — keep it quick, lock-free, and cycle-free (its own writes apply inline). A task may hold several subscriptions on one scope, one per module watching it; `storageUnsubscribe(scope)` drops all of them, so a module sharing a task with others (anything on the lcd task) drops its own callback with `storageUnsubscribeCb(scope, cb)` instead. |
 | `uiTelemetryWanted` | Whether published stat keys have a plausible reader (LCD build, or WiFi up so a browser can pull them) — periodic publishers gate on it to skip churn on a headless, WiFi-down node. See [power-management](power-management.md#idle-discipline--park-dont-poll). |
 
 For threading rules, the op-list wire format, the change fan-out, and the
@@ -173,9 +173,8 @@ owned and documented by their producing straddles.
 Each module installs its own config block in its init, gated by an
 `s.<mod>.version` key: on first boot the version is absent, the install runs and
 bumps the version; later boots skip it, preserving user edits. The APIs are
-`storageDefault(key,val)` (set if absent), `storageDefaultTree(prefix,json)`
-(walk a JSON literal, install each missing leaf), and `cronDefault(schedule,cmd)`
-(append a crontab line if absent). All three are **silent** — they fire no
+`storageDefault(key,val)` (set if absent) and `storageDefaultTree(prefix,json)`
+(walk a JSON literal, install each missing leaf). Both are **silent** — they fire no
 change subscriptions, since first-boot seeding would otherwise flood subscriber
 inboxes. The `s.<mod>.version` gate is purely a code mechanism; this project
 runs no config-version migrations, so do not treat version-bumping as a

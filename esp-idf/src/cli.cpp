@@ -1658,7 +1658,30 @@ static struct serial_claim_t {
     char     task[16];
     uint16_t itsPort;
     bool     claimed;
+    /* In-band attach trigger (cli.h). Empty = DTR attach (CDC only). */
+    uint8_t  trig[8];
+    uint8_t  trigLen;
 } serialClaims[SERIAL_PORT_COUNT];
+
+/* Trigger bytes matched so far on an unattached triggered port. Owned by the
+ * serial task; reset on claim change and on detach. */
+static uint8_t serialTrigMatched[SERIAL_PORT_COUNT];
+
+/* True between handler connect and release. Written by the serial task, read
+ * from any task (the TinyUSB line-state callback gates esptool arming on it). */
+static volatile bool serialAttachedFlag[SERIAL_PORT_COUNT];
+
+/* Serial-task liveness readouts for `usb`: main-loop iterations, trigger scans
+ * of non-console ports, and bytes those scans drained. The question they
+ * answer is whether the task runs at all and whether a claimed spare port's
+ * bytes ever reach it. */
+static volatile uint32_t serialLoopCount, serialScanCount, serialScanBytes;
+
+extern "C" void serialTaskStats(uint32_t* loops, uint32_t* scans, uint32_t* scanBytes) {
+    if (loops)     *loops     = serialLoopCount;
+    if (scans)     *scans     = serialScanCount;
+    if (scanBytes) *scanBytes = serialScanBytes;
+}
 
 /* A claim was taken or dropped; the serial task re-reads the registry. */
 static volatile bool serialClaimChanged = false;
@@ -1813,8 +1836,19 @@ extern "C" bool serialPortIsClaimed(int port) {
     return port >= 0 && port < SERIAL_PORT_COUNT && serialClaims[port].claimed;
 }
 
+extern "C" bool serialPortIsAttached(int port) {
+    return port >= 0 && port < SERIAL_PORT_COUNT && serialAttachedFlag[port];
+}
+
+extern "C" bool serialPortClaimTriggered(int port) {
+    return serialPortIsClaimed(port) && serialClaims[port].trigLen > 0;
+}
+
 extern "C" void serialPortHostAttached(int port) {
     if (!serialPortIsClaimed(port)) return;
+    /* A triggered claim attaches in band only: a host opening the port (DTR
+     * rise) is not yet a client. */
+    if (serialClaims[port].trigLen) return;
     serialAttachReq[port] = true;
     serialPortWake();
 }
@@ -1825,8 +1859,10 @@ extern "C" void serialPortHostDetached(int port) {
     serialPortWake();
 }
 
-bool serialPortClaim(int port, const char* task, uint16_t itsPort) {
-    if (port < 0 || port >= SERIAL_PORT_COUNT || !task || !*task) {
+bool serialPortClaim(int port, const char* task, uint16_t itsPort,
+                     const uint8_t* trigger, size_t triggerLen) {
+    if (port < 0 || port >= SERIAL_PORT_COUNT || !task || !*task
+        || triggerLen > sizeof(serialClaims[0].trig) || (triggerLen && !trigger)) {
         warn("serial: port %d cannot be claimed (0 = console port%s)", port,
              SERIAL_PORT_COUNT > 1 ? ", 1 = second cdc port"
                                    : "; this build has no second port — "
@@ -1843,18 +1879,25 @@ bool serialPortClaim(int port, const char* task, uint16_t itsPort) {
     if (c.claimed) {
         /* Re-applying an identical claim is how a claimant reacts to a
          * transport switch, so it must not read as a conflict. */
-        if (strcmp(c.task, task) == 0 && c.itsPort == itsPort) return true;
+        if (strcmp(c.task, task) == 0 && c.itsPort == itsPort
+            && c.trigLen == triggerLen
+            && (triggerLen == 0 || memcmp(c.trig, trigger, triggerLen) == 0))
+            return true;
         warn("serial: port %d already claimed by %s", port, c.task);
         return false;
     }
     safeStrncpy(c.task, task, sizeof(c.task));
     c.itsPort = itsPort;
+    if (triggerLen) memcpy(c.trig, trigger, triggerLen);
+    c.trigLen = (uint8_t)triggerLen;
     c.claimed = true;
+    serialTrigMatched[port] = 0;
     serialAttachReq[port] = false;
     serialDetachReq[port] = false;
     serialClaimChanged = true;
     serialPortWake();
-    info("serial: port %d claimed by %s:%u", port, task, (unsigned)itsPort);
+    info("serial: port %d claimed by %s:%u%s", port, task, (unsigned)itsPort,
+         triggerLen ? " (in-band trigger)" : "");
     return true;
 }
 
@@ -1956,6 +1999,8 @@ static void serialTaskFn(void* arg) {
       itsDisconnect(hdlHandle[port]);
       hdlHandle[port] = -1;
       serialHdlPendLen[port] = 0;
+      serialTrigMatched[port] = 0;
+      serialAttachedFlag[port] = false;
       if (port == 0) serialInHandler = false;
   };
 
@@ -1972,6 +2017,8 @@ static void serialTaskFn(void* arg) {
       if (h < 0) return false;
       hdlHandle[port] = h;
       serialHdlPendLen[port] = 0;
+      serialTrigMatched[port] = 0;
+      serialAttachedFlag[port] = true;
       if (port == 0) {
         /* A CLI session cannot outlive the port it runs on. Drop it silently —
          * the banner would go to the client, not to a person. */
@@ -2025,19 +2072,42 @@ static void serialTaskFn(void* arg) {
       if (!itsConnected(h)) hdlDetach(port);
   };
 
+  /* Pre-attach trigger scan for a claimed non-console port: nothing else
+   * reads it, so the bytes are consumed here, matched against the claim's
+   * trigger and otherwise dropped — a port with no console has no other place
+   * for them. On a match the client's stream begins: the trigger and whatever
+   * followed it in the same read are forwarded through the attach. */
+  auto trigScan = [&](int port) {
+      auto& cl = serialClaims[port];
+      if (!cl.claimed || !cl.trigLen || hdlHandle[port] >= 0) return;
+      serialScanCount++;
+      uint8_t rb[128];
+      int n = portRead(port, rb, sizeof(rb));
+      if (n > 0) serialScanBytes += (uint32_t)n;
+      for (int i = 0; i < n; i++) {
+        if (rb[i] == cl.trig[serialTrigMatched[port]]) {
+          if (++serialTrigMatched[port] < cl.trigLen) continue;
+          serialTrigMatched[port] = 0;
+          /* Client revealed: attach with the trigger plus the rest of this
+           * read — all of it is the client's stream, in order. */
+          uint8_t first[sizeof(rb) + sizeof(cl.trig)];
+          memcpy(first, cl.trig, cl.trigLen);
+          size_t rest = (size_t)(n - i - 1);
+          memcpy(first + cl.trigLen, rb + i + 1, rest);
+          if (!hdlAttach(port, first, cl.trigLen + rest))
+            warn("serial: port %d trigger matched but the handler refused the "
+                 "session (busy, or its connect failed)", port);
+          return;
+        }
+        serialTrigMatched[port] = (rb[i] == cl.trig[0]) ? 1 : 0;
+      }
+  };
+
   /* Handle one inbound console byte: enter CLI mode on the first keystroke,
    * forward keys to the CLI, treat Ctrl-C as "drop back to log". Reached only
-   * for bytes the frame sniffer in handleChar() below did not claim. */
+   * for bytes neither the trigger sniffer nor the frame sniffer in
+   * handleChar() below claimed. */
   auto consoleChar = [&](char c) {
-      /* In-band attach for a claimed console port on USB-Serial-JTAG, which
-       * offers no DTR to watch. 0xC0 is the KISS frame delimiter and opens
-       * every such client's first burst; no console keystroke produces it. The
-       * byte belongs to the client, so it is forwarded, not swallowed. */
-      if ((uint8_t)c == 0xC0 && !consoleOnCdc &&
-          serialPortIsClaimed(0) && hdlHandle[0] < 0) {
-        uint8_t b = 0xC0;
-        if (hdlAttach(0, &b, 1)) return;
-      }
       if (c == 0x03) {
         /* Ctrl-C on serial: abort any CLI line in flight, print a hint
          * (so the user doesn't think Ctrl-C exits the monitor — Ctrl-]
@@ -2272,9 +2342,39 @@ static void serialTaskFn(void* arg) {
    * It also sits ahead of the 0xC0 attach check, so an id or length byte that
    * happens to be 0xC0 cannot open a handler session mid-frame; idle, the 0xC0
    * check keeps its place. */
-  auto handleChar = [&](char c) {
+  /* Console-byte chain past the trigger sniffer: framed-RPC first, keys next. */
+  auto consoleByte = [&](char c) {
       if (rpcFeed((uint8_t)c)) return;
       consoleChar(c);
+  };
+
+  /* In-band attach for a claimed console port (cli.h): match the claim's
+   * trigger in the keystroke stream. Bytes extending a partial match are
+   * withheld — they are exactly the trigger's own prefix, so a mismatch
+   * replays them from the claim — and a completed match attaches with the
+   * trigger forwarded, because it opens the client's stream. Skipped while an
+   * RPC frame is mid-assembly: its binary payload may contain the trigger,
+   * and those bytes are already spoken for. */
+  auto handleChar = [&](char c) {
+      auto& cl = serialClaims[0];
+      if (cl.claimed && cl.trigLen && hdlHandle[0] < 0 && !rpcAssembling()) {
+        uint8_t& n = serialTrigMatched[0];
+        if ((uint8_t)c == cl.trig[n]) {
+          if (++n < cl.trigLen) return;
+          n = 0;
+          if (hdlAttach(0, cl.trig, cl.trigLen)) return;
+          /* Refused — the handler already has a session. The port stays a
+           * console, and the withheld bytes go back to it. */
+          for (uint8_t i = 0; i + 1 < cl.trigLen; i++) consoleByte((char)cl.trig[i]);
+        } else if (n) {
+          uint8_t held = n;
+          n = 0;
+          for (uint8_t i = 0; i < held; i++) consoleByte((char)cl.trig[i]);
+          /* The mismatching byte may itself reopen a match. */
+          if ((uint8_t)c == cl.trig[0]) { n = 1; return; }
+        }
+      }
+      consoleByte(c);
   };
 
   /* Console input that predates the console. The USB-Serial-JTAG controller
@@ -2312,6 +2412,7 @@ static void serialTaskFn(void* arg) {
   info("serial: framed rpc v1\n");
 
   for (;;) {
+    serialLoopCount++;
     rpcCheckTimeout();
     /* ---- serial-handler bookkeeping, ahead of every console mode ----
      * A claimed port 1 must be shuttled whether or not the console has a CLI
@@ -2343,6 +2444,7 @@ static void serialTaskFn(void* arg) {
      * while the link is gone. */
     if (cliUsbSerialLinkDown)
       for (int p = 0; p < SERIAL_PORT_COUNT; p++) hdlDetach(p);
+    for (int p = 1; p < serialPortCount(); p++) trigScan(p);
     hdlPump(1);
 
     if (hdlHandle[0] >= 0) {
@@ -2360,10 +2462,9 @@ static void serialTaskFn(void* arg) {
       /* Idle / log mode: log fanout goes direct-to-stdout, so nothing is queued
        * to this task over ITS until a CLI session opens — only a keystroke moves
        * us forward, and there is nothing to poll for (USB recovery is driven by
-       * the log task's pmPollUsb, not us). So park indefinitely on the driver's
-       * ISR-fed RX ring: a keystroke wakes us at once, and an idle console adds
-       * zero wakes — this task drops off the wake path entirely so both cores
-       * can light-sleep. */
+       * the log task's pmPollUsb, not us). So park on the driver's ISR-fed RX
+       * ring: a keystroke wakes us at once, and an idle console costs one wake
+       * per period rather than a poll. */
       char c;
       pmBoostAuto(false);
       /* The auto-resume latch belongs to a session; carrying it into log mode
@@ -2379,9 +2480,16 @@ static void serialTaskFn(void* arg) {
         if (consoleCdcRead(&c)) { pmBoostAuto(true); handleChar(c); }
         else ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(50));
       } else {
-        /* Park indefinitely only when no frame is part-assembled: nothing else
-         * wakes this task, so an abandoned frame would never be timed out. */
-        TickType_t wait = rpcAssembling() ? pdMS_TO_TICKS(50) : portMAX_DELAY;
+        /* The park must be BOUNDED: nothing can interrupt the driver read —
+         * not the task notification serialPortWake sends, and not
+         * consoleSwitchPending — so a `usb cdc` issued over the network (no
+         * console byte ever arrives to return this read) would strand this
+         * task forever on a controller that just lost the pads, deaf to the
+         * new console and to every claimed port. The period is the cap on how
+         * stale this task's view may get; two seconds keeps light sleep
+         * effective. Short while a frame is part-assembled, so an abandoned
+         * one is timed out promptly. */
+        TickType_t wait = rpcAssembling() ? pdMS_TO_TICKS(50) : pdMS_TO_TICKS(2000);
         if (usb_serial_jtag_read_bytes(&c, 1, wait) == 1) {
           pmBoostAuto(true);
           handleChar(c);

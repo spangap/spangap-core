@@ -64,11 +64,12 @@
 extern "C" { volatile bool consoleOnCdc = false; }
 
 /* Set for the duration of a transport switch. When idle the serial task parks
- * indefinitely on the USB-Serial-JTAG RX ring — deliberately, so an idle
- * console costs no wakes — and from there it would never reconsider which
- * transport to read. That park has to be avoided across a switch, or the task
- * blocks on the controller being taken away and the new console is deaf.
- * While this is set the task polls instead. */
+ * on the USB-Serial-JTAG RX ring — bounded at two seconds, because nothing can
+ * interrupt that read from outside — and per pass it re-reads this flag to
+ * decide which transport to service. While this is set the task takes the
+ * polling branch instead of re-entering the park, so it rides out the switch
+ * on the right side; a task already inside the read picks the change up when
+ * the bound expires. */
 extern "C" { volatile bool consoleSwitchPending = false; }
 
 /* Set while no transport owns the pads: the outgoing controller has lost them
@@ -95,6 +96,14 @@ static int cdcPorts = 0;
  * Held for as long as the console lives on CDC. */
 static pm_lock_handle_t cdcLock = nullptr;
 
+/* Per-port shuttle counters, read by `usb` — the first question about a
+ * silent claimed port is whether bytes move at all, and at which layer they
+ * stop. rx counts what a reader drained, tx what was queued out; rxEvt counts
+ * TinyUSB's rx callbacks (bytes ARRIVED, drained or not) and dtrEvt its DTR
+ * edges (a host opened/closed the port at all). All since boot. */
+static uint32_t cdcRxCount[TINYUSB_CDC_ACM_MAX], cdcTxCount[TINYUSB_CDC_ACM_MAX];
+static uint32_t cdcRxEvt[TINYUSB_CDC_ACM_MAX], cdcDtrEvt[TINYUSB_CDC_ACM_MAX];
+
 /** Take one byte from the console CDC port; 1 when a byte was read, else 0.
  *  The serial task comes through here rather than reading STDIN_FILENO because
  *  freopen() need not preserve a descriptor number — fd 0 can still refer to
@@ -104,7 +113,17 @@ extern "C" int consoleCdcRead(char* out) {
   if (!consoleOnCdc) return 0;
   size_t n = 0;
   if (tinyusb_cdcacm_read(TINYUSB_CDC_ACM_0, (uint8_t*)out, 1, &n) != ESP_OK) return 0;
+  cdcRxCount[TINYUSB_CDC_ACM_0] += (uint32_t)n;
   return n == 1 ? 1 : 0;
+}
+
+extern "C" void consoleCdcPortStats(int itf, uint32_t* rx, uint32_t* tx,
+                                    uint32_t* rxEvt, uint32_t* dtrEvt) {
+  bool ok = itf >= 0 && itf < TINYUSB_CDC_ACM_MAX;
+  if (rx)     *rx     = ok ? cdcRxCount[itf] : 0;
+  if (tx)     *tx     = ok ? cdcTxCount[itf] : 0;
+  if (rxEvt)  *rxEvt  = ok ? cdcRxEvt[itf] : 0;
+  if (dtrEvt) *dtrEvt = ok ? cdcDtrEvt[itf] : 0;
 }
 
 /* Block read/write on a named CDC port, for the serial task's handler shuttle
@@ -116,6 +135,7 @@ extern "C" int consoleCdcReadPort(int itf, uint8_t* out, size_t max) {
   if (!consoleOnCdc || itf < 0 || itf >= cdcPorts) return 0;
   size_t n = 0;
   if (tinyusb_cdcacm_read((tinyusb_cdcacm_itf_t)itf, out, max, &n) != ESP_OK) return 0;
+  cdcRxCount[itf] += (uint32_t)n;
   return (int)n;
 }
 
@@ -123,6 +143,7 @@ extern "C" int consoleCdcWritePort(int itf, const uint8_t* data, size_t len) {
   if (!consoleOnCdc || itf < 0 || itf >= cdcPorts) return 0;
   size_t w = tinyusb_cdcacm_write_queue((tinyusb_cdcacm_itf_t)itf, data, len);
   tinyusb_cdcacm_write_flush((tinyusb_cdcacm_itf_t)itf, pdMS_TO_TICKS(50));
+  cdcTxCount[itf] += (uint32_t)w;
   return (int)w;
 }
 
@@ -208,6 +229,8 @@ static bool          prevDtr[TINYUSB_CDC_ACM_MAX];
 /* Serial-handler registry hooks (cli.cpp). A claimed port's DTR edges are
  * attach/detach for its handler, and its reset arming is suppressed. */
 extern "C" bool serialPortIsClaimed(int port);
+extern "C" bool serialPortIsAttached(int port);
+extern "C" bool serialPortClaimTriggered(int port);
 extern "C" void serialPortHostAttached(int port);
 extern "C" void serialPortHostDetached(int port);
 extern "C" void serialPortWake(void);
@@ -228,6 +251,7 @@ static void cdcLineStateCb(int itf, cdcacm_event_t* event) {
   bool rts = event->line_state_changed_data.rts;
   bool dtr = event->line_state_changed_data.dtr;
   bool claimed = serialPortIsClaimed(itf);
+  if (dtr != prevDtr[itf]) cdcDtrEvt[itf]++;
 
   if (dtr && !prevDtr[itf]) {
     /* Drop anything queued while no host was reading. A CDC TX FIFO holds its
@@ -239,13 +263,21 @@ static void cdcLineStateCb(int itf, cdcacm_event_t* event) {
   }
 
   if (claimed) {
-    /* DTR is the attach signal on CDC: a pyserial-class client raises it on
-     * open and drops it on close. It is also why the esptool arming below is
-     * skipped — a clean close drops DTR before RTS, which is the reset
-     * sequence's own shape, and would reboot the device on every client exit. */
+    /* DTR is the attach signal on a DTR claim: a pyserial-class client raises
+     * it on open and drops it on close (a triggered claim ignores the rise —
+     * serialPortHostAttached filters it — and attaches in band instead). The
+     * drop releases either kind of attached session. */
     if (dtr && !prevDtr[itf])       serialPortHostAttached(itf);
     else if (!dtr && prevDtr[itf])  serialPortHostDetached(itf);
-  } else if (itf == TINYUSB_CDC_ACM_0) {
+  }
+  /* The esptool reset convention is suppressed while a client session is on
+   * the port — a clean close drops DTR before RTS, the reset sequence's own
+   * shape, and would reboot the device on every client exit — and for a DTR
+   * claim while the claim exists at all, since there a mere open is a client.
+   * A dormant triggered claim leaves auto-reset armed: until a client speaks
+   * the port is fully a console. */
+  if (itf == TINYUSB_CDC_ACM_0
+      && (!claimed || (serialPortClaimTriggered(itf) && !serialPortIsAttached(itf)))) {
     /* Console port only. The other port carries data, and a host driver there
      * raises and drops these same lines as a matter of course — opening and
      * closing an interface is routine — which must never restart a running
@@ -279,6 +311,7 @@ static void cdcLineStateCb(int itf, cdcacm_event_t* event) {
 /* Inbound bytes on a CDC port. The serial task reads the ports itself; this
  * only has to wake it, so a handler's stream is not paced by a poll interval. */
 static void cdcRxCb(int itf, cdcacm_event_t*) {
+  if (itf >= 0 && itf < TINYUSB_CDC_ACM_MAX) cdcRxEvt[itf]++;
   if (serialPortIsClaimed(itf)) serialPortWake();
 }
 
@@ -576,6 +609,13 @@ static void cmdUsbJtagAlias(const char* a) { if (cliWantsHelp(a)) return; switch
 extern "C" int  consoleCdcRead(char*) { return 0; }
 extern "C" int  consoleCdcReadPort(int, uint8_t*, size_t) { return 0; }
 extern "C" int  consoleCdcWritePort(int, const uint8_t*, size_t) { return 0; }
+extern "C" void consoleCdcPortStats(int, uint32_t* rx, uint32_t* tx,
+                                    uint32_t* rxEvt, uint32_t* dtrEvt) {
+  if (rx) *rx = 0;
+  if (tx) *tx = 0;
+  if (rxEvt) *rxEvt = 0;
+  if (dtrEvt) *dtrEvt = 0;
+}
 extern "C" void consoleCdcFlush(void) {}
 
 extern "C" const char* consoleModeName(void) {

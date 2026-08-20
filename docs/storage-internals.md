@@ -227,6 +227,7 @@ Op-list wire format (one heap block, single leading flags byte; `bit0 = SILENT`)
 'D' DELETE  key\0                        'S': u32 len + bytes
 'd' DEFAULT key\0 vtype value            'J': u32 len + printed JSON subtree
 '+' SUB     scope\0 cb(void*)
+'#' SUBD    scope\0 cb(void*)     direct: cb runs inline at dispatch
 '-' UNSUB   scope\0 cb(void*)     cb NULL = all of sender's subs on scope
 'W' SAVE    sem(SemaphoreHandle_t)
 ```
@@ -259,9 +260,18 @@ writes auto-commit individually (atomicity lost, never data lost).
 
 `notifyChange` iterates the subscription table for each changed key:
 
-- The storage task's own subs (the `""` browser-sync sub) are invoked
-  **directly** — no self-send, and the full value is passed (the DC handler
-  re-reads by key anyway).
+- The storage task's own subs (the `""` browser-sync sub) and **direct rows**
+  (`onStorageTask=true`, op `'#'`) are invoked **inline** — no self-send, and
+  the full value is passed (the DC handler re-reads by key anyway). Direct rows
+  are how a module with no long-lived task reacts to changes (subscribing from
+  an `onInit` on app_main would otherwise die with it). They have no owner task
+  (`task = nullptr`, `direct = true`): `subReap`/`storageOnTaskDeath` skip them,
+  and only an explicit `storageUnsubscribeCb(scope, cb)` removes one — a
+  `cb=NULL` scope sweep must not nuke other modules' direct watches. The
+  callback runs on the storage actor (or on the writing task before the actor
+  spawns): it must be quick, take no lock a writer may hold across a blocking
+  storage write, and its own writes apply inline — a subscription cycle
+  recurses, so don't build one.
 - A remote subscriber gets a variable-length `gp_alloc`'d CHANGED message
   `{cb(void*), key\0, val\0}` sent to its `STORAGE_CHANGE_PORT` aux with a
   bounded enqueue (`CONFIG_SPANGAP_STORAGE_NOTIFY_TIMEOUT_MS`, 10 ms). On
@@ -276,7 +286,7 @@ writes auto-commit individually (atomicity lost, never data lost).
 The subscription table is **owned by the actor** — only ever mutated on the
 storage task via SUB/UNSUB ops (or at boot before the task spawns), so the
 old unguarded-`subCount++` race is gone by construction. `subAdd` is idempotent
-on `(task, scope, cb)`, so re-subscribing a captureless lambda from a repeating
+on `(task, scope, cb, direct)`, so re-subscribing a captureless lambda from a repeating
 event does not leak rows until the table fills. Task death is handled by
 `storageOnTaskDeath` (called from ITS's global `vTaskPreDeletionHook` in a
 scheduler critical section — no locks/alloc/logging there): it nulls the owner

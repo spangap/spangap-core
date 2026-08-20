@@ -288,8 +288,21 @@ typedef void (*storage_change_cb_t)(const char* key, const char* val);
  *  Callback fires on the calling task's own stack (via itsPoll).
  *  Scope is prefix-matched: "s.camera.img" matches "s.camera.img.quality", etc.
  *  Empty scope "" matches all changes.
- *  Call from the task that should receive the callback (during init). */
-void storageSubscribeChanges(const char* scope, storage_change_cb_t cb);
+ *  Call from the task that should receive the callback (during init) — NOT
+ *  from a task that dies after boot (app_main / an onInit): its subscriptions
+ *  are reaped with it and never fire.
+ *
+ *  onStorageTask=true hosts the callback on the storage machinery instead: it
+ *  runs inline at change dispatch, on the storage task (or on the writing task
+ *  before storage spawns). This is how a module WITHOUT a long-lived task
+ *  reacts to config changes — subscribe from onInit and forget. Contract:
+ *  - be quick, never block, and take no lock another task may hold across a
+ *    blocking storage write (that deadlocks the actor);
+ *  - reads and writes of storage are fine — same-task writes apply inline, so
+ *    a subscription cycle recurses: don't build one;
+ *  - the callback sees the full value (no cross-task truncation);
+ *  - removal works only via storageUnsubscribeCb with the exact cb. */
+void storageSubscribeChanges(const char* scope, storage_change_cb_t cb, bool onStorageTask = false);
 
 /** Remove all subscriptions on `scope` registered by the calling task.
  *  Exact-string scope match; pair with storageSubscribeChanges.
@@ -319,6 +332,17 @@ void storageUnsubscribeCb(const char* scope, storage_change_cb_t cb);
 #define NOW_AND_ON_CHANGE(scope, ...) do { \
     storage_change_cb_t _naoc = [](const char* key, const char* val) __VA_ARGS__; \
     storageSubscribeChanges((scope), _naoc); \
+    _naoc((scope), storageGetStr(scope).c_str()); \
+  } while (0)
+
+/** NOW_AND_ON_CHANGE with the subscription hosted on the storage task
+ *  (storageSubscribeChanges onStorageTask=true, same contract): the "now"
+ *  invocation still runs on the calling task, later changes fire inline at
+ *  dispatch. This is the form to use from an onInit — the plain macro's
+ *  subscription would die with app_main and never fire again. */
+#define NOW_AND_ON_CHANGE_DIRECT(scope, ...) do { \
+    storage_change_cb_t _naoc = [](const char* key, const char* val) __VA_ARGS__; \
+    storageSubscribeChanges((scope), _naoc, /*onStorageTask=*/true); \
     _naoc((scope), storageGetStr(scope).c_str()); \
   } while (0)
 

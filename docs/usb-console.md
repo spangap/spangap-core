@@ -15,6 +15,13 @@ Only one of the two is on the wire at a time: the chip has a single internal USB
 PHY, shared between the USB-Serial-JTAG controller and the USB-OTG core that
 TinyUSB drives. Switching moves the PHY, so the host sees a disconnect and then
 a fresh enumeration — a monitor attached across the switch must reopen the port.
+The two transports also enumerate under **different host device names** (the CDC
+composite carries its own serial string), which is why **flashing from CDC mode
+cannot work**: esptool's reset lands the chip in the ROM bootloader — which is
+back on USB-Serial-JTAG under the other name — and the stub upload then fails
+reopening the name it started with, leaving the device parked in download mode
+until a manual reset. `usb cdc` is per-boot, so a plain `reboot` (or `usb
+jtag`) restores the flashable transport and its stable name; flash from there.
 
 **Off by default.** The CDC transport is built only under
 `CONFIG_SPANGAP_USB_CDC`, because the TinyUSB device stack it links in holds
@@ -32,7 +39,7 @@ do nothing.
 
 | Command | Does |
 |---|---|
-| `usb` | Peer presence, the transport the console is on, the port count, and the reason the last switch failed (if one did). |
+| `usb` | Peer presence, the transport the console is on, the port count, and the reason the last switch failed (if one did). On a CDC build it adds a line per port — RX/TX byte counts and RX/DTR event counts since boot, plus that port's claim state (`claimed (in-band trigger)` / `claimed (dtr)`) and whether a client is attached — and the serial task's loop, spare-port-scan and scanned-byte totals. The first question about a silent claimed port is whether bytes move at all, and these say. |
 | `usb cdc` | Move the console onto the two-port TinyUSB composite device. |
 | `usb jtag` | Move it back onto the USB-Serial-JTAG controller. |
 | `usb up` / `usb down` | Reconnect / disconnect the USB-serial peer — [power-management](power-management.md), unrelated to the transport. |

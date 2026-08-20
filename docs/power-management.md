@@ -64,7 +64,7 @@ server, a peripheral driver — and it shows up in `pm` alongside these):
 |---|---|---|---|
 | `usb` | `NO_LIGHT_SLEEP` | a USB-serial host is attached (SOF detected; 5 s boot grace) | pm |
 | `usbcdc` | `NO_LIGHT_SLEEP` | the console runs on a TinyUSB CDC device (`usb cdc`) — a nap gates the USB clock and drops the link | [usb-console](usb-console.md) |
-| `cron` | `NO_DEEP_SLEEP` | cron is disabled **or** the crontab is empty | [cron](cron.md) |
+| `cron` | `NO_DEEP_SLEEP` | cron is disabled **or** no `s.cron.tab.*` entry exists | [cron](cron.md) |
 | `waittime` | `NO_DEEP_SLEEP` | a `waitForTime()` clock-sync barrier is in progress | core (`spangap_init`) |
 | `waitflag` | `NO_DEEP_SLEEP` | a `waitForFlag()` readiness barrier is in progress | core (`spangap_init`) |
 | `net` | `NO_DEEP_SLEEP` | WiFi is up | [spangap-net](../../spangap-net) |
@@ -195,7 +195,7 @@ pm never calls deep sleep directly. `pmLockRelease()` sets the `sys.going_down`
 storage var the moment `deepSleepAllowed()` becomes true (every lock released);
 cron observes that and sleeps the device until the next scheduled minute. So
 `usb down` alone only reaches **light** sleep — deep sleep additionally needs a
-crontab entry that can wake the device (otherwise the `cron` lock stays held).
+cron entry that can wake the device (otherwise the `cron` lock stays held).
 See [cron](cron.md).
 
 ## CLI
