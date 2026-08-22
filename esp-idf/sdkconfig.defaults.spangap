@@ -136,6 +136,14 @@ CONFIG_FREERTOS_USE_TICKLESS_IDLE=y
 # level-triggered ISR can miss a bounced press needs to re-check on the wake
 # itself, not just when the post-wake interrupt is sampled.
 CONFIG_PM_LIGHT_SLEEP_CALLBACKS=y
+# Sleep entry/exit out of flash and into IRAM. Both of these buy back time the
+# chip would otherwise spend awake running the sleep path itself: ~310 us per
+# cycle for the light-sleep code, ~20 us for the RTOS idle hook. That is paid on
+# EVERY wake, so what they are worth scales with how often the device wakes —
+# which on a battery node is the whole budget. Cost is IRAM: ~2.1 KB and ~180 B.
+# PM_SLP_IRAM_OPT selects ESP_TIMER_IN_IRAM, which is already on here.
+CONFIG_PM_SLP_IRAM_OPT=y
+CONFIG_PM_RTOS_IDLE_OPT=y
 
 # FAT — long filenames (strftime patterns exceed 8.3).
 # exFAT was removed from ESP-IDF 5.4 menuconfig — SD cards must be FAT32.

@@ -26,6 +26,14 @@ void pmInit();
  *  Called periodically from log task. */
 void pmPollUsb();
 
+/** Is a USB-serial host attached? The debounced state pmPollUsb() tracks — the
+ *  same one the `usb` NO_LIGHT_SLEEP lock follows, so it is true through the
+ *  boot grace window and false after `usb down`. Raw
+ *  usb_serial_jtag_is_connected() is SOF-based and noisy at sub-second rates;
+ *  this is the settled answer, and the serial task is notified on the rising
+ *  edge so it can park indefinitely while it reads false. */
+bool pmUsbAttached();
+
 /** Register PM CLI commands (pm, top, usb). */
 void pmRegisterCmds();
 

@@ -11,6 +11,8 @@
 #include "fs.h"
 #include <esp_log.h>
 #include <esp_heap_caps.h>
+#include <memory>
+#include <new>
 #include <string>
 #include <esp_timer.h>
 #if CONFIG_SPANGAP_WATCH_ADDR
@@ -39,6 +41,31 @@ static portMUX_TYPE logSpinlock = portMUX_INITIALIZER_UNLOCKED;
  * drain as one marker line once space frees — a log that drops silently is a
  * log that can't be trusted during exactly the bursts worth reading. */
 static volatile uint32_t logRingDropped = 0;
+
+/* Lines logVprintf never formatted because nothing could receive them (see
+ * logNowhereToGo). Counted and reported separately from logRingDropped: "the
+ * writers outran the drain" and "nobody was listening at all" are different
+ * facts about a gap in the log, and one marker for both would say neither. */
+static volatile uint32_t logSuppressed = 0;
+
+/* Refreshed by the log task once per pass, read by logVprintf on every line
+ * from whatever task called it.
+ *
+ *   logDrainWanted — a consumer or the log file is attached, so waking the log
+ *                    task achieves something. Without it the notify is a wake
+ *                    that finds a drain it will decline to run.
+ *   logSinkLive    — any of the above OR a live console wire, which is a sink
+ *                    that needs no consumer at all (logVprintf echoes straight
+ *                    to stdout).
+ *
+ * Neither is load-bearing for correctness: both are hints that go stale for at
+ * most one log-task pass, and every path they gate is idempotent.
+ *
+ * Both start TRUE so the gates stay inert until the log task has evaluated
+ * them for real. The window is short — logInit() blocks until the task is up —
+ * but it is the boot window, where an early line is the one worth having. */
+static volatile bool logDrainWanted = true;
+static volatile bool logSinkLive    = true;
 
 static size_t logRingWrite(const char* data, size_t len) {
   taskENTER_CRITICAL(&logSpinlock);
@@ -497,18 +524,67 @@ extern "C" volatile bool consoleWriteDead;
 extern "C" void consoleWriteLock(void);
 extern "C" void consoleWriteUnlock(void);
 
+/* True while the console is on a TinyUSB CDC device. Defined in usb_ports.cpp. */
+extern "C" volatile bool consoleOnCdc;
+
+/* Is there a wire the direct echo can actually reach anyone on? On CDC the
+ * transport carries its own presence and holds its own PM lock, so it counts
+ * outright. Otherwise it is pm's debounced USB-host answer — true through the
+ * boot grace, so boot banners always go out, and false once `usb down` or a
+ * genuine unplug has settled. With no host the echo is a console write lock, an
+ * fwrite and a driver call per line, into a FIFO nothing will ever drain. */
+static inline bool logWireLive(void) {
+    return consoleOnCdc || pmUsbAttached();
+}
+
+/* Is there nowhere at all for this line to go? No consumer, no log file, no
+ * live wire — and a ring with no space left, which is the part that makes this
+ * a saving rather than a loss. The ring is what holds the boot window, the
+ * stretch between the log hook being installed and the serial task connecting
+ * as the first consumer; while it has room it IS a sink and every line is
+ * formatted into it. Once it is full with nothing draining it, logRingWrite
+ * would drop this line's bytes on the floor, so formatting it is work with no
+ * destination whatsoever: two heap buffers, a vsnprintf, a reformat, a scrub
+ * pass and a spinlock, per line, for a result nobody will ever read.
+ *
+ * head/tail are read without the spinlock: both are single aligned words that
+ * cannot tear, the drain reads them the same way, and being one line out of
+ * date changes nothing here. */
+static inline bool logNowhereToGo(void) {
+    if (logSinkLive) return false;
+    return (uint32_t)(logRingHead - logRingTail) >= LOG_RING_SIZE;
+}
+
+/* logVprintf's two scratch buffers: what vsnprintf renders into, and what
+ * logReformat builds from it. */
+#define LOG_RAW_MAX  1024
+#define LOG_FMT_MAX  1056
+
 static int logVprintf(const char* fmt, va_list args) {
     if (!logInited) return 0;
+    if (logNowhereToGo()) {
+        taskENTER_CRITICAL(&logSpinlock);
+        logSuppressed++;
+        taskEXIT_CRITICAL(&logSpinlock);
+        return 0;
+    }
 
-    /* PSRAM-backed via the default allocator (CONFIG_SPIRAM_MALLOC_ALWAYS-
-     * INTERNAL=0 prefers SPIRAM for std::string). RAII frees on every
-     * return path — no leaks possible. */
-    std::string buf(1024, '\0');
-    int rawLen = vsnprintf(buf.data(), buf.size(), fmt, args);
+    /* Heap, not stack: this runs on whichever task called ESP_LOGx, and 2 KB is
+     * more than the smaller ones have to spare. PSRAM-backed via the default
+     * allocator (CONFIG_SPIRAM_MALLOC_ALWAYS_INTERNAL=0). One block for both
+     * buffers rather than two, and deliberately NOT value-initialised: zeroing
+     * 2 KB per log line is 2 KB of PSRAM writes that vsnprintf and logReformat
+     * immediately overwrite, and both NUL-terminate what they produce.
+     * unique_ptr frees on every return path — no leaks possible. */
+    std::unique_ptr<char[]> scratch(new (std::nothrow) char[LOG_RAW_MAX + LOG_FMT_MAX]);
+    if (!scratch) return 0;
+    char* buf       = scratch.get();
+    char* formatted = buf + LOG_RAW_MAX;
+
+    int rawLen = vsnprintf(buf, LOG_RAW_MAX, fmt, args);
     if (rawLen <= 0) return 0;
 
-    std::string formatted(1056, '\0');
-    int fmtLen = logReformat(buf.c_str(), formatted.data(), formatted.size(), true);
+    int fmtLen = logReformat(buf, formatted, LOG_FMT_MAX, true);
     if (fmtLen <= 0) return rawLen;
 
     /* Terminal-state backstop. A single 0x0E (Shift Out) anywhere in any line
@@ -536,21 +612,27 @@ static int logVprintf(const char* fmt, va_list args) {
 
     /* Write to ring buffer — spinlock serializes concurrent writers.
      * Safe from any task context (spinlock disables interrupts briefly). */
-    logRingWrite(formatted.data(), fmtLen);
+    logRingWrite(formatted, fmtLen);
 
-    /* Wake log task */
-    if (logTaskHandle) xTaskNotifyGive(logTaskHandle);
+    /* Wake the log task — but only when waking it achieves something. With no
+     * consumer and no log file its drain declines to run, so the notify would
+     * buy a wake and a pass for nothing; the line stays in the ring and the
+     * first consumer to connect drains it. A consumer connecting is itself an
+     * ITS event on that task, so it is never the notify that has to deliver
+     * the news. */
+    if (logTaskHandle && logDrainWanted) xTaskNotifyGive(logTaskHandle);
 
-    /* Always echo to stdout (USB Serial JTAG) unless serial is in CLI mode.
-     * This bypasses the ITS log→serial consumer path entirely so logs reach
-     * the wire even if the serial task is wedged or not yet connected.
+    /* Echo to stdout (USB Serial JTAG / CDC) when a wire is live and the serial
+     * task isn't using it for something else. This bypasses the ITS log→serial
+     * consumer path entirely so logs reach the wire even if the serial task is
+     * wedged or not yet connected.
      *
      * Under the console write lock: the serial task writes framed-RPC replies
      * to the same wire from its own context, and a log line landing inside a
      * length-counted frame is unrecoverable for the host. */
-    if (!serialInCli && !serialInHandler && !consoleWriteDead) {
+    if (logWireLive() && !serialInCli && !serialInHandler && !consoleWriteDead) {
         consoleWriteLock();
-        fwrite(formatted.data(), 1, fmtLen, stdout);
+        fwrite(formatted, 1, fmtLen, stdout);
         consoleWriteUnlock();
     }
 
@@ -970,13 +1052,23 @@ static void logTaskFn(void* arg) {
       }
     }
 
-    /* Skip the drain entirely while there are no consumers and no log file.
-     * The ring keeps its contents so they fan out the moment a consumer
-     * (typically the serial task) connects. Without this, the boot script's
-     * logs would silently disappear because the drain happens between hook
-     * install and the first consumer's connect being processed. */
     bool hasConsumer = (itsServerActive() > 0);
     bool hasFile = (logFile >= 0);
+
+    /* Republish what logVprintf checks before it does any work at all. Both are
+     * computed here, on this task, right after the pmPollUsb() at the top of
+     * this pass refreshed the wire's answer — so the hint is as fresh as the
+     * state it summarises. */
+    logDrainWanted = hasConsumer || hasFile;
+    logSinkLive    = logDrainWanted || logWireLive();
+
+    /* Did suppression just end — a consumer connected, a file opened, a cable
+     * went in? Noted here, acted on at the end of the pass: the ring is full by
+     * definition while suppressing, so a line written before the drain is a
+     * line the drain never gets to see. */
+    static bool sinkWas = true;
+    bool sinkArrived = logSinkLive && !sinkWas;
+    sinkWas = logSinkLive;
 
     /* Drain any inbound bytes from connected consumers — each complete line
      * is fanned out to the OTHER consumers + log file as-is. Allows browser /
@@ -984,27 +1076,13 @@ static void logTaskFn(void* arg) {
     if (hasConsumer)
       for (int i = 0; i < LOG_MAX_CONSUMERS; i++) logSlotDrainInbound(i);
 
-    if (!hasConsumer && !hasFile) {
-      logFileFlush();
-      continue;
-    }
-
-    /* Ring overflow marker, ahead of the next drained chunk: the loss already
-     * happened, but an unmarked gap reads as "nothing was logged" — and the
-     * bytes lost are always the tail of a burst, the part worth reading. */
-    if (logRingDropped) {
-      uint32_t d;
-      taskENTER_CRITICAL(&logSpinlock);
-      d = logRingDropped; logRingDropped = 0;
-      taskEXIT_CRITICAL(&logSpinlock);
-      char mark[64];
-      int mn = snprintf(mark, sizeof mark,
-                        "\nW [log] ring overflow: %u bytes dropped\n", (unsigned)d);
-      if (mn > 0) logRingWrite(mark, (size_t)mn);
-    }
-
-    /* Drain input stream → fan out to ITS consumers + log file */
-    for (;;) {
+    /* Drain input stream → fan out to ITS consumers + log file. Skipped whole
+     * while there is neither: the ring keeps its contents so they fan out the
+     * moment a consumer (typically the serial task) connects. Without that, the
+     * boot script's logs would silently disappear, because the drain happens
+     * between hook install and the first consumer's connect being processed.
+     * Guarded rather than `continue`d past, so the tail below runs either way. */
+    while (hasConsumer || hasFile) {
       size_t n = logRingRead(buf, sizeof(buf) - 1);
       if (n == 0) break;
       buf[n] = '\0';
@@ -1036,6 +1114,41 @@ static void logTaskFn(void* arg) {
            unit (stream bytes / one DC message per line). */
         itsSend(h, out, outLen, 0);
       }
+    }
+
+    /* Ring overflow marker, written into the now-empty ring so the next pass
+     * carries it out. The loss already happened, so trailing the lines it
+     * refers to is the honest placement — and writing it ahead of the drain,
+     * into the full ring that is the very condition it reports, is how the
+     * marker itself gets dropped. An unmarked gap reads as "nothing was
+     * logged", and the bytes lost are always the tail of a burst, the part
+     * worth reading. (The other kind of gap — nothing listening at all — is
+     * reported by the sink edge above, not here.) Only once the drain has run:
+     * with nothing draining, the ring the marker goes into is the full one, so
+     * writing it would fail and re-count its own bytes as dropped, every pass,
+     * forever. */
+    if (logRingDropped && (hasConsumer || hasFile)) {
+      uint32_t d;
+      taskENTER_CRITICAL(&logSpinlock);
+      d = logRingDropped; logRingDropped = 0;
+      taskEXIT_CRITICAL(&logSpinlock);
+      char mark[64];
+      int mn = snprintf(mark, sizeof mark,
+                        "\nW [log] ring overflow: %u bytes dropped\n", (unsigned)d);
+      if (mn > 0) logRingWrite(mark, (size_t)mn);
+    }
+
+    /* Account for a suppressed stretch on the surface that has just appeared.
+     * An ordinary log line, not a ring marker, because the reader is as likely
+     * to be the direct console echo — which the drain above never runs for —
+     * as a consumer the drain can reach. Last in the pass, so the ring it goes
+     * into has been emptied by that drain. */
+    if (sinkArrived && logSuppressed) {
+      uint32_t s;
+      taskENTER_CRITICAL(&logSpinlock);
+      s = logSuppressed; logSuppressed = 0;
+      taskEXIT_CRITICAL(&logSpinlock);
+      warn("%u lines not recorded: nothing was listening\n", (unsigned)s);
     }
     logFileFlush();
   }

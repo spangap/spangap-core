@@ -20,8 +20,10 @@ the sum of who is holding which lock.
 
 The required ESP-IDF options for any of this to work —
 `CONFIG_PM_ENABLE`, `CONFIG_FREERTOS_USE_TICKLESS_IDLE` (automatic light sleep),
-`CONFIG_PM_PROFILING` (per-mode/per-lock stats), and
-`CONFIG_FREERTOS_THREAD_LOCAL_STORAGE_POINTERS≥2` (the boost TLS slot) — are
+`CONFIG_PM_PROFILING` (per-mode/per-lock stats),
+`CONFIG_FREERTOS_THREAD_LOCAL_STORAGE_POINTERS≥2` (the boost TLS slot), and
+`CONFIG_PM_SLP_IRAM_OPT` + `CONFIG_PM_RTOS_IDLE_OPT` (the sleep path itself in
+IRAM, so a wake spends ~330 µs less awake running it) — are
 supplied by spangap-core's own board-agnostic
 [`sdkconfig.defaults.spangap`](../esp-idf/sdkconfig.defaults.spangap). A consuming
 board that overrides sdkconfig must keep them set; they are the contract pm
@@ -63,7 +65,7 @@ server, a peripheral driver — and it shows up in `pm` alongside these):
 | Name | Type | Held while | Owner |
 |---|---|---|---|
 | `usb` | `NO_LIGHT_SLEEP` | a USB-serial host is attached (SOF detected; 5 s boot grace) | pm |
-| `usbcdc` | `NO_LIGHT_SLEEP` | the console runs on a TinyUSB CDC device (`usb cdc`) — a nap gates the USB clock and drops the link | [usb-console](usb-console.md) |
+| `usbcdc` | `NO_LIGHT_SLEEP` | the console runs on a TinyUSB CDC device (`usb cdc`) — a nap gates the USB clock and drops the link. Held host-or-no-host, which is why `usb down` on a CDC console first returns the console to USB-Serial-JTAG (releasing this) before killing the link | [usb-console](usb-console.md) |
 | `cron` | `NO_DEEP_SLEEP` | cron is disabled **or** no `s.cron.tab.*` entry exists | [cron](cron.md) |
 | `waittime` | `NO_DEEP_SLEEP` | a `waitForTime()` clock-sync barrier is in progress | core (`spangap_init`) |
 | `waitflag` | `NO_DEEP_SLEEP` | a `waitForFlag()` readiness barrier is in progress | core (`spangap_init`) |
@@ -112,15 +114,25 @@ timer — even a cheap one — caps the whole chip's sleep window at its poll pe
 and pays a wake each time. The rule for an event-driven task: **block on the
 actual wake source with a long or infinite timeout, not a short poll.**
 
-- The **serial console** (`cli.cpp`) parks on the USB-serial-JTAG driver's RX
-  ring (`usb_serial_jtag_read_bytes(…, portMAX_DELAY)`), so a keystroke wakes it
-  via the driver ISR and an idle console adds zero wakes — it used to poll
-  `read()` at 20 Hz. It also drops any open console CLI session when the USB link
-  goes down (see [internals §4](power-management-internals.md)), so a session left
-  open by the `usb down` command itself can't keep polling a dead console.
-- The **log task** ticks at **1 Hz** only to service `pmPollUsb()`; log fan-out
-  is `xTaskNotifyGive`-driven (every `logVprintf` notifies), so delivery stays
-  instant without a fast poll.
+- The **serial console** (`cli.cpp`) waits according to whether a host is on the
+  wire, which `pmUsbAttached()` answers. **No host** — park on the task
+  notification (`portMAX_DELAY`), because no byte can arrive at a controller
+  nobody is driving: an unplugged console costs **zero** wakes. The two events
+  that must still reach the task raise that notification themselves — pm calls
+  `serialPortWake()` on the edge where it takes the `usb` lock, and a `usb cdc`
+  switch calls it 400 ms before it takes the pads away. **Host attached** — read
+  the driver's RX ring with a 2 s bound, so a keystroke wakes the task via the
+  driver ISR and a network-issued `usb cdc` is still noticed; the bound is free
+  because the `usb` lock forbids light sleep for as long as the host is there.
+  50 ms while a framed-RPC frame is part-assembled, so an abandoned one times
+  out promptly. The task also drops any open console CLI session when the USB
+  link goes down (see [internals §4](power-management-internals.md)), so a
+  session left open by the `usb down` command itself can't keep polling a dead
+  console.
+- The **log task** ticks at **1 Hz** while WiFi is up and **0.2 Hz** (5 s) when
+  it is down — the tick exists only to service `pmPollUsb()`, and a WiFi-down
+  node is the battery-first case. Log fan-out is `xTaskNotifyGive`-driven (every
+  `logVprintf` notifies), so delivery stays instant without a fast poll.
 - The **LoRa task** reads the radio (a SPI `getIrqFlags`) only when a DIO1 IRQ
   actually fired, not on every task wake — otherwise SPI traffic tracks *wakes*
   rather than *packets*. See [iface-lora internals](../../iface-lora/INTERNALS.md).
@@ -168,7 +180,9 @@ All of this is a USB-serial-JTAG notion. While the console runs on a TinyUSB CDC
 device the USB-serial-JTAG controller does not own the USB PHY, so `pmPollUsb()`
 early-returns rather than fight the OTG core for the pads, and the CDC link
 holds its own `usbcdc` `NO_LIGHT_SLEEP` lock instead — light sleep gates the USB
-clock, and TinyUSB has no arrangement to survive that. `pmUsbSerialJtagReattach()`
+clock, and TinyUSB has no arrangement to survive that. `usb down` on a CDC
+console tears the composite device down first (console back on USB-serial-JTAG,
+`usbcdc` released with it), then proceeds as above. `pmUsbSerialJtagReattach()`
 is the hand-back the transport switch calls. See
 [usb-console](usb-console.md).
 

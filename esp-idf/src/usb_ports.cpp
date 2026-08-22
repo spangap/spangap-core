@@ -554,6 +554,11 @@ static void switchConsole(bool wantCdc) {
    * the notice as a log line — the CLI's own output is addressed to one session
    * and stops at the wire, while the log fans out to every consumer. */
   consoleSwitchPending = true;
+  /* With no host attached the serial task parks on this notification instead of
+   * in a bounded driver read, so the flag alone would not reach it — and the
+   * 400 ms of notice below is exactly the window it has to get off a controller
+   * that is about to lose the pads. */
+  serialPortWake();
   cliSerialResumeLog();
   delay(150);
   if (wantCdc) warn("USB JTAG serial port going away\n");
@@ -598,6 +603,14 @@ static void cmdUsbJtag(const char* a) {
  * `help` so the listing carries one line per action, not two. */
 static void cmdUsbCdcAlias(const char* a)  { if (cliWantsHelp(a)) return; switchConsole(true); }
 static void cmdUsbJtagAlias(const char* a) { if (cliWantsHelp(a)) return; switchConsole(false); }
+
+/* `usb down` while the console is on CDC: hand the console back to the
+ * USB-Serial-JTAG controller first. Tearing the composite device down is what
+ * releases the `usbcdc` NO_LIGHT_SLEEP lock — held for the whole life of the
+ * CDC transport, host or no host, because light sleep gates the USB clock —
+ * so without this step a CDC-console device can never light-sleep and `usb
+ * down` saves nothing. pm's own down path then drops the JTAG link as usual. */
+extern "C" void consoleForceJtag(void) { switchConsole(false); }
 
 #else /* the CDC transport is not built */
 
@@ -646,6 +659,9 @@ static void cmdUsbJtag(const char* a) {
 }
 static void cmdUsbCdcAlias(const char* a)  { if (!cliWantsHelp(a)) cmdUsbCdc(a); }
 static void cmdUsbJtagAlias(const char* a) { if (!cliWantsHelp(a)) cmdUsbJtag(a); }
+
+/* No CDC transport, so the console is never on it — nothing to hand back. */
+extern "C" void consoleForceJtag(void) {}
 
 #endif
 

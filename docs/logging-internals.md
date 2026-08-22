@@ -63,12 +63,43 @@ system.
 
 ## 2. Capture and fan-out
 
-`logVprintf` runs on whatever task called the `ESP_LOGx` macro. It formats into a
-PSRAM-backed `std::string` (so it never eats DRAM stack), writes the bytes into
-`logRing` under a spinlock that serializes concurrent writers, and — while the
-serial console is in log mode — mirrors the line straight to `stdout` with a
-direct `fwrite`. The static DRAM ring means logging never depends on the heap
-being intact, so a line about heap corruption still reaches the wire.
+`logVprintf` runs on whatever task called the `ESP_LOGx` macro. It formats into
+one PSRAM-backed scratch block (so it never eats DRAM stack), writes the bytes
+into `logRing` under a spinlock that serializes concurrent writers, and — while
+the serial console is in log mode and a wire is live — mirrors the line straight
+to `stdout` with a direct `fwrite`. The static DRAM ring means logging never
+depends on the heap being intact, so a line about heap corruption still reaches
+the wire.
+
+Three things gate that work, because on an unattended node most of it has no
+destination. `logSinkLive` and `logDrainWanted` are recomputed by the log task
+once per pass and read by `logVprintf` on every line:
+
+| Gate | Skipped when |
+|---|---|
+| The whole format-and-ring path | `!logSinkLive` **and** the ring is full (`logNowhereToGo`) |
+| `xTaskNotifyGive(logTaskHandle)` | `!logDrainWanted` — no consumer and no log file, so the drain would decline to run |
+| The direct `fwrite(stdout)` | `!logWireLive()` — not on CDC and pm reports no USB host |
+
+`logSinkLive` is "a consumer, the log file, or a live console wire"; the ring is
+the fourth sink and the reason the first gate needs the fullness test. While the
+ring has space it holds the **boot window** — everything logged between the hook
+being installed and the first consumer connecting — so lines are formatted into
+it whether or not anyone is watching yet. Once it is full with nothing draining
+it, `logRingWrite` would discard the bytes anyway, and formatting a line to
+discard it is two heap buffers, a `vsnprintf`, a `logReformat`, a control-byte
+scrub and a spinlock, for nothing.
+
+Suppressed lines are counted in `logSuppressed`, and the count is reported as an
+ordinary `warn()` on the pass where a sink reappears — deliberately not as a
+ring marker, since the reader is as often the direct console echo, which the
+drain never runs for. It is kept separate from `logRingDropped` because the two
+say different things: *the writers outran the drain* and *there was nobody here
+at all*. Both are emitted at the **end** of a pass, once the drain has emptied
+the ring they go into; emitted ahead of the drain they would be dropped by the
+very condition they exist to report. The `logRingDropped` marker additionally
+waits for a consumer or the log file, since with nothing draining it would
+re-count its own bytes as dropped on every pass.
 
 Before anything is written, `logVprintf` folds the **terminal-state control
 bytes** in the formatted line to `.`. A single `0x0E` (Shift Out) switches an
@@ -202,8 +233,11 @@ sends.
 
 ## 8. Other work on the log task loop
 
-The log task's loop also calls `pmPollUsb()` once per pass (the ~1 Hz USB
-presence poll, see [power-management-internals.md](power-management-internals.md))
+The log task's loop also calls `pmPollUsb()` once per pass, which sets the loop's
+own cadence: it blocks 1 s while WiFi is up and 5 s when it is down (the
+battery-first case), because the USB presence poll is the only reason the loop
+has a timeout at all — fan-out is notify-driven. See
+[power-management-internals.md](power-management-internals.md).
 and, when the debug Kconfig is enabled, hosts the heap-corruption hunt:
 `CONFIG_SPANGAP_HEAP_INTEGRITY_POLL` runs `heap_caps_check_integrity` every
 `CONFIG_SPANGAP_HEAP_INTEGRITY_POLL_MS`, and `CONFIG_SPANGAP_WATCH_ADDR` arms a
@@ -213,7 +247,7 @@ documented in [memory-internals.md](memory-internals.md).
 ## 9. Pitfalls
 
 - **PSRAM-stack tasks must not `printf`.** Use the `err()`/`warn()`/`info()` /
-  `dbg()`/`verb()` macros; `logVprintf` formats into a PSRAM string, but a raw
+  `dbg()`/`verb()` macros; `logVprintf` formats into a PSRAM scratch block, but a raw
   `printf` from a PSRAM-stack task can fault.
 - **Code must not prefix the task name.** `logReformat` adds `[task]`; a
   hand-written prefix double-stamps.

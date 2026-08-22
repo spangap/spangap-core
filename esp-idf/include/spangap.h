@@ -137,7 +137,7 @@ void spangapPostAppInit(void);
  *  a probe drives the power rail it needs. */
 void spangapConfirmBoard(void);
 
-/** Say who this device is, on whatever console is attached:
+/** Say who this device is, as boot log lines:
  *
  *      build: hw hw-lilygo-tdeck
  *      build: catalogue stable
@@ -148,14 +148,26 @@ void spangapConfirmBoard(void);
  *  is omitted when its fact does not exist — a generic image claims no board, an
  *  image from outside a catalogue run has no catalogue and no stamp — because
  *  absent is the honest answer and it is what tells a tool to go and look for
- *  itself.
- *
- *  Called at boot, and again by the console whenever one attaches (a bare Enter
- *  is answered with it). A boot happens once and is almost never watched, so a
- *  device that only announced itself then forced every tool to interrogate it
- *  afterwards for facts it had already stated; saying it again when someone
- *  shows up is what makes that query channel unnecessary. */
+ *  itself. Boot only; a console that attaches is answered with
+ *  spangapIdentityLine() instead. */
 void spangapLogBuildIdentity(void);
+
+/** Compose the console greeting's identity line into buf (NUL-terminated, no
+ *  newline):
+ *
+ *      dev f9fb74, host tbeam, fw rop/reticulous_hw-lilygo-tbeam-supreme_20260814130700, ap "lab", ip 10.1.2.3
+ *
+ *  The physical unit (low three MAC bytes, the digits that lead the USB serial
+ *  string), the hostname (same source as the CLI prompt), the image named
+ *  exactly as its catalogue file — `<catalogue>/<project-slug>_<dist>_<stamp>`
+ *  — and, while associated, the network and address the device is reachable
+ *  at (the SSID is free text and therefore the one quoted field). A field
+ *  whose fact does not exist is dropped; `hw <board>` is added only when the
+ *  detected board differs from the dist (a variant entry whose name is not
+ *  simply the board's). Emitted by the console for a bare Enter: a boot log
+ *  is watched by almost nobody, and a tool that opens the port later learns
+ *  everything from this one answer instead of interrogating the device. */
+void spangapIdentityLine(char* buf, size_t n);
 
 /** Block the calling task until the platform clock is known-valid — the storage
  *  key `sys.time.valid` flips to 1 when a time source syncs (SNTP in

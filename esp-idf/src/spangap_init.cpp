@@ -57,37 +57,91 @@ extern "C" const char* detect_hw(void) __attribute__((weak));
  * than published where it is found. Empty when no board straddle is staged. */
 static const char* s_detectedHw = "";
 
-/* Who this device is, in three lines, emitted whenever something might be
- * listening.
+/* Who this device is, as boot log lines.
  *
  *     build: hw hw-lilygo-tdeck
  *     build: catalogue stable
  *     build: datetime 20260814130700
  *
  * The board, the catalogue that published this image, and the stamp of that
- * run — everything a flasher needs to decide whether it holds something newer,
- * and everything a person reading a console needs to know what they are looking
- * at.
- *
- * Printed at boot, and again whenever a console attaches (cli.cpp answers a bare
- * Enter with it). That second call is the point of factoring this out: a boot
- * happens once and almost nobody watches it, so a tool that opens the port five
- * minutes later used to have to INTERROGATE the device for facts it had already
- * announced to an empty room. Saying it again when someone shows up costs three
- * lines and removes the need for a query channel entirely.
- *
- * One fact per line, each self-describing, because the reader is a line parser
- * on the other side of a stream it does not control — it may join mid-line, and
- * a line it does not recognise must cost it nothing.
+ * run — everything a flasher reading a boot log needs to decide whether it
+ * holds something newer. One fact per line, each self-describing, because the
+ * reader is a line parser on the other side of a stream it does not control —
+ * it may join mid-line, and a line it does not recognise must cost it nothing.
  *
  * Lines are omitted rather than emitted empty when the fact does not exist: a
  * generic image claims no board, and an image that did not come from a catalogue
  * run has no catalogue and no stamp. Absent is the honest answer, and it is what
- * tells a flasher to go and look for itself. */
+ * tells a flasher to go and look for itself.
+ *
+ * Boot only. A console that ATTACHES is answered with the identity line below
+ * instead (cli.cpp emits it for a bare Enter) — that is a message to the
+ * console, not a log event, and dressing it as a log line put timestamps and
+ * task tags on what a person reads as a greeting. */
 extern "C" void spangapLogBuildIdentity(void) {
     if (s_detectedHw[0])        info("build: hw %s\n", s_detectedHw);
     if (app_build_catalogue[0]) info("build: catalogue %s\n", app_build_catalogue);
     if (app_build_datetime[0])  info("build: datetime %s\n", app_build_datetime);
+}
+
+/* The one-line identity a console greeting carries:
+ *
+ *     dev f9fb74, host tbeam, fw rop/reticulous_hw-lilygo-tbeam-supreme_20260814130700, ap "lab", ip 10.1.2.3
+ *
+ * Simple comma-separated fields, all the facts at once. `dev` is the low three
+ * bytes of the MAC — the same six digits that lead the USB serial string, and
+ * the one fact that names WHICH physical unit answered: USB descriptors do not
+ * reach every consumer, and a host that reopens a port after the device
+ * re-enumerated sees only the byte stream. `host` is the hostname, the same
+ * source as the CLI prompt. `fw` is the image exactly as its catalogue file is
+ * named — `<catalogue>/<project-slug>_<dist>_<stamp>` — so what a device
+ * reports and what a builds directory lists read as the same thing; the slug
+ * lowercases the project name the way make-builds does. Absent facts drop
+ * their field: no catalogue run, no `fw`. An `hw <board>` field appears only
+ * when the detected board differs from the dist — a variant entry whose name
+ * is not simply the board's; a generic image stages no board straddle and so
+ * claims no board at all. */
+extern "C" void spangapIdentityLine(char* buf, size_t n) {
+    uint8_t mac[6] = {};
+    esp_efuse_mac_get_default(mac);
+    char host[48];
+    storageGetStr("s.net.hostname", host, sizeof host, CONFIG_SPANGAP_FW_HOSTNAME);
+    if (!host[0]) snprintf(host, sizeof host, "%s", CONFIG_SPANGAP_FW_HOSTNAME);
+    size_t o = (size_t)snprintf(buf, n, "dev %02x%02x%02x, host %s",
+                                mac[3], mac[4], mac[5], host);
+    if (s_detectedHw[0] && strcmp(s_detectedHw, app_build_dist) != 0 && o < n)
+        o += (size_t)snprintf(buf + o, n - o, ", hw %s", s_detectedHw);
+    if (app_build_dist[0] && app_build_datetime[0] && o < n) {
+        char slug[40];
+        size_t s = 0;
+        for (const char* p = CONFIG_SPANGAP_PROJECT_NAME; *p && s + 1 < sizeof slug; p++) {
+            char c = *p;
+            if (c >= 'A' && c <= 'Z') c = (char)(c - 'A' + 'a');
+            if ((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9')) slug[s++] = c;
+            else if (s && slug[s - 1] != '-') slug[s++] = '-';
+        }
+        while (s && slug[s - 1] == '-') s--;
+        slug[s] = '\0';
+        o += (size_t)snprintf(buf + o, n - o, ", fw ");
+        if (app_build_catalogue[0] && o < n)
+            o += (size_t)snprintf(buf + o, n - o, "%s/", app_build_catalogue);
+        if (o < n)
+            o += (size_t)snprintf(buf + o, n - o, "%s_%s_%s",
+                     s ? slug : "builds", app_build_dist, app_build_datetime);
+    }
+    /* Online, and where: the association and address the network component
+     * publishes into the ephemeral tree — absent on a build without one,
+     * empty while unassociated, and either way the fields simply drop. The
+     * pair is what tells a host the device is reachable over the network
+     * without asking it anything. The SSID is free text, commas and spaces
+     * included, so it is the one quoted field; a reader anchors on the
+     * `", ip` that follows it. */
+    char ssid[40] = "";
+    char ip[48]   = "";
+    storageGetStr("wifi.sta.ssid", ssid, sizeof ssid, "");
+    storageGetStr("wifi.sta.ip",   ip,   sizeof ip,   "");
+    if (ssid[0] && ip[0] && o < n)
+        snprintf(buf + o, n - o, ", ap \"%s\", ip %s", ssid, ip);
 }
 
 /* Confirm the image is on the board it was built for, and halt if it is not.
@@ -516,11 +570,13 @@ extern "C" void spangapInit(void) {
     /* The chip's index within its OUI block, and the same six digits that lead
      * the USB serial string. Emitted every boot, on whatever console is
      * attached, so a host that can read the log can identify which physical
-     * unit it is holding — USB descriptors do not reach every consumer. */
+     * unit it is holding — USB descriptors do not reach every consumer. The
+     * `dev` spelling is the one the fact has everywhere: the same field the
+     * console greeting's identity line leads with. */
     {
         uint8_t mac[6] = {};
         esp_efuse_mac_get_default(mac);
-        info("device %02x%02x%02x", mac[3], mac[4], mac[5]);
+        info("dev %02x%02x%02x", mac[3], mac[4], mac[5]);
     }
     vTaskDelay(pdMS_TO_TICKS(100));
 

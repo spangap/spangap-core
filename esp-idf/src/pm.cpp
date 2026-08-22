@@ -361,6 +361,34 @@ extern "C" bool          serialPortClaimTriggered(int port);
 extern "C" bool          serialPortIsAttached(int port);
 extern "C" void          serialTaskStats(uint32_t* loops, uint32_t* scans, uint32_t* scanBytes);
 extern "C" const char*   consoleLastSwitchError(void);
+extern "C" void          consoleForceJtag(void);
+extern "C" void          serialPortWake(void);
+
+bool pmUsbAttached() {
+#if CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG
+  /* Before pmInit() there is no lock and so no answer. Report attached: every
+   * caller uses this to decide whether it may stop doing something, and the
+   * safe reading of "not known yet" is "keep going". The boot grace that
+   * follows says the same thing for the first five seconds. */
+  if (!usbLock) return true;
+  return usbLock->count > 0;
+#else
+  return true;   /* UART console: always "attached" — there is no peer to lose */
+#endif
+}
+
+#if CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG
+/* Take the usb lock and tell the serial task. With no host attached that task
+ * parks on its notification rather than in a bounded driver read — nothing can
+ * arrive on a controller no host is driving — so this edge is what brings it
+ * back to reading the console. Both acquire sites go through here; the notify
+ * is cheap and idempotent, so a redundant one costs a single loop pass. */
+static void usbLockHold() {
+  if (!usbLock || usbLock->count > 0) return;
+  pmLockAcquire(usbLock);
+  serialPortWake();
+}
+#endif
 
 void pmPollUsb() {
   pmStatsPoll();             /* runs every log-loop iteration, before USB early-outs */
@@ -402,7 +430,7 @@ void pmPollUsb() {
   if (connected || inGrace) {
     downStreak = 0;
     lastRecoverMs = 0;
-    if (!held) pmLockAcquire(usbLock);
+    usbLockHold();
     /* A host enumerating on the USB console is someone at a desk with a cable
      * in hand — not the unattended device the long holds are there to protect.
      * Not during the boot grace window, which asserts nothing about a host. */
@@ -446,6 +474,12 @@ extern "C" volatile bool cliUsbSerialLinkDown;
 
 static void cliUsbDown() {
 #if CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG
+  /* On a CDC console, tear the composite device down first: its `usbcdc` lock
+   * forbids light sleep for as long as the transport is up — host attached or
+   * not — so leaving it standing makes the rest of this a no-op power-wise.
+   * The console lands back on USB-Serial-JTAG (where a later `usb up`
+   * revives it), and the link kill below applies to that controller. */
+  if (consoleOnCdc) consoleForceJtag();
   info("usb down\n");
   cliUsbSerialLinkDown = true;   /* the session this command runs in must not outlive the link */
   vTaskDelay(pdMS_TO_TICKS(10));
@@ -466,8 +500,7 @@ static void cliUsbUp() {
   /* Acquire lock first to prevent light sleep during re-enumeration */
   rtcUsbDisabled = false;
   cliUsbSerialLinkDown = false;   /* console link is back; serial CLI sessions allowed again */
-  if (usbLock && usbLock->count == 0)
-    pmLockAcquire(usbLock);
+  usbLockHold();
   /* Reset the USB Serial JTAG peripheral — clears internal state machine
    * that may be confused after light sleep gated the USB clock. */
   int __DECLARE_RCC_ATOMIC_ENV __attribute__((unused));

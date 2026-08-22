@@ -2125,31 +2125,31 @@ static void serialTaskFn(void* arg) {
       if (cliHandle < 0 && (c == '\n' || c == '\r')) {
         /* Enter is the one key that does not open a session — it is how a
          * session is left, so treating it as the first keystroke of a new one
-         * would make leaving impossible. Say what the console is doing instead
-         * of swallowing the key, which reads as an unresponsive terminal.
+         * would make leaving impossible. Answer it with the greeting instead of
+         * swallowing the key, which reads as an unresponsive terminal.
          *
-         * The hostname is in the line because Enter is what people press to find
-         * out which device they are talking to, and otherwise the only way to
-         * learn that is to open a CLI session and read it off the prompt. Same
-         * source as the prompt (cliPromptBuild), so the two never disagree. */
+         * The greeting is two plain lines — a message to the console, not log
+         * output, so no timestamps or task tags:
+         *
+         *     dev f9fb74, host tbeam, fw rop/reticulous_hw-lilygo-tbeam-supreme_20260814130700
+         *     Spangap console on JTAG/serial. Start typing to enter CLI.
+         *
+         * A bare Enter is how something announces itself on the other end of
+         * the wire, and this is the one moment we know someone is listening —
+         * the boot log said all this to an empty room. The identity line
+         * (spangapIdentityLine) is what lets a flasher name the unit, the
+         * hostname, and the exact image without asking a question, without a
+         * CLI session, and above all without resetting the device. */
         {
-          char host[48];
-          storageGetStr("s.net.hostname", host, sizeof(host), CONFIG_SPANGAP_FW_HOSTNAME);
-          if (!host[0]) safeStrncpy(host, CONFIG_SPANGAP_FW_HOSTNAME, sizeof(host));
-          char hint[160];
+          char id[256];
+          spangapIdentityLine(id, sizeof id);
+          char hint[352];
           int n = snprintf(hint, sizeof hint,
-                           "\r\n" RESET "Spangap console on serial %s of '%s'. "
-                           "Start typing to enter CLI\r\n",
-                           consoleOnCdc ? "cdc 0" : "jtag", host);
+                           "\r\n" RESET "%s\r\n"
+                           "Spangap console on %s. Start typing to enter CLI.\r\n",
+                           id, consoleOnCdc ? "USB/CDC 0" : "JTAG/serial");
           if (n > 0) serialEmit(hint, (size_t)n < sizeof hint ? (size_t)n : sizeof hint - 1);
         }
-        /* …and say who we are. A bare Enter is how something announces itself on
-         * the other end of the wire, and this is the one moment we know someone
-         * is listening — the boot log said all this already, to an empty room.
-         * Repeating it here is what lets a flasher identify the board without
-         * asking a question, without opening a CLI session, and above all
-         * without resetting the device to read it off the chip. */
-        spangapLogBuildIdentity();
         cliFlush();
         return;
       }
@@ -2462,9 +2462,10 @@ static void serialTaskFn(void* arg) {
       /* Idle / log mode: log fanout goes direct-to-stdout, so nothing is queued
        * to this task over ITS until a CLI session opens — only a keystroke moves
        * us forward, and there is nothing to poll for (USB recovery is driven by
-       * the log task's pmPollUsb, not us). So park on the driver's ISR-fed RX
-       * ring: a keystroke wakes us at once, and an idle console costs one wake
-       * per period rather than a poll. */
+       * the log task's pmPollUsb, not us). Three ways to wait, in the order
+       * tested below: CDC (no ISR-fed ring, so it polls), no host at all (park
+       * on the notification and cost the chip nothing), and a host on the
+       * USB-Serial-JTAG ring (bounded read, woken by the driver's ISR). */
       char c;
       pmBoostAuto(false);
       /* The auto-resume latch belongs to a session; carrying it into log mode
@@ -2479,16 +2480,34 @@ static void serialTaskFn(void* arg) {
          * a claim change) is serviced without waiting out the interval. */
         if (consoleCdcRead(&c)) { pmBoostAuto(true); handleChar(c); }
         else ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(50));
+      } else if (!pmUsbAttached() && !rpcAssembling()) {
+        /* No USB host on the wire: the controller is driven by nobody, so no
+         * byte can arrive and there is nothing whatever to poll for. Drain
+         * anything the ring already holds (a host that attached and typed
+         * between the check and here), then park on the task NOTIFICATION —
+         * the one wait the two events that matter can actually break. A host
+         * attaching raises pm's `usb` lock and pm notifies us from that edge;
+         * a `usb cdc` switch notifies us before it takes the pads away. A
+         * bounded driver read here would instead wake the chip every period
+         * for a peer that is not there, and on a battery node with WiFi down
+         * this is otherwise the fastest recurring wake in the system. */
+        if (usb_serial_jtag_read_bytes(&c, 1, 0) == 1) {
+          pmBoostAuto(true);
+          handleChar(c);
+        } else {
+          ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+        }
       } else {
-        /* The park must be BOUNDED: nothing can interrupt the driver read —
-         * not the task notification serialPortWake sends, and not
-         * consoleSwitchPending — so a `usb cdc` issued over the network (no
-         * console byte ever arrives to return this read) would strand this
-         * task forever on a controller that just lost the pads, deaf to the
-         * new console and to every claimed port. The period is the cap on how
-         * stale this task's view may get; two seconds keeps light sleep
-         * effective. Short while a frame is part-assembled, so an abandoned
-         * one is timed out promptly. */
+        /* A host is attached (or a framed-RPC frame is part-assembled), so the
+         * park must be BOUNDED: nothing can interrupt the driver read — not the
+         * task notification serialPortWake sends, and not consoleSwitchPending
+         * — so a `usb cdc` issued over the network (no console byte ever
+         * arrives to return this read) would strand this task forever on a
+         * controller that just lost the pads, deaf to the new console and to
+         * every claimed port. The period is the cap on how stale this task's
+         * view may get; two seconds is free while a host holds the `usb` lock,
+         * which forbids light sleep anyway. Short while a frame is
+         * part-assembled, so an abandoned one is timed out promptly. */
         TickType_t wait = rpcAssembling() ? pdMS_TO_TICKS(50) : pdMS_TO_TICKS(2000);
         if (usb_serial_jtag_read_bytes(&c, 1, wait) == 1) {
           pmBoostAuto(true);

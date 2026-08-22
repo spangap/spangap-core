@@ -71,9 +71,13 @@ The composite device's strings are built per install rather than compiled in:
   desk get distinguishable device nodes — the Kconfig default (`123456`) gives
   every board the same two names.
 
-The same six MAC digits are logged every boot (`device a1b2c3`), so a host that
-can read the log can tell which physical unit it is holding without reading USB
-descriptors.
+The same six MAC digits are logged every boot (`dev a1b2c3`), and the same
+field leads the identity line a console answers a bare Enter with (`dev a1b2c3,
+host …, fw …, ap "…", ip …` — see spangapIdentityLine and cli.cpp), so a host
+that can read either can tell which physical unit it is holding without reading
+USB descriptors — including on a port it has just reopened after the device
+re-enumerated — and, from the `ap`/`ip` pair, whether the device is online and
+where.
 
 Both CDC interfaces share one USB interface string, so a host cannot tell port 0
 from port 1 by name — only by interface number (port 0 first).
@@ -148,11 +152,15 @@ Two operator-visible consequences:
 ## Cost
 
 While the console is on CDC the platform holds a `NO_LIGHT_SLEEP` lock named
-`usbcdc`, so the device does not light-sleep. Light sleep gates the USB clock,
-and TinyUSB has no arrangement to survive that (the USB-Serial-JTAG controller
-does, via `CONFIG_USJ_NO_AUTO_LS_ON_CONNECTION`) — a nap would drop the CDC link
-and the host would have to replug. `pm` shows the lock; see
-[power-management](power-management.md).
+`usbcdc`, so the device does not light-sleep — host attached or not. Light
+sleep gates the USB clock, and TinyUSB has no arrangement to survive that (the
+USB-Serial-JTAG controller does, via `CONFIG_USJ_NO_AUTO_LS_ON_CONNECTION`) — a
+nap would drop the CDC link and the host would have to replug. `pm` shows the
+lock; see [power-management](power-management.md). `usb down` on a CDC console
+therefore tears the transport down first (the console returns to
+USB-Serial-JTAG, releasing the lock) and then kills that link as usual — so
+`usb down` means low power on either transport, and the way back is `usb up`
+then `usb cdc`.
 
 The TinyUSB device stack is linked in for the whole life of an image that has
 it, holding internal `.bss` whether or not `usb cdc` is ever run — which is what
