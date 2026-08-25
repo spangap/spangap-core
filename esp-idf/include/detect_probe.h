@@ -522,8 +522,19 @@ static inline const char* detect_radio(int sck, int mosi, int miso, int cs,
 
     /* SX126x — no version register: write a scratch byte to the sync-word
      * register 0x0740 and read it back; GetStatus (0xC0) must return a live
-     * status byte too. */
+     * status byte too.
+     *
+     * SetStandby(STDBY_RC) first, and not as ceremony. A part that reaches here
+     * asleep wakes on the NSS edge and DISCARDS the transaction that woke it, so
+     * without this the scratch write is the sacrificial one: the readback then
+     * returns 0x14 — register 0x0740's reset value, the default sync word's MSB
+     * — and a radio that is sitting there working reads as an empty header.
+     * Standby takes that hit instead, and leaves the chip in the one mode where
+     * register access is defined. */
     if (!found && busy >= 0 && detect_busy_low(busy)) {
+        uint8_t sb[2] = { 0x80, 0x00 };                                    /* SetStandby(STDBY_RC) */
+        detect_spi_xfer(h, sb, NULL, 2);
+        detect_busy_low(busy);
         uint8_t w[4] = { 0x0D, 0x07, 0x40, 0xA5 };                         /* WriteRegister */
         detect_spi_xfer(h, w, NULL, 4);
         detect_busy_low(busy);
@@ -668,6 +679,24 @@ static inline void detect_rail_drive(int pin, int level)
 static inline void detect_rail_release(int pin)
 {
     gpio_reset_pin((gpio_num_t)pin);
+}
+
+/* ── shared-bus CS park ──────────────────────────────────────────────────────
+ * Where the radio shares its SPI bus with a panel or an SD card, every OTHER
+ * device's chip-select has to be HIGH while the radio is probed. A CS left
+ * floating reads low often enough that the idle device answers the radio's
+ * traffic and drives MISO against it, and what comes back is neither part's
+ * reply. The board's own bring-up parks them before its first shared-bus
+ * access; a probe runs before any of that exists, so it parks them itself —
+ * and hands them back like every other pin it drove. */
+static inline void detect_cs_park(int pin)
+{
+    detect_rail_drive(pin, 1);
+}
+
+static inline void detect_cs_release(int pin)
+{
+    detect_rail_release(pin);
 }
 
 #ifdef __cplusplus
