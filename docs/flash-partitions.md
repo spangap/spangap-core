@@ -75,11 +75,13 @@ The floor is a **build-time policy number, not the chip size**: it must be set
 below the smallest physical flash you ship on, or that device gets no `state`
 (the start lands at/above `phys` and `statePartitionEnsure()` logs a warning and
 skips). If the builder changes the floor between releases, the table top and thus
-state's start move, its old LittleFS superblock is no longer found, and the first
-mount reformats it (`fs.cpp` `format_if_mount_failed`) — a clean factory reset.
-**Warn users before bumping the floor.** The same `format_if_mount_failed` means a
-fresh or re-grown device self-heals to the factory defaults held in the read-only
-`fixed` partition — usable even unattended.
+state's start move, its old LittleFS superblock is no longer found, and the
+mount fails — so `mountStateLittlefs()` reformats on its second attempt, a clean
+factory reset. **Warn users before bumping the floor.** The same fallback is what
+lets a fresh or re-grown device self-heal to the factory defaults held in the
+read-only `fixed` partition — usable even unattended. It is never silent: the
+wipe is logged and counted in NVS, so a device that comes up empty can be asked
+whether it was reformatted (fs-internals §4).
 
 If a board pins `state` in its own table, `statePartitionEnsure()` finds it
 already present and does nothing.

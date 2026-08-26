@@ -223,6 +223,7 @@ pm registers three commands (run on-device via `spangap cli "<command>"`):
 | `pm wifi [none\|min\|max]` | Read or set the WiFi modem power-save mode (`esp_wifi_set_ps`). |
 | `usb up` / `usb down` | Reconnect / disconnect the USB-serial peer (above); bare `usb` reports connection state, the console transport, and the reason the last transport switch failed. `usb cdc` / `usb jtag` move the console between controllers — [usb-console](usb-console.md), not pm. |
 | `top` | Per-task CPU%, stack, per-task DRAM/PSRAM, per-core busy, heap, uptime. |
+| `top -b <task> [hex]` | That task's internal-DRAM blocks grouped by exact size, largest first, with any block the kernel can name (a TCB is its own `TaskHandle_t`, a stack is `pxTaskGetStackStart`) labelled. `hex` adds the first 32 bytes of each size class, for identifying a struct by its contents. The DRAM column says how much a task holds; this says what — match a size against a `sizeof` in the suspected allocator. Blocks are billed to the task that ran malloc, so a server carries what it allocates for its clients. |
 
 Chain `usb down; sleep 30; usb up` on one line — the CLI splits the commands up
 front, so they all run even after the console disconnects. (`pm deep|light|slow

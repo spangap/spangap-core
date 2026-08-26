@@ -496,8 +496,10 @@ overwrite is real there and pointless here.
 ### Implementation constraints
 
 - **Wipe low-to-high.** The superblock at block 0 dies first, so a crash mid-wipe
-  leaves a store whose mount fails → `format_if_mount_failed` → empty → first
-  boot. That is why a factory reset needs no marker and no recovery path.
+  leaves a store whose mount fails → `mountStateLittlefs()`'s format fallback →
+  empty → first boot. That is why a factory reset needs no marker and no
+  recovery path. The fallback logs and counts the wipe, so this shows up
+  afterwards as a reformat rather than as a mystery empty node.
 - **The random source buffer must be internal DRAM**, and the whole operation
   runs on a DRAM-stack worker: a flash program disables the PSRAM cache, so
   reading the source out of PSRAM mid-write faults.

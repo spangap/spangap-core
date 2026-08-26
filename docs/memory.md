@@ -76,6 +76,27 @@ produces corruption that surfaces far from the cause.
    Being "task-context only" (no ISR access) is **not** sufficient — these fault
    in plain task context. Allocate them with `dram_alloc`.
 
+   **It is the control block that is bound, not the object.** A queue is a
+   `StaticQueue_t` plus a slot array; a stream buffer is a
+   `StaticStreamBuffer_t` plus a ring. Only the first of each pair carries the
+   spinlock. The payload half is plain bytes — `memcpy`'d under the lock, which
+   costs a cached PSRAM read and nothing else — so it belongs in PSRAM by the
+   ordinary default. The `*CreateWithCaps` helpers allocate BOTH halves with one
+   capability set and are therefore the wrong tool wherever the payload is
+   worth moving; allocate the two blocks yourself and use the `*CreateStatic`
+   form:
+
+   ```c
+   auto* ctrl  = (StaticQueue_t*)heap_caps_malloc(sizeof(StaticQueue_t),
+                                                  MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+   auto* store = (uint8_t*)heap_caps_malloc(depth * itemSize, MALLOC_CAP_SPIRAM);
+   q = xQueueCreateStatic(depth, itemSize, store, ctrl);
+   ```
+
+   Three places in ITS do exactly this — the stream-buffer pool, the packet-link
+   descriptor rings, and every task's inbox queue — and the split is worth
+   ~7.5 KB of internal DRAM on a full image.
+
 2. **DMA buffers** — WiFi static RX (16 × ~1.6 KB, internal-DMA-only, allocated
    when the radio connects), the SD-on-SPI read bounce, LCD transfer buffers.
    Use `dma_alloc` / `MALLOC_CAP_DMA`. Headroom is reserved via
@@ -108,11 +129,43 @@ PSRAM cache is disabled. Pair every `spawnTask` with `killSelf()` (or
 
 ```
 Is it ISR-touched / inside a critical section / a FreeRTOS sync object? → dram_alloc
+  …but only its CONTROL BLOCK — the slot array / ring goes to PSRAM     → split, above
 Is it a DMA target?                                                     → dma_alloc
 Is it touched while a flash op has the cache disabled (incl. that
   task's own stack)?                                                    → internal (STACK_DRAM)
 Otherwise (bulk data, std::, cJSON, UI):                                → gp_alloc (PSRAM)
 ```
+
+## Known headroom: ~6 KB still in ITS
+
+Placement has been taken as far as it goes in ITS — the tables, the ring
+storage and the inbox slot arrays are all in PSRAM now. What is still internal
+is control blocks and semaphores, and it costs:
+
+| Per | Blocks | Bytes |
+|-----|--------|-------|
+| packet-link direction | ring control 48 + `spaceFreedSem` 96 | **144** |
+| ITS-registered task | inbox control 96 + `pickupSem` 96 + `ackSem` 96 | **288** |
+
+A full image carries roughly two dozen registered tasks and a dozen-odd link
+directions, so the semaphores alone are **~6 KB**: 24 × 192 + 16 × 96.
+
+Every one of them is a **single-waiter wakeup**, which is what FreeRTOS task
+notifications are, at zero heap cost. Moving the three semaphores to a
+dedicated notification index would reclaim that ~6 KB for the price of
+`CONFIG_FREERTOS_TASK_NOTIFICATION_ARRAY_ENTRIES` 1 → 2 — 8 bytes per task
+control block, about 370 B across a full image. A dedicated index is what keeps
+it clean: index 0 is already spoken for by the `xTaskNotifyGive` ITS uses to
+wake a receiving task's inbox.
+
+This is deferred deliberately, and it is a different risk class from the
+placement work above. `pickupSem` is what holds a caller blocked until the
+receiver has *finished* dispatching, and callers hand over pointers into their
+own live stack frames (`proxyOp` in `fs.cpp` is the clearest case — the worker
+writes results, file data and `struct stat` back into the caller's frame).
+Release that wakeup a moment too early and the caller returns while its frame is
+still being written to. So: its own build, its own soak, and no other change
+riding along with it.
 
 ## Kconfig knobs
 

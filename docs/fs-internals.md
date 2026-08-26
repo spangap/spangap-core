@@ -32,7 +32,7 @@ PSRAM cache and SDMMC DMA must serialize):
 | Path | Partition label | RO | DRAM-stack | Format-on-fail |
 |---|---|---|---|---|
 | `/fixed` | `fixedLabel` (resolved to `"fixed"` at `fs_init`) | yes | yes | no |
-| `/state` | `"state"` | no | yes | yes |
+| `/state` | `"state"` | no | yes | yes — as a deliberate second attempt, logged and counted (§4) |
 
 `/sdcard` is **not** in the table — it is mounted separately and optionally by
 `fs_mount_sd()`.
@@ -69,6 +69,18 @@ far inside the ESP32-S3's 32 MB data-address window — the budget only needs
 revisiting if a board ships 16+ MB PSRAM together with a very large asset
 partition.
 
+`handleOp` opens with a **tripwire on the request itself**: a pointer below the
+memory map is refused, with a log line naming the op, the request pointer, both
+path pointers, and the task that *sent* it (`s_opSender`, stamped in `onFsOp`) —
+because a malformed request is the sender's bug and the worker's own backtrace
+names only the worker. Which pointers are judged depends on the op
+(`opUsesPath` / `opUsesPath2`): a slot-keyed op carries no path and legitimately
+passes NULL, while for an op that dereferences one NULL is bogus. That
+distinction is the whole point — `fs_op_t::OPEN` is enumerator 0, so an all-zero
+request decodes as "open NULL with mode NULL", and newlib dereferences the mode
+before it ever looks at the path. Passing NULL blanket-wise turns that into a
+`LoadProhibited` at 0x0 inside `fopen` with the offending request unrecorded.
+
 The worker handler `handleOp` does **no path rewriting** — `/state` and
 `/sdcard/state` are both real, and callers already pass whichever is active.
 `STAT`/`LISTDIR` special-case `"/"` (not a real VFS mount) by synthesizing a
@@ -100,6 +112,17 @@ when `sdReady`).
    ones via littlefs), **including `/state`** — it is always mounted regardless
    of where the active store ends up.
 4. Spawn the `fs` and `fs_strm` workers (each gated on a ready semaphore).
+
+**A state-store format is a factory reset, so it is never silent.**
+`mountStateLittlefs()` mounts **without** `format_if_mount_failed` first and
+enters the format deliberately on failure, after `noteStateWipe()` has logged
+the wipe (with the mount error that caused it) and counted it in **NVS** —
+`spangap/state_wipes` and `state_wipe_err`, a separate partition precisely so
+the record outlives the thing being wiped. Both are readable afterwards, which
+is the only way to tell a node that came up empty because it was reformatted
+from a node that is genuinely new: the two are otherwise identical. It counts
+rather than overwrites, because a node wiped repeatedly has a different problem
+from one wiped once.
 
 `fs_init` deliberately does **not** probe SD or do the first-boot copy —
 mounting SD that early raced the bus/power bring-up. Those run later from

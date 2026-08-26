@@ -1253,8 +1253,162 @@ static void cmdPm(const char* args) {
     if (strstr(args, "-v")) pmDumpLocks();   /* lock + mode + sleep stats are opt-in */
 }
 
+#ifdef CONFIG_HEAP_TASK_TRACKING
+/* `top -b <task>` — the DRAM column of `top -v` split into the individual heap
+ * blocks behind it, grouped by size. A total says how much internal RAM a task
+ * holds; only the size histogram says WHAT it holds, and that is the whole
+ * question: a 44 B stream-buffer control block, a 92 B FreeRTOS queue and a
+ * 4 kB DMA buffer come from three different places. Sizes are exact allocated
+ * sizes (`multi_heap_get_allocated_size`), so they can be matched against a
+ * `sizeof` in the suspected allocator.
+ *
+ * Ownership is the block-owner stamp the allocator writes, i.e. the task that
+ * ran malloc — not the task that uses the memory. A server task is therefore
+ * billed for everything it allocates on a client's behalf, and a block a
+ * library allocates on first use belongs to whichever task got there first.
+ *
+ * Internal DRAM only: PSRAM block counts run into the thousands and the scarce
+ * heap is the one worth itemising. */
+static void topBlocks(const char* name, bool hex)
+{
+    UBaseType_t ntask = uxTaskGetNumberOfTasks();
+    int cap = (int)ntask + 8;              /* headroom for tasks spawned mid-walk */
+    auto* raw = (TaskStatus_t*)gp_alloc(cap * sizeof(TaskStatus_t));
+    if (!raw) { cliPrintf("top -b: out of memory\n"); return; }
+    int cnt = (int)uxTaskGetSystemState(raw, cap, nullptr);
+    TaskHandle_t target = nullptr;
+    for (int i = 0; i < cnt; i++)
+        if (strcmp(raw[i].pcTaskName, name) == 0) { target = raw[i].xHandle; break; }
+    if (!target) {
+        free(raw);
+        cliPrintf("top -b: no live task named '%s'\n", name);
+        return;
+    }
+
+    constexpr size_t MAX_BLOCKS = 512;
+    auto* blocks = (heap_task_block_t*)gp_alloc(MAX_BLOCKS * sizeof(heap_task_block_t));
+    if (!blocks) { free(raw); cliPrintf("top -b: out of memory\n"); return; }
+
+    size_t ntotals = 0;
+    heap_task_info_params_t p = {};
+    p.caps[0] = MALLOC_CAP_INTERNAL; p.mask[0] = MALLOC_CAP_INTERNAL;
+    /* The unused cap slots have to be made unmatchable. The walk takes the
+     * FIRST slot whose (region caps & mask) == caps, and a zeroed slot matches
+     * every region — which would sweep the PSRAM heap into the listing. */
+    for (int i = 1; i < NUM_HEAP_TASK_CAPS; i++) { p.caps[i] = ~0u; p.mask[i] = ~0u; }
+    p.totals = nullptr;
+    p.num_totals = &ntotals;    /* dereferenced even when totals is NULL */
+    p.max_totals = 0;
+    p.tasks = &target; p.num_tasks = 1;
+    p.blocks = blocks; p.max_blocks = MAX_BLOCKS;
+    size_t n = heap_caps_get_per_task_info(&p);
+
+    /* Under heap task tracking every block carries its owner's TaskHandle_t as
+     * a header word, and the walk reports the block from that word — so the
+     * pointer malloc actually returned, and everything that can be matched
+     * against it, is OWNER bytes further in. `size` likewise spans the stamp,
+     * so the payload is size - OWNER before TLSF rounds up to its size class
+     * (which is why a 360 B TCB shows as 368). */
+    constexpr size_t OWNER = sizeof(TaskHandle_t);
+
+    size_t total = 0;
+    for (size_t i = 0; i < n; i++) total += blocks[i].size;
+    cliPrintf("%s: %u B of internal DRAM in %u blocks%s\n", name,
+              (unsigned)total, (unsigned)n,
+              n == MAX_BLOCKS ? "  (LISTING TRUNCATED — raise MAX_BLOCKS)" : "");
+    cliPrintf("(size spans a %u B owner stamp; payload is size-%u, TLSF-rounded)\n",
+              (unsigned)OWNER, (unsigned)OWNER);
+
+    /* Name the blocks the kernel lets us name. A task's TCB block IS its
+     * TaskHandle_t and its stack block is what pxTaskGetStackStart returns, so
+     * both can be identified by address alone — which settles the one question
+     * a size histogram always raises first, since a TCB (`sizeof(StaticTask_t)`)
+     * and an ordinary struct can land in the same size class. */
+    auto owned = [&](const void* a, char* out, size_t outsz) -> bool {
+        for (int i = 0; i < cnt; i++) {
+            if ((const void*)raw[i].xHandle == a) {
+                snprintf(out, outsz, "TCB %s", raw[i].pcTaskName); return true;
+            }
+            if ((const void*)pxTaskGetStackStart(raw[i].xHandle) == a) {
+                snprintf(out, outsz, "stack %s", raw[i].pcTaskName); return true;
+            }
+        }
+        return false;
+    };
+
+    std::sort(blocks, blocks + n, [](const heap_task_block_t& a, const heap_task_block_t& b) {
+        return a.size > b.size;
+    });
+    cliPrintf("%9s %6s %10s  first       what\n", "size", "count", "bytes");
+    constexpr int MAX_ROWS = 32;   /* keep one task's dump to a screenful */
+    int rows = 0;
+    size_t shownBytes = 0, shownBlocks = 0;
+    for (size_t i = 0; i < n && rows < MAX_ROWS; rows++) {
+        size_t j = i, sz = blocks[i].size;
+        while (j < n && blocks[j].size == sz) j++;
+        /* Name up to three of the class; "+n" stands for the rest. */
+        char what[96] = "";
+        int named = 0;
+        for (size_t k = i; k < j; k++) {
+            char one[40];
+            if (!owned((const uint8_t*)blocks[k].address + OWNER, one, sizeof(one))) continue;
+            if (named < 3) {
+                snprintf(what + strlen(what), sizeof(what) - strlen(what),
+                         "%s%s", named ? ", " : "", one);
+            }
+            named++;
+        }
+        if (named > 3)
+            snprintf(what + strlen(what), sizeof(what) - strlen(what), " +%d", named - 3);
+        cliPrintf("%9u %6u %10u  %p  %s\n",
+                  (unsigned)sz, (unsigned)(j - i), (unsigned)(sz * (j - i)),
+                  (const uint8_t*)blocks[i].address + OWNER, what);
+        /* First 32 payload bytes of the first block of the class. A struct
+         * nothing names is still recognisable by its contents — an embedded
+         * string, a pointer into a known region, a magic word. */
+        if (hex) {
+            const uint8_t* q = (const uint8_t*)blocks[i].address + OWNER;
+            size_t show = sz - OWNER < 32 ? sz - OWNER : 32;
+            for (size_t off = 0; off < show; off += 16) {
+                char hx[52] = "", as[20] = "";
+                size_t end = off + 16 < show ? off + 16 : show;
+                for (size_t b = off; b < end; b++) {
+                    snprintf(hx + strlen(hx), sizeof(hx) - strlen(hx), "%02x ", q[b]);
+                    as[b - off] = (q[b] >= 0x20 && q[b] < 0x7f) ? (char)q[b] : '.';
+                    as[b - off + 1] = '\0';
+                }
+                cliPrintf("          %-48s |%s|\n", hx, as);
+            }
+        }
+        shownBytes += sz * (j - i); shownBlocks += j - i;
+        i = j;
+    }
+    if (shownBlocks < n)
+        cliPrintf("%9s %6u %10u  (smaller size classes not listed)\n",
+                  "...", (unsigned)(n - shownBlocks), (unsigned)(total - shownBytes));
+    free(blocks);
+    free(raw);
+}
+#endif
+
 static void cmdTop(const char* args) {
-    if (cliWantsHelp(args)) { cliPrintf("%-*s tasks, CPU%%, heap, uptime (-v: stack/byte/block detail + heap tables; human: readable sizes; -d/-p: sort by DRAM/PSRAM)\n", CLI_HELP_COL, "top [-v] [human] [-d|-p]"); return; }
+    if (cliWantsHelp(args)) { cliPrintf("%-*s tasks, CPU%%, heap, uptime (-v: stack/byte/block detail + heap tables; human: readable sizes; -d/-p: sort by DRAM/PSRAM; -b <task> [hex]: that task's DRAM blocks by size, named where the kernel knows them)\n", CLI_HELP_COL, "top [-v] [human] [-d|-p] [-b <task> [hex]]"); return; }
+    /* -b <task> is its own report, not a modifier of the table below. */
+    if (const char* b = args ? strstr(args, "-b") : nullptr) {
+        const char* nm = b + 2;
+        while (*nm == ' ') nm++;
+        char name[configMAX_TASK_NAME_LEN];
+        size_t k = 0;
+        while (nm[k] && nm[k] != ' ' && k + 1 < sizeof(name)) { name[k] = nm[k]; k++; }
+        name[k] = '\0';
+#ifdef CONFIG_HEAP_TASK_TRACKING
+        if (!k) cliPrintf("usage: top -b <task> [hex]\n");
+        else    topBlocks(name, strstr(args, "hex") != nullptr);
+#else
+        cliPrintf("top -b: needs CONFIG_HEAP_TASK_TRACKING\n");
+#endif
+        return;
+    }
     const bool verbose = (strstr(args, "-v") != nullptr);
     const bool human   = (strstr(args, "human") != nullptr);
     const bool byDram  = (strstr(args, "-d") != nullptr);
@@ -1314,7 +1468,13 @@ static void cmdTop(const char* args) {
     size_t preDram = 0, preDblk = 0, preP = 0, prePblk = 0;
     size_t delDram = 0, delDblk = 0, delP = 0, delPblk = 0;
 #ifdef CONFIG_HEAP_TASK_TRACKING
-    { constexpr size_t MAX_HT = 32;
+    /* Owners, not tasks: the walk also books blocks to deleted tasks and to
+     * pre-scheduler code, and IDF DROPS every owner past this cap silently —
+     * the excess tasks then read 0/0, which looks like a task that owns
+     * nothing rather than one that was not counted. A full image with BLE up
+     * runs past 45. Saturation is reported below rather than left to be
+     * discovered by two snapshots disagreeing. */
+    { constexpr size_t MAX_HT = 72;
       PSRAM_BSS static heap_task_totals_t htotals[MAX_HT];
       memset(htotals, 0, sizeof(htotals));
       size_t ntot = 0;
@@ -1323,6 +1483,9 @@ static void cmdTop(const char* args) {
       p.caps[1] = MALLOC_CAP_SPIRAM;   p.mask[1] = MALLOC_CAP_SPIRAM;
       p.totals = htotals; p.num_totals = &ntot; p.max_totals = MAX_HT;
       heap_caps_get_per_task_info(&p);
+      if (ntot >= MAX_HT)
+          cliPrintf("(heap owners hit the %u-entry cap — some rows under-report; "
+                    "raise MAX_HT)\n", (unsigned)MAX_HT);
       for (size_t i = 0; i < ntot; i++) {
           if (htotals[i].task == nullptr) {
               preDram += htotals[i].size[0];  preDblk += htotals[i].count[0];
@@ -1511,8 +1674,9 @@ void heapDump(const char* reason) {
     heapRegionInfo("INTERNAL", MALLOC_CAP_8BIT | MALLOC_CAP_INTERNAL);
     heapRegionInfo("SPIRAM",   MALLOC_CAP_SPIRAM);
 #ifdef CONFIG_HEAP_TASK_TRACKING
-    constexpr size_t MAX_TASKS = 24;
-    static heap_task_totals_t totals[MAX_TASKS];
+    /* Owners past this cap are dropped silently by IDF — see cmdTop. */
+    constexpr size_t MAX_TASKS = 72;
+    PSRAM_BSS static heap_task_totals_t totals[MAX_TASKS];
     memset(totals, 0, sizeof(totals));
     size_t ntotals = 0;
     heap_task_info_params_t p = {};

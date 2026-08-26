@@ -16,8 +16,8 @@ below is ours.
 
 | Table | Constant | Home | Meaning |
 |-------|----------|------|---------|
-| Connection table (`connTable`) | `ITS_MAX_CONNS = 128` | `.bss` | Active connections; handle = slot index, round-robin allocation. |
-| Stream-buffer pool (`itsPool`) | `ITS_MAX_POOL = 128` | `.bss` descriptors, PSRAM rings | Per-direction byte rings for stream/legacy connections, keyed by size. |
+| Connection table (`connTable`) | `ITS_MAX_CONNS = 128` | PSRAM (`PSRAM_BSS`, under test) | Active connections; handle = slot index, round-robin allocation. |
+| Stream-buffer pool (`itsPool`) | `ITS_MAX_POOL = 128` | PSRAM (`PSRAM_BSS`, under test) descriptors, PSRAM rings, internal control blocks | Per-direction byte rings for stream/legacy connections, keyed by size. |
 | Packet-link descriptor rings (`itsLinks`) | `ITS_MAX_LINKS = 256` | PSRAM (lazy) | Two per packet connection (one per direction); each is a ring of message descriptors. |
 | Task table (`s_tasks`) | `ITS_MAX_TASKS = 48` | PSRAM (lazy) | One `its_task_t` per ITS-registered task. |
 
@@ -34,9 +34,29 @@ Moving these two tables off `.bss` reclaimed ~25 KB of internal DRAM; before the
 move, the ~10 KB of static arrays the ITS-as-mailbox work added tipped the pool
 over — WiFi AP-fallback crashed in `ieee80211_hostap_attach` ("alloc eb … fail")
 and a boot-time SD read crashed in `setup_dma_priv_buffer` ("Failed to allocate
-priv RX buffer"), both internal-DMA-pool exhaustion. `connTable` and `itsPool`'s
-descriptor array are still `.bss`; move them the same way (lazy, count-guarded)
-if more headroom is needed.
+priv RX buffer"), both internal-DMA-pool exhaustion.
+
+`connTable` and `itsPool`'s descriptor array are `PSRAM_BSS`, another 10240 B off
+internal DRAM — **under test**: one earlier attempt booted into a LoadProhibited
+in the fs worker and has not reproduced since. Read
+[plans/its-tables-psram.md](../../plans/its-tables-psram.md) — the evidence and
+the one open question are there — before taking that marker off.
+
+The same split applies to the two per-connection allocations: a packet link's
+descriptor ring and a task's inbox queue each keep their control block internal
+and put the ring / slot array in PSRAM, so a link direction costs 144 B and a
+registered task 288 B rather than 288 and 424.
+
+What certainly cannot move is the lock itself and any FreeRTOS control block
+embedding one (`connMux`/`itsPoolMux`/`itsLinkMux`, a queue's `StaticQueue_t`, a
+stream buffer's `StaticStreamBuffer_t`, `itsPool[].sbCtrl`): the spinlock
+acquire uses an `S32C1I` atomic that is unreliable on external RAM.
+
+That leaves ITS's remaining internal footprint as control blocks and
+semaphores — about **6 KB**, all of it single-waiter wakeups that FreeRTOS task
+notifications would carry for free. The arithmetic, the cost, and why it is a
+different risk class from the placement work are in
+[memory.md](memory.md#known-headroom-6-kb-still-in-its).
 
 **Adding static `.bss` to spangap-core is dangerous.** Any new fixed array in
 this layer competes for the internal DMA pool. Measure `.dram0.bss`

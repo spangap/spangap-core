@@ -27,6 +27,7 @@
 #include "spanfs.h"
 #include "esp_timer.h"
 #include "nvs_flash.h"
+#include "nvs.h"             /* nvs_open/_get_u32 — the state-wipe breadcrumb */
 #include "esp_ota_ops.h"
 #include "esp_partition.h"
 #include "esp_flash.h"
@@ -147,10 +148,44 @@ bool fsStateOnSd() { return strcmp(s_stateDir, FS_STATE) != 0; }
  * mount failure, matching the FS_MOUNTS table entry). It is ALWAYS mounted,
  * regardless of where the active state store is. Shared by fs_init() and
  * fsFormatFlash(). */
+/* Record an emergency wipe where it can outlive the thing being wiped. NVS is
+ * its own partition, so a node that came up empty because its state store was
+ * reformatted can be told apart from one that is genuinely new — the question
+ * an operator cannot otherwise answer, since both look identical afterwards.
+ * Counts rather than overwrites: a node wiped repeatedly has a different
+ * problem from one wiped once. */
+static void noteStateWipe(esp_err_t why) {
+    uint32_t n = 0;
+    nvs_handle_t h;
+    if (nvs_open("spangap", NVS_READWRITE, &h) == ESP_OK) {
+        nvs_get_u32(h, "state_wipes", &n);       /* absent → stays 0 */
+        n++;
+        nvs_set_u32(h, "state_wipes", n);
+        nvs_set_u32(h, "state_wipe_err", (uint32_t)why);
+        nvs_commit(h);
+        nvs_close(h);
+    }
+    /* No trailing \n: pre-logInit(), the native ESP-IDF logger appends its own. */
+    err("state store REFORMATTED after mount failure (%s) — every setting stored "
+        "on it is gone. This node has now been wiped %u time(s)",
+        esp_err_to_name(why), (unsigned)n);
+}
+
+/* Register the on-flash `state` partition, formatting only as a last resort.
+ * The format is a factory reset: it is how a node loses every setting it has,
+ * and it must never happen quietly. So the mount is tried WITHOUT the fallback
+ * first and the fallback is entered deliberately, loudly, and on the record —
+ * rather than handing esp_littlefs a format_if_mount_failed flag and learning
+ * about the wipe from a device that is suddenly on its own AP. */
 static esp_err_t mountStateLittlefs() {
     esp_vfs_littlefs_conf_t conf = {};
     conf.base_path = FS_STATE;
     conf.partition_label = "state";
+    conf.format_if_mount_failed = false;
+    esp_err_t e = esp_vfs_littlefs_register(&conf);
+    if (e == ESP_OK) return e;
+
+    noteStateWipe(e);
     conf.format_if_mount_failed = true;
     return esp_vfs_littlefs_register(&conf);
 }
@@ -254,15 +289,57 @@ static size_t fsSdFwrite(const void* buf, size_t size, size_t nmemb, FILE* fp, b
     return done / size;
 }
 
+/* The task whose request the worker is currently executing, for the tripwire
+ * below: a bad request is the SENDER's bug, and the worker's own backtrace
+ * names only the worker. Null on the direct (no-worker) path. */
+static TaskHandle_t s_opSender = nullptr;
+
+/* Which pointers an op actually dereferences. Ops keyed by an open slot
+ * (read/write/seek/close/readdir/…) carry no path at all and legitimately pass
+ * NULL, so the tripwire below can only judge a pointer against the op. */
+static bool opUsesPath(int op) {
+    switch (op) {
+    case fs_op_t::OPEN:    case fs_op_t::STAT:     case fs_op_t::RENAME:
+    case fs_op_t::REMOVE:  case fs_op_t::MKDIR:    case fs_op_t::OPENDIR:
+    case fs_op_t::FILE_INFO: case fs_op_t::LFS_INFO: case fs_op_t::LISTDIR:
+        return true;
+    default:
+        return false;
+    }
+}
+/* open: the mode string. rename: the destination. */
+static bool opUsesPath2(int op) {
+    return op == fs_op_t::OPEN || op == fs_op_t::RENAME;
+}
+
 static void handleOp(fs_op_t* req) {
     /* Tripwire, not a fix: a caller once handed a path pointer of 0x24 (a
      * small integer where a pointer belongs — the shape of an unchecked
      * failed alloc upstream) and the worker took the whole device down inside
      * the VFS. A pointer below the memory map is refused with a loud log
-     * naming the op, so the culprit shows itself instead of a corpse. */
-    if ((uintptr_t)req->path != 0 && (uintptr_t)req->path < 0x3C000000) {
-        err("fs op %s: bogus path pointer %p — refusing",
-            fsOpName((int)req->op), (const void*)req->path);
+     * naming the op, so the culprit shows itself instead of a corpse.
+     *
+     * NULL counts as bogus wherever the op dereferences the pointer. It used
+     * to pass, on the reasoning that pathless ops carry NULL legitimately —
+     * but that let an all-zero request through as OPEN (enumerator 0) with a
+     * null path AND a null mode, and newlib dereferences the mode before it
+     * ever looks at the path: LoadProhibited at 0x0, inside fopen, with the
+     * request that caused it unrecorded. The request pointer is logged too,
+     * since a zeroed struct and a wild pointer are different bugs. */
+    const bool badPath  = opUsesPath((int)req->op)  &&
+                          (uintptr_t)req->path  < 0x3C000000;
+    const bool badPath2 = opUsesPath2((int)req->op) &&
+                          (uintptr_t)req->path2 < 0x3C000000;
+    /* A pathless op still must not carry a small non-null integer where a
+     * pointer belongs — that is the original 0x24 case, and it means the
+     * request itself is not what the caller thinks. */
+    const bool badSpare = !opUsesPath((int)req->op) && (uintptr_t)req->path != 0 &&
+                          (uintptr_t)req->path < 0x3C000000;
+    if (badPath || badPath2 || badSpare) {
+        err("fs op %s from [%s]: bogus request %p (path %p, path2 %p) — refusing",
+            fsOpName((int)req->op),
+            s_opSender ? pcTaskGetName(s_opSender) : "direct",
+            (const void*)req, (const void*)req->path, (const void*)req->path2);
         req->result = -1;
         return;
     }
@@ -452,11 +529,12 @@ static volatile uint32_t fsOpCount = 0;
 static volatile int fsCurrentOp = -1;
 static volatile int fsCurrentSlot = -1;
 
-static void onFsOp(TaskHandle_t, const void* data, size_t len) {
+static void onFsOp(TaskHandle_t sender, const void* data, size_t len) {
     static uint32_t lastOpExitUs = 0;
     if (len < sizeof(fs_op_t*)) return;
     fs_op_t* op;
     memcpy(&op, data, sizeof(op));
+    s_opSender = sender;
     uint32_t t0 = (uint32_t)esp_timer_get_time();
     /* Time gap since previous op exited — exposes whether fs worker is being
      * starved between picking up messages. */
@@ -468,6 +546,7 @@ static void onFsOp(TaskHandle_t, const void* data, size_t len) {
     fsCurrentOp = (int)op->op;
     fsCurrentSlot = op->slot;
     handleOp(op);
+    s_opSender = nullptr;
     fsCurrentOp = -1;
     fsCurrentSlot = -1;
     fsOpCount = fsOpCount + 1;  /* C++20 deprecates ++ on volatile */

@@ -5,7 +5,11 @@ independent, optional straddles. Each owns its own setup, keys, and CLI; this
 page only explains how they fit together and points at the owners.
 
 - **[upnp](../../upnp)** — punches NAT port mappings on the gateway via
-  UPnP/IGD so inbound connections reach the device.
+  UPnP/IGD so inbound connections reach the device. Besides the web and WebRTC
+  ports it forwards any listener whose owner flagged it `publicFacing` when it
+  registered with [spangap-net](../../spangap-net) — which is how a pane
+  elsewhere in the tree ("Accessible from internet") publishes a port without
+  either side naming the other.
 - **[duckdns](../../duckdns)** — keeps a stable public hostname pointed at the
   device's changing IP, and can publish DNS TXT records.
 - **[acme](../../acme)** — obtains a real (Let's Encrypt-style, RFC 8555) TLS

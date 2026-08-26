@@ -5,6 +5,7 @@
 #include "freertos/stream_buffer.h"
 #include "esp_heap_caps.h"
 #include "esp_timer.h"
+#include "mem.h"
 #include "pm.h"
 #include <string.h>
 #include <atomic>
@@ -71,9 +72,13 @@ struct its_pool_entry_t {
     SemaphoreHandle_t    spaceFreedSem;
 };
 
-static its_pool_entry_t itsPool[ITS_MAX_POOL];
+/* UNDER TEST — see plans/its-tables-psram.md. PSRAM costs nothing but a cached
+ * read here (task-context data, guarded by a lock that stays internal) and
+ * reclaims 10 kB of internal DRAM, but the last attempt booted into a
+ * LoadProhibited in the fs worker. Reverted if this run reproduces it. */
+PSRAM_BSS static its_pool_entry_t itsPool[ITS_MAX_POOL];
 static int              itsPoolCount = 0;
-static portMUX_TYPE     itsPoolMux = portMUX_INITIALIZER_UNLOCKED;
+static portMUX_TYPE     itsPoolMux = portMUX_INITIALIZER_UNLOCKED;   /* internal: S32C1I */
 
 /* Acquire a stream buffer of `size` bytes.
  *  - Pooled (noPool=false): reuse a free same-size entry, else create a
@@ -338,13 +343,23 @@ static int linkAcquire(size_t depth, size_t byteCap, size_t maxMsg) {
     /* (depth+1) records of headroom: a FreeRTOS stream buffer holds one byte
      * short of its size, so size it so `depth` whole 8-byte descriptors always
      * fit. The extra 8 bytes is negligible. */
-    /* Internal RAM, not PSRAM: the stream buffer's control block embeds an SMP
-     * spinlock (taskENTER_CRITICAL in every send/recv) whose S32C1I atomic is
-     * unreliable on PSRAM and is touched during flash cache-disable windows.
-     * The ring is small ((depth+1)*8 B of descriptors), so the whole buffer can
-     * live internally rather than splitting control/storage like the pool. */
-    L.ring = xStreamBufferCreateWithCaps((depth + 1) * sizeof(its_desc), sizeof(its_desc),
-                                         MALLOC_CAP_INTERNAL);
+    /* Split control/storage exactly like poolGet: the control block embeds an
+     * SMP spinlock whose S32C1I atomic is unreliable on PSRAM, so it is
+     * internal; the descriptor ring is plain data copied under that lock, the
+     * same way the pool's PSRAM ring storage has always been, so it is not.
+     * The ring is only (depth+1)*8 B, but a packet-heavy image carries far more
+     * links than pool entries and internal DRAM is the contended heap.
+     * Storage area must be xBufferSizeBytes + 1 (FreeRTOS static requirement).
+     * Neither block is ever freed: a link is retained for reuse (linkFree), so
+     * there is no teardown path to hand the pointers back to. */
+    const size_t ringBytes = (depth + 1) * sizeof(its_desc);
+    auto* ringCtrl  = (StaticStreamBuffer_t*)heap_caps_malloc(
+                          sizeof(StaticStreamBuffer_t), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    auto* ringStore = (uint8_t*)heap_caps_malloc(ringBytes + 1, MALLOC_CAP_SPIRAM);
+    L.ring = (ringCtrl && ringStore)
+             ? xStreamBufferCreateStatic(ringBytes, sizeof(its_desc), ringStore, ringCtrl)
+             : nullptr;
+    if (!L.ring) { heap_caps_free(ringCtrl); heap_caps_free(ringStore); }
     if (L.spaceFreedSem == nullptr) L.spaceFreedSem = xSemaphoreCreateBinary();
     if (!L.ring || !L.spaceFreedSem) {
         ITS_LOGE("link alloc failed for depth-%u ring", (unsigned)depth);
@@ -433,9 +448,10 @@ struct its_conn_t {
     its_disconnect_cb_t cliDisconnectCb;
 };
 
-static its_conn_t    connTable[ITS_MAX_CONNS];
+/* UNDER TEST — see the note on itsPool above. */
+PSRAM_BSS static its_conn_t    connTable[ITS_MAX_CONNS];
 static int           connCounter = 0;
-static portMUX_TYPE  connMux = portMUX_INITIALIZER_UNLOCKED;
+static portMUX_TYPE  connMux = portMUX_INITIALIZER_UNLOCKED;   /* internal: S32C1I */
 
 static int connAlloc() {
     portENTER_CRITICAL(&connMux);
@@ -710,8 +726,24 @@ static its_task_t* taskFindOrCreate(TaskHandle_t task, size_t inboxMaxMsgLen, si
      *   2. a flash op on the OTHER core disables the cache, making the PSRAM
      *      queue struct unreadable while this core is in the critical section.
      * Slots are pointers (~4 B), so the whole queue is tiny in internal RAM;
-     * payloads stay borrowed per-message in PSRAM (read outside the lock). */
-    e->inbox = xQueueCreateWithCaps(depth, sizeof(its_msg*), MALLOC_CAP_INTERNAL);
+     * payloads stay borrowed per-message in PSRAM (read outside the lock).
+     *
+     * Split control/storage like poolGet and the link rings: only the control
+     * block carries the spinlock, so only it must be internal. The slot array
+     * is depth pointers — 128 B at the default depth of 32, per ITS-registered
+     * task, and a full image registers twenty-odd. */
+    auto* qCtrl  = (StaticQueue_t*)heap_caps_malloc(sizeof(StaticQueue_t),
+                                                    MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    auto* qStore = (uint8_t*)heap_caps_malloc((size_t)depth * sizeof(its_msg*),
+                                              MALLOC_CAP_SPIRAM);
+    e->inbox = (qCtrl && qStore)
+               ? xQueueCreateStatic(depth, sizeof(its_msg*), qStore, qCtrl)
+               : nullptr;
+    if (!e->inbox) {
+        heap_caps_free(qCtrl);
+        heap_caps_free(qStore);
+        ITS_LOGE("inbox alloc failed for [%s] (depth %d)", pcTaskGetName(task), depth);
+    }
     return e;
 }
 
