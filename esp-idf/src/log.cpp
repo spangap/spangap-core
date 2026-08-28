@@ -237,11 +237,17 @@ static void logFileFlush() {
 
 #define LOG_MAX_CONSUMERS 5      /* up to 3 TCP + 2 DC (browser + on-device viewer) */
 #define LOG_INBOUND_BUF   512    /* per-slot accumulator for partial inbound lines */
+/* What a truncated inbound line says for itself. A line silently shortened is
+ * worse than a long one: the reader has no way to tell a cut from the end of
+ * the message, and the part a browser puts last is usually the part that
+ * matters. */
+#define LOG_CUT_MARK      " ...[cut]"
 static struct {
   int itsHandle;
   log_ansi_t ansi;
   char  lineBuf[LOG_INBOUND_BUF];
   size_t lineLen;
+  bool  truncated;      /* this line hit the cap; swallow to the newline */
   bool  pastePending;   /* DC: paste-back deferred out of onConnect (below) */
   long  pasteBacklog;   /* kB requested (0 = default) */
 } logSlots[LOG_MAX_CONSUMERS];
@@ -251,6 +257,7 @@ static int logAllocSlot(int h) {
     if (logSlots[i].itsHandle < 0) {
       logSlots[i].itsHandle = h;
       logSlots[i].lineLen = 0;
+      logSlots[i].truncated = false;
       return i;
     }
   return -1;
@@ -793,6 +800,7 @@ static void logOnDisconnect(int ref) {
   if (ref >= 0 && ref < LOG_MAX_CONSUMERS) {
     logSlots[ref].itsHandle = -1;
     logSlots[ref].lineLen = 0;
+    logSlots[ref].truncated = false;
     logSlots[ref].pastePending = false;
   }
 }
@@ -843,8 +851,15 @@ static void logInboundLineOut(int srcSlot, const char* line, size_t len) {
     if (len == 0) return;
     dbg("inbound from slot %d (%u bytes)\n", srcSlot, (unsigned)len);
 
-    /* Plain version (ANSI-stripped) for file + non-ANSI consumers */
-    char plain[LOG_INBOUND_BUF + 8];
+    /* Plain version (ANSI-stripped) for file + non-ANSI consumers.
+     *
+     * STATIC, not on the stack. This runs on the log task, whose 6 KB is spent
+     * by a single chain: logTaskFn's own buf+plain, then logSlotDrainInbound's
+     * packet-sized tmp, then these two — four kilobytes of buffer before any
+     * snprintf or itsSend has its own frame. Nothing here recurses and only the
+     * log task ever reaches it, so one copy each is all that is needed, and the
+     * stack is not where to keep them. */
+    static char plain[LOG_INBOUND_BUF + 8];
     size_t plainLen = len;
     if (plainLen > sizeof(plain) - 2) plainLen = sizeof(plain) - 2;
     memcpy(plain, line, plainLen);
@@ -856,7 +871,7 @@ static void logInboundLineOut(int srcSlot, const char* line, size_t len) {
 
     /* ANSI version: if line already has escape sequences, pass through; else
      * re-apply color around level char (and grey on the timestamp prefix). */
-    char ansi[LOG_INBOUND_BUF + 64];
+    static char ansi[LOG_INBOUND_BUF + 64];
     size_t ansiLen = 0;
     bool ansiDone = false;
     auto ensureAnsi = [&]() {
@@ -899,8 +914,11 @@ static void logSlotDrainInbound(int slot) {
     int h = logSlots[slot].itsHandle;
     if (h < 0 || !itsConnected(h)) return;
     /* Packet-mode reads need the recv buffer to hold the entire packet at
-     * once; size to match the slot's toSize (2048 at port-open). */
-    char tmp[2048];
+     * once; size to match the slot's toSize (2048 at port-open). STATIC for the
+     * same reason as the buffers in logInboundLineOut, and this is the largest
+     * of them: two kilobytes of packet on the stack of the task that then calls
+     * into the fan-out is most of what overflowed it. */
+    static char tmp[2048];
     size_t got = itsRecv(h, tmp, sizeof(tmp), 0);  /* non-blocking */
     if (got == 0) return;
     auto& s = logSlots[slot];
@@ -910,10 +928,19 @@ static void logSlotDrainInbound(int slot) {
         if (c == '\n') {
             logInboundLineOut(slot, s.lineBuf, s.lineLen);
             s.lineLen = 0;
-        } else if (s.lineLen + 1 < sizeof(s.lineBuf)) {
-            s.lineBuf[s.lineLen++] = c;
+            s.truncated = false;
+            continue;
         }
-        /* Overflow → silently drop until next newline */
+        if (s.lineLen + 1 < sizeof(s.lineBuf)) { s.lineBuf[s.lineLen++] = c; continue; }
+        /* TRUNCATE, and say so. Everything past the cap is swallowed to the
+         * newline: an inbound line is a browser's or a client's to make as long
+         * as it likes, and nothing downstream of here should have to carry
+         * that. The mark is stamped once, over the tail already accumulated. */
+        if (!s.truncated) {
+            s.truncated = true;
+            const size_t m = sizeof(LOG_CUT_MARK) - 1;
+            if (s.lineLen >= m) memcpy(s.lineBuf + s.lineLen - m, LOG_CUT_MARK, m);
+        }
     }
 }
 

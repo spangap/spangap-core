@@ -149,6 +149,20 @@ relaxed heuristic — a single `E`/`W`/`I`/`D`/`V` bounded by spaces or at line
 start — so both the device's native `<ts> L [task] msg` and a free-form
 `<ts> L Browser: msg` are colored correctly.
 
+A line longer than `LOG_INBOUND_BUF` ends in **`...[cut]`** and the remainder is
+swallowed to the newline: a line silently shortened is worse than a long one,
+because the reader cannot tell a cut from the end of the message and the part a
+browser puts last is usually the part that matters. The senders bound their own
+lines too — see spangap-web, which caps the wire form in bytes at the single
+door to the device.
+
+The ANSI and plain copies of an inbound line are **static, not stack**. They sit
+at the end of one chain on the log task's 6 KB: `logTaskFn`'s own buffers, then
+the packet-sized temporary in `logSlotDrainInbound()`, then these two — four
+kilobytes of buffer before any `snprintf` or `itsSend` has a frame of its own.
+Nothing on the path recurses and only the log task reaches it, so one copy of
+each is all that is needed.
+
 ## 4. CLI output routing
 
 CLI command output does not go through the log fan-out; it is written back to the
