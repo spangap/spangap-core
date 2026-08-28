@@ -49,6 +49,12 @@ dropping any SSID that is not representable on one line — so a reader knows ho
 many records to expect and a short read is a truncated reply rather than a
 device that lied. `ap=` puts the SSID last so spaces need no quoting.
 
+`net scan -O` answers from the access-point cache and does **not** start a scan,
+where the human `net scan` does. That is the rule for this whole contract rather
+than a quirk of one verb: a reader here is holding a two-second timeout on a
+framed round trip, and a full sweep of the band does not fit inside it. An `-O`
+verb reports what the device already knows.
+
 `show` is not in this list and does not need to be: it is already
 machine-shaped (`key = value`) and takes a prefix, so `show sys.build` and
 `show sys.flash` each fetch a whole subtree in one round trip.

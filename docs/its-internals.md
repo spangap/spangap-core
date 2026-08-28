@@ -249,9 +249,15 @@ separate borrowed block.
   direction first (`asServer=false` writes client→server, `asServer=true` writes
   server→client), so the new owner re-parses a whole-looking request. This is how
   the web task hands an HTTP connection to the target service.
-- **Disconnect** — works from either side; `itsDisconnect(-1)` closes every
-  connection the calling task owns. The connection record is freed before the
-  remote's disconnect callback runs.
+- **Disconnect** — works from either side, but only for the task that *owns*
+  that end: the buffers, the descriptor ring and the peer's callback all belong
+  to the two endpoint tasks, so a third party has no correct teardown to
+  perform. Such a call is refused with an error line rather than acted on —
+  closing a connection from a callback that runs on someone else's task (a net
+  event handler, say) leaves the peer sending into a queue nobody drains, which
+  surfaces as send timeouts far from the caller. `itsDisconnect(-1)` closes
+  every connection the calling task owns. The connection record is freed before
+  the remote's disconnect callback runs.
 
 ### Disconnect-payload trick
 When a server kicks a client, the connection record (and the client's

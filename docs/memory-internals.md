@@ -138,7 +138,7 @@ is gotten wrong.
     T-Deck GPS UART (`hw-lilygo-tdeck/gps.cpp`) runs on the APB clock and held no PM
     lock; its autobaud detect loop blocks in `uart_read_bytes`, so with
     `PM_ENABLE`+tickless idle, light sleep gates the UART mid-listen and the
-    receiver reads as absent ("no NMEA at any baud", intermittent). It only ever
+    receiver reads as absent ("GPS not detected", intermittent). It only ever
     worked because early WiFi bring-up held a pre-connect-scan no-light-sleep
     lock that blanketed the ~2–4 s autobaud window; deferral removed that cover.
     Fix: GPS takes its own `PM_NO_LIGHT_SLEEP` across autobaud **only** (steady

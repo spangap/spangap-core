@@ -1969,6 +1969,17 @@ void itsDisconnect(int handle) {
             poolRetainOnFree(toIdx); poolRetainOnFree(fromIdx);
             connFree(handle);
         }
+    } else {
+        /* Neither end is ours, so there is no correct teardown to perform: the
+         * buffers, the ring and the peer's callback all belong to tasks that
+         * are not us. Say so loudly — a caller that thinks it closed a
+         * connection and did not leaves the peer sending into a queue nobody
+         * drains, which reads as unexplained send timeouts far from here. */
+        ITS_LOGE("itsDisconnect(%d) from [%s]: owns neither end ([%s] -> [%s:%u]) — ignored",
+                 handle, pcTaskGetName(me),
+                 c->clientTask ? pcTaskGetName(c->clientTask) : "?",
+                 c->serverTask ? pcTaskGetName(c->serverTask) : "?",
+                 (unsigned)c->itsPort);
     }
 }
 

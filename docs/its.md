@@ -144,7 +144,7 @@ the authoritative reference; this is the map.
 | Server callbacks | `itsServerOnConnect`, `itsServerOnBusy`, `itsServerOnDisconnect`, `itsServerOnRecv` |
 | Server plumbing | `itsInject`, `itsServerForward`, `itsServerForwardByTaskHandle`, `itsServerPort`, `itsServerActive` |
 | Client | `itsClientInit`, `itsConnect`, `itsConnectByTaskHandle`, `itsRef` |
-| Disconnect | `itsDisconnect` (either side; `-1` closes all of this task's connections) |
+| Disconnect | `itsDisconnect` (either side, **called by the task that owns that end**; `-1` closes all of this task's connections) |
 | Aux | `itsOnAux`, `itsSendAux`, `itsSendAuxByTaskHandle`, `itsSendAuxOwnedByTaskHandle` |
 | Poll | `itsPoll` |
 | Data | `itsSend`, `itsRecv`, `itsSendOwned`, `itsRecvRef` |
