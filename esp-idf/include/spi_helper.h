@@ -36,6 +36,23 @@
 extern "C" {
 #endif
 
+/** The shared bus's transfer ceiling, for every driver that brings it up.
+ *
+ *  First caller wins, and what it wins for everyone else is the LARGEST SINGLE
+ *  TRANSFER any of them will ever be allowed. That is a display's whole
+ *  performance story: a panel repaints in strips of at most this many bytes,
+ *  so a small ceiling turns one repaint into dozens of transactions, each with
+ *  its own bus lock, DMA setup and completion wait — and a redraw you can watch
+ *  travel down the glass. Nobody else is sensitive to it (an SD card and a
+ *  radio move small blocks), and the cost of a big ceiling is a handful of DMA
+ *  descriptors, so every caller states THIS rather than its own need.
+ *
+ *  32 KB is 51 lines of a 320-wide 16-bit panel: a full-screen repaint in 5
+ *  transfers instead of 40. Raising it costs nothing but descriptors; the
+ *  display's own strip buffer (CONFIG_LCD_DRAW_STRIP_KB) is what actually
+ *  spends RAM, and it must not exceed this. */
+#define SPANGAP_SPI_MAX_TRANSFER 32768
+
 /** Idempotent `spi_bus_initialize`. Returns ESP_OK if the bus is
  *  already up (regardless of who initialized it) or comes up cleanly.
  *  Suppresses the IDF SPI driver's `"SPI bus already initialized"`

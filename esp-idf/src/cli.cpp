@@ -2080,10 +2080,10 @@ static void serialTaskFn(void* arg) {
   auto trigScan = [&](int port) {
       auto& cl = serialClaims[port];
       if (!cl.claimed || !cl.trigLen || hdlHandle[port] >= 0) return;
-      serialScanCount++;
+      serialScanCount = serialScanCount + 1;
       uint8_t rb[128];
       int n = portRead(port, rb, sizeof(rb));
-      if (n > 0) serialScanBytes += (uint32_t)n;
+      if (n > 0) serialScanBytes = serialScanBytes + (uint32_t)n;
       for (int i = 0; i < n; i++) {
         if (rb[i] == cl.trig[serialTrigMatched[port]]) {
           if (++serialTrigMatched[port] < cl.trigLen) continue;
@@ -2412,7 +2412,7 @@ static void serialTaskFn(void* arg) {
   info("serial: framed rpc v1\n");
 
   for (;;) {
-    serialLoopCount++;
+    serialLoopCount = serialLoopCount + 1;
     rpcCheckTimeout();
     /* ---- serial-handler bookkeeping, ahead of every console mode ----
      * A claimed port 1 must be shuttled whether or not the console has a CLI

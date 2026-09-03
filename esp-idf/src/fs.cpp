@@ -941,7 +941,10 @@ bool fs_mount_sd(void) {
     bus.miso_io_num     = CONFIG_SPANGAP_SDCARD_SPI_PIN_MISO;
     bus.quadwp_io_num   = -1;
     bus.quadhd_io_num   = -1;
-    bus.max_transfer_sz = 4096;
+    /* Not the card's need — the BUS's ceiling, and first caller wins it for
+     * everyone. A display sharing this bus repaints in transfers capped by
+     * whatever went up first, so the SD states the shared maximum too. */
+    bus.max_transfer_sz = SPANGAP_SPI_MAX_TRANSFER;
     /* Kconfig SPANGAP_SDCARD_SPI_HOST is the peripheral *name* (2 = SPI2/FSPI,
      * 3 = SPI3/HSPI), matching how board headers spell BOARD_*_SPI_HOST. The
      * IDF spi_host_device_t enum is offset by one (SPI1_HOST=0, SPI2_HOST=1,

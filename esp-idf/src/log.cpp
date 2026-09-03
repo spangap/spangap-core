@@ -71,7 +71,7 @@ static size_t logRingWrite(const char* data, size_t len) {
   taskENTER_CRITICAL(&logSpinlock);
   uint32_t h = logRingHead, t = logRingTail;
   uint32_t free = LOG_RING_SIZE - (h - t);
-  if (len > free) { logRingDropped += (uint32_t)(len - free); len = free; }
+  if (len > free) { logRingDropped = logRingDropped + (uint32_t)(len - free); len = free; }
   for (size_t i = 0; i < len; i++)
     logRing[(h + i) % LOG_RING_SIZE] = data[i];
   logRingHead = h + len;
@@ -571,7 +571,7 @@ static int logVprintf(const char* fmt, va_list args) {
     if (!logInited) return 0;
     if (logNowhereToGo()) {
         taskENTER_CRITICAL(&logSpinlock);
-        logSuppressed++;
+        logSuppressed = logSuppressed + 1;
         taskEXIT_CRITICAL(&logSpinlock);
         return 0;
     }
