@@ -1553,6 +1553,18 @@ static void cliTaskFn(void* arg) {
 
 /* ---- Serial task: byte shuttle between serial port and log/CLI ---- */
 
+/* The USB-Serial-JTAG driver's TX ring, and the largest single write that may be
+ * handed to it. usb_serial_jtag_write_bytes passes the buffer to xRingbufferSend
+ * as ONE item and answers `size` or 0 — never a partial count — and an item
+ * longer than the whole ring is refused immediately and permanently ("data will
+ * never ever fit in the queue"). So the ceiling follows the ring's size rather
+ * than how busy it is, and no timeout or retry reaches past it: every writer here
+ * chunks, or loses everything beyond the first ring-full without a word. The
+ * chunk is half the ring so a write still has somewhere to go while the TX ISR is
+ * draining the one before it. */
+#define USJ_TX_RING   256
+#define USJ_TX_CHUNK  (USJ_TX_RING / 2)
+
 /** Write CLI bytes to the console.
  *
  * On USB-Serial-JTAG we bypass stdout and write straight to the driver's TX
@@ -1598,7 +1610,9 @@ static void serialEmit(const char* p, size_t n) {
        * once; only a host that has stopped reading times out, at which point
        * dropping the rest is correct (nobody's listening) rather than wedging
        * the serial task — which would stall every other console consumer. */
-      int w = usb_serial_jtag_write_bytes(d + off, len - off, pdMS_TO_TICKS(250));
+      size_t want = len - off;
+      if (want > USJ_TX_CHUNK) want = USJ_TX_CHUNK;
+      int w = usb_serial_jtag_write_bytes(d + off, want, pdMS_TO_TICKS(250));
       if (w <= 0) break;
       off += (size_t)w;
     }
@@ -1932,6 +1946,10 @@ static void serialTaskFn(void* arg) {
    * even with bytes in the hardware FIFO. Installing the driver attaches an
    * ISR that drains LL → ringbuffer, and the VFS then reads from the ring. */
   usb_serial_jtag_driver_config_t cfg = USB_SERIAL_JTAG_DRIVER_CONFIG_DEFAULT();
+  /* Named rather than left to the driver's default: the TX ring's size is also
+   * the largest write it will ever accept (see USJ_TX_CHUNK), so the two have to
+   * be stated in one place or portWrite's chunking silently outgrows the ring. */
+  cfg.tx_buffer_size = USJ_TX_RING;
   /* Force the driver's TX/RX ring buffers into INTERNAL RAM. The driver builds
    * them with plain xRingbufferCreate (no caps), so with SPIRAM_MALLOC_ALWAYSINTERNAL=0
    * they land in PSRAM — but the ring buffer is touched by the driver's ISR, and
@@ -1939,7 +1957,7 @@ static void serialTaskFn(void* arg) {
    * mauling a PSRAM ring during a flash-op cache-disable window corrupts that
    * pointer → a later xRingbufferSend on the serial task calls a garbage PSRAM
    * address → InstructionFetchError (deterministic, reproduced via `cat` of a state file).
-   * Buffers are tiny (256 B TX + 256 B RX default), so internal cost is ~1 KB.
+   * Buffers are tiny (USJ_TX_RING TX + 256 B RX), so internal cost is ~1 KB.
    * extmem_enable sets the runtime alwaysinternal threshold; restore it after. */
   heap_caps_malloc_extmem_enable(32 * 1024);
   usb_serial_jtag_driver_install(&cfg);
@@ -1978,9 +1996,18 @@ static void serialTaskFn(void* arg) {
 #if CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG
       if (consoleOnCdc) { consoleCdcWritePort(port, data, len); return; }
       if (port != 0) return;
+      /* Chunked, because usb_serial_jtag_write_bytes hands the whole buffer to
+       * xRingbufferSend as ONE item and returns `size` or 0 — never a partial
+       * count. An item longer than the ring is refused immediately and for good
+       * ("data will never ever fit in the queue"), so the write reports nothing
+       * sent and the loop below would drop the remainder. Length-counted traffic
+       * cannot survive that: a framed-RPC reply over the ring size went out as no
+       * bytes at all, and the host saw a device that never answered. */
       size_t off = 0;
       while (off < len) {
-        int w = usb_serial_jtag_write_bytes((const char*)data + off, len - off,
+        size_t want = len - off;
+        if (want > USJ_TX_CHUNK) want = USJ_TX_CHUNK;
+        int w = usb_serial_jtag_write_bytes((const char*)data + off, want,
                                             pdMS_TO_TICKS(250));
         if (w <= 0) break;
         off += (size_t)w;

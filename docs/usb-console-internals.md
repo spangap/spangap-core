@@ -234,6 +234,15 @@ error string, because `ESP_ERR_NO_MEM` here is not about the heap.
   DTR is seen goes permanently mute against such a host.
 - **`consoleCdcRead` is one byte at a time and console-only.** A handler's
   stream goes through `consoleCdcReadPort`/`consoleCdcWritePort`.
+- **A USB-Serial-JTAG write is capped by the ring, and the cap is silent.**
+  `usb_serial_jtag_write_bytes` hands the whole buffer to `xRingbufferSend` as
+  one item and answers `size` or `0`, never a partial count; an item longer than
+  the ring is refused the moment it is offered ("data will never ever fit in the
+  queue"), so no timeout, retry or idle host gets past it. Every writer chunks at
+  `USJ_TX_CHUNK` for that reason. Text mostly hides the ceiling — `serialEmit`
+  splits on newlines, and lines are short — but length-counted traffic cannot
+  survive it: a framed-RPC reply over the ring size went out as *no bytes at
+  all*, which the host reads as a device that never answered.
 - **`consoleCdcPortCount()` reports 0, not 1, while the console is on
   USB-Serial-JTAG.** `sys.usb.serial_ports` is published from
   `publishSerialPorts()`, which does the mapping; do not derive it at the call

@@ -139,12 +139,30 @@ extern "C" int consoleCdcReadPort(int itf, uint8_t* out, size_t max) {
   return (int)n;
 }
 
+/* A stalled host must not hold the serial task: this many flushes in a row that
+ * moved nothing ends the write and drops the remainder. At the 50 ms flush
+ * timeout below that is a couple of seconds of a host that has stopped reading
+ * — long enough that a busy one is never cut off, short enough that the console
+ * comes back. */
+#define CDC_WRITE_STALL_LIMIT  40
+
 extern "C" int consoleCdcWritePort(int itf, const uint8_t* data, size_t len) {
   if (!consoleOnCdc || itf < 0 || itf >= cdcPorts) return 0;
-  size_t w = tinyusb_cdcacm_write_queue((tinyusb_cdcacm_itf_t)itf, data, len);
-  tinyusb_cdcacm_write_flush((tinyusb_cdcacm_itf_t)itf, pdMS_TO_TICKS(50));
-  cdcTxCount[itf] += (uint32_t)w;
-  return (int)w;
+  /* The queue takes only what fits in the TX FIFO and reports how much that
+   * was; the rest is the caller's to send again, and the flush is what empties
+   * the FIFO to make room for it. So one write is a loop, not a call: a single
+   * pass silently loses everything past the FIFO, which is the whole of any
+   * framed-RPC reply longer than a couple of lines. */
+  size_t off = 0;
+  int stalled = 0;
+  while (off < len && stalled < CDC_WRITE_STALL_LIMIT) {
+    size_t w = tinyusb_cdcacm_write_queue((tinyusb_cdcacm_itf_t)itf, data + off, len - off);
+    off += w;
+    tinyusb_cdcacm_write_flush((tinyusb_cdcacm_itf_t)itf, pdMS_TO_TICKS(50));
+    stalled = w ? 0 : stalled + 1;
+  }
+  cdcTxCount[itf] += (uint32_t)off;
+  return (int)off;
 }
 
 /* Discard whatever the host queued while nobody was reading. Bytes that arrived
