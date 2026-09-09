@@ -232,6 +232,14 @@ Op-list wire format (one heap block, single leading flags byte; `bit0 = SILENT`)
 'W' SAVE    sem(SemaphoreHandle_t)
 ```
 
+`vtype` on a `storageSet(key, const char*)` is inferred: digits with an optional
+leading `-` that **fit an int32** become `'I'`, and everything else — including
+digits that do not fit — stays `'S'`. The range check is the rule, not a detail
+of it. An int a value does not fit is not a narrower reading of that value but a
+different number, and the encode is `atoi`, which saturates: a 20-digit account
+id or an epoch in milliseconds became `2147483647` with the original gone. Over
+the range, the string a caller wrote is what is stored and what it reads back.
+
 `storageApplyOps` runs in two passes: **pass 1** validates and parses the whole
 list with no side effects (a malformed list is rejected whole, and any queued
 SAVE sems are released so `storageSave` callers don't hang); **pass 2** applies

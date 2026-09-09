@@ -48,6 +48,7 @@
 #include <algorithm>
 #include <functional>
 #include <cstdio>
+#include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <sys/stat.h>
@@ -856,10 +857,16 @@ static void writePendingBlobs();
  * stopped for 300 ms, and reading it that way turns routine writes into
  * suspects.
  *
- * Threshold matches the actor's own warn level: below it a flush cannot
- * account for a reported stall even if every microsecond of it were a freeze,
- * so warning about it is noise. */
+ * Two thresholds, because a flush worth SEEING and a flush worth WORRYING about
+ * are different lengths. Below the first a flush cannot account for a reported
+ * stall even if every microsecond of it were a freeze, so it is not logged at
+ * all; between them it is a fact about a slow write and rides `info`; at or past
+ * the second it is long enough to be the answer to somebody's stall report, and
+ * only then is it a warning. Routine writes on a busy filesystem cross the first
+ * line all the time, and a log that calls each of them a warning trains the
+ * reader to skip the one that mattered. */
 #define FLUSH_SLOW_MS 250
+#define FLUSH_WARN_MS 500
 
 static void saveWorkerFn(void*) {
   for (;;) {
@@ -870,12 +877,20 @@ static void saveWorkerFn(void*) {
     int64_t flushBlobs = esp_timer_get_time();
     writeSettingsFile();
     int64_t flushEnd = esp_timer_get_time();
-    if ((flushEnd - flushT0) / 1000 >= FLUSH_SLOW_MS)
-      warn("flush %lldms (blobs=%lldms files=%lldms) worst=%s@%ums — flash "
-           "windows within it suspend both cores' cache\n",
-           (flushEnd - flushT0) / 1000, (flushBlobs - flushT0) / 1000,
-           (flushEnd - flushBlobs) / 1000,
-           g_flushWorstPath[0] ? g_flushWorstPath : "-", (unsigned)g_flushWorstMs);
+    const int64_t flushMs = (flushEnd - flushT0) / 1000;
+    /* One sentence, two levels — written once so the two can never drift apart
+     * and a reader grepping the shape finds every flush that crossed the floor.
+     * The log macros take the level from their own name, so the choice is here
+     * rather than in a variable. */
+#define FLUSH_FMT  "flush %lldms (blobs=%lldms files=%lldms) worst=%s@%ums"
+#define FLUSH_ARGS flushMs, (flushBlobs - flushT0) / 1000, \
+                   (flushEnd - flushBlobs) / 1000, \
+                   g_flushWorstPath[0] ? g_flushWorstPath : "-", \
+                   (unsigned)g_flushWorstMs
+    if      (flushMs >= FLUSH_WARN_MS) warn(FLUSH_FMT, FLUSH_ARGS);
+    else if (flushMs >= FLUSH_SLOW_MS) info(FLUSH_FMT, FLUSH_ARGS);
+#undef FLUSH_FMT
+#undef FLUSH_ARGS
     /* Release any save-now semaphores queued by SAVE ops while we flushed. */
     CFG_LOCK();
     std::vector<SemaphoreHandle_t> sems = std::move(pendingSaveSems);
@@ -1950,15 +1965,29 @@ void storageUnsubscribeCb(const char* scope, storage_change_cb_t cb) {
 
 /* ---- Type inference ---- */
 
+/* Digits (with an optional leading '-') that FIT an int32 are stored as one.
+ * The range check is the whole point: an int the value does not fit is not a
+ * narrower reading of it but a different number — atoi() saturates, so a 20-digit
+ * account id or an epoch-in-milliseconds came back as 2147483647 and the original
+ * was gone. Anything that does not fit stays the string it was written as, which
+ * is lossless and what every over-range caller wanted. */
 static cfg_type_t inferType(const char* val) {
   if (!val || !*val) return CFG_STR;
   const char* p = val;
-  if (*p == '-') p++;
+  bool neg = (*p == '-');
+  if (neg) p++;
   if (!*p) return CFG_STR;
+  /* Accumulated as the negative range, which is the wider of the two by one and
+   * so has no value of its own that overflows on the way in. */
+  int32_t acc = 0;
   while (*p) {
     if (*p < '0' || *p > '9') return CFG_STR;
+    int d = *p - '0';
+    if (acc < (INT32_MIN + d) / 10) return CFG_STR;
+    acc = acc * 10 - d;
     p++;
   }
+  if (!neg && acc == INT32_MIN) return CFG_STR;   /* 2147483648 has no positive form */
   return CFG_INT;
 }
 
