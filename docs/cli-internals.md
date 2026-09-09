@@ -11,7 +11,7 @@ code without breaking it.
 ## 1. What cli owns and adds
 
 `cli` provides the command registry + dispatcher, the interactive line editor,
-the per-client slot pool, two ITS server ports, and the serial console shuttle.
+the per-client slot pool, two ITS server ports, and the serial console byte relay.
 `cliInit` (auto-called from the platform init chain) seeds `s.cli` defaults,
 registers the builtin commands on the main task, then spawns the `cli` and
 `serial` tasks.
@@ -114,12 +114,12 @@ Two tasks, both prio 1, both spawned by `cliInit`:
   line editor (ANSI) or buffers to newline (LINE), then runs a deferred-close
   sweep, then drains cron commands. `cliActiveSlot` is set around each slot's
   processing so `cliPrintf`/cwd/`cliReadLine` resolve to the right client.
-- **`serial`** (4096-byte stack) is a byte shuttle between the USB serial ports
+- **`serial`** (4096-byte stack) is a byte relay between the USB serial ports
   and the cli/log views. It is **an ITS client** (`itsClientInit(2)` — a handler
   session must be able to coexist with a console CLI session) **to `cli:1`/TCP**
   — the first non-newline keystroke flips `serialInCli = true`, connects to
   `CLI_PORT_TCP` with a `cli_connect_t{CLI_ANSI, from_usb_serial=1, …}`, and
-  shuttles bytes both ways; an empty Enter, a trailing `;`, `^D`, or `^C` returns
+  relays bytes both ways; an empty Enter, a trailing `;`, `^D`, or `^C` returns
   to the live log. The log/CLI serial mode switch and `serialInCli` suppression
   are owned by [logging](logging.md) — don't duplicate that here. It also owns
   the serial-handler registry described in §3.
@@ -224,7 +224,7 @@ gates both of log.cpp's console mirrors (`logVprintf`'s direct `stdout` echo and
 the inbound-line echo) and CLI entry: the port is carrying a client's protocol,
 and console text pushed into that stream would corrupt it.
 
-### Idle loop and the shuttle
+### Idle loop and the byte relay
 
 The port-1 pump and the claim bookkeeping run at the top of the serial task's
 loop, ahead of every console mode, so a claimed port 1 is serviced whether or not

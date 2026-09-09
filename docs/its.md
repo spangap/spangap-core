@@ -74,7 +74,7 @@ nudges, register-this-port handshakes. ITS rejects an aux send to a port with no
 registered callback, so misrouted messages fail loudly at startup instead of
 corrupting silently later.
 
-### Pickup wait
+### Delivery wait
 
 By default `itsSendAux` returns once the message is in the receiver's inbox.
 Pass `ITS_WAIT_PICKUP` to instead block until the receiver's `itsPoll` has

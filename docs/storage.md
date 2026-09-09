@@ -205,7 +205,7 @@ two strcmp-sorted rodata arrays (`include/timezones.h`, generated
 `src/timezones_gen.c`, refreshed by the release-time `make timezones` step).
 It never attaches to the config tree, costs no RAM, and is looked up with a
 binary search (`tzLookup`). The application logic (`ntpApplyTimezone`, the
-`ntp.tz.set` sentinel) belongs to **spangap-net**; see the ntp docs.
+`ntp.tz.set` command key) belongs to **spangap-net**; see the ntp docs.
 
 ## CLI
 
