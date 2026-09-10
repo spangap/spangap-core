@@ -13,7 +13,7 @@ a host runs an ordinary CLI command and gets exactly that command's output back.
 
 This document is the contract. Both ends implement it: the device in
 [`cli.cpp`](../esp-idf/src/cli.cpp) (the serial task), and flashmon in
-`flashmon/flashmon/flashmon.py`.
+`flashmon/flashmon/flashmon.js` (search `RPC_MAGIC`).
 
 ## Wire format
 
@@ -165,7 +165,7 @@ Three rules:
   place.
 - **Frames are dead while a handler owns port 0** — bytes go to `hdlPump` and
   never reach `handleChar`. Deliberate: the handler mechanism exists for
-  Reticulum clients, and a port claimed for one is for-sure not a flasher.
+  Reticulum clients, and a port claimed for one is for-sure not flashmon.
 
 Transport-agnostic: it sits above both USB-Serial-JTAG and CDC, unlike the
 `0xC0` attach, which is gated on `!consoleOnCdc` because it substitutes for a

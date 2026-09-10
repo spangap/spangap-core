@@ -5,7 +5,7 @@ password set, is WiFi up, what is the IP, which networks are in range. Reading
 those out of a status display means parsing human formatting that nobody thinks
 of as an API — and that anyone improving the display is free to change.
 
-`-O` is the alternative. A command that a flasher depends on takes `-O` and
+`-O` is the alternative. A command that flashmon depends on takes `-O` and
 prints exactly what onboarding needs, nothing else.
 
 The flag *is* the contract. It says, on the device side, that this output is

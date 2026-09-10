@@ -15,7 +15,7 @@ idf.py build it spawns:
 
 The datetime is set by flashmon's make-builds.py when it builds a catalogue
 image, so the running firmware logs the exact stamp its image is published under
-and a flasher can tell whether a newer build is available. Empty for any build
+and flashmon can tell whether a newer build is available. Empty for any build
 that isn't a stamped catalogue build.
 
 The dist is that same run's catalogue entry name, and it is what identifies
@@ -26,7 +26,7 @@ outside a catalogue build, exactly like the datetime.
 
 The catalogue is the directory that run published into — `stable`, `dev`, a
 personal one. It is the channel, one level above the dist: two catalogues share
-a stamp series but not a meaning, so a flasher has to know which one an image
+a stamp series but not a meaning, so flashmon has to know which one an image
 came from before comparing stamps at all. Empty outside a catalogue build.
 
 The hw is extracted here rather than read from an env var because `spangap
@@ -92,7 +92,7 @@ def board_of(invocation: str) -> str:
 straddle = os.environ.get("SPANGAP_BUILD_STRADDLE") or "(unknown)"
 version = os.environ.get("SPANGAP_BUILD_VERSION") or "(unknown)"
 args = os.environ.get("SPANGAP_BUILD_ARGS") or "(unknown)"
-# Empty (not "(unknown)") when unset: the flasher matches a 14-digit stamp, so a
+# Empty (not "(unknown)") when unset: flashmon matches a 14-digit stamp, so a
 # non-catalogue build simply reads as "no stamp" rather than a bogus one. Same
 # reasoning for the dist, the catalogue and the board.
 datetime = os.environ.get("SPANGAP_BUILD_DATETIME") or ""

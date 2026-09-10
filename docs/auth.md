@@ -120,7 +120,7 @@ passwd                        set the admin password (prompts twice, echoed as s
 ```
 
 `auth -O` is the machine-readable form of `auth realms`: one `<realm>=<state>`
-line and nothing else, for a flasher deciding whether a device still needs a
+line and nothing else, for flashmon deciding whether a device still needs a
 password. See [onboarding-output.md](onboarding-output.md) for the contract —
 in particular that a reader ignores realms it doesn't know and treats a missing
 key as unknown, so the realm set can grow without breaking anything.

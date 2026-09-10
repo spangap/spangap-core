@@ -110,9 +110,9 @@ a host wrote while something other than this firmware was on the chip — the RO
 loader, or an image running out of RAM, neither of which reads the console — are
 still queued when the console task comes up, and would be handed to the line
 editor as keystrokes: a CLI session opening on a character nobody typed, with
-the boot log suppressed behind it. A flasher that RAM-loads a peripheral
-detector and then resets into the real firmware (flashmon's hardware detection
-does exactly this) hits it every time it writes to the port around the detector.
+the boot log suppressed behind it. flashmon's hardware detection — which
+RAM-loads a peripheral detector and then resets into the real firmware — hits it
+every time it writes to the port around the detector.
 
 Nothing that arrived before the console existed was addressed to it, so the
 serial task drains its receive path once, immediately before arming the frame

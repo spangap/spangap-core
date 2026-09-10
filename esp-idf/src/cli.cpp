@@ -1767,7 +1767,7 @@ extern "C" void consoleWriteUnlock(void) {
  * Frames reach this code only while port 0 is a console: once a serial handler
  * owns the port its bytes go to hdlPump and never reach handleChar. That is
  * deliberate — the handler mechanism exists for Reticulum clients, and a port
- * claimed for one is not carrying a flasher. */
+ * claimed for one is not carrying flashmon. */
 static const uint8_t rpcMagic[4] = { 0xF5, 'S', 'G', 0x01 };
 
 /* The 2-byte length allows 64 KB. Frame buffers come from PSRAM at that cap;
@@ -2164,7 +2164,7 @@ static void serialTaskFn(void* arg) {
          * A bare Enter is how something announces itself on the other end of
          * the wire, and this is the one moment we know someone is listening —
          * the boot log said all this to an empty room. The identity line
-         * (spangapIdentityLine) is what lets a flasher name the unit, the
+         * (spangapIdentityLine) is what lets flashmon name the unit, the
          * hostname, and the exact image without asking a question, without a
          * CLI session, and above all without resetting the device. */
         {

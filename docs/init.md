@@ -53,9 +53,9 @@ phase purely by overriding that phase's virtual:
   runs at the very top of this walk, ahead of the first `onStart` (see [Board
   identity](#board-identity)).
 
-- **`spangapInit()`** — brings up the core foundations only: filesystem mounts,
-  the active state-store choice, the config tree, then the log / CLI / power /
-  auth tasks. It returns with a usable platform but **no siblings yet**. The
+- **`spangapInit()`** — brings up the core foundations only: the CSPRNG
+  ([random.md](random.md)), filesystem mounts, the active state-store choice,
+  the config tree, then the log / CLI / power / auth tasks. It returns with a usable platform but **no siblings yet**. The
   storage *task* and cron are ordinary services like everything else — they come
   up in the `onInit` walk, not here.
 
@@ -194,7 +194,7 @@ build: datetime 20260814130700
 A line is omitted when its fact does not exist, so a generic image names no board
 and an image from outside a catalogue run carries no stamp — absent is the honest
 answer, and it is what tells a tool to go and look for itself. Saying it again to
-whoever turns up is what lets a flasher learn the board without a query channel
+whoever turns up is what lets flashmon learn the board without a query channel
 and without resetting the device to probe the chip.
 
 Each board's anchor peripheral, and the rule that a probe which drives a rail
