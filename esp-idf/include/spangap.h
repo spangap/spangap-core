@@ -35,6 +35,7 @@
 
 /* spangap-core foundation */
 #include "compat.h"
+#include "random.h"
 #include "pm.h"
 #include "log.h"
 #include "fs.h"
@@ -50,7 +51,8 @@ extern "C" {
 
 /** Bring up the spangap CORE platform:
  *
- *    line-buffered stdout → fs_init → optional fs_mount_sd (when
+ *    randomInit (seed the DRBG before any radio or ADC) → line-buffered
+ *      stdout → fs_init → optional fs_mount_sd (when
  *      CONFIG_SPANGAP_SDCARD=y) → fsSelectStateStore → storageLoad
  *      → project-mismatch factory reset →
  *      logInit/cliInit/pmInit → cronWakeupHandler → publishBuildTimes

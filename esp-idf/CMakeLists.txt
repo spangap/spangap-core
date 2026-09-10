@@ -53,7 +53,8 @@ set(_REQ
     spi_flash
     esp_partition
     lwip
-    mbedtls)
+    mbedtls
+    bootloader_support)   # bootloader_random_enable() for random.cpp's seed window
 
 # The TinyUSB device stack is only on the link line when the `usb cdc` console
 # transport is built (src/usb_ports.cpp compiles to the stub branch otherwise).

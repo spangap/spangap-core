@@ -28,7 +28,8 @@ init chain, before sshd and web.
 
 - `hashPassword(pw, salt, saltLen)` = SHA-256 of `salt || pw` (mbedTLS), rendered
   as `salt_hex(32) ":" hash_hex(64)`.
-- `hashPasswordNew(pw)` draws a 16-byte salt from four `esp_random()` words.
+- `hashPasswordNew(pw)` draws a 16-byte salt from `randomBytes()` (the core
+  DRBG, [random.md](random.md)).
 - `verifyPassword(pw, stored)` parses the salt out of `stored` (rejects unless
   the colon sits at offset 32), recomputes, and compares the **whole**
   `salt:hash` string. There is no constant-time compare — `std::string ==`.
@@ -47,8 +48,8 @@ password.
 `secrets.auth.cookies.<N>.{cookie,realm,expires}`, counted by
 `storageArrayCount("secrets.auth.cookies.")`.
 
-- **Token**: `authLogin` fills four `esp_random()` words (16 bytes = 128 bits)
-  and hex-encodes them to a 32-char token. Expiry = `now + COOKIE_EXPIRY_S`
+- **Token**: `authLogin` draws 16 bytes (128 bits) from `randomBytes()` and
+  hex-encodes them to a 32-char token. Expiry = `now + COOKIE_EXPIRY_S`
   (`60 * 24 * 3600`, 60 days).
 - **`cookieAdd`** appends at index `count`. If `count >= MAX_COOKIES` (16) it
   first scans for the entry with the smallest `expires` and `cookieRemove`s it —

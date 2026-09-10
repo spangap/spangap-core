@@ -19,7 +19,7 @@
 #include "compat.h"
 #include "cli.h"
 #include "mbedtls/sha256.h"
-#include "esp_random.h"
+#include "random.h"
 #include "esp_heap_caps.h"
 #include <cstdio>
 #include <cstring>
@@ -65,9 +65,7 @@ static std::string hashPassword(const char* password, const uint8_t* salt, size_
 
 static std::string hashPasswordNew(const char* password) {
     uint8_t salt[16];
-    uint32_t r[4];
-    for (int i = 0; i < 4; i++) r[i] = esp_random();
-    memcpy(salt, r, 16);
+    randomBytes(salt, sizeof(salt));
     return hashPassword(password, salt, 16);
 }
 
@@ -221,7 +219,7 @@ static void authCliCmd(const char* args) {
         return;
     }
     /* Onboarding output — the machine-readable contract, one `<realm>=<state>`
-     * line and nothing else. A flasher reads `admin` to decide whether the
+     * line and nothing else. flashmon reads `admin` to decide whether the
      * device still needs a password; every realm is reported, so the set can
      * grow without breaking a reader that ignores keys it doesn't know. */
     if (strcmp(args, "-O") == 0) {
@@ -424,10 +422,10 @@ auth_err_t authLogin(const char* password, const char* tryRealm,
         if (hash[0] == '\0' || strcmp(hash, "--") == 0) continue;
         if (verifyPassword(password, hash)) {
             failCount = 0;
-            uint32_t rnd[4];
-            for (int j = 0; j < 4; j++) rnd[j] = esp_random();
+            uint8_t rnd[16];
+            randomBytes(rnd, sizeof(rnd));
             char token[33];
-            toHex((const uint8_t*)rnd, 16, token);
+            toHex(rnd, 16, token);
             struct timeval tv;
             gettimeofday(&tv, nullptr);
             time_t expires = tv.tv_sec + COOKIE_EXPIRY_S;

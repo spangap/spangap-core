@@ -22,6 +22,7 @@ with the function you need.
 | **logging** | [docs/logging.md](docs/logging.md) | The log task, the `info()`/`warn()`/`err()`/`dbg()`/`verb()` macros, levels, log files, and the serial console. |
 | **cli** | [docs/cli.md](docs/cli.md) | The on-device command line — registry, line editor, boot scripts, and the full core command manual. |
 | **auth** | [docs/auth.md](docs/auth.md) | The credential primitive: realm passwords and session cookies (`secrets.auth.*`). HTTP enforcement lives in spangap-web. |
+| **random** | [docs/random.md](docs/random.md) | The device's one CSPRNG: `randomBytes()`/`randomU32()`, a CTR-DRBG seeded at boot inside an entropy-source window, and why `esp_fill_random` alone is not enough. |
 | **cron** | [docs/cron.md](docs/cron.md) | Minute-resolution, deep-sleep-aware scheduler driven by `s.cron.tab.*` entries. |
 | **power-management** | [docs/power-management.md](docs/power-management.md) | DFS + light/deep sleep, PM locks, notify-driven CPU boost, USB pullup, GPIO wake. |
 | **usb-console** | [docs/usb-console.md](docs/usb-console.md) | Which USB controller drives the console — the built-in USB-Serial-JTAG port or a two-port TinyUSB CDC device (`usb cdc`, off by default: `CONFIG_SPANGAP_USB_CDC`) — and who owns each serial port. |

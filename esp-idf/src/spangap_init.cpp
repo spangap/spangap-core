@@ -64,7 +64,7 @@ static const char* s_detectedHw = "";
  *     build: datetime 20260814130700
  *
  * The board, the catalogue that published this image, and the stamp of that
- * run — everything a flasher reading a boot log needs to decide whether it
+ * run — everything flashmon, reading a boot log, needs to decide whether it
  * holds something newer. One fact per line, each self-describing, because the
  * reader is a line parser on the other side of a stream it does not control —
  * it may join mid-line, and a line it does not recognise must cost it nothing.
@@ -72,7 +72,7 @@ static const char* s_detectedHw = "";
  * Lines are omitted rather than emitted empty when the fact does not exist: a
  * generic image claims no board, and an image that did not come from a catalogue
  * run has no catalogue and no stamp. Absent is the honest answer, and it is what
- * tells a flasher to go and look for itself.
+ * tells flashmon to go and look for itself.
  *
  * Boot only. A console that ATTACHES is answered with the identity line below
  * instead (cli.cpp emits it for a bare Enter) — that is a message to the
@@ -227,7 +227,7 @@ extern "C" void spangapConfirmBoard(void) {
      * boot and resets the chip. A halt that reboots every few seconds is worse
      * than no halt at all: the message scrolls past in a loop and the port
      * re-enumerates under whoever is trying to talk to it, which is exactly when
-     * a flasher needs the device to hold still. */
+     * flashmon needs the device to hold still. */
 #if CONFIG_BOOTLOADER_WDT_DISABLE_IN_USER_CODE
     {
         wdt_hal_context_t rwdt = RWDT_HAL_CONTEXT_DEFAULT();
@@ -345,7 +345,7 @@ void publishBuildTimes() {
     storageSet("sys.build.datetime", app_build_datetime);
     /* Which distribution this image is (the catalogue entry name), which
      * catalogue published it (`stable`, `dev`, …) and which board it was built
-     * for. A flasher matches on the set: same catalogue, same dist, newer
+     * for. flashmon matches on the set: same catalogue, same dist, newer
      * datetime. All three are empty for a build that didn't come from a
      * catalogue run, which is a distinct state rather than a missing value. */
     storageSet("sys.build.dist", app_build_dist);
@@ -558,6 +558,9 @@ static EventBits_t flagBitFor(const char* key) {
 }
 
 extern "C" void spangapInit(void) {
+    /* First, before any driver can claim the ADC or a radio: seed the DRBG
+     * every key on the device is drawn from (include/random.h). */
+    randomInit();
     /* The boot-barrier events must exist before any straddle task (which spawn
      * after this) can wait on them. */
     s_bootEvents = xEventGroupCreate();

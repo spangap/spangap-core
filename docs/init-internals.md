@@ -29,7 +29,11 @@ contracts that order encodes. Source: [`spangap_init.cpp`](../esp-idf/src/spanga
 
 Exactly this sequence, and the ordering is load-bearing:
 
-1. `setvbuf(stdout, _IOLBF)` — line-buffer stdout so each `\n` flushes (USB Serial
+1. `randomInit()` — seed the device's one CSPRNG inside a
+   `bootloader_random_enable()` window ([random.md](random.md)). It is first
+   because that window must close before any driver touches the ADC or a
+   radio, and every later step that mints a key or token draws from it. Then
+   `setvbuf(stdout, _IOLBF)` — line-buffer stdout so each `\n` flushes (USB Serial
    JTAG is fully-buffered by default and would hide log lines). Then two lines
    through the native IDF logger (`logInit()` has not run yet, so neither
    carries a trailing `\n` — IDF appends its own): `spangap starting`, and
