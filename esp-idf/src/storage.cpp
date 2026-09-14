@@ -130,11 +130,21 @@ static std::unordered_set<std::string> dcDirtyKeys;
  * incremental mirror is no longer a complete account of what changed. Cleared by
  * the re-dump dcFlushPatch triggers once the client has room again. */
 static bool dcMirrorLost = false;
-/* The structured-DB instance prefix the single client currently has "open"
- * (set by a {"fetch":...} request). Record bodies never ride the connect dump
- * (they aren't in cfgRoot); on fetch we ship the instance's records once, then
- * mirror only that instance's live changes as ordinary patches. */
-static std::string dcOpenPrefix;
+/* The structured-DB instance prefixes the single client currently has "open"
+ * (set by a {"fetch":...} request), most recently opened first. Record bodies
+ * never ride the connect dump (they aren't in cfgRoot); on fetch we ship the
+ * instance's records once, then mirror that instance's live changes as ordinary
+ * patches.
+ *
+ * Several stay open at once because the client keeps what it has already been
+ * shipped: a conversation it revisits is still in its mirror, complete and live,
+ * so it re-renders instantly instead of asking for a resync that empties the
+ * subtree and refills it a chunk at a time. Past DC_OPEN_MAX the least recently
+ * opened is dropped AND cleared in the client (dcQueueClear), so "not in the
+ * mirror" and "not mirrored live" never disagree — the client refetches it the
+ * next time it is opened. */
+static constexpr size_t DC_OPEN_MAX = 8;
+static std::vector<std::string> dcOpenPrefixes;
 
 /* File I/O moved to fs.cpp/h — unified PSRAM-safe API. */
 
@@ -3357,6 +3367,21 @@ static void dcAccumulateChange(const char* key, const char* val) {
     dcDirtyKeys.insert(key);
 }
 
+/* Queue one message nulling `prefix` in the client's mirror: the merge form of
+ * "this subtree is gone". Rides dcDumpQueue so it stays ordered against the
+ * chunks around it. Runs on the storage task. */
+static void dcQueueClear(const char* prefix) {
+    char leaf[96];
+    cJSON* clear = cJSON_CreateObject();
+    cJSON* parent = clear ? navigateOrCreate(clear, prefix, leaf, sizeof(leaf)) : nullptr;
+    if (parent) {
+        cJSON_AddNullToObject(parent, leaf);
+        char* t = cJSON_PrintUnformatted(clear);
+        if (t) { dcDumpQueue.emplace_back(t); cJSON_free(t); }
+    }
+    cJSON_Delete(clear);
+}
+
 /* Queue a full reload of `prefix`: one message clearing the subtree, then its
  * entire current contents packed into DC_DUMP_MAX chunks.
  *
@@ -3368,7 +3393,8 @@ static void dcAccumulateChange(const char* key, const char* val) {
  * can express an eviction — the ephemeral cap drops the oldest records silently
  * and a merge patch has no way to say "these are gone" — so a resync is what
  * clears destinations the device has already forgotten. The client sees the
- * subtree briefly empty between the clear and the first chunk.
+ * subtree briefly empty between the clear and the first chunk, which is why a
+ * client that already holds an instance must not ask for it again.
  *
  * Chunks ride dcDumpQueue, so they stream paced to buffer space and patches are
  * held behind them (dcDumpInProgress) — the snapshot can never be overtaken by
@@ -3388,16 +3414,9 @@ static void dcQueueReload(const char* prefix) {
         it = under ? dcDirtyKeys.erase(it) : std::next(it);
     }
 
-    char leaf[96];
-    cJSON* clear = cJSON_CreateObject();
-    cJSON* parent = clear ? navigateOrCreate(clear, prefix, leaf, sizeof(leaf)) : nullptr;
-    if (parent) {
-        cJSON_AddNullToObject(parent, leaf);
-        char* t = cJSON_PrintUnformatted(clear);
-        if (t) { dcDumpQueue.emplace_back(t); cJSON_free(t); }
-    }
-    cJSON_Delete(clear);
+    dcQueueClear(prefix);
 
+    char leaf[96];
     /* Pack into chunks the pump can actually send. Records arrive in arena
      * order, so a chunk's objects stay shallow and navigateOrCreate's scans stay
      * short — the batch is reset every DC_DUMP_MAX bytes. The budget is an
@@ -3429,13 +3448,13 @@ static void dcQueueReload(const char* prefix) {
 }
 
 /* Queue a reload of every store subtree the client mirrors: each resident
- * instance of a browserMirror store, plus the conversation body it has open.
+ * instance of a browserMirror store, plus every conversation body it has open.
  *
  * Pair this with any mid-session re-dump. Records live outside cfgRoot, so a
  * dump does not carry them, and the browser only issues its {"fetch"} requests
  * when the stream transitions to synced — which a re-dump on an already-synced
  * session never does. Without this the config tree resyncs and the directory,
- * catalogue and open conversation silently do not. */
+ * catalogue and open conversations silently do not. */
 static void dcReloadMirroredStores() {
     std::vector<std::string> prefixes;
     CFG_LOCK();
@@ -3458,8 +3477,28 @@ static void dcReloadMirroredStores() {
         }
     }
     CFG_UNLOCK();
-    if (!dcOpenPrefix.empty()) prefixes.push_back(dcOpenPrefix);
+    for (auto& p : dcOpenPrefixes) prefixes.push_back(p);
     for (auto& p : prefixes) dcQueueReload(p.c_str());
+}
+
+/* Mark `prefix` the most recently opened instance. Past DC_OPEN_MAX the oldest
+ * is closed and cleared in the client, so the client's mirror and what we keep
+ * mirroring stay the same set. Runs on the storage task. */
+static void dcOpenAdd(const char* prefix) {
+    for (auto it = dcOpenPrefixes.begin(); it != dcOpenPrefixes.end(); ++it)
+        if (*it == prefix) { dcOpenPrefixes.erase(it); break; }
+    dcOpenPrefixes.insert(dcOpenPrefixes.begin(), prefix);
+    while (dcOpenPrefixes.size() > DC_OPEN_MAX) {
+        dcQueueClear(dcOpenPrefixes.back().c_str());
+        dcOpenPrefixes.pop_back();
+    }
+}
+
+/* Is `key` a leaf under one of the open instances? Caller holds CFG_LOCK. */
+static bool dcKeyIsOpen(const char* key) {
+    for (auto& p : dcOpenPrefixes)
+        if (strncmp(key, p.c_str(), p.size()) == 0 && key[p.size()] == '.') return true;
+    return false;
 }
 
 /* Ship a structured-DB instance's records to the browser, placed at the
@@ -3473,10 +3512,10 @@ static void dcShipStorePrefix(const char* prefix) {
     bool mirror = routed && sm.reg->browserMirror;
     CFG_UNLOCK();
     if (!routed) return;
-    /* Track the open instance only for on-demand bodies (conversations). A
+    /* Track open instances only for on-demand bodies (conversations). A
      * browser-mirrored store is fetched once and then kept live by the change
-     * mirror, so it must not displace the open conversation here. */
-    if (!mirror) dcOpenPrefix = prefix;
+     * mirror, so it must not take a slot in the open set here. */
+    if (!mirror) dcOpenAdd(prefix);
     dcQueueReload(prefix);
 }
 
@@ -3490,13 +3529,10 @@ static bool dcResolveKey(const char* key, cJSON** out) {
     sdb_match sm;
     if (sdbRoute(key, sm)) {
         /* Structured-DB bodies aren't in cfgRoot. A body (message conversation)
-         * mirrors only while it is the open instance; a browser-mirrored store
+         * mirrors only while its instance is open; a browser-mirrored store
          * (contacts directory, announce catalogue) mirrors every change, exactly
          * as the equivalent cfgRoot subtree used to. */
-        bool open = !dcOpenPrefix.empty() &&
-                    strncmp(key, dcOpenPrefix.c_str(), dcOpenPrefix.size()) == 0 &&
-                    key[dcOpenPrefix.size()] == '.';
-        if (!open && !sm.reg->browserMirror) return false;
+        if (!dcKeyIsOpen(key) && !sm.reg->browserMirror) return false;
         std::string sv;
         *out = sdbGetLocked(key, sv) ? cJSON_CreateString(sv.c_str()) : cJSON_CreateNull();
         return true;
@@ -3707,11 +3743,11 @@ static void dcHandleMessage(int handle, const char* text, size_t len) {
     if (!root) return;
     /* {"fetch":"<store-prefix>"} — the client opened a conversation: ship that
      * instance's records once, and mark it open so its live changes mirror. An
-     * empty/absent fetch closes (stops mirroring bodies). */
+     * empty/absent fetch closes every open instance (stops mirroring bodies). */
     cJSON* fetch = cJSON_GetObjectItem(root, "fetch");
     if (fetch && cJSON_IsString(fetch)) {
         if (*fetch->valuestring) dcShipStorePrefix(fetch->valuestring);
-        else                     dcOpenPrefix.clear();
+        else                     dcOpenPrefixes.clear();
         cJSON_Delete(root);
         return;
     }
@@ -3756,7 +3792,7 @@ static int storageItsConnect(int handle, const void* data, size_t len) {
 static void storageItsDisconnect(int ref) {
     (void)ref;
     dcHandle = -1;
-    dcOpenPrefix.clear();
+    dcOpenPrefixes.clear();
     s_dumpGen.fetch_add(1, std::memory_order_relaxed);   /* orphan any in-flight build */
     dcDumpPending = false;
     dcDumpQueue.clear();

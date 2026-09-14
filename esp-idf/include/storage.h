@@ -21,7 +21,12 @@
  * Browser config DataChannel (`storage:1`, packet-mode):
  * - Device→browser: full nested JSON dump on connect, then coalesced merge-patches.
  * - Browser→device: nested JSON merge-patches. null = delete subtree (silent).
- * - Deletes via storageDeleteTree() do not fire storageSubscribeChanges callbacks.
+ * - A dump is a snapshot, but the browser applies it as a MERGE: it re-states
+ *   what exists and says nothing about what doesn't, so a key deleted — or
+ *   merely no longer written — while the link was down is never retracted by
+ *   the dump that follows. Any root a publisher writes only while a viewer is
+ *   watching is declared snapshot-authoritative on the browser side, which
+ *   drops the subtree as the dump begins and lets the dump refill it.
  *
  * File I/O: use fs.h (unified PSRAM-safe API).
  */
@@ -109,11 +114,20 @@ bool   storageDefaultTree(const char* prefix, const cJSON* json);
 bool   storageDefaultTree(const char* prefix, const char* jsonStr);
 /** Set an arbitrary cJSON node (array, object, etc.) at a dot-notation key.
  *  Takes ownership of val — caller must not free it.
+ *
+ *  **`val` must be a tree this caller built and nothing else holds.** It is
+ *  serialized and then `cJSON_Delete`d here, so passing a BORROWED node — one
+ *  still attached to another tree, or one the caller frees too — frees a node
+ *  its owner still points at. The damage surfaces far away, as a double free
+ *  inside whatever deletes that owner later. Pass a fresh node, or
+ *  `cJSON_Duplicate` first.
+ *
  *  Uses patch/commit: fires subscriptions and WS broadcast. */
 void   storageSetTree(const char* key, cJSON* val);
 /** Delete a single key via patch/commit. Fires storageSubscribeChanges with val="". */
 void   storageUnset(const char* key);
-/** Delete a key/subtree directly. No change callbacks. Sends null on WS.
+/** Delete a key/subtree directly. Fires storageSubscribeChanges with val="",
+ *  the same as storageUnset, and sends a null to the browser mirror.
  *  If the key (or an ancestor of it) names a registered external file
  *  (see storageNewTreeFile), that file is removed and unregistered on the
  *  next flush — so deleting a contact/identity also drops its own .json. */

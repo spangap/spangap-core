@@ -109,6 +109,7 @@ build-time guard.
 | `fmtElapsed(secs, buf, len)` | Elapsed seconds as `"3s"` / `"1m22s"` / `"2h3m"` / `"3d5h"` (zero components dropped). |
 | `fmtSize(bytes, buf, len)` | Byte count with 3 significant digits (`"1.23kB"`, `"45.6MB"`). |
 | `fmtBps(bps, buf, len)` | Bandwidth with 3 significant digits (`"1.23kbps"`, `"45.6Mbps"`). |
+| `fmtPower(dbm, buf, len)` | A transmit power in dBm as watts (`"10 mW"`, `"158 mW"`, `"126 µW"`, `"1 W"`) — whole units, since the input is a whole dBm. |
 
 `compat.h` also declares two facilities owned by other functions, kept here so
 every module shares one definition: the task-stack spawner

@@ -12,6 +12,7 @@
 #include <time.h>
 #include <cstring>
 #include <cerrno>
+#include <cmath>
 
 /** Central RTC RAM validity — one magic word for all application RTC state.
  *  Set before deep sleep, checked on wakeup. If invalid, all RTC vars are stale. */
@@ -164,6 +165,27 @@ static inline const char* fmtSize(uint32_t bytes, char* buf, size_t len) {
     else if (bytes < 100000000) snprintf(buf, len, "%.1fMB", bytes / (1024.0 * 1024));
     else if (bytes < 1000000000) snprintf(buf, len, "%.0fMB", bytes / (1024.0 * 1024));
     else snprintf(buf, len, "%.2fGB", bytes / (1024.0 * 1024 * 1024));
+    return buf;
+}
+
+/** Format a transmit power given in dBm the way a person reads power:
+ *  "10 mW", "158 mW", "126 µW", "1 W".
+ *
+ *  dBm is the unit a radio is configured in and the unit an air protocol states
+ *  levels in — a path loss is a subtraction in it. It is the wrong unit for
+ *  judging what a link actually costs: the difference between a whisper and a
+ *  shout is the thing a reader is after, and nobody converts a logarithm in
+ *  their head. So a level shown to somebody carries both.
+ *
+ *  Whole units, no decimals: the input is a whole dBm, a quarter of a dB either
+ *  way moves the milliwatts by a few percent, and a decimal here would claim a
+ *  precision the number never had. */
+static inline const char* fmtPower(int dbm, char* buf, size_t len) {
+    double mw = pow(10.0, dbm / 10.0);
+    if      (mw >= 999.5)  snprintf(buf, len, "%.0f W",  mw / 1000.0);
+    else if (mw >= 0.9995) snprintf(buf, len, "%.0f mW", mw);
+    else if (mw >= 0.0005) snprintf(buf, len, "%.0f µW", mw * 1000.0);
+    else                   snprintf(buf, len, "<1 µW");
     return buf;
 }
 

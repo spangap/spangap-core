@@ -121,17 +121,40 @@ int cliPrintf(const char* fmt, ...) {
      * every CLI output path, and `help` prints one line per registered command
      * through here in a loop — a 256 B stack buffer at this point tipped the
      * (shallow) cli task over its stack limit. A heap buffer keeps the peak flat
-     * regardless of how much a command prints. */
-    constexpr size_t CAP = 256;
+     * regardless of how much a command prints.
+     *
+     * The first buffer is a guess, not a limit. It used to be both: anything
+     * longer was silently cut, which reads as a command whose last sentence
+     * trails off and whose final newline never arrives — `lora probe`'s
+     * five-line explanation of a missing probe address lost its last 35
+     * characters that way, and the missing newline is what somebody noticed.
+     * vsnprintf reports what it needed, so a long one is simply formatted
+     * again into a buffer that fits.
+     *
+     * The retry is bounded. Past HARD_CAP the output is a bug in the caller —
+     * a format that big is a listing, and a listing belongs in a loop of lines
+     * where the reader can see where it stops — so it is cut there and said so,
+     * rather than being cut in silence at any size. */
+    constexpr size_t CAP      = 256;
+    constexpr size_t HARD_CAP = 4096;
     std::vector<char> buf(CAP);
-    va_list ap;
+    va_list ap, ap2;
     va_start(ap, fmt);
+    va_copy(ap2, ap);
     int n = vsnprintf(buf.data(), CAP, fmt, ap);
     va_end(ap);
-    if (n > 0) {
-        size_t w = (size_t)n < CAP ? (size_t)n : CAP - 1;
-        cliOut(buf.data(), w);
+    if (n > 0 && (size_t)n >= CAP) {
+        size_t want = (size_t)n + 1;
+        bool cut = want > HARD_CAP;
+        if (cut) want = HARD_CAP;
+        buf.assign(want, '\0');
+        vsnprintf(buf.data(), want, fmt, ap2);
+        if (cut) warn("cli: output over %u B truncated — print it as lines",
+                      (unsigned)HARD_CAP);
+        n = (int)strlen(buf.data());
     }
+    va_end(ap2);
+    if (n > 0) cliOut(buf.data(), (size_t)n);
     return n;
 }
 

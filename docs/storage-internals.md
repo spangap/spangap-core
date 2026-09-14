@@ -78,19 +78,32 @@ unlinks are deferred to `g_sdbPendingDeletes`, drained here (fs I/O off the acto
 **Browser sync (three layers).** (1) The connect dump is cheap because bodies
 aren't in cfgRoot. (2) On open, the browser sends `{"fetch":"<instance-prefix>"}`;
 `dcShipStorePrefix` ships that instance's records as one merge-patch at the
-instance path (where the browser's message code already reads) and records
-`dcOpenPrefix`. (3) `dcAccumulateChange` mirrors a routed body change **only**
-when it's under `dcOpenPrefix` (reading the value from the store, not cfgRoot);
-other conversations are represented only by their directory entry.
+instance path (where the browser's message code already reads) and adds it to
+`dcOpenPrefixes`. (3) `dcAccumulateChange` mirrors a routed body change **only**
+when it's under one of those prefixes (reading the value from the store, not
+cfgRoot); other conversations are represented only by their directory entry.
 *Note:* this ships records as JSON, not the plan's raw `.db.gz` cold-ship — a
 correctness-first realization; the raw-bytes speedup is a future optimization.
 (4) **Browser-mirrored stores** (`opts.browserMirror`) are small always-needed
 collections — a directory or catalogue, not a body — so they behave like a
 cfgRoot subtree used to: the browser fetches each once (same `{"fetch":…}` →
-`dcShipStorePrefix`, but it does **not** claim `dcOpenPrefix`), and
+`dcShipStorePrefix`, but it does **not** take an open slot), and
 `dcAccumulateChange` mirrors **every** change to them, not just while open. So a
-mirrored store stays live in the browser without being the open instance. LXMF's
+mirrored store stays live in the browser without being an open instance. LXMF's
 contacts + announces set this; message bodies do not.
+
+**The open set is DC_OPEN_MAX deep, not one.** A fetch is a resync — it nulls the
+subtree in the client's mirror and refills it a chunk at a time — so a client that
+had to re-fetch every time it came back to a conversation would watch each one
+rebuild itself on screen. Instead the client keeps what it has been shipped and
+asks only for conversations it does not hold, and the device keeps mirroring the
+last `DC_OPEN_MAX` (`dcOpenAdd`, most-recently-opened first). Dropping the oldest
+also `dcQueueClear`s it in the client, so "absent from the mirror" and "no longer
+mirrored live" are the same fact and the client's test for whether to ask is just
+whether the subtree is there. Same reasoning on the client side: a (re)dump is a
+new stream and the device's open set went with the old one, so the client forgets
+what it was shipped and re-asks for the conversation on screen
+(`browser/src/modules/lxmf.ts`, `shipThread`).
 
 **Conversation directory (LXMF-side, maintained).** `contacts.<peer>.{count,
 last_ts,preview,unread,display_name,…}` is now its own **browser-mirrored**
