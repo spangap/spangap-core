@@ -360,9 +360,9 @@ static void cmdDf(const char* a) {
   uint64_t total = 0, used = 0;
   bool ok = false;
   const char* lfsLabel = nullptr;
-  if (strcmp(path, "/webroot") == 0 || strncmp(path, "/fixed", 6) == 0)
+  if (strcmp(path, "/webroot") == 0 || strncmp(path, FS_FIXED, strlen(FS_FIXED)) == 0)
     lfsLabel = "webroot";
-  else if (strncmp(path, "/state", 6) == 0)
+  else if (strncmp(path, FS_STATE, strlen(FS_STATE)) == 0)
     lfsLabel = "state";
   if (lfsLabel) {
     size_t t = 0, u = 0;

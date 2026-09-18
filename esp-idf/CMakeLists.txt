@@ -1,5 +1,18 @@
 file(GLOB CORE_SRCS "src/*.cpp" "src/*.c")
 
+# The host target has no power manager, no SPI bus, no USB device and no IDF
+# heap-tracking to wrap. Each of those files is chip code end to end, and each
+# has a host counterpart under src/host/ instead.
+if(IDF_TARGET STREQUAL "linux")
+    list(REMOVE_ITEM CORE_SRCS
+        "${CMAKE_CURRENT_LIST_DIR}/src/pm.cpp"
+        "${CMAKE_CURRENT_LIST_DIR}/src/spi_helper.cpp"
+        "${CMAKE_CURRENT_LIST_DIR}/src/usb_ports.cpp"
+        "${CMAKE_CURRENT_LIST_DIR}/src/heap_track_stub.c")
+    file(GLOB HOST_SRCS "src/host/*.cpp" "src/host/*.c")
+    list(APPEND CORE_SRCS ${HOST_SRCS})
+endif()
+
 # Build epoch — `app_build_unix` (UTC seconds at link time). Generated each
 # build by scripts/write-build-epoch.py so OTA can refuse images older than
 # the running firmware. Lives in the build dir to avoid dirtying the source
@@ -56,6 +69,25 @@ set(_REQ
     mbedtls
     bootloader_support)   # bootloader_random_enable() for random.cpp's seed window
 
+# On the host only the components that actually register there. `driver` and
+# `esp_timer` are the board straddle's own; the radio, power, USB, SD and
+# LittleFS halves are not built at all.
+if(IDF_TARGET STREQUAL "linux")
+    set(_REQ
+        driver
+        esp_event
+        nvs_flash
+        json
+        esp_timer
+        esp_rom
+        esp_app_format
+        spi_flash
+        esp_partition
+        mbedtls
+        esp_hw_support
+        fatfs)
+endif()
+
 # The TinyUSB device stack is only on the link line when the `usb cdc` console
 # transport is built (src/usb_ports.cpp compiles to the stub branch otherwise).
 # The component manager still fetches it — idf_component.yml dependencies cannot
@@ -75,6 +107,13 @@ idf_component_register(
     INCLUDE_DIRS "include"
     REQUIRES ${_REQ}
 )
+
+# The deflate/inflate the chip takes from ROM comes from the system zlib on the
+# host (src/host/miniz_host.c is the translation). Named by soname because the
+# container carries the runtime library and not its development symlink.
+if(IDF_TARGET STREQUAL "linux")
+    target_link_libraries(${COMPONENT_LIB} INTERFACE "-l:libz.so.1")
+endif()
 
 # Cross-straddle header injection for the one genuinely-cyclic case:
 # cli/log/cron in this component call into spangap-net's ITS-port-registration
@@ -139,7 +178,9 @@ add_dependencies(${COMPONENT_LIB} spangap_build_info)
 # heap-tracking entry points to no-ops; if Espressif renames or splits
 # them, the --wrap silently reverts to the broken behavior, so verify
 # their names still appear at the expected call sites and fail loud
-# otherwise.
+# otherwise. The host target's heap_caps_* wrap libc and track nothing,
+# so there is no bookkeeping to bypass and no symbol to wrap.
+if(NOT IDF_TARGET STREQUAL "linux")
 set(_HEAP_TRACK_FNS
     heap_caps_update_per_task_info_alloc
     heap_caps_update_per_task_info_free
@@ -189,6 +230,7 @@ target_link_options(${COMPONENT_LIB} INTERFACE
     "-Wl,--wrap=heap_caps_update_per_task_info_alloc"
     "-Wl,--wrap=heap_caps_update_per_task_info_free"
     "-Wl,--wrap=heap_caps_update_per_task_info_realloc")
+endif()
 
 # Keep the board straddle's detect_hw() on the link line.
 #

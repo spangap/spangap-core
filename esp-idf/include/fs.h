@@ -13,13 +13,26 @@
 #include <cstddef>
 #include <cstdint>
 #include <string>
+#include "sdkconfig.h"
 #include "esp_err.h"
 
 /* ---- Filesystem layout ---- */
 
+/* The three roots. On the chip they are VFS mount points, absolute by
+ * definition. On the host a station's whole world is its own directory, which
+ * the board chdir()s into before anything opens a path, so the same three
+ * roots are relative names inside it — which is what keeps one host's stations
+ * out of each other's files. They stay literals either way because call sites
+ * concatenate them at compile time. */
+#if CONFIG_IDF_TARGET_LINUX
+#define FS_FIXED  "fixed"
+#define FS_STATE  "state"
+#define FS_SDCARD "sdcard"
+#else
 #define FS_FIXED  "/fixed"
 #define FS_STATE  "/state"
 #define FS_SDCARD "/sdcard"
+#endif
 
 /** Filesystem mount descriptor. */
 struct fs_mount_t {

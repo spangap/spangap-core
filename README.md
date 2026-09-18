@@ -7,6 +7,11 @@ ESP-IDF managed component, published as `spangap/spangap-core`, and its straddle
 `info`, `itsPoll`, `gp_alloc`, …) are meant to read as language primitives, so
 every other firmware straddle depends on it and assumes it is there.
 
+It also builds for ESP-IDF's Linux host target, where host-only code lives in
+[`esp-idf/src/host/`](esp-idf/src/host/) and chip-only code drops out. That is
+there for the simulated testbed, not for running spangap on a Linux machine —
+see `reticulous/sim/`.
+
 This is a multi-function straddle: each function has its own operator guide under
 [`docs/`](docs/), with a companion `-internals.md` maintainer reference. Start
 with the function you need.

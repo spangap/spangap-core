@@ -639,7 +639,7 @@ static int logVprintf(const char* fmt, va_list args) {
      * length-counted frame is unrecoverable for the host. */
     if (logWireLive() && !serialInCli && !serialInHandler && !consoleWriteDead) {
         consoleWriteLock();
-        fwrite(formatted, 1, fmtLen, stdout);
+        consoleEmitRaw(formatted, fmtLen);
         consoleWriteUnlock();
     }
 
@@ -905,7 +905,7 @@ static void logInboundLineOut(int srcSlot, const char* line, size_t len) {
      * inbound lines also reach the serial console. */
     if (!serialInCli && !serialInHandler && !consoleWriteDead) {
         ensureAnsi();
-        if (ansiLen > 0) fwrite(ansi, 1, ansiLen, stdout);
+        if (ansiLen > 0) consoleEmitRaw(ansi, ansiLen);
     }
 }
 

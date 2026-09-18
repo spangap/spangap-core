@@ -3,7 +3,11 @@
 #include "random.h"
 #include "log.h"
 
+/* The ADC noise source the bootloader RNG window opens is a chip peripheral;
+ * on the host esp_fill_random is the entropy source on its own. */
+#if !CONFIG_IDF_TARGET_LINUX
 #include "bootloader_random.h"
+#endif
 #include "esp_random.h"
 #include "mbedtls/ctr_drbg.h"
 
@@ -30,10 +34,14 @@ extern "C" void randomInit(void) {
     if (s_ready) return;
     static const unsigned char pers[] = "spangap-core drbg";
 
+#if !CONFIG_IDF_TARGET_LINUX
     bootloader_random_enable();
+#endif
     mbedtls_ctr_drbg_init(&s_drbg);
     int rc = mbedtls_ctr_drbg_seed(&s_drbg, entropySource, nullptr, pers, sizeof(pers) - 1);
+#if !CONFIG_IDF_TARGET_LINUX
     bootloader_random_disable();
+#endif
 
     if (rc != 0) {
         /* No DRBG means no trustworthy keys; a device in that state must not

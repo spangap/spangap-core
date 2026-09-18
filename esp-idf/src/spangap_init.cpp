@@ -23,10 +23,14 @@
 #include <cstdio>
 #include <cstring>
 #include <ctime>
-#include "esp_littlefs.h"
 #include "esp_mac.h"
 #include "esp_system.h"
+/* The state store's own format call and the bootloader watchdog are both
+ * flash-and-silicon; the host has neither. */
+#if !CONFIG_IDF_TARGET_LINUX
+#include "esp_littlefs.h"
 #include "hal/wdt_hal.h"
+#endif
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/event_groups.h"
@@ -617,7 +621,11 @@ extern "C" void spangapInit(void) {
                    stored, CONFIG_SPANGAP_PROJECT_NAME);
             fflush(stdout);
             vTaskDelay(pdMS_TO_TICKS(200));
+#if CONFIG_IDF_TARGET_LINUX
+            fsFormatFlash();       /* the store is a directory: empty it */
+#else
             esp_littlefs_format("state");
+#endif
             esp_restart();
             /* unreachable */
         }

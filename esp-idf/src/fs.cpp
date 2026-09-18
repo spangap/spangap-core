@@ -23,15 +23,20 @@
 #include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "log.h"
-#include "esp_littlefs.h"
-#include "spanfs.h"
 #include "esp_timer.h"
 #include "nvs_flash.h"
 #include "nvs.h"             /* nvs_open/_get_u32 — the state-wipe breadcrumb */
-#include "esp_ota_ops.h"
 #include "esp_partition.h"
-#include "esp_flash.h"
 #include "esp_random.h"      /* esp_fill_random — the factory-reset overwrite */
+/* The flash chip and everything mounted on it: the two image filesystems, the
+ * OTA partition table, the raw flash API and the SD card. On the host `fixed`
+ * is a link the board planted and `state` an ordinary directory, so none of
+ * this has a counterpart there. */
+#if !CONFIG_IDF_TARGET_LINUX
+#include "esp_littlefs.h"
+#include "spanfs.h"
+#include "esp_ota_ops.h"
+#include "esp_flash.h"
 #include "esp_rom_spiflash.h"
 #include "esp_vfs_fat.h"
 #include "ff.h"
@@ -41,6 +46,7 @@
 #include "driver/sdspi_host.h"
 #include "driver/spi_master.h"
 #include "spi_helper.h"
+#endif
 #endif
 
 /* ---- Handle table ---- */
@@ -66,9 +72,11 @@ static bool firstBoot = false;
 
 static char fixedLabel[12] = "fixed_a";   /* default: app0 → fixed_a */
 
+#if !CONFIG_IDF_TARGET_LINUX
 /* /fixed is a read-only spanfs image mmap'd in place (not LittleFS). The handle
  * stays open for the process lifetime; the mapping backs every /fixed read. */
 static spanfs_t* s_fixed = nullptr;
+#endif
 
 const fs_mount_t FS_MOUNTS[] = {
     { FS_FIXED, fixedLabel, true,  true, false },
@@ -81,9 +89,15 @@ const char* fs_inactive_fixed_label() {
     return strcmp(fixedLabel, "fixed_a") == 0 ? "fixed_b" : "fixed_a";
 }
 const char* fs_inactive_app_label() {
+#if CONFIG_IDF_TARGET_LINUX
+    /* Nothing runs from a partition here, so neither app slot is the one in
+     * use; the first is as good an answer as the question allows. */
+    return "app1";
+#else
     const esp_partition_t* run = esp_ota_get_running_partition();
     if (run && run->subtype == ESP_PARTITION_SUBTYPE_APP_OTA_1) return "app0";
     return "app1";
+#endif
 }
 
 static int allocSlot() {
@@ -108,8 +122,12 @@ __attribute__((unused)) static bool isFlashPath(const char* path) {
 }
 
 __attribute__((unused)) static bool callerOnPsram() {
+#if CONFIG_IDF_TARGET_LINUX
+    return false;      /* one address space, and no cache to disable */
+#else
     int local;
     return !esp_ptr_internal(&local);
+#endif
 }
 
 /* Route ALL fs access through the worker once it's up.
@@ -177,6 +195,7 @@ static void noteStateWipe(esp_err_t why) {
  * first and the fallback is entered deliberately, loudly, and on the record —
  * rather than handing esp_littlefs a format_if_mount_failed flag and learning
  * about the wipe from a device that is suddenly on its own AP. */
+#if !CONFIG_IDF_TARGET_LINUX
 static esp_err_t mountStateLittlefs() {
     esp_vfs_littlefs_conf_t conf = {};
     conf.base_path = FS_STATE;
@@ -189,6 +208,7 @@ static esp_err_t mountStateLittlefs() {
     conf.format_if_mount_failed = true;
     return esp_vfs_littlefs_register(&conf);
 }
+#endif
 
 static bool needsProxyHandle(int f) {
     if (f < 0 || f >= MAX_FILE_SLOTS || !fileSlots[f].active) return false;
@@ -478,7 +498,11 @@ static void handleOp(fs_op_t* req) {
     case fs_op_t::LFS_INFO: {
         /* path carries the partition label; size/nmemb return total/used. */
         size_t t = 0, u = 0;
+#if CONFIG_IDF_TARGET_LINUX
+        req->result = -1;      /* the store is a host directory, not an image */
+#else
         req->result = esp_littlefs_info(req->path, &t, &u);
+#endif
         req->size  = t;
         req->nmemb = u;
         break;
@@ -1010,6 +1034,8 @@ bool fs_mount_sd(void) {
 #endif  /* CONFIG_SPANGAP_SDCARD */
 }
 
+static void clearTree(const char* dir);   /* defined with the safe-mode ops below */
+
 /* Unmount, reformat, and remount the on-flash `state` partition. /state is
  * always mounted (even when the active state store is the SD one), so this
  * always unmounts and remounts it. Must run on a DRAM stack —
@@ -1017,10 +1043,16 @@ bool fs_mount_sd(void) {
  * Disruptive: callers either reboot right after (factory reset) or accept
  * that /state is briefly empty. */
 void fsFormatFlash(void) {
+#if CONFIG_IDF_TARGET_LINUX
+    /* There is no image to reformat: the store is a directory, and emptying
+     * it is what a format means here. */
+    clearTree(FS_STATE);
+#else
     esp_vfs_littlefs_unregister("state");
     esp_littlefs_format("state");
     if (mountStateLittlefs() != ESP_OK)
         printf("remount " FS_STATE " after format failed\n");
+#endif
 }
 
 /* Reformat the SD card in place (FAT). The card stays mounted at /sdcard.
@@ -1244,6 +1276,12 @@ static uint32_t flashStateStart = 0, flashStateSize = 0;
 static bool flashStatePinned = false;
 
 static void statePartitionEnsure() {
+#if CONFIG_IDF_TARGET_LINUX
+    /* The store is a directory in the station's own directory. There is no
+     * flash chip to size and no runtime partition to register, so the geometry
+     * keys stay at zero and report exactly that. */
+    return;
+#else
     /* A board can pin `state` in its own table; then there is nothing to
      * register. The geometry is computed on that path too — the same questions
      * are asked of such a board, and returning early before computing it would
@@ -1310,6 +1348,7 @@ static void statePartitionEnsure() {
         info("state: flash %#" PRIx32 ", floor %#" PRIx32 ", /state at %#" PRIx32
              " size %#" PRIx32, phys, floor, start, size);
     }
+#endif
 }
 
 void fsFlashGeometry(uint32_t* size, uint32_t* floor,
@@ -1356,6 +1395,13 @@ void fsFactoryWipeExtent(uint32_t* start, uint32_t* size) {
 }
 
 bool fsWipeFlashState(void (*progress)(uint32_t done, uint32_t total)) {
+#if CONFIG_IDF_TARGET_LINUX
+    /* Overwriting the medium is a flash-chip operation. The store is a
+     * directory, and emptying it is the whole of what can be done to it. */
+    (void)progress;
+    clearTree(FS_STATE);
+    return true;
+#else
     uint32_t start = 0, total = 0;
     fsFactoryWipeExtent(&start, &total);
     if (!total) {
@@ -1418,6 +1464,7 @@ bool fsWipeFlashState(void (*progress)(uint32_t done, uint32_t total)) {
     /* /state is deliberately left unmounted — the caller reboots, and the next
      * boot places a fresh store wherever this firmware computes it belongs. */
     return ok;
+#endif
 }
 
 void fs_init() {
@@ -1434,6 +1481,12 @@ void fs_init() {
     safeStrncpy(fixedLabel, "fixed", sizeof(fixedLabel));
     statePartitionEnsure();
 
+#if CONFIG_IDF_TARGET_LINUX
+    /* Both roots are already there: `fixed` is the link the board planted to
+     * the build's merged data tree, and `state` is an ordinary directory it
+     * made. Nothing to mount. */
+    fs_mkdirp(FS_STATE);
+#else
     /* /fixed: read-only spanfs image, mmap'd in place. Reads are plain cache
      * fills from the mapping (no SPI-flash-driver traffic, no cache-disable
      * hazard) — safe from any task, PSRAM stack included. Mounted by label, so
@@ -1450,6 +1503,7 @@ void fs_init() {
      * active state store ends up. */
     if (mountStateLittlefs() != ESP_OK)
         printf("mount %s failed\n", FS_STATE);
+#endif
 
     /* SD probe + active-state-store selection + first-boot factory copy do
      * NOT happen here. They run in fsSelectStateStore(), called from
@@ -1657,6 +1711,12 @@ int fs_stat(const char* path, struct stat* st) {
 }
 
 esp_err_t fsLittlefsInfo(const char* label, size_t* total, size_t* used) {
+#if CONFIG_IDF_TARGET_LINUX
+    /* Neither root is an image: a host directory has no size of its own to
+     * report and no ceiling to report it against. */
+    (void)label; (void)total; (void)used;
+    return ESP_ERR_NOT_SUPPORTED;
+#else
     /* /fixed is spanfs now, not LittleFS: report from the mmap'd header
      * (total == used == the byte-exact image size). A pure memory read, so no
      * worker proxy is needed. */
@@ -1677,6 +1737,7 @@ esp_err_t fsLittlefsInfo(const char* label, size_t* total, size_t* used) {
         return e;
     }
     return esp_littlefs_info(label, total, used);
+#endif
 }
 
 int fs_rename(const char* from, const char* to) {

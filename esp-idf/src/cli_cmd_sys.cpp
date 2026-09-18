@@ -8,6 +8,7 @@
 #include "fs.h"
 
 #include "compat.h"
+#include "esp_system.h"   /* esp_restart */
 #include <cstring>
 #include <cstdio>
 #include "freertos/FreeRTOS.h"

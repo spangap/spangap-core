@@ -10,6 +10,24 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <stdio.h>
+#include <unistd.h>
+
+/** Put bytes on the console wire, unbuffered and unformatted.
+ *
+ *  Two tasks write the console — the log sink's direct echo and the serial
+ *  task's own output — and on the host stdio's lock is not async-signal-safe:
+ *  the tick signal can land inside it and switch to a task that takes the same
+ *  lock, which deadlocks. So there the bytes go to the descriptor directly.
+ *  Callers serialise with consoleWriteLock() as before. */
+static inline void consoleEmitRaw(const char* data, size_t len) {
+#if CONFIG_IDF_TARGET_LINUX
+    ssize_t n = write(STDOUT_FILENO, data, len);
+    (void)n;
+#else
+    fwrite(data, 1, len, stdout);
+#endif
+}
 
 /** CLI task's ITS server ports.
  *    CLI_PORT_TCP: stream-mode, for raw TCP `nc` access and the on-device

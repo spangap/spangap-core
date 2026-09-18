@@ -95,6 +95,16 @@ static inline TaskHandle_t spawnTask(TaskFunction_t fn, const char* name,
     uint32_t caps = MALLOC_CAP_INTERNAL;   /* no PSRAM: every task stack is internal */
     (void)stackMem;
 #endif
+#if CONFIG_IDF_TARGET_LINUX
+    /* A task is a pthread here and its stack is a real mapping the port hands
+     * to pthread_attr_setstack, which fails outright below the port's floor —
+     * and a host frame is several times a Xtensa one, so the floor is raised
+     * well above it rather than to it. */
+    if (stackBytes < 20480) stackBytes = 20480;
+    /* One core, and asking for the second one is an assertion failure rather
+     * than a placement hint. */
+    core = tskNO_AFFINITY;
+#endif
     BaseType_t r = xTaskCreatePinnedToCoreWithCaps(fn, name, stackBytes, arg,
                                                    prio, &h, core, caps);
     return (r == pdPASS) ? h : nullptr;

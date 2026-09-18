@@ -358,6 +358,10 @@ static void cronDeepSleep() {
 #endif
 
 bool cronWakeupHandler() {
+#if CONFIG_IDF_TARGET_LINUX
+    /* A process starts; it never wakes. */
+    return false;
+#else
     if (esp_sleep_get_wakeup_cause() != ESP_SLEEP_WAKEUP_TIMER)
         return false;
     if (!rtcRamValid())
@@ -374,6 +378,7 @@ bool cronWakeupHandler() {
 
     /* The minute has arrived — stay awake, cron task will service it */
     return true;
+#endif
 }
 
 /* ---- Cron task ---- */

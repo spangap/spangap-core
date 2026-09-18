@@ -310,5 +310,6 @@ CONFIG_ESPTOOLPY_FLASHMODE_QIO=y
 # They now live in spangap-lcd's gated `kconfig:` block, applied only when lcd
 # is actually staged.
 
-# Target
-CONFIG_IDF_TARGET="esp32s3"
+# Target: named by the board straddle and exported as IDF_TARGET around the
+# build, never asserted here — a defaults file that names one would be written
+# into sdkconfig and then fail IDF's mismatch check on any other target.

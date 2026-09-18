@@ -104,6 +104,16 @@ function(spangap_create_factory_image)
             VERBATIM)
     endif()
 
+    # On the host target the merged tree IS `/fixed`: the station's directory
+    # carries a symlink to it, so there is no partition image to pack and no
+    # partition report to draw.
+    if(IDF_TARGET STREQUAL "linux")
+        if(TARGET spangap_browser_build_target)
+            add_dependencies(spangap_data_merge spangap_browser_build_target)
+        endif()
+        return()
+    endif()
+
     # `fixed` is a spanfs image now (read-only, mmap-native) instead of a
     # LittleFS image — byte-exact, placement-independent. spanfs_create_partition_image
     # mirrors littlefs_create_partition_image(); the target is spanfs_<part>_bin.
@@ -152,7 +162,10 @@ function(spangap_browser_build web_dir)
         WORKING_DIRECTORY ${web_dir}
         COMMENT "Building web interface in ${web_dir}"
         VERBATIM)
-    add_dependencies(flash spangap_browser_build_target)
+    # There is no `flash` target on a target that produces no flashable image.
+    if(TARGET flash)
+        add_dependencies(flash spangap_browser_build_target)
+    endif()
 
     # If the consumer already called spangap_create_factory_image(), retro-wire
     # the dependency now (works in either call order).

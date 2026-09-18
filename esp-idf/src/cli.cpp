@@ -18,6 +18,7 @@
 #endif
 #include <esp_heap_caps.h>
 #include <fcntl.h>
+#include <sys/select.h>
 #include <unistd.h>
 #include <cstdio>
 #include <cstring>
@@ -100,7 +101,12 @@ extern "C" int  consoleCdcReadPort(int itf, uint8_t* out, size_t max);
 extern "C" int  consoleCdcWritePort(int itf, const uint8_t* data, size_t len);
 
 static void cliFlush() {
+#if !CONFIG_IDF_TARGET_LINUX
+  /* Nothing to flush where every console write already went to the descriptor
+   * — and taking stdio's lock from a second task is what the host build
+   * avoids. */
   fflush(stdout);
+#endif
 #if CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG
   /* USB Serial JTAG echo needs a TX FIFO flush — fflush(stdout) only pushes
    * into the USB FIFO, but bytes don't actually leave until either a newline
@@ -1650,7 +1656,7 @@ static void serialEmit(const char* p, size_t n) {
   }
   if (start < p + n) put(start, (size_t)(p + n - start));
 #else
-  fwrite(p, 1, n, stdout);
+  consoleEmitRaw(p, n);
 #endif
 }
 
@@ -2011,6 +2017,14 @@ static void serialTaskFn(void* arg) {
       return n > 0 ? n : 0;
 #else
       if (port != 0) return 0;
+      /* stdin is non-blocking; the select is the wait, and it is the one IDF
+       * interposes for a FreeRTOS task — it polls, then sleeps on a delay, so
+       * the scheduler sees a blocked task rather than a spinning one. */
+      fd_set rd;
+      FD_ZERO(&rd);
+      FD_SET(STDIN_FILENO, &rd);
+      struct timeval tv = { 0, 1000 * portTICK_PERIOD_MS };
+      if (select(STDIN_FILENO + 1, &rd, nullptr, nullptr, &tv) <= 0) return 0;
       int n = (int)read(STDIN_FILENO, out, max);
       return n > 0 ? n : 0;
 #endif
@@ -2038,8 +2052,7 @@ static void serialTaskFn(void* arg) {
       usb_serial_jtag_ll_txfifo_flush();
 #else
       if (port != 0) return;
-      fwrite(data, 1, len, stdout);
-      fflush(stdout);
+      consoleEmitRaw((const char*)data, len);
 #endif
   };
 
