@@ -118,9 +118,16 @@ is already blocked on it. So any barrier flag is settable from off-device.
 and stamps `sys.human_last_s` with the uptime seconds of the latest interaction,
 then signals the flag. Call it from anything that means a person is at the
 controls; core calls it for a keystroke on any console session and for a USB host
-enumerating on the console, spangap-lcd for a screen leaving standby, and the web
-UI writes the key over the config channel on the first click, key, scroll or
-touch in the tab.
+enumerating on the console, spangap-lcd for every registered input — a touch, a
+button, a trackball edge, a keyboard key (`lcdActivity`, where every input path
+on a screen device converges), plus the one press a board absorbs to leave
+standby — and the web UI writes the key over the config channel on the first
+click, key, scroll or touch in the tab.
+
+**Interaction, not wake.** Counting only a screen leaving standby misses the
+person who boots the device and starts using it straight away, since they wake
+nothing — and an unattended hold that outlasts their patience is exactly the
+hold that should have ended the moment they touched it.
 
 A hold that only exists to protect an *unattended* device waits on it:
 
@@ -235,7 +242,7 @@ init owns the project-identity and boot/build telemetry keys.
 | `sys.time.valid` | `1` once a time source has synced (published by the time source; read by `waitForTime`). |
 | `sys.time.set` | Browser pushes epoch seconds here; the time source accepts it when the clock is invalid. |
 | `sys.going_down` | Set when the last power lock releases — cron acts on it to enter deep sleep (see [power-management](power-management.md)). |
-| `sys.human_detected` | `1` once somebody has interacted with the device this boot — console keystroke, USB host, screen wake, click in the web UI. Waited on by holds that only protect an unattended node. |
+| `sys.human_detected` | `1` once somebody has interacted with the device this boot — console keystroke, USB host, any touch/button/key on the screen, click in the web UI. Waited on by holds that only protect an unattended node. |
 | `sys.human_last_s` | Uptime seconds of the most recent such interaction (uptime, so it means something before the clock syncs). |
 | `sys.build_time` | Compact `a<app> f<fixed> w<web>` build-epoch summary. |
 | `sys.buildtime.{app,fixed,web}` | Build epochs: firmware link time, `fixed` source mtime, webroot CRC32. |

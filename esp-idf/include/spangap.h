@@ -215,7 +215,9 @@ bool waitForFlag(const char* key, int timeout_s);
 void signalFlagIfWaited(const char* key);
 
 /** Report that a person is interacting with this device — a keystroke on a
- *  console, a screen woken by a touch, a click in the browser UI. Publishes the
+ *  console, a touch or key on the screen, a click in the browser UI. It is
+ *  interaction that counts, not a device coming out of standby: somebody who
+ *  boots a screen device and starts using it wakes nothing. Publishes the
  *  ephemeral flag `sys.human_detected` = 1 (sticky for the boot) and stamps
  *  `sys.human_last_s` with the uptime seconds of the most recent interaction
  *  (uptime, not wall clock, so it is meaningful before the clock syncs), then

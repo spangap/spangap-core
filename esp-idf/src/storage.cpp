@@ -3162,11 +3162,13 @@ void storageRegisterCmds() {
  * brackets the stream so the browser can defer its post-dump pending-set
  * re-flush until full state has landed. */
 
-/* The server→client ITS buffer is 16K (fromSize at itsServerPortOpen below).
- * Every packet is header(4)+body <= 16384. DC_DUMP_MAX is a conservative body
- * budget for a streamed chunk: it leaves room for the header plus the path
- * wrapper a deep subtree (e.g. s.<...>.<64-char-hash>) adds around its payload,
- * since the per-unit size below is an estimate, not the exact printed length. */
+/* A conservative body budget for one streamed chunk. The server→client window
+ * is far larger (fromCap/maxMsg at itsServerPortOpen below), and a single leaf
+ * over this — a Nomad page — rides its own oversized chunk up to that guard;
+ * what this bounds is how much the chunker packs together, leaving room for
+ * the packet header plus the path wrapper a deep subtree (e.g.
+ * s.<...>.<64-char-hash>) adds around its payload, since the per-unit size
+ * below is an estimate and not the exact printed length. */
 static constexpr size_t DC_DUMP_MAX   = 14000;
 static constexpr int    DC_DUMP_DEPTH = 32;     /* cfgRoot nests ~9 deep */
 
