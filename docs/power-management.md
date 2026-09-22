@@ -226,19 +226,58 @@ pm registers three commands (run on-device via `spangap cli "<command>"`):
 | `top -b <task> [hex]` | That task's internal-DRAM blocks grouped by exact size, largest first, with any block the kernel can name (a TCB is its own `TaskHandle_t`, a stack is `pxTaskGetStackStart`) labelled. `hex` adds the first 32 bytes of each size class, for identifying a struct by its contents. The DRAM column says how much a task holds; this says what — match a size against a `sizeof` in the suspected allocator. Blocks are billed to the task that ran malloc, so a server carries what it allocates for its clients. |
 
 Chain `usb down; sleep 30; usb up` on one line — the CLI splits the commands up
-front, so they all run even after the console disconnects. (`pm deep|light|slow
-inhibit|allow` exists as a debug knob that holds a `cli`-named lock; it is not
-part of normal operation.)
+front, so they all run even after the console disconnects.
+
+`pm inhibit deep|light|slow` holds a `cli`-named lock until `pm allow` gives it
+back — `slow` being the CPU, which it pins at its maximum. It is not part of
+normal operation, and it is the first thing to reach for when a fault appears
+only after a device has been running a while: a picture that comes apart, a
+timing that was fine and then isn't, anything whose arrival coincides with
+nothing that was changed. Holding the clock up either makes it go away — in
+which case the fault belongs to whatever the CPU stopped keeping up with, and
+`pm -v`'s frequency histogram says how much of the time that is — or it doesn't,
+and a whole class of suspect is gone in one command.
 
 The **`bat`** command (battery voltage and percent) is **not** pm — it lives in
 core's system commands ([`cli_cmd_sys.cpp`](../esp-idf/src/cli_cmd_sys.cpp)) and
 just reports the `battery.*` ephemerals a board's battery monitor publishes.
 `net up` / `net down` likewise belong to [spangap-net](../../spangap-net), not pm.
 
+## The activity sampler
+
+While something is watching — an on-device Activity monitor or a browser one —
+pm runs a 1 Hz sampler (`cpustat`, core 0) that fills a ring of per-second
+samples: per-core busy percentages and PM-mode residency, one sample per second,
+`s.sys.cpu_sample_buf` of them (320 by default, 5 bytes each; a piggy-backed
+sampler such as -net's traffic ring uses the same length and beat). The rings
+exist only while a watcher does, and `pmStatsHistory()` / `pmStatsAvg()` read
+them. A monitor claims the sampler with **`pmStatsWatch(true)`**, which raises
+`sys.stats.lcd_actmon` *and* acts on it — raising the flag alone leaves the
+start waiting on a storage subscription delivered on the log task, which is a
+monitor that opens onto an empty graph.
+
+**That tick must never walk the task list.** `uxTaskGetSystemState()` holds the
+FreeRTOS kernel lock across every task list — interrupts off on that core, and
+the other core spinning for the same lock the moment it makes a scheduler call,
+also with interrupts off. With forty tasks that is milliseconds, once a second,
+during which nothing on the device can service an interrupt. It is invisible in
+most things and fatal to anything with a hard deadline: an RGB panel's bounce
+refill has 0.7 ms, so an open Activity monitor made the *display* lose sync once
+a second, answering to none of the display's own settings.
+
+So the tick takes per-core busy from the idle tasks' own run-time counters —
+`ulTaskGetIdleRunTimeCounterForCore()`, two O(1) reads — and keeps no per-task
+table at all. `top` is the one caller that wants per-task figures and samples
+for itself when asked, which is where a walk belongs: once, on demand, by
+someone who is watching for the answer.
+
 ## Storage keys
 
 pm owns **no** `s.pm.*` storage keys. It reacts to `sys.going_down` (which it
 writes) and is configured entirely through sdkconfig and the lock API.
+`s.sys.cpu_sample_buf` (the sampler ring length, above) is a `sys` key rather
+than a pm one; a monitor raises it to its own graph width, since the graph draws
+one sample per pixel column.
 
 ## See also
 

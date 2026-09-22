@@ -678,59 +678,35 @@ struct cpuPrev { TaskHandle_t h; uint32_t run; };
 static cpuPrev* s_prevRun;
 static int      s_prevRunN, s_prevRunCap;
 static uint32_t s_prevWall;
+static uint32_t s_prevIdle0, s_prevIdle1;   /* per-core idle run-time baseline */
 #ifdef CONFIG_PM_PROFILING
 static int64_t  s_prevGrand[PM_MODE_COUNT];
 static bool     s_prevGrandValid;
 #endif
 
+/* THIS TICK MUST NOT WALK THE TASK LIST. uxTaskGetSystemState holds the
+   FreeRTOS kernel lock across every task list — interrupts off on this core,
+   and the other core spinning for the same lock the moment it makes any
+   scheduler call, also with interrupts off. With forty tasks that is
+   milliseconds, once a second, during which nothing on this device can service
+   an interrupt. Anything holding a hard deadline misses it: an RGB panel's
+   bounce refill has 0.7 ms, so the picture visibly loses sync once a second
+   for as long as an Activity monitor is open.
+
+   Per-core busy is the only thing this tick needs from the scheduler, and the
+   idle tasks' own run-time counters give it in two O(1) reads. `top` is the one
+   caller that wants the per-task table, and it already samples for itself. */
 static void statsTick(bool driveSamplers = true) {
-  UBaseType_t ntask = uxTaskGetNumberOfTasks();
-  int cap = (int)ntask + 8;                 /* headroom for tasks spawned mid-walk */
-  auto* raw = (TaskStatus_t*)gp_alloc(cap * sizeof(TaskStatus_t));
-  if (!raw) return;
-  uint32_t wall = 0;
-  int cnt = (int)uxTaskGetSystemState(raw, cap, &wall);
-
-  auto* cur = (cpuSnap*)gp_alloc((cnt ? cnt : 1) * sizeof(cpuSnap));
-  if (!cur) { free(raw); return; }
-
-  uint32_t idle0 = 0, idle1 = 0;
-  for (int i = 0; i < cnt; i++) {
-    cur[i].h = raw[i].xHandle;
-    safeStrncpy(cur[i].name, raw[i].pcTaskName, configMAX_TASK_NAME_LEN);
-    cur[i].pri   = (int)raw[i].uxCurrentPriority;
-    cur[i].stack = raw[i].usStackHighWaterMark;
-    cur[i].stkMem = esp_ptr_external_ram(pxTaskGetStackStart(raw[i].xHandle)) ? 'P' : 'D';
-#if CONFIG_FREERTOS_VTASKLIST_INCLUDE_COREID
-    cur[i].core = raw[i].xCoreID == tskNO_AFFINITY ? -1 : (int)raw[i].xCoreID;
-#else
-    cur[i].core = -2;
-#endif
-    uint32_t prev = 0; bool found = false;
-    for (int j = 0; j < s_prevRunN; j++)
-      if (s_prevRun[j].h == raw[i].xHandle) { prev = s_prevRun[j].run; found = true; break; }
-    cur[i].delta = found ? (raw[i].ulRunTimeCounter - prev) : 0;
-    if      (strcmp(cur[i].name, "IDLE0") == 0) idle0 = cur[i].delta;
-    else if (strcmp(cur[i].name, "IDLE1") == 0) idle1 = cur[i].delta;
-  }
+  uint32_t wall = (uint32_t)portGET_RUN_TIME_COUNTER_VALUE();
+  uint32_t run0 = (uint32_t)ulTaskGetIdleRunTimeCounterForCore(0);
+  uint32_t run1 = (uint32_t)ulTaskGetIdleRunTimeCounterForCore(1);
 
   uint32_t window = (s_prevWall && wall > s_prevWall) ? (wall - s_prevWall) : 0;
+  uint32_t idle0  = run0 - s_prevIdle0;
+  uint32_t idle1  = run1 - s_prevIdle1;
+  s_prevWall = wall; s_prevIdle0 = run0; s_prevIdle1 = run1;
 
-  /* Save this walk as next tick's baseline. */
-  if (cnt > s_prevRunCap) {
-    free(s_prevRun);
-    s_prevRun = (cpuPrev*)gp_alloc(cnt * sizeof(cpuPrev));
-    s_prevRunCap = s_prevRun ? cnt : 0;
-  }
-  s_prevRunN = 0;
-  for (int i = 0; i < cnt && i < s_prevRunCap; i++) {
-    s_prevRun[i].h = raw[i].xHandle; s_prevRun[i].run = raw[i].ulRunTimeCounter;
-    s_prevRunN++;
-  }
-  s_prevWall = wall;
-  free(raw);
-
-  if (!window) { free(cur); return; }        /* first tick: baseline only */
+  if (!window) return;                        /* first tick: baseline only */
 
   /* Any nonzero busy time rounds up to at least 1% so the graph always shows a
      pixel for a core that did any work this second. */
@@ -758,12 +734,8 @@ static void statsTick(bool driveSamplers = true) {
   }
 #endif
 
-  /* Swap in the fresh snapshot + append the ring sample under the lock. */
+  /* Append the ring sample under the lock. */
   xSemaphoreTake(s_statsMux, portMAX_DELAY);
-  cpuSnap* old = s_snap;
-  s_snap = cur; s_snapN = cnt;
-  s_snapWindow = window; s_snapIdle0 = idle0; s_snapIdle1 = idle1;
-  s_snapReady = true;
   if (s_ring && s_ringCap > 0) {
     PmStatSample& e = s_ring[s_ringHead];
     e.core0 = (uint8_t)b0; e.core1 = (uint8_t)b1;
@@ -772,7 +744,6 @@ static void statsTick(bool driveSamplers = true) {
     if (s_ringCount < s_ringCap) s_ringCount++;
   }
   xSemaphoreGive(s_statsMux);
-  free(old);
 
   /* Drive any piggy-backed samplers (e.g. -net traffic) on the same 1 Hz beat.
      They run every tick to keep their own rings filled and self-gate publishing.
@@ -825,7 +796,7 @@ static void statsFreeState() {
   free(s_snap);  s_snap = nullptr; s_snapN = 0;   s_snapReady = false;
   xSemaphoreGive(s_statsMux);
   free(s_prevRun); s_prevRun = nullptr; s_prevRunN = 0; s_prevRunCap = 0;
-  s_prevWall = 0;
+  s_prevWall = 0; s_prevIdle0 = 0; s_prevIdle1 = 0;
 #ifdef CONFIG_PM_PROFILING
   s_prevGrandValid = false;
 #endif
@@ -861,7 +832,7 @@ static void statsStart() {
   s_snap = nullptr; s_snapN = 0; s_snapReady = false;
   xSemaphoreGive(s_statsMux);
   s_prevRun = nullptr; s_prevRunN = 0; s_prevRunCap = 0;   /* freed at prior teardown */
-  s_prevWall = 0;
+  s_prevWall = 0; s_prevIdle0 = 0; s_prevIdle1 = 0;
 #ifdef CONFIG_PM_PROFILING
   s_prevGrandValid = false;
 #endif
@@ -890,6 +861,17 @@ static void statsWatchApply() {
   } else if (s_statsRunning && !s_statsStop) {
     s_statsStop = true;                              /* task tears itself down within ~1s */
   }
+}
+
+/* Raise or drop the on-device monitor's claim on the sampler, and act on it in
+   the same breath. The flag alone is not enough: it is acted on by a storage
+   subscription delivered on the log task, and a watcher that sets it from
+   anywhere else is left waiting for a callback that may not come — which is an
+   Activity monitor that opens onto an empty graph, and works when you try it
+   again because something else has since pumped that loop. */
+void pmStatsWatch(bool on) {
+  storageSet("sys.stats.lcd_actmon", on ? 1 : 0);
+  statsWatchApply();
 }
 
 /* Called every log-loop iteration; sets up the flag subscription once. The
@@ -1194,7 +1176,20 @@ static void cmdUsb(const char* a) {
 }
 
 static void cmdPm(const char* args) {
-    if (cliWantsHelp(args)) { cliPrintf("%-*s power management status (-v: lock stats); wifi none|min|max\n", CLI_HELP_COL, "pm [-v] [wifi ...]"); return; }
+    if (cliWantsHelp(args)) {
+        cliPrintf("%-*s power management status (-v: lock stats); wifi none|min|max\n",
+                  CLI_HELP_COL, "pm [-v] [wifi ...]");
+        /* The locks are the reason this command is reached for at all during a
+         * bring-up — holding the CPU up, or sleep off, is how a fault that only
+         * appears at 80 MHz or across a light sleep is pinned on the clock
+         * rather than on whatever was changed last. A help line that does not
+         * mention them sends the next person the long way round. */
+        cliPrintf("%-*s hold a lock until released: deep/light sleep, or slow (CPU)\n",
+                  CLI_HELP_COL, "pm inhibit deep|light|slow");
+        cliPrintf("%-*s let it back off again\n",
+                  CLI_HELP_COL, "pm allow deep|light|slow");
+        return;
+    }
     if (strstr(args, "allow") || strstr(args, "inhibit")) {
         static pm_lock_handle_t cliDeep = nullptr, cliLight = nullptr, cliSlow = nullptr;
         static bool deepHeld = false, lightHeld = false, slowHeld = false;
@@ -1437,7 +1432,10 @@ static void cmdTop(const char* args) {
        after, leaving no sampling buffers alive on an idle node. */
     int n2 = 0; uint32_t deltaTotal = 0, idle0 = 0, idle1 = 0;
     cpuSnap* localSnap = nullptr;
-    const bool live = s_statsRunning;
+    /* The 1 Hz sampler no longer keeps a per-task table — the walk that built it
+       stops every interrupt on the device for as long as it takes — so `top`
+       always takes its own one-second sample. */
+    const bool live = false;
     if (live && !s_snapReady) { cliPrintf("top: CPU stats warming up, retry in ~1s\n"); return; }
     if (!live) {
         localSnap = topSample(&n2, &deltaTotal, &idle0, &idle1);

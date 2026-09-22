@@ -160,6 +160,14 @@ void pmStatsAddSampler(void (*tick)(void), void (*onStart)(void) = nullptr,
  *  Thread-safe. */
 int pmStatsHistory(PmStatSample* out, int max);
 
+/** Claim or release the 1 Hz sampler that fills that ring, from wherever the
+ *  watcher runs. An on-device Activity monitor calls this when it is shown and
+ *  hidden; the flag it sets (`sys.stats.lcd_actmon`) is what a browser's monitor
+ *  raises for itself, and is also what keeps the sampler alive while either is
+ *  watching. Setting that flag alone leaves the start waiting on a subscription
+ *  delivered elsewhere; this acts on it directly. */
+void pmStatsWatch(bool on);
+
 /* Averaged PM-mode residency over the recent ring window, plus a rough current
  * estimate. Percentages are integer; the current is in tenths of a milliamp
  * (mA10 = 83 → 8.3 mA) so the whole path stays integer. */
