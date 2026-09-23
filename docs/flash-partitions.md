@@ -10,7 +10,8 @@ parameter and no A/B layout in the default table.
 
 ## Layout
 
-The on-flash partition table is generated into `partitions.csv` by
+The on-flash partition table is generated into the build dir's
+`partitions.csv` (`esp-idf/build.<target>/partitions.csv`) by
 `esp-idf/scripts/gen-partitions.py` — **never hand-edit it**. The table holds
 only what ships in the floor image; `state` is deliberately absent because it is
 created at runtime.

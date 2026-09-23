@@ -60,7 +60,7 @@ different risk class from the placement work are in
 
 **Adding static `.bss` to spangap-core is dangerous.** Any new fixed array in
 this layer competes for the internal DMA pool. Measure `.dram0.bss`
-(`xtensa-esp32s3-elf-size -A build/reticulous.elf`) after such a change and
+(`xtensa-esp32s3-elf-size -A build.esp32s3/reticulous.elf`) after such a change and
 prefer PSRAM for task-context-only data. Reclaiming *PSRAM* instead (e.g. the
 packet-link work freed 18×4 KB of rnsd stream-pool buffers and 256 KB of seccam)
 does nothing for the internal-DRAM budget.

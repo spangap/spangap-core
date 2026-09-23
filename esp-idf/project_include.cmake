@@ -89,6 +89,14 @@ function(spangap_create_factory_image)
         COMMAND find "${_data_merged}" -name .DS_Store -delete
         VERBATIM)
 
+    # 3b. The SPA bundle spangap_browser_build() laid out in this build dir
+    #     (webroot/*.gz, build_times). Made first so a build without one merges
+    #     an empty dir.
+    add_custom_command(TARGET spangap_data_merge POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_BINARY_DIR}/web/data"
+        COMMAND ${CMAKE_COMMAND} -E copy_directory "${CMAKE_BINARY_DIR}/web/data" "${_data_merged}"
+        VERBATIM)
+
     # 4. Build manifest → served webroot as /BUILD.md. `spangap build` writes
     #    build/spangap-build-manifest.md before this configure runs (git hash +
     #    date of every staged straddle); ship it so the on-device viewer can
@@ -125,7 +133,7 @@ function(spangap_create_factory_image)
     # the fixed (factory data) side.
     add_custom_command(TARGET spanfs_${partition_name}_bin POST_BUILD
         COMMAND python3 "${_spangap_core_dir}/scripts/report-sizes.py"
-            --partitions "${CMAKE_SOURCE_DIR}/partitions.csv"
+            --partitions "${CMAKE_BINARY_DIR}/partitions.csv"
             --data-dir "${_data_merged}"
             --partition-name ${partition_name}
         VERBATIM)
@@ -134,7 +142,7 @@ function(spangap_create_factory_image)
     # configure-time print in bootstrap.cmake (which caches away on rebuilds).
     add_custom_command(TARGET spanfs_${partition_name}_bin POST_BUILD
         COMMAND python3 "${_spangap_core_dir}/scripts/report-partitions.py"
-            --partitions "${CMAKE_SOURCE_DIR}/partitions.csv"
+            --partitions "${CMAKE_BINARY_DIR}/partitions.csv"
         VERBATIM)
 
     # If the consumer also called spangap_browser_build(), wire its target as
@@ -147,8 +155,10 @@ endfunction()
 
 # spangap_browser_build(<web_dir>)
 #
-# Adds a custom target that runs <web_dir>/deploy.sh on every build, so the
-# consumer's SPA is rebuilt before the LittleFS factory image is assembled.
+# Adds a custom target that runs `<web_dir>/deploy.sh ${CMAKE_BINARY_DIR}/web`
+# on every build, so the consumer's SPA is rebuilt — into this build dir's
+# web/dist, laid out as /fixed files in web/data — before the factory image is
+# assembled.
 # Also tied to the `flash` target so `idf.py flash` (without a prior `build`)
 # still picks up SPA changes.
 #
@@ -158,7 +168,7 @@ endfunction()
 # precedes it does too.
 function(spangap_browser_build web_dir)
     add_custom_target(spangap_browser_build_target ALL
-        COMMAND bash ${web_dir}/deploy.sh
+        COMMAND bash ${web_dir}/deploy.sh "${CMAKE_BINARY_DIR}/web"
         WORKING_DIRECTORY ${web_dir}
         COMMENT "Building web interface in ${web_dir}"
         VERBATIM)

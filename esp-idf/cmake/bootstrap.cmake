@@ -1,12 +1,15 @@
 # spangap-core pre-project bootstrap. Consumers `include()` this file BEFORE
 # `project()`, like:
 #
-#   include("${CMAKE_SOURCE_DIR}/managed_components/spangap__spangap-core/cmake/bootstrap.cmake")
+#   include("${CMAKE_BINARY_DIR}/staging/components/spangap-core/cmake/bootstrap.cmake")
 #
-# The build tooling stages spangap-core into managed_components/ before CMake
+# `spangap build` stages spangap-core into the build dir's staging/ before CMake
 # runs — committed consumer files carry no workspace-relative paths.
 #
 # What it does:
+#   0. Keeps every generated file in the build dir (${CMAKE_BINARY_DIR}):
+#      staging/ (SPANGAP_STAGING_DIR), sdkconfig, partitions.csv
+#      (SPANGAP_PARTITIONS_CSV). One build dir per target, nothing shared.
 #   1. Prepends spangap's sdkconfig.defaults.spangap to SDKCONFIG_DEFAULTS,
 #      and appends the spangap-inside-generated staging/sdkconfig.spangap-overrides
 #      (which carries CLI-driven values like --flash-size). Order: platform
@@ -19,15 +22,25 @@
 #      --flash-size between builds takes effect. Suppressed by a
 #      `.spangap-manual-kconfig` marker in the workspace (`spangap menuconfig`
 #      sets it, `spangap autoconfig` clears it) for deliberate hand-tuning.
-#   3. Generates `${CMAKE_SOURCE_DIR}/partitions.csv` from CONFIG_SPANGAP_APP_PERCENT,
-#      CONFIG_ESPTOOLPY_FLASHSIZE_*MB, and whether `staging/components/ota/`
-#      exists (the post-Kconfig-cleanup signal for "OTA is in this build").
-#      With OTA on, partitions are paired A/B; with OTA off they're single
-#      (and twice the size).
+#   3. Generates `${CMAKE_BINARY_DIR}/partitions.csv` from CONFIG_SPANGAP_APP_PERCENT,
+#      CONFIG_ESPTOOLPY_FLASHSIZE_*MB, and whether `staging/components/updater/`
+#      exists (the signal for "the updater is in this build").
 
 # This file lives in spangap-core/cmake/bootstrap.cmake; one level up is the
-# component root, where sdkconfig.defaults.spangap and partitions.csv live.
+# component root, where sdkconfig.defaults.spangap lives.
 get_filename_component(_SPANGAP_CORE_DIR "${CMAKE_CURRENT_LIST_DIR}/.." ABSOLUTE)
+
+# Everything a build generates lives in its build dir — `spangap build` passes
+# `-B build.<target>`, so a chip build and a host build share no generated file:
+# not the staging, not the sdkconfig, not the partition table.
+set(SPANGAP_STAGING_DIR "${CMAKE_BINARY_DIR}/staging")
+set(SPANGAP_PARTITIONS_CSV "${CMAKE_BINARY_DIR}/partitions.csv")
+
+# IDF reads the table from CONFIG_PARTITION_TABLE_CUSTOM_FILENAME, relative to the
+# project dir unless absolute; this layer points it at the build dir's own copy.
+set(_SPANGAP_PATHS "${CMAKE_BINARY_DIR}/sdkconfig.spangap-paths")
+file(WRITE "${_SPANGAP_PATHS}"
+    "CONFIG_PARTITION_TABLE_CUSTOM_FILENAME=\"${SPANGAP_PARTITIONS_CSV}\"\n")
 
 # ─── 1. Layer SDKCONFIG_DEFAULTS: platform → straddle kconfig: → consumer → overrides ───
 # _SPANGAP_FRAGMENTS is the spangap-inside-collected `kconfig:` blocks from every
@@ -35,11 +48,12 @@ get_filename_component(_SPANGAP_CORE_DIR "${CMAKE_CURRENT_LIST_DIR}/.." ABSOLUTE
 # above the bare platform defaults but below the buildable's own sdkconfig.defaults
 # and the CLI overrides, so the building straddle and explicit CLI flags still win.
 set(_SPANGAP_DEFAULTS "${_SPANGAP_CORE_DIR}/sdkconfig.defaults.spangap")
-set(_SPANGAP_FRAGMENTS "${CMAKE_SOURCE_DIR}/staging/sdkconfig.spangap-fragments")
+set(_SPANGAP_FRAGMENTS "${SPANGAP_STAGING_DIR}/sdkconfig.spangap-fragments")
 set(_CONSUMER_DEFAULTS "${CMAKE_SOURCE_DIR}/sdkconfig.defaults")
-set(_SPANGAP_OVERRIDES "${CMAKE_SOURCE_DIR}/staging/sdkconfig.spangap-overrides")
+set(_SPANGAP_OVERRIDES "${SPANGAP_STAGING_DIR}/sdkconfig.spangap-overrides")
 set(SDKCONFIG_DEFAULTS "")
-foreach(_f "${_SPANGAP_DEFAULTS}" "${_SPANGAP_FRAGMENTS}" "${_CONSUMER_DEFAULTS}" "${_SPANGAP_OVERRIDES}")
+foreach(_f "${_SPANGAP_DEFAULTS}" "${_SPANGAP_FRAGMENTS}" "${_CONSUMER_DEFAULTS}" "${_SPANGAP_OVERRIDES}"
+        "${_SPANGAP_PATHS}")
     if(EXISTS "${_f}")
         list(APPEND SDKCONFIG_DEFAULTS "${_f}")
     endif()
@@ -65,7 +79,8 @@ endforeach()
 # aren't being applied. SPANGAP_WORKSPACE is exported by spangap-outside on
 # every docker exec; a raw `idf.py` build (no marker visible) just gets the
 # default auto-regen behavior.
-set(_SDKCONFIG "${CMAKE_SOURCE_DIR}/sdkconfig")
+set(_SDKCONFIG "${CMAKE_BINARY_DIR}/sdkconfig")
+set(SDKCONFIG "${_SDKCONFIG}")
 set(_DEFHASH_FILE "${CMAKE_BINARY_DIR}/sdkconfig.defaults.hash")
 set(_SDK_REGENERATED FALSE)
 
@@ -148,7 +163,7 @@ else()
     math(EXPR _STATE_FLOOR "${_FLASH_MB} * 1024 * 1024")
 endif()
 
-if(EXISTS "${CMAKE_SOURCE_DIR}/staging/components/updater")
+if(EXISTS "${SPANGAP_STAGING_DIR}/components/updater")
     set(_UPDATER y)
 else()
     set(_UPDATER n)
@@ -171,13 +186,13 @@ execute_process(
         --updater ${_UPDATER}
         --fixed-bytes 0
         --state-floor ${_STATE_FLOOR}
-        --out "${CMAKE_SOURCE_DIR}/partitions.csv"
+        --out "${SPANGAP_PARTITIONS_CSV}"
     COMMAND_ERROR_IS_FATAL ANY)
 
 # Print the layout so `spangap build` shows how flash is carved up.
 execute_process(
     COMMAND python3 "${_SPANGAP_CORE_DIR}/scripts/report-partitions.py"
-        --partitions "${CMAKE_SOURCE_DIR}/partitions.csv")
+        --partitions "${SPANGAP_PARTITIONS_CSV}")
 
 # Stash for post-project (shrink-wrap re-gen + `fixed` utilization report).
 set(_SPANGAP_PART_FLASH_MB ${_FLASH_MB} CACHE INTERNAL "")
