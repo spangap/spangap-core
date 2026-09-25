@@ -48,12 +48,15 @@ finishes so scripted one-liners don't race the format.
 
 ### Slots & ports
 
-- `CLI_MAX_CLIENTS = 8` PSRAM-resident `cli_slot_t`s, each holding its ITS
+- `CLI_MAX_CLIENTS = 10` PSRAM-resident `cli_slot_t`s, each holding its ITS
   handle, a `cli_edit` line-editor state, mode/color/usbSerial/noPrompt flags, a
   LINE-mode accumulation buffer, reported terminal `cols`/`rows`, a `cwd[256]`,
-  and a `pendingClose` flag.
+  and a `pendingClose` flag. The LINE-mode buffer holds a command of up to
+  `CLI_LINE_MAX` (4096) bytes plus the trailing `;` of a one-shot exec, and
+  drops bytes past that.
 - Two ITS server ports, opened on the cli task: **`CLI_PORT_TCP = 8081`**
-  (stream-mode, 6 slots — raw `nc` and the on-device serial task) and
+  (stream-mode, 8 slots — raw `nc`, sshd backends, and the on-device serial
+  task's console session and framed-RPC exec) and
   **`CLI_PORT_DC = 1`** (packet-mode, 2 slots — the browser WebRTC terminal and
   the on-device LCD CLI). The two caps sum to the pool, so the DC pair stays
   guaranteed under a TCP flood. The TCP listener itself is exposed by
@@ -112,11 +115,14 @@ Two tasks, both prio 1, both spawned by `cliInit`:
 - **`cli`** (6144-byte stack) owns the registry, the slot pool, and the two ITS
   ports. Its loop drains `itsPoll`, then per slot feeds received bytes to the
   line editor (ANSI) or buffers to newline (LINE), then runs a deferred-close
-  sweep, then drains cron commands. `cliActiveSlot` is set around each slot's
+  sweep, then drains cron commands. A pass reads at most 128 bytes per slot,
+  and ITS notifies once per send rather than per byte left unread, so the loop
+  parks only when every connected slot's input stream is empty; otherwise it
+  goes round again at once. `cliActiveSlot` is set around each slot's
   processing so `cliPrintf`/cwd/`cliReadLine` resolve to the right client.
 - **`serial`** (4096-byte stack) is a byte relay between the USB serial ports
-  and the cli/log views. It is **an ITS client** (`itsClientInit(2)` — a handler
-  session must be able to coexist with a console CLI session) **to `cli:1`/TCP**
+  and the cli/log views. It is **an ITS client** (`itsClientInit(3)` — a handler
+  session, a console CLI session and a framed-RPC exec can all be live at once) **to `cli:1`/TCP**
   — the first non-newline keystroke flips `serialInCli = true`, connects to
   `CLI_PORT_TCP` with a `cli_connect_t{CLI_ANSI, from_usb_serial=1, …}`, and
   relays bytes both ways; an empty Enter, a trailing `;`, `^D`, or `^C` returns
@@ -240,6 +246,16 @@ ever arrives) would otherwise strand the task forever on a controller that has
 lost the pads, deaf to the new console and to every claimed port. The bound is
 the cap on how stale the task's view may get; an idle console costs one wake
 per period.
+
+A board that can wake a task when a descriptor is ready offers
+`hwLinuxWait()`, declared weak here; when it is linked and the console is not
+on CDC, the idle branch sleeps in it on `stdin` and the task's own
+notification instead of polling ITS every 50 ms, and then drains ITS without
+waiting. That wait is unbounded while nothing is in progress and bounded at
+50 ms while a CLI session is open (the CLI task sets the auto-resume latch
+without a notification of its own) or a frame is part-assembled (so an
+abandoned one is timed out). Without the symbol, the loop waits in
+`itsPoll` for up to 50 ms per pass.
 
 Shuttle reads are **block** reads (`consoleCdcReadPort` → `tinyusb_cdcacm_read`,
 or `usb_serial_jtag_read_bytes`), not the console's one-byte `consoleCdcRead`

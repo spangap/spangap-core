@@ -11,10 +11,19 @@
 #include "cron.h"
 #include "compat.h"
 #include "mem.h"
+/* The Linux host target selects CONFIG_ESP_CONSOLE_UART, but its console is the
+ * process's stdin/stdout with no UART driver behind it, so in this file it takes
+ * the plain-descriptor console path. */
+#if CONFIG_IDF_TARGET_LINUX
+#undef CONFIG_ESP_CONSOLE_UART
+#endif
 #if CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG
 #include <driver/usb_serial_jtag.h>
 #include <driver/usb_serial_jtag_vfs.h>
 #include <hal/usb_serial_jtag_ll.h>
+#elif CONFIG_ESP_CONSOLE_UART
+#include <driver/uart.h>
+#include <driver/uart_vfs.h>
 #endif
 #include <esp_heap_caps.h>
 #include <fcntl.h>
@@ -204,6 +213,12 @@ struct cli_edit {
     bool savedValid = false;
 };
 
+/* Longest command a LINE-mode session accepts, not counting the trailing ';'
+ * that asks for one-shot exec: the accumulation buffer holds this plus one, and
+ * drops bytes past it. Framed RPC refuses a longer command outright rather than
+ * hand it over cut. */
+#define CLI_LINE_MAX 4096
+
 /* CLI ITS server: per-slot state */
 #define CLI_MAX_CLIENTS 10   /* up to 8 TCP + 2 DC (browser session + on-device CLI) */
 PSRAM_BSS static struct cli_slot_t {
@@ -213,7 +228,7 @@ PSRAM_BSS static struct cli_slot_t {
     bool usbSerial;
     bool color;        /* emit ANSI color escapes (CLI_ANSI input echo) */
     bool noPrompt;     /* suppress connect-time prompt (one-shot exec clients) */
-    std::string lineBuf;   /* LINE-mode accumulation (dynamic) */
+    std::string lineBuf;   /* LINE-mode accumulation, CLI_LINE_MAX + 1 bytes at most */
     int cols, rows;    /* client terminal size (0 = unknown → 80x24); for ssh pty-req */
     char cwd[256];
     /* True when the slot wants to disconnect once its outgoing stream is
@@ -1486,11 +1501,20 @@ static void cliTaskFn(void* arg) {
      * polling — an idle console then adds zero wakes and both cores can light-
      * sleep. The lone exception is a slot waiting to close once its output has
      * drained to the peer (pendingClose): that drain-complete transition isn't a
-     * notify, so fall back to a short re-check tick only while one is pending. */
-    bool draining = false;
-    for (int s = 0; s < CLI_MAX_CLIENTS; s++)
-      if (cliSlots[s].pendingClose) { draining = true; break; }
-    itsPoll(draining ? pdMS_TO_TICKS(20) : portMAX_DELAY);
+     * notify, so fall back to a short re-check tick only while one is pending.
+     *
+     * A pass takes at most one buffer's worth from each slot, and ITS notifies
+     * per send, not per byte left unread: a peer that wrote more than that in
+     * one send has already spent its notification. So a slot with input still
+     * queued must not park the loop — it runs again at once until every slot's
+     * input is consumed. Each such pass consumes bytes, so this never spins. */
+    bool draining = false, unread = false;
+    for (int s = 0; s < CLI_MAX_CLIENTS; s++) {
+      if (cliSlots[s].pendingClose) draining = true;
+      int h = cliSlots[s].itsHandle;
+      if (h >= 0 && itsConnected(h) && !itsIsEmpty(h)) unread = true;
+    }
+    itsPoll(unread ? 0 : draining ? pdMS_TO_TICKS(20) : portMAX_DELAY);
     while (itsPoll(0)) {}
 
     /* Process each active slot. Stream and packet modes both deliver bytes
@@ -1540,7 +1564,7 @@ static void cliTaskFn(void* arg) {
             cl.lineBuf.clear();
             if (hangup) break;
             cliWritePrompt(itsCliWrite);
-          } else if (cl.lineBuf.size() < 4096) {
+          } else if (cl.lineBuf.size() < CLI_LINE_MAX + 1) {
             cl.lineBuf.push_back(c);
           }
         }
@@ -1863,6 +1887,14 @@ static void rpcReset(void) {
 
 extern "C" int consoleCdcPortCount(void);
 
+#if !CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG
+/* The Linux host board's descriptor wait: select() that also returns when the
+ * calling task is notified, leaving the notification for its own take. Weak
+ * and absent on a chip. */
+extern "C" int hwLinuxWait(int nfds, fd_set* rfds, fd_set* wfds, fd_set* efds,
+                           TickType_t ticks) __attribute__((weak));
+#endif
+
 /* Serial ports the hardware presents right now. consoleCdcPortCount() reports 0
  * while the console is not on CDC, which is the one-port USB-Serial-JTAG case. */
 static int serialPortCount(void) {
@@ -1992,6 +2024,20 @@ static void serialTaskFn(void* arg) {
   usb_serial_jtag_driver_install(&cfg);
   usb_serial_jtag_vfs_use_driver();
   heap_caps_malloc_extmem_enable(CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL);
+#elif CONFIG_ESP_CONSOLE_UART
+  /* A console on a UART — a board whose USB port is a USB-to-UART bridge — needs
+   * the driver for the same reason as above, and for one more: without it the
+   * VFS reads the peripheral's 128-byte hardware FIFO directly, and this task
+   * visits it every 50 ms, which at 115200 baud is room for a fifth of what can
+   * arrive in that time. A framed-RPC request is longer than that, so it would
+   * lose its middle. The driver's ISR drains the FIFO into a ring as bytes land.
+   * Its TX ring is what keeps a log burst from stalling the writer on the wire.
+   * Both rings internal, for the reason the USB-Serial-JTAG block gives. */
+  heap_caps_malloc_extmem_enable(32 * 1024);
+  if (uart_driver_install((uart_port_t)CONFIG_ESP_CONSOLE_UART_NUM, 2048, 2048, 0,
+                          nullptr, 0) == ESP_OK)
+    uart_vfs_dev_use_driver(CONFIG_ESP_CONSOLE_UART_NUM);
+  heap_caps_malloc_extmem_enable(CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL);
 #endif
 
   /* Set stdin non-blocking */
@@ -2015,11 +2061,17 @@ static void serialTaskFn(void* arg) {
       if (port != 0) return 0;
       int n = usb_serial_jtag_read_bytes(out, max, 0);
       return n > 0 ? n : 0;
+#elif CONFIG_ESP_CONSOLE_UART
+      if (port != 0) return 0;
+      int n = uart_read_bytes((uart_port_t)CONFIG_ESP_CONSOLE_UART_NUM, out, max, 1);
+      return n > 0 ? n : 0;
 #else
       if (port != 0) return 0;
-      /* stdin is non-blocking; the select is the wait, and it is the one IDF
-       * interposes for a FreeRTOS task — it polls, then sleeps on a delay, so
-       * the scheduler sees a blocked task rather than a spinning one. */
+      /* stdin is non-blocking; the select is the wait. On the Linux host target
+       * select() is interposed for a FreeRTOS task — by the board, which
+       * blocks the task until the descriptor is ready, or else by IDF, which
+       * polls and sleeps on a delay — so the scheduler sees a blocked task
+       * rather than a spinning one. */
       fd_set rd;
       FD_ZERO(&rd);
       FD_SET(STDIN_FILENO, &rd);
@@ -2050,6 +2102,11 @@ static void serialTaskFn(void* arg) {
         off += (size_t)w;
       }
       usb_serial_jtag_ll_txfifo_flush();
+#elif CONFIG_ESP_CONSOLE_UART
+      /* The UART VFS rewrites \n as \r\n on the way out; a length-counted frame
+       * cannot survive that, so it goes to the driver untouched. */
+      if (port != 0) return;
+      uart_write_bytes((uart_port_t)CONFIG_ESP_CONSOLE_UART_NUM, data, len);
 #else
       if (port != 0) return;
       consoleEmitRaw((const char*)data, len);
@@ -2210,7 +2267,13 @@ static void serialTaskFn(void* arg) {
           int n = snprintf(hint, sizeof hint,
                            "\r\n" RESET "%s\r\n"
                            "Spangap console on %s. Start typing to enter CLI.\r\n",
-                           id, consoleOnCdc ? "USB/CDC 0" : "JTAG/serial");
+                           id, consoleOnCdc ? "USB/CDC 0"
+#if CONFIG_ESP_CONSOLE_UART
+                                            : "UART"
+#else
+                                            : "JTAG/serial"
+#endif
+                           );
           if (n > 0) serialEmit(hint, (size_t)n < sizeof hint ? (size_t)n : sizeof hint - 1);
         }
         cliFlush();
@@ -2277,8 +2340,22 @@ static void serialTaskFn(void* arg) {
    * Synchronous on the serial task by design: a retry that arrives mid-exec
    * waits in the driver's buffer until this returns, so both frames get
    * answered and the host's duplicate-reply rule absorbs the extra. An async
-   * implementation would have to choose a policy there instead. */
+   * implementation would have to choose a policy there instead.
+   *
+   * The session's input stream is smaller than the longest command, so the
+   * line goes in as the CLI task makes room — each send takes what fits, and a
+   * one-shot free-space notification wakes the poll below when the CLI task has
+   * read some — interleaved with collecting the output. A command longer than
+   * the session accepts is refused here: cut, it would run as some other
+   * command and lose the ';' that ends the session. */
   auto rpcRun = [&](uint8_t id, const char* cmd, size_t cmdLen) {
+      if (cmdLen > CLI_LINE_MAX) {
+          char msg[64];
+          int m = snprintf(msg, sizeof msg, "rpc: command over %u bytes\n",
+                           (unsigned)CLI_LINE_MAX);
+          rpcReply(id, msg, m > 0 ? (size_t)m : 0);
+          return;
+      }
       size_t cap = 0;
       char* out = rpcAlloc(0xffff, &cap);
       if (!out) { rpcReply(id, NULL, 0); return; }
@@ -2293,20 +2370,21 @@ static void serialTaskFn(void* arg) {
           line += ";\n";
           const TickType_t deadline = xTaskGetTickCount() + pdMS_TO_TICKS(RPC_EXEC_MS);
           size_t off = 0;
-          while (off < line.size() && (int32_t)(xTaskGetTickCount() - deadline) < 0)
-              off += itsSend(h, line.data() + off, line.size() - off, pdMS_TO_TICKS(50));
           char buf[256];
           while ((int32_t)(xTaskGetTickCount() - deadline) < 0) {
-              itsPoll(pdMS_TO_TICKS(20));
-              size_t n = itsRecv(h, buf, sizeof(buf), 0);
-              if (n == 0) {
-                  if (!itsConnected(h)) break;
-                  continue;
+              if (off < line.size()) {
+                  off += itsSend(h, line.data() + off, line.size() - off, 0);
+                  if (off < line.size()) itsSetFreeNotify(h, 1);
               }
-              size_t room = cap - len;
-              if (n > room) { n = room; cut = true; }
-              memcpy(out + len, buf, n);
-              len += n;
+              itsPoll(pdMS_TO_TICKS(20));
+              size_t n;
+              while ((n = itsRecv(h, buf, sizeof(buf), 0)) > 0) {
+                  size_t room = cap - len;
+                  if (n > room) { n = room; cut = true; }
+                  memcpy(out + len, buf, n);
+                  len += n;
+              }
+              if (!itsConnected(h)) break;
           }
           /* On the deadline this drops the session mid-command and answers with
            * whatever had been printed — the console is worth more than the
@@ -2459,6 +2537,9 @@ static void serialTaskFn(void* arg) {
       /* One blocking pass: the driver's ISR has to move the hardware FIFO into
        * its ring before there is anything to read. */
       if (usb_serial_jtag_read_bytes(drop, sizeof(drop), pdMS_TO_TICKS(10)) <= 0) break;
+#elif CONFIG_ESP_CONSOLE_UART
+      if (uart_read_bytes((uart_port_t)CONFIG_ESP_CONSOLE_UART_NUM, drop, sizeof(drop),
+                          pdMS_TO_TICKS(10)) <= 0) break;
 #else
       if (read(STDIN_FILENO, drop, sizeof(drop)) <= 0) break;
 #endif
@@ -2508,7 +2589,10 @@ static void serialTaskFn(void* arg) {
     if (cliUsbSerialLinkDown)
       for (int p = 0; p < SERIAL_PORT_COUNT; p++) hdlDetach(p);
     for (int p = 1; p < serialPortCount(); p++) trigScan(p);
-    hdlPump(1);
+    /* Every port past the console, and only the ones this image has: without
+     * the CDC transport there is no port 1, and its slots in the per-port
+     * arrays do not exist. */
+    for (int p = 1; p < SERIAL_PORT_COUNT; p++) hdlPump(p);
 
     if (hdlHandle[0] >= 0) {
       /* The console port belongs to a handler: no log mirror, no CLI, and no
@@ -2592,6 +2676,22 @@ static void serialTaskFn(void* arg) {
     }
 #endif
 
+#if !CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG
+    /* A board that can wake a task when a descriptor is ready (hwLinuxWait,
+     * weak above) lets this task sleep until a console byte arrives or another
+     * task notifies it — ITS traffic, a claim change — with nothing to poll.
+     * Bounded while a CLI session is open, because the CLI task sets the
+     * auto-resume latch without a notification of its own, and while a frame
+     * is part-assembled, so an abandoned one is timed out. */
+    if (hwLinuxWait && !consoleOnCdc) {
+      fd_set rd;
+      FD_ZERO(&rd);
+      FD_SET(STDIN_FILENO, &rd);
+      TickType_t wait = (cliHandle >= 0 || rpcAssembling()) ? pdMS_TO_TICKS(50) : portMAX_DELAY;
+      hwLinuxWait(STDIN_FILENO + 1, &rd, nullptr, nullptr, wait);
+      while (itsPoll(0)) {}
+    } else
+#endif
     while (itsPoll(pdMS_TO_TICKS(50))) {}
 
     /* Poll serial input from the driver rather than fd 0. A console that has
@@ -2602,6 +2702,11 @@ static void serialTaskFn(void* arg) {
     if (consoleOnCdc) { while (consoleCdcRead(&c)) handleChar(c); }
 #if CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG
     else              { while (usb_serial_jtag_read_bytes(&c, 1, 0) == 1) handleChar(c); }
+#elif CONFIG_ESP_CONSOLE_UART
+    /* From the driver, not the VFS: its CR -> LF input translation would rewrite
+     * the bytes of a framed request as well as the Enter it was meant for. */
+    else              { while (uart_read_bytes((uart_port_t)CONFIG_ESP_CONSOLE_UART_NUM,
+                                               &c, 1, 0) == 1) handleChar(c); }
 #else
     else              { while (read(STDIN_FILENO, &c, 1) == 1) handleChar(c); }
 #endif

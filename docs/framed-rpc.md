@@ -58,6 +58,10 @@ against here, only line noise to recover from.
 - **No progress for ~1 s abandons an inbound frame** and resyncs on the magic.
   What that guards against is a corrupted length — a flaky cable — leaving the
   device allocated and waiting for bytes that never arrive.
+- **A command is at most 4096 bytes.** A longer one is not run; the reply is
+  the single line `rpc: command over 4096 bytes`. A payload the device cannot
+  buffer at all (over 8 KB on a board without PSRAM) is swallowed unanswered,
+  as a corrupted length would be.
 - **The exec is bounded** at a few seconds. On the deadline the device drops the
   CLI session and replies with whatever had been printed, rather than wedging
   the relay and the console with it.
@@ -198,6 +202,17 @@ changes: a second ITS client connection to `CLI_PORT_TCP` with
 login=0}`, fed `"<cmd>;\n"` — the trailing `;` being the CLI's "run this and
 close the session" signal — read until the session closes, then framed back out.
 This is what ssh `exec` already does.
+
+The session's input stream (512 bytes) is smaller than the longest command, so
+the line is fed in as the CLI task drains it: each non-blocking `itsSend` takes
+what fits, a one-shot `itsSetFreeNotify` wakes the serial task's `itsPoll` once
+the CLI task has read some, and the output is collected in the same loop. The
+CLI task, for its part, reads a session 128 bytes at a time and does not park
+while any session still has input queued, because ITS notifies once per send,
+not once per byte left unread. The command bound is the CLI's: a LINE-mode
+session accumulates at most `CLI_LINE_MAX` (4096) bytes plus the trailing `;`,
+so the relay refuses anything longer instead of handing over a cut line, which
+would run as a different command and lose the `;` that closes the session.
 
 It runs **synchronously** on the serial task. That is what makes a retry
 arriving mid-exec need no handling: the second frame waits in the driver's
