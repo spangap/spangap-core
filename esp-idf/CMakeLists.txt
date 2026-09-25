@@ -232,6 +232,13 @@ target_link_options(${COMPONENT_LIB} INTERFACE
     "-Wl,--wrap=heap_caps_update_per_task_info_realloc")
 endif()
 
+# hosted.cpp holds nothing but a constructor, which nothing references, so the
+# linker would leave it in the archive; it is asked for by name on the chips
+# whose radio is an ESP-Hosted co-processor.
+if(CONFIG_ESP_HOSTED_SDIO_HOST_INTERFACE)
+    target_link_options(${COMPONENT_LIB} INTERFACE "-Wl,-u,hostedQuietCardDump")
+endif()
+
 # Keep the board straddle's detect_hw() on the link line.
 #
 # spangapInit() calls it through a WEAK declaration, so a build with no board

@@ -59,6 +59,19 @@ foreach(_f "${_SPANGAP_DEFAULTS}" "${_SPANGAP_FRAGMENTS}" "${_CONSUMER_DEFAULTS}
     endif()
 endforeach()
 
+# What the staleness check below hashes: every defaults file, and after each one
+# the `<file>.<target>` twin IDF layers straight after it when it exists
+# (sdkconfig.defaults.spangap.esp32p4). Those twins are read by IDF, not listed
+# in SDKCONFIG_DEFAULTS, so an edit to one moves nothing unless it is named here.
+# The target is the one spangap-inside exports around the build.
+set(_DEFHASH_FILES "")
+foreach(_f IN LISTS SDKCONFIG_DEFAULTS)
+    list(APPEND _DEFHASH_FILES "${_f}")
+    if(DEFINED ENV{IDF_TARGET} AND EXISTS "${_f}.$ENV{IDF_TARGET}")
+        list(APPEND _DEFHASH_FILES "${_f}.$ENV{IDF_TARGET}")
+    endif()
+endforeach()
+
 # ─── 2. sdkconfig.defaults staleness check ───
 # IDF's default behavior: sdkconfig.defaults is one-shot — its values seed
 # sdkconfig once, then sdkconfig is authoritative. Edits to defaults after
@@ -92,7 +105,7 @@ endif()
 if(EXISTS "${_SDKCONFIG}" AND EXISTS "${_DEFHASH_FILE}" AND SDKCONFIG_DEFAULTS)
     # Combined hash of all defaults files in order
     set(_DEF_NOW_HASH "")
-    foreach(_f IN LISTS SDKCONFIG_DEFAULTS)
+    foreach(_f IN LISTS _DEFHASH_FILES)
         if(EXISTS "${_f}")
             file(SHA256 "${_f}" _one_hash)
             string(APPEND _DEF_NOW_HASH "${_one_hash}")
@@ -124,7 +137,7 @@ endif()
 set(_SPANGAP_SDK_REGENERATED ${_SDK_REGENERATED} CACHE INTERNAL "")
 set(_SPANGAP_SDKCONFIG "${_SDKCONFIG}" CACHE INTERNAL "")
 set(_SPANGAP_DEFHASH_FILE "${_DEFHASH_FILE}" CACHE INTERNAL "")
-set(_SPANGAP_SDKCONFIG_DEFAULTS_LIST "${SDKCONFIG_DEFAULTS}" CACHE INTERNAL "")
+set(_SPANGAP_SDKCONFIG_DEFAULTS_LIST "${_DEFHASH_FILES}" CACHE INTERNAL "")
 
 # ─── 3. Generate partitions.csv (provisional / configure-time) ───
 # This is a size-agnostic FLOOR image: the table is sized to the configured

@@ -31,9 +31,33 @@
 #endif
 #include <freertos/FreeRTOS.h>
 #include <freertos/semphr.h>
+#include <soc/soc_caps.h>
 #include <cstdio>
 #include <cstring>
 #include <algorithm>
+
+/* The clock range dynamic frequency scaling moves between, per chip. The S3
+ * runs 240 at the top and keeps 80 at the bottom, where its APB clock stays at
+ * 80 MHz. The P4's CPU clock is a division of a 400 or 360 MHz PLL, depending on
+ * the silicon revision, so its top is whatever IDF was configured to boot at
+ * and its bottom is the crystal. */
+#if CONFIG_IDF_TARGET_ESP32S3
+#define PM_CPU_MAX_MHZ 240
+#define PM_CPU_MIN_MHZ 80
+#else
+#define PM_CPU_MAX_MHZ CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ
+#define PM_CPU_MIN_MHZ CONFIG_XTAL_FREQ
+#endif
+
+/* Automatic light sleep, on a chip whose radio is its own. Where Wi-Fi and
+ * Bluetooth are a co-processor's, reached over SDIO, the co-processor announces
+ * traffic on a line this chip cannot wake on, so a light sleep drops whatever
+ * arrives during it. */
+#if SOC_WIFI_SUPPORTED
+#define PM_LIGHT_SLEEP true
+#else
+#define PM_LIGHT_SLEEP false
+#endif
 
 /* 1 Hz CPU/PM stats sampler. Not started by pmInit and not always-on: the
    sampler task and its history ring exist only while an Activity monitor is
@@ -321,9 +345,11 @@ static void pmDumpLocks() {
 }
 
 void pmInit() {
-  esp_pm_config_t pm = { .max_freq_mhz = 240, .min_freq_mhz = 80, .light_sleep_enable = true };
+  esp_pm_config_t pm = { .max_freq_mhz = PM_CPU_MAX_MHZ, .min_freq_mhz = PM_CPU_MIN_MHZ,
+                         .light_sleep_enable = PM_LIGHT_SLEEP };
   esp_err_t err = esp_pm_configure(&pm);
-  dbg("pm: configured 240/80 MHz + light sleep (%s)\n", esp_err_to_name(err));
+  dbg("pm: configured %d/%d MHz, light sleep %s (%s)\n", PM_CPU_MAX_MHZ, PM_CPU_MIN_MHZ,
+      PM_LIGHT_SLEEP ? "on" : "off", esp_err_to_name(err));
 
   pmLockCreate(PM_NO_LIGHT_SLEEP, "usb", &usbLock);
 #if CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG
@@ -576,10 +602,10 @@ static void pmPrintModeLines(int64_t mode[PM_MODE_COUNT], int64_t deepUs,
   int dsPct     = (int)(deepUs * 100 / wall);
   int sleepPct  = (int)(mode[PM_MODE_LIGHT_SLEEP] * 100 / wall);
   int cpuMaxPct = (int)(mode[PM_MODE_CPU_MAX] * 100 / wall);
-  /* APB_MIN and APB_MAX BOTH run the CPU at the DFS floor (80 MHz); they differ
-   * only in whether the APB bus is pinned high. So "80 MHz" is their sum and
-   * only CPU_MAX is 240 MHz. (The old split folded APB_MAX — CPU 80 — into the
-   * 240 MHz line, so a chip pinned at APB-max by a radio read as "240 MHz".) */
+  /* APB_MIN and APB_MAX BOTH run the CPU at the DFS floor (PM_CPU_MIN_MHZ); they
+   * differ only in whether the APB bus is pinned high. So the floor's line is
+   * their sum and only CPU_MAX is the top — a chip pinned at APB-max by a radio
+   * is still running at the floor. */
   int cpu80Pct  = 100 - dsPct - sleepPct - cpuMaxPct;
   /* Share of wall time the APB bus was pinned high while awake (APB_MAX +
    * CPU_MAX). This — not CPU speed — is what holds off light sleep: a high value
@@ -591,8 +617,8 @@ static void pmPrintModeLines(int64_t mode[PM_MODE_COUNT], int64_t deepUs,
   (void)dsCount;
   // cliPrintf("deep sleep    %d%% (%d)\n", dsPct, (int)dsCount);
   cliPrintf("light sleep   %d%%\n", sleepPct);
-  cliPrintf("CPU  80 MHz   %d%%\n", cpu80Pct);
-  cliPrintf("CPU 240 MHz   %d%%\n", cpuMaxPct);
+  cliPrintf("CPU %3d MHz   %d%%\n", PM_CPU_MIN_MHZ, cpu80Pct);
+  cliPrintf("CPU %3d MHz   %d%%\n", PM_CPU_MAX_MHZ, cpuMaxPct);
   cliPrintf("\nAPB_FREQ_MAX  %d%%  (prevents light sleep)\n", apbHiPct);
 }
 #endif

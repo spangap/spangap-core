@@ -1,0 +1,27 @@
+# spangap-mandated sdkconfig defaults for the ESP32-P4 — layered by IDF
+# directly after sdkconfig.defaults.spangap, on this target only (IDF reads
+# `<defaults>.<target>` beside every defaults file it is given). What is here is
+# the platform's policy restated for a chip whose radio is somebody else's; a
+# board's own facts (which co-processor, which pins, which console) stay in its
+# straddle.yaml `kconfig:`.
+
+# PSRAM: the P4's is in the package and HEX-mode. 200 MHz is the speed every
+# silicon revision runs; 250 MHz exists only from revision 3.0, which is a board
+# fact (the chip it carries), so a board on such a chip raises it itself.
+CONFIG_SPIRAM_SPEED_200M=y
+
+# Wi-Fi runs on the co-processor, and esp_wifi_remote names its copy of each
+# setting WIFI_RMT_*. Those values travel to the co-processor in esp_wifi_init's
+# configuration, so the platform policy of sdkconfig.defaults.spangap is restated
+# here under their names: no Wi-Fi state cached in NVS (net.cpp owns
+# reconnection), and the wider aggregation window.
+CONFIG_WIFI_RMT_NVS_ENABLED=n
+CONFIG_WIFI_RMT_TX_BA_WIN=32
+
+# Bluetooth: there is no controller on this chip, so NimBLE runs as a host only
+# and its HCI travels over the same ESP-Hosted link as Wi-Fi, to the
+# co-processor's controller. NimBLE's own default for a controller-less chip is
+# a dedicated UART to one, which no board here wires.
+CONFIG_BT_NIMBLE_TRANSPORT_UART=n
+CONFIG_ESP_HOSTED_ENABLE_BT_NIMBLE=y
+CONFIG_ESP_HOSTED_NIMBLE_HCI_VHCI=y

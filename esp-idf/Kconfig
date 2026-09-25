@@ -92,6 +92,29 @@ config SPANGAP_SDCARD_PIN_D0
     int "SDMMC D0 pin"
     depends on SPANGAP_SDCARD_BUS_SDMMC
 
+config SPANGAP_SDCARD_SDMMC_SLOT
+    int "SDMMC controller slot"
+    depends on SPANGAP_SDCARD_BUS_SDMMC
+    range 0 1
+    default 1
+    help
+        Which of the controller's two slots the card is on. Slot 1 reaches any
+        pins through the GPIO matrix, which is what every ESP32-S3 board here
+        uses. On the ESP32-P4, slot 0 is the one wired to the dedicated SD pins
+        (GPIO 39-44) through the IO MUX, and slot 1 is often a Wi-Fi
+        co-processor's SDIO link instead — the two share one controller.
+
+config SPANGAP_SDCARD_LDO_CHAN
+    int "On-chip LDO powering the SD pins (-1 = none)"
+    depends on SPANGAP_SDCARD_BUS_SDMMC
+    default -1
+    help
+        Set when the card's pins sit in an IO power domain fed by one of the
+        chip's own LDOs rather than the board's 3.3 V rail — the ESP32-P4's
+        GPIO 39-44 are, on channel 4 — so the SD driver brings that supply up
+        with the card. Nothing on those pins works without it, the card
+        included. -1 on every board whose SD pins are on the ordinary rail.
+
 config SPANGAP_SDCARD_4BIT
     bool "4-bit SDMMC bus (D0..D3 wired)"
     depends on SPANGAP_SDCARD_BUS_SDMMC

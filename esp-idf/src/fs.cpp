@@ -33,6 +33,7 @@
  * is a link the board planted and `state` an ordinary directory, so none of
  * this has a counterpart there. */
 #if !CONFIG_IDF_TARGET_LINUX
+#include "esp_memory_utils.h"   /* esp_ptr_internal */
 #include "esp_littlefs.h"
 #include "spanfs.h"
 #include "esp_ota_ops.h"
@@ -42,6 +43,12 @@
 #include "ff.h"
 #include "sdmmc_cmd.h"
 #include "driver/sdmmc_host.h"
+/* An unset Kconfig int is an undefined macro, which #if reads as 0 — a valid
+ * LDO channel — so the symbol's existence is asked first. */
+#if defined(CONFIG_SPANGAP_SDCARD_LDO_CHAN) && CONFIG_SPANGAP_SDCARD_LDO_CHAN >= 0
+#define FS_SD_LDO 1
+#include "sd_pwr_ctrl_by_on_chip_ldo.h"
+#endif
 #if CONFIG_SPANGAP_SDCARD_BUS_SPI
 #include "driver/sdspi_host.h"
 #include "driver/spi_master.h"
@@ -931,12 +938,35 @@ bool fs_mount_sd(void) {
 
 #if CONFIG_SPANGAP_SDCARD_BUS_SDMMC
     sdmmc_host_t host = SDMMC_HOST_DEFAULT();
+    /* Only the width bits are this board's to choose. The rest of the default
+     * flags stay — DEINIT_ARG above all, which makes a failed mount release its
+     * own slot rather than the whole controller. The controller has two slots,
+     * and on a chip whose Wi-Fi is a co-processor on the other one, releasing
+     * the controller would take the network down with an empty card slot. */
+    host.flags &= ~(SDMMC_HOST_FLAG_1BIT | SDMMC_HOST_FLAG_4BIT | SDMMC_HOST_FLAG_8BIT);
 #if CONFIG_SPANGAP_SDCARD_4BIT
-    host.flags = SDMMC_HOST_FLAG_4BIT;
+    host.flags |= SDMMC_HOST_FLAG_4BIT;
 #else
-    host.flags = SDMMC_HOST_FLAG_1BIT;
+    host.flags |= SDMMC_HOST_FLAG_1BIT;
 #endif
+    host.slot = CONFIG_SPANGAP_SDCARD_SDMMC_SLOT;
     host.max_freq_khz = SDMMC_FREQ_HIGHSPEED;
+#if FS_SD_LDO
+    /* The slot's pins are powered by one of the chip's own LDOs rather than by
+     * the board's 3.3 V rail, and the SD driver switches that supply as part of
+     * bringing the card up. Created once: the handle holds the LDO channel for
+     * the life of the device. */
+    static sd_pwr_ctrl_handle_t s_sdPwr = nullptr;
+    if (!s_sdPwr) {
+        sd_pwr_ctrl_ldo_config_t ldo = {};
+        ldo.ldo_chan_id = CONFIG_SPANGAP_SDCARD_LDO_CHAN;
+        if (sd_pwr_ctrl_new_on_chip_ldo(&ldo, &s_sdPwr) != ESP_OK) {
+            warn("SD: LDO %d for the card's pins would not start", CONFIG_SPANGAP_SDCARD_LDO_CHAN);
+            s_sdPwr = nullptr;
+        }
+    }
+    host.pwr_ctrl_handle = s_sdPwr;
+#endif
 
     sdmmc_slot_config_t slot = SDMMC_SLOT_CONFIG_DEFAULT();
 #if CONFIG_SPANGAP_SDCARD_4BIT

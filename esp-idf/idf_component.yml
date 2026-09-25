@@ -1,9 +1,10 @@
-description: "spangap core: runtime, networking, web/auth/TLS, storage, log/CLI, ITS, WebRTC plumbing for ESP32-S3 device apps."
+description: "spangap core: runtime, networking, web/auth/TLS, storage, log/CLI, ITS, WebRTC plumbing for ESP32-S3 and ESP32-P4 device apps."
 url: https://github.com/spangap/spangap
 version: "0.1.0"
 license: "Apache-2.0"
 targets:
   - esp32s3
+  - esp32p4
   - linux
 dependencies:
   idf:
@@ -27,6 +28,21 @@ dependencies:
     version: "^2.2"
     rules:
       - if: "target != linux"
+  # The ESP32-P4 has no radio. IDF gives it the esp_wifi headers and nothing
+  # behind them; esp_wifi_remote supplies the calls and forwards each one over
+  # ESP-Hosted to the co-processor that does have one. Here rather than in
+  # spangap-net because pm.cpp calls esp_wifi too, and a P4 image without the
+  # network straddle must still link. The two versions are a pair, and they are
+  # the pair the co-processor's own firmware speaks: esp_hosted's host and slave
+  # halves exchange RPCs whose layout moves between releases.
+  espressif/esp_wifi_remote:
+    version: "0.14.5"
+    rules:
+      - if: "target == esp32p4"
+  espressif/esp_hosted:
+    version: "1.4.7"
+    rules:
+      - if: "target == esp32p4"
   # esp_wireguard is vendored under src/esp_wireguard/ for now (waiting on
   # upstream netif->state fix to propagate). When that lands, drop the
   # vendored copy and add: trombik/esp_wireguard: ">=<fixed-version>".

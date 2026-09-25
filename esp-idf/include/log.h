@@ -66,6 +66,12 @@ void logSetGlobal(const char* level);
 /** Set per-tag log level (updates cfg + applies). level="-" means inherit from global. */
 void logSetTag(const char* tag, const char* level);
 
+/** A component's own default level for a tag it knows to be chatty — below the
+ *  global level, above nothing an operator sets: `log <tag> <level>` still wins,
+ *  and `log <tag> -` comes back here rather than to the global level. Callable
+ *  from a constructor, before logging is up; up to 16 tags across the image. */
+void logTagDefault(const char* tag, const char* level);
+
 /** Rewrite one noisy library line, matched by what it starts with. A `prefix`
  *  without a colon is compared against the start of the message body (the text
  *  after the tag), so a few characters settle it and nothing else that tag

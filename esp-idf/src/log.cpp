@@ -15,13 +15,14 @@
 #include <new>
 #include <string>
 #include <esp_timer.h>
-#if CONFIG_SPANGAP_WATCH_ADDR
+#if !CONFIG_IDF_TARGET_LINUX
 #include <esp_cpu.h>
 #include <esp_ipc.h>
 #endif
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <sys/stat.h>
 #include <dirent.h>
@@ -1255,12 +1256,41 @@ static esp_log_level_t parseEspLevel(const char* val) {
   }
 }
 
+/* Components' own per-tag defaults (logTagDefault). IDF forgets every per-tag
+ * level when "*" is set, so these are re-applied each time the global is. Plain
+ * static storage, so a constructor can register before anything is initialised. */
+struct TagDefault { const char* tag; esp_log_level_t level; };
+static TagDefault s_tagDefaults[16];
+static int        s_tagDefaultCount = 0;
+
+static esp_log_level_t tagDefaultLevel(const char* tag, esp_log_level_t global) {
+  for (int i = 0; i < s_tagDefaultCount; i++)
+    if (strcmp(s_tagDefaults[i].tag, tag) == 0) return s_tagDefaults[i].level;
+  return global;
+}
+
+void logTagDefault(const char* tag, const char* level) {
+  if (!tag) return;
+  esp_log_level_t lvl = parseEspLevel(level);
+  int i = 0;
+  while (i < s_tagDefaultCount && strcmp(s_tagDefaults[i].tag, tag) != 0) i++;
+  if (i == s_tagDefaultCount) {
+    if (i >= (int)(sizeof(s_tagDefaults) / sizeof(s_tagDefaults[0]))) return;
+    s_tagDefaults[s_tagDefaultCount++] = { tag, lvl };
+  } else {
+    s_tagDefaults[i].level = lvl;
+  }
+  esp_log_level_set(tag, lvl);
+}
+
 void logApplyLevels() {
   /* Global level from "s.log.level" key */
   char val[16];
   storageGetStr("s.log.level", val, sizeof(val), "info");
   esp_log_level_t global = parseEspLevel(val);
   esp_log_level_set("*", global);
+  for (int i = 0; i < s_tagDefaultCount; i++)
+    esp_log_level_set(s_tagDefaults[i].tag, s_tagDefaults[i].level);
 
   /* Map to our internal level for logIsDebug() etc */
   if (global >= ESP_LOG_DEBUG) currentLogLevel = LOG_DEBUG;
@@ -1271,10 +1301,10 @@ void logApplyLevels() {
   storageForEach("s.log.tag.", [](const char* key, const char* val) {
     const char* tag = key + 10;  /* skip "s.log.tag." */
     if (val[0] == '-') {
-      /* Inherit: re-apply global */
+      /* Inherit: the component's own default for the tag, else the global */
       char gval[16];
       storageGetStr("s.log.level", gval, sizeof(gval), "info");
-      esp_log_level_set(tag, parseEspLevel(gval));
+      esp_log_level_set(tag, tagDefaultLevel(tag, parseEspLevel(gval)));
     } else {
       esp_log_level_set(tag, parseEspLevel(val));
     }
@@ -1482,6 +1512,45 @@ static void cmdLogrotate(const char* a) {
 void logRegisterCmds() {
     cliRegisterCmd("logfile", cmdLogfile);
     cliRegisterCmd("logrotate", cmdLogrotate);
+#if !CONFIG_IDF_TARGET_LINUX
+    /* `watch <addr>` / `watch off` — a hardware STORE watchpoint over the
+     * 16 bytes around <addr>, on both cores, armed at runtime. `peek <addr> [n]`
+     * prints n words from <addr>. Debug tools for memory that changes when it
+     * should not. */
+    cliRegisterCmd("watch", [](const char* a) {
+        if (cliWantsHelp(a)) {
+            cliPrintf("%-*s HW store watchpoint, both cores\n", CLI_HELP_COL, "watch <addr>|off");
+            return;
+        }
+        static uintptr_t s_watch;
+        if (!strcmp(a, "off")) s_watch = 0;
+        else s_watch = (uintptr_t)strtoul(a, nullptr, 16) & ~(uintptr_t)0xF;
+        auto arm = [](void*) {
+            if (s_watch) esp_cpu_set_watchpoint(1, (void*)s_watch, 16, ESP_CPU_WATCHPOINT_STORE);
+            else         esp_cpu_clear_watchpoint(1);
+        };
+        esp_ipc_call_blocking(0, arm, nullptr);
+        esp_ipc_call_blocking(1, arm, nullptr);
+        if (s_watch) cliPrintf("watching 0x%08x..0x%08x\n", (unsigned)s_watch, (unsigned)s_watch + 15);
+        else         cliPrintf("watch off\n");
+    });
+    cliRegisterCmd("peek", [](const char* a) {
+        if (cliWantsHelp(a)) {
+            cliPrintf("%-*s read memory words\n", CLI_HELP_COL, "peek <addr> [words]");
+            return;
+        }
+        char* end = nullptr;
+        uintptr_t p = (uintptr_t)strtoul(a, &end, 16) & ~(uintptr_t)3;
+        int n = end ? atoi(end) : 0;
+        if (n <= 0) n = 4;
+        if (n > 64) n = 64;
+        for (int i = 0; i < n; i++) {
+            if (i % 4 == 0) cliPrintf("%s%08x:", i ? "\n" : "", (unsigned)(p + i * 4));
+            cliPrintf(" %08x", (unsigned)((volatile uint32_t*)p)[i]);
+        }
+        cliPrintf("\n");
+    });
+#endif
     cliRegisterCmd("log", [](const char* a) {
         if (strcmp(a, "help") == 0) { cliPrintf("%-*s show/set log level\n", CLI_HELP_COL, "log [tag] [level]"); return; }
         if (cliWantsHelp(a)) {

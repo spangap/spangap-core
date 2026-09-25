@@ -43,11 +43,11 @@
 #include "esp_err.h"
 #include "esp_system.h"
 #include "soc/soc.h"
-#include "soc/rtc_cntl_reg.h"
 
 /* SPANGAP_CDC_BUILT — "the CDC transport is built" — comes from cli.h, where
  * the serial-port contract it sizes lives. */
 #if SPANGAP_CDC_BUILT
+#include "soc/rtc_cntl_reg.h"
 #include <driver/usb_serial_jtag.h>
 #include "tinyusb.h"
 #include "tusb.h"
@@ -652,6 +652,8 @@ extern "C" void consoleCdcFlush(void) {}
 extern "C" const char* consoleModeName(void) {
 #if CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG
   return "usb-serial-jtag";
+#elif CONFIG_ESP_CONSOLE_UART
+  return "uart";
 #else
   return "n/a";
 #endif
