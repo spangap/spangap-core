@@ -1896,9 +1896,12 @@ extern "C" int hwLinuxWait(int nfds, fd_set* rfds, fd_set* wfds, fd_set* efds,
 #endif
 
 /* Serial ports the hardware presents right now. consoleCdcPortCount() reports 0
- * while the console is not on CDC, which is the one-port USB-Serial-JTAG case. */
+ * while the console is not on CDC, which is the one-port USB-Serial-JTAG case.
+ * Never more than SERIAL_PORT_COUNT: the per-port arrays are sized to it, and
+ * the CDC count is set by TinyUSB's own Kconfig, which nothing ties to it. */
 static int serialPortCount(void) {
     int n = consoleCdcPortCount();
+    if (n > SERIAL_PORT_COUNT) n = SERIAL_PORT_COUNT;
     return n > 0 ? n : 1;
 }
 

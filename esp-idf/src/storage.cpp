@@ -1727,7 +1727,8 @@ static std::string slowOpsReport() {
   std::string out;
   for (int i = 0; i < slowOpCount; i++) {
     char buf[80];
-    snprintf(buf, sizeof(buf), " %s=%ums(%dop)", slowOps[i].key,
+    snprintf(buf, sizeof(buf), " %.*s=%ums(%dop)",
+             (int)sizeof(slowOps[i].key) - 1, slowOps[i].key,
              (unsigned)(slowOps[i].us / 1000), slowOps[i].ops);
     out += buf;
   }

@@ -20,12 +20,17 @@ bool rtcRamValid();
 void rtcRamSetValid();
 
 
-/** strncpy with truncation warning. Always NUL-terminates. */
+/** strncpy with truncation warning. Always NUL-terminates, and zero-fills the
+ *  rest of dst as strncpy does. Written as a copy of the measured length, since
+ *  a bare strncpy bounded at n - 1 is what -Wstringop-truncation flags. */
 static inline char* safeStrncpy(char* dst, const char* src, size_t n) {
-    if (strlen(src) >= n)
+    size_t len = strlen(src);
+    if (len >= n) {
         ESP_LOGE("strncpy", "truncated: '%s' to %u chars", src, (unsigned)(n - 1));
-    strncpy(dst, src, n - 1);
-    dst[n - 1] = '\0';
+        len = n - 1;
+    }
+    memcpy(dst, src, len);
+    memset(dst + len, 0, n - len);
     return dst;
 }
 

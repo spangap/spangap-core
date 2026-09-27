@@ -158,7 +158,7 @@ static void cookieAdd(const char* token, const char* realm, time_t expires) {
     snprintf(key, sizeof(key), "secrets.auth.cookies.%d.realm", count);
     storageSet(key, realm);
     snprintf(key, sizeof(key), "secrets.auth.cookies.%d.expires", count);
-    char expStr[20];
+    char expStr[24];                    /* any long long, sign and NUL included */
     snprintf(expStr, sizeof(expStr), "%lld", (long long)expires);
     storageSet(key, expStr);
     storageEnd();
@@ -473,7 +473,7 @@ std::string authCheck(const char* cookie) {
         storageGetStr(key, stored, sizeof(stored));
         if (strcmp(stored, cookie) != 0) continue;
 
-        char expStr[20];
+        char expStr[24];
         snprintf(key, sizeof(key), "secrets.auth.cookies.%d.expires", i);
         storageGetStr(key, expStr, sizeof(expStr));
         time_t exp = (time_t)strtoll(expStr, nullptr, 10);
