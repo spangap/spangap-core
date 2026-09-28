@@ -24,14 +24,17 @@ enum auth_err_t : int {
 /** Initialise auth: sweep expired cookies. Call once at startup. */
 void authInit();
 
-/** Returns true when secrets.auth.enable == 1. */
+/** Returns true when secrets.auth.enable == 1; always false under
+ *  CONFIG_SPANGAP_AUTH_OPEN. */
 bool authEnabled();
 
-/** True if `realm` exists but has no password set yet (empty hash). */
+/** True if `realm` exists but has no password set yet (empty hash); always
+ *  false under CONFIG_SPANGAP_AUTH_OPEN. */
 bool authRealmUnset(const char* realm);
 
 /** Set or change a realm password.
- *  - Probe unset state: old="" + new="" → AUTH_OK if password is unset.
+ *  - Probe unset state: old="" + new="" → AUTH_OK if password is unset
+ *    (never under CONFIG_SPANGAP_AUTH_OPEN, where none is needed).
  *  - Set initial password: old="" + new=<pw> (realm hash must be "" or "--").
  *  - Change password: old=<current> + new=<new>.
  *  - Cannot set empty password (new="" when hash is set → AUTH_WRONG_PASSWORD).

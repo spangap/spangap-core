@@ -234,6 +234,19 @@ config SPANGAP_I2C_INTERNAL_PULLUP
         marginal rather than total: most transfers land, the occasional one
         does not. Halving the bus clock is the other lever.
 
+config SPANGAP_AUTH_OPEN
+    bool "No credentials: nothing enforced, no password needed"
+    default n
+    help
+        A build with no login at all. Enforcement is off whatever
+        secrets.auth.enable says, and no realm counts as waiting for a
+        password, so nothing that holds until one is set holds, and a UI asking
+        whether the device needs a password is told it does not. Passwords can
+        still be set; they gate nothing.
+
+        Only for a device nobody but its operator can reach, such as a station
+        simulated on a host. Never on hardware.
+
 config SPANGAP_USB_CDC
     bool "USB CDC console transport (TinyUSB) + second serial port"
     depends on ESP_CONSOLE_USB_SERIAL_JTAG

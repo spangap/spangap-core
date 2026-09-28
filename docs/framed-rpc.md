@@ -97,6 +97,11 @@ prints one line the moment the sniffer arms, very early in boot:
 serial: framed rpc v1
 ```
 
+It goes out through the logger, so on the wire it is a log line carrying the
+`serial` tag and the text `framed rpc v1`, with the logger's level letter,
+brackets and colour codes around them (`I [serial] framed rpc v1`). A host
+matches the tag and the text, in either form, rather than the literal line.
+
 A host that sees that line uses frames from then on, at no cost and with no
 guessing. That is the fast path, and for a host that watched the device boot —
 flash, then watch it come up — it is the only path ever taken.

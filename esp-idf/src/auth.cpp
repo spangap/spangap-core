@@ -13,6 +13,7 @@
  * The HTTP /auth/{login,passwd,logout} endpoints live in
  * spangap-web/src/auth_web.cpp on top of this API — see authWebInit.
  */
+#include "sdkconfig.h"
 #include "auth.h"
 #include "storage.h"
 #include "log.h"
@@ -227,6 +228,10 @@ static void authCliCmd(const char* args) {
         for (int i = 0; i < n; i++) {
             char name[32], hash[128];
             if (!realmGet(i, name, sizeof(name), hash, sizeof(hash))) continue;
+#if CONFIG_SPANGAP_AUTH_OPEN
+            cliPrintf("%s=open\n", name);
+            continue;
+#endif
             cliPrintf("%s=%s\n", name, hash[0] == '\0' ? "unset"
                                      : strcmp(hash, "--") == 0 ? "locked"
                                      : "set");
@@ -354,10 +359,18 @@ void authInit() {
 }
 
 bool authEnabled() {
+#if CONFIG_SPANGAP_AUTH_OPEN
+    return false;
+#else
     return storageGetInt("secrets.auth.enable", 0) == 1;
+#endif
 }
 
 bool authRealmUnset(const char* realm) {
+#if CONFIG_SPANGAP_AUTH_OPEN
+    (void)realm;
+    return false;
+#endif
     int idx = realmFind(realm);
     if (idx < 0) return false;
     char key[64], hash[128];
@@ -377,6 +390,11 @@ auth_err_t authPasswd(const char* realm, const char* oldPw, const char* newPw) {
 
     bool unset = (hash[0] == '\0');
     bool locked = (strcmp(hash, "--") == 0);
+
+#if CONFIG_SPANGAP_AUTH_OPEN
+    /* The probe's answer is "no password needed": nothing is enforced. */
+    if (oldPw[0] == '\0' && newPw[0] == '\0') return AUTH_WRONG_PASSWORD;
+#endif
 
     if (unset) {
         if (oldPw[0] != '\0') return AUTH_WRONG_PASSWORD;

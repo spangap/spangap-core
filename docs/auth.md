@@ -35,6 +35,12 @@ spangap-web.
 - **Enforcement** is active when `secrets.auth.enable == 1` (`authEnabled()`).
   The flag is seeded to `1` at init; consumers of this primitive (spangap-web,
   sshd) decide what to do when it is off.
+- **A build with no credentials** (`CONFIG_SPANGAP_AUTH_OPEN`, off by default;
+  for a device nobody but its operator reaches, such as a simulated station)
+  is never enforced, whatever the flag says; `authRealmUnset` is false for
+  every realm, so nothing holds for a password; the probe below answers
+  `AUTH_WRONG_PASSWORD`, so a UI never asks for one; and `auth -O` reports
+  every realm `open`. Passwords can still be set, and gate nothing.
 
 A realm's password hash carries three states: empty string `""` = **unset** (no
 password — login against it always fails), `"--"` = **locked** (administratively

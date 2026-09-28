@@ -31,7 +31,9 @@ so a command is free to leave out what it has no answer for.
 ## The commands
 
     auth -O
-      <realm>=set|unset|locked          one line per realm that exists
+      <realm>=set|unset|locked|open     one line per realm that exists;
+                                        open: a build with no credentials
+                                        (CONFIG_SPANGAP_AUTH_OPEN)
 
     net -O
       state=ap|sta|connecting|down
