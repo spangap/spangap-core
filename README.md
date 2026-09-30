@@ -10,7 +10,7 @@ every other firmware straddle depends on it and assumes it is there.
 It also builds for ESP-IDF's Linux host target, where host-only code lives in
 [`esp-idf/src/host/`](esp-idf/src/host/) and chip-only code drops out. That is
 there for the simulated testbed, not for running spangap on a Linux machine —
-see `SIMesh/`.
+see `sim-mesh/`.
 
 This is a multi-function straddle: each function has its own operator guide under
 [`docs/`](docs/), with a companion `-internals.md` maintainer reference. Start
