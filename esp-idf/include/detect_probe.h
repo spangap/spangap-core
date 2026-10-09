@@ -486,7 +486,7 @@ static inline bool detect_busy_low(int busy)
 }
 
 /** Which LoRa modem is on this header, as a short slug ("sx1262", "sx1276",
- *  "sx1280", "lr1121", "lr2021"), or NULL if none answers. Fills `slug` (>= 8 bytes) when
+ *  "sx1280", "lr1110"/"lr1120"/"lr1121", "lr2021"), or NULL if none answers. Fills `slug` (>= 8 bytes) when
  *  given. Order is most-specific first: SX127x has a real version register,
  *  the rest are identified by a command exchange over BUSY. */
 static inline const char* detect_radio(int sck, int mosi, int miso, int cs,
@@ -508,15 +508,20 @@ static inline const char* detect_radio(int sck, int mosi, int miso, int cs,
         }
     }
 
-    /* LR11xx — GetVersion (0x01 0x01); reply device byte 0xDF/0xDA/0xDB. */
+    /* LR11xx — GetVersion (0x01 0x01); reply device byte 0x01/0x02/0x03 =
+     * LR1110/LR1120/LR1121. An LR2021 answers the same opcode with two status
+     * bytes and then its firmware version, so its byte 2 is a firmware major
+     * (0x01 on the W12) — the LR11xx's own firmware major, a single digit,
+     * is what keeps the W12's 0x18 minor from reading as an LR1110. */
     if (!found && busy >= 0 && detect_busy_low(busy)) {
         uint8_t cmd[2] = { 0x01, 0x01 };
         detect_spi_xfer(h, cmd, NULL, 2);
         detect_busy_low(busy);
         uint8_t rtx[5] = {0}, rrx[5] = {0};   /* stat, hw, device, fw_maj, fw_min */
-        if (detect_spi_xfer(h, rtx, rrx, 5)) {
-            uint8_t dev = rrx[2];
-            if (dev == 0xDF || dev == 0xDA || dev == 0xDB) found = "lr1121";
+        if (detect_spi_xfer(h, rtx, rrx, 5) && rrx[3] >= 0x01 && rrx[3] <= 0x0F) {
+            if      (rrx[2] == 0x01) found = "lr1110";
+            else if (rrx[2] == 0x02) found = "lr1120";
+            else if (rrx[2] == 0x03) found = "lr1121";
         }
     }
 
