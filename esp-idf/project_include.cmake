@@ -156,9 +156,9 @@ endfunction()
 # spangap_browser_build(<web_dir>)
 #
 # Adds a custom target that runs `<web_dir>/deploy.sh ${CMAKE_BINARY_DIR}/web`
-# on every build, so the consumer's SPA is rebuilt — into this build dir's
-# web/dist, laid out as /fixed files in web/data — before the factory image is
-# assembled.
+# on every build, by way of scripts/browser-build.sh, so the consumer's SPA is
+# rebuilt — into this build dir's web/dist, laid out as /fixed files in
+# web/data — before the factory image is assembled.
 # Also tied to the `flash` target so `idf.py flash` (without a prior `build`)
 # still picks up SPA changes.
 #
@@ -167,8 +167,10 @@ endfunction()
 # spangap_create_factory_image() lives here, so the build helper that
 # precedes it does too.
 function(spangap_browser_build web_dir)
+    idf_component_get_property(_spangap_core_dir spangap-core COMPONENT_DIR)
     add_custom_target(spangap_browser_build_target ALL
-        COMMAND bash ${web_dir}/deploy.sh "${CMAKE_BINARY_DIR}/web"
+        COMMAND bash "${_spangap_core_dir}/scripts/browser-build.sh" ${web_dir}
+            "${CMAKE_BINARY_DIR}/web-src" "${CMAKE_BINARY_DIR}/web"
         WORKING_DIRECTORY ${web_dir}
         COMMENT "Building web interface in ${web_dir}"
         VERBATIM)
