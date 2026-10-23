@@ -2023,10 +2023,14 @@ static void serialTaskFn(void* arg) {
    * address → InstructionFetchError (deterministic, reproduced via `cat` of a state file).
    * Buffers are tiny (USJ_TX_RING TX + 256 B RX), so internal cost is ~1 KB.
    * extmem_enable sets the runtime alwaysinternal threshold; restore it after. */
+#if CONFIG_SPIRAM
   heap_caps_malloc_extmem_enable(32 * 1024);
+#endif
   usb_serial_jtag_driver_install(&cfg);
   usb_serial_jtag_vfs_use_driver();
+#if CONFIG_SPIRAM
   heap_caps_malloc_extmem_enable(CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL);
+#endif
 #elif CONFIG_ESP_CONSOLE_UART
   /* A console on a UART — a board whose USB port is a USB-to-UART bridge — needs
    * the driver for the same reason as above, and for one more: without it the
@@ -2036,11 +2040,15 @@ static void serialTaskFn(void* arg) {
    * lose its middle. The driver's ISR drains the FIFO into a ring as bytes land.
    * Its TX ring is what keeps a log burst from stalling the writer on the wire.
    * Both rings internal, for the reason the USB-Serial-JTAG block gives. */
+#if CONFIG_SPIRAM
   heap_caps_malloc_extmem_enable(32 * 1024);
+#endif
   if (uart_driver_install((uart_port_t)CONFIG_ESP_CONSOLE_UART_NUM, 2048, 2048, 0,
                           nullptr, 0) == ESP_OK)
     uart_vfs_dev_use_driver(CONFIG_ESP_CONSOLE_UART_NUM);
+#if CONFIG_SPIRAM
   heap_caps_malloc_extmem_enable(CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL);
+#endif
 #endif
 
   /* Set stdin non-blocking */
