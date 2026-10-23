@@ -67,7 +67,8 @@ set(_REQ
     esp_partition
     lwip
     mbedtls
-    bootloader_support)   # bootloader_random_enable() for random.cpp's seed window
+    bootloader_support    # bootloader_random_enable() for random.cpp's seed window
+    efuse)                # detect_probe.h's embedded-PSRAM size, for board detect_hw()s
 
 # On the host only the components that actually register there. `driver` and
 # `esp_timer` are the board straddle's own; the radio, power, USB, SD and

@@ -39,6 +39,7 @@
 #include <stdint.h>
 #include <string.h>
 
+#include "sdkconfig.h"
 #include "driver/gpio.h"
 #include "driver/i2c_master.h"
 #include "driver/ledc.h"
@@ -46,6 +47,10 @@
 #include "driver/uart.h"
 #include "esp_flash.h"
 #include "esp_log.h"
+#if CONFIG_IDF_TARGET_ESP32S3
+#include "esp_efuse.h"
+#include "esp_efuse_table.h"
+#endif
 #include "esp_rom_sys.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -114,11 +119,8 @@ const char* detect_hw(void);
 /* ── flash size ──────────────────────────────────────────────────────────────
  * Physical flash size (SFDP) is board-specific and readable without touching a
  * single pin, so it is the cheapest way for a probe to rule its board out
- * (16 MB → tdeck/heltec, 8 MB → xiao, 4 MB → t3s3/nibble). PSRAM size would
- * split the 16 MB pair further, but a RAM-loaded detector cannot init PSRAM
- * (octal vs quad is build-fixed), so the peripheral anchor settles same-flash
- * boards instead. A read error fails open — an unreadable size rules nothing
- * out. */
+ * (16 MB → tdeck/heltec/w12/tap-v2, 8 MB → xiao, 4 MB → t3s3/nibble). A read
+ * error fails open — an unreadable size rules nothing out. */
 static inline bool detect_flash_mb(int mb)
 {
     uint32_t bytes = 0;
@@ -130,6 +132,34 @@ static inline bool detect_flash_mb(int mb)
     detect_dbg("flash %u MB, want %d MB: %s",
                (unsigned)(bytes / (1024u * 1024u)), mb, ok ? "yes" : "no");
     return ok;
+}
+
+/* ── embedded PSRAM size ─────────────────────────────────────────────────────
+ * An ESP32-S3 with in-package PSRAM records its size in the eFuses, readable
+ * without initialising the PSRAM — which a RAM-loaded detector cannot do, since
+ * octal vs quad is fixed at build time — and without touching a pin. It splits
+ * boards that differ only by module: the Heltec V4 ships on the S3R2 (2 MB,
+ * quad) and the S3R8 (8 MB, octal). Asking first matters there, because the
+ * octal part claims GPIO 33-37 and the R2's Vext gate is GPIO 36. Only the size
+ * of IN-PACKAGE PSRAM is fused: a board with a separate PSRAM chip reads 0. On
+ * any other target, or on an unreadable field, it fails open. */
+static inline bool detect_psram_mb(int mb)
+{
+#if CONFIG_IDF_TARGET_ESP32S3
+    uint8_t cap = 0;
+    if (esp_efuse_read_field_blob(ESP_EFUSE_PSRAM_CAP, &cap, 3) != ESP_OK) {
+        detect_dbg("PSRAM size unreadable — not ruling out %d MB", mb);
+        return true;
+    }
+    static const int8_t kCapMb[8] = { 0, 8, 2, 16, 4, -1, -1, -1 };
+    int have = kCapMb[cap & 7];
+    bool ok = have == mb;
+    detect_dbg("embedded PSRAM %d MB, want %d MB: %s", have, mb, ok ? "yes" : "no");
+    return ok;
+#else
+    (void)mb;
+    return true;
+#endif
 }
 
 /* ── I2C ─────────────────────────────────────────────────────────────────────
