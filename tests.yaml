@@ -1,0 +1,7 @@
+tests:
+  - id: spanfs-host
+    type: host
+    tier: smoke
+    run: cd esp-idf/components/spanfs/test && bash run_host_tests.sh
+    tools: [cc, python3]
+    paths: [esp-idf/components/spanfs/**]
