@@ -390,6 +390,12 @@ void publishFlashGeometry() {
      * asking it needs to know before it asks. */
     storageSet("sys.state.on_sd", fsStateOnSd() ? 1 : 0);
     storageSet("sys.sd.present",  sdAvailable() ? 1 : 0);
+    /* Reformats after a failed mount, counted in NVS: the one record of a
+     * store that was lost rather than never had. */
+    uint32_t wipes = 0, wipeErr = 0;
+    fsStateWipes(&wipes, &wipeErr);
+    storageSet("sys.state.wipes", (int)wipes);
+    storageSet("sys.state.wipe_err", wipes ? esp_err_to_name((esp_err_t)wipeErr) : "");
     storageEnd();
 }
 

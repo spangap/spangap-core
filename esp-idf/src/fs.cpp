@@ -1389,6 +1389,18 @@ void fsFlashGeometry(uint32_t* size, uint32_t* floor,
     if (stateSize)  *stateSize  = flashStateSize;
 }
 
+void fsStateWipes(uint32_t* count, uint32_t* lastErr) {
+    uint32_t n = 0, e = 0;
+    nvs_handle_t h;
+    if (nvs_open("spangap", NVS_READONLY, &h) == ESP_OK) {
+        nvs_get_u32(h, "state_wipes", &n);
+        nvs_get_u32(h, "state_wipe_err", &e);
+        nvs_close(h);
+    }
+    if (count)   *count = n;
+    if (lastErr) *lastErr = e;
+}
+
 void fsFactoryWipeExtent(uint32_t* start, uint32_t* size) {
     uint32_t s = 0, n = 0;
     if (flashStatePinned) {

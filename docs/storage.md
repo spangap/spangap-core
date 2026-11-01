@@ -159,6 +159,7 @@ modules subscribe to react to them.
 | `sys.flash.size` | `publishFlashGeometry` | Real chip size in bytes (SFDP). Equals `floor` when SFDP failed — not a confident chip size, so read it together with `state_size`. |
 | `sys.flash.floor` | `publishFlashGeometry` | Top of the on-flash partition table: the minimum chip size this image needs. |
 | `sys.flash.state_start` / `.state_size` | `publishFlashGeometry` | Where `/state` begins (the floor, 4K-aligned) and how big it is. `state_size` is `0` when no `/state` could be registered. |
+| `sys.state.wipes` / `.wipe_err` | `publishFlashGeometry` | How many times the flash state store has been reformatted because it would not mount, and the mount error of the last time (`""` when never). Read from NVS, which neither a reformat nor a flash touches — the one record that tells a node that lost its store from one that never had one. |
 | `sys.going_down` | `pm.cpp` | Set to `1` ahead of sleep/shutdown so subscribers can flush. |
 | `sys.human_detected` / `.human_last_s` | `humanDetected()` | A person is at the controls: sticky `1` for the boot, plus the uptime seconds of the latest interaction. Also written by the browser on first interaction in the tab. See [init](init.md). |
 | `sys.usb.serial_ports` | `usb_ports.cpp` | How many serial ports the console presents right now — `1` on USB-Serial-JTAG, `2` on `usb cdc`. A serial-port claimant subscribes to re-apply a port-1 claim across a transport switch ([usb-console](usb-console.md)). |

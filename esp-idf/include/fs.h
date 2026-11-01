@@ -83,6 +83,12 @@ bool fs_first_boot();
 void fsFlashGeometry(uint32_t* size, uint32_t* floor,
                      uint32_t* stateStart, uint32_t* stateSize);
 
+/** How many times the flash state store has been reformatted because it would
+ *  not mount, and the mount error of the last time (0 = never). Kept in NVS,
+ *  which neither the reformat nor a flash touches, so a node that came up
+ *  empty that way can be told apart from one that is genuinely new. */
+void fsStateWipes(uint32_t* count, uint32_t* lastErr);
+
 /** Copy factory defaults from /fixed/factory_state/ to the active state
  *  store (fsStateDir()). */
 void fs_factory_reset();
