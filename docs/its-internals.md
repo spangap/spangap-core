@@ -155,6 +155,12 @@ still bind, so don't reintroduce them casually:
 
 ### Task death and the append-only task table
 
+A slot is claimed only once its inbox queue (control block in internal RAM) and
+pickup semaphore exist; if either allocation fails the task stays unregistered
+and its ITS calls fail as they would for any unknown task, rather than hand
+FreeRTOS a null queue. Likewise `itsClientInit` marks a task a client only once
+its ack semaphore exists.
+
 `s_tasks` is append-only: `taskFindOrCreate` adds a permanent slot the first time
 a task touches ITS — including a transient task that registers only to use the
 connectionless fs/storage pickup proxy (`pickupArm`) and then dies. The slot is

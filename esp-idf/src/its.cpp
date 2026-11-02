@@ -699,13 +699,6 @@ static its_task_t* taskFindOrCreate(TaskHandle_t task, size_t inboxMaxMsgLen, si
         return nullptr;
     }
 
-    e = &s_tasks[s_taskCount++];
-    memset(e, 0, sizeof(*e));
-    e->task = task;
-    e->ackHandle = -1;
-    e->pickupSem = xSemaphoreCreateBinary();
-    pendingPayOf(e).store(0, std::memory_order_relaxed);
-
     /* inboxMaxMsgLen is now a per-task PAYLOAD size guard, floored at
      * ITS_MAX_MSG_DATA so small-guard tasks never regress below today's cap
      * (320). 0 = the Kconfig default. The queue item is always one pointer. */
@@ -713,8 +706,6 @@ static its_task_t* taskFindOrCreate(TaskHandle_t task, size_t inboxMaxMsgLen, si
                                       : (size_t)CONFIG_SPANGAP_ITS_INBOX_MSG_MAX;
     if (guard < ITS_MAX_MSG_DATA) guard = ITS_MAX_MSG_DATA;
     int depth = inboxDepth > 0 ? (int)inboxDepth : CONFIG_SPANGAP_ITS_INBOX_DEPTH;
-    e->inboxMsgMax = guard;
-    e->inboxDepth = depth;
     /* Internal RAM, NOT PSRAM: a FreeRTOS queue's control block embeds an SMP
      * spinlock taken by taskENTER_CRITICAL inside xQueueSend/xQueueReceive. Two
      * reasons that spinlock can't sit in PSRAM, even though ITS is task-context
@@ -736,14 +727,37 @@ static its_task_t* taskFindOrCreate(TaskHandle_t task, size_t inboxMaxMsgLen, si
                                                     MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
     auto* qStore = (uint8_t*)heap_caps_malloc((size_t)depth * sizeof(its_msg*),
                                               MALLOC_CAP_SPIRAM);
-    e->inbox = (qCtrl && qStore)
-               ? xQueueCreateStatic(depth, sizeof(its_msg*), qStore, qCtrl)
-               : nullptr;
-    if (!e->inbox) {
+    QueueHandle_t inbox = (qCtrl && qStore)
+                          ? xQueueCreateStatic(depth, sizeof(its_msg*), qStore, qCtrl)
+                          : nullptr;
+    SemaphoreHandle_t pickup = inbox ? xSemaphoreCreateBinary() : nullptr;
+    /* Everything is allocated before the slot is claimed: a task ITS could not
+     * give an inbox and pickup semaphore stays unregistered, so every ITS call
+     * it makes fails cleanly instead of handing FreeRTOS a null queue. */
+    if (!pickup) {
         heap_caps_free(qCtrl);
         heap_caps_free(qStore);
-        ITS_LOGE("inbox alloc failed for [%s] (depth %d)", pcTaskGetName(task), depth);
+        /* Every ITS call the task makes tries again; say so once per task. */
+        static TaskHandle_t s_told[ITS_MAX_TASKS];
+        bool told = false;
+        for (auto t : s_told) if (t == task) { told = true; break; }
+        if (!told) {
+            for (auto& t : s_told) if (!t) { t = task; break; }
+            ITS_LOGE("inbox alloc failed for [%s] (depth %d) — task left out of ITS",
+                     pcTaskGetName(task), depth);
+        }
+        return nullptr;
     }
+
+    e = &s_tasks[s_taskCount++];
+    memset(e, 0, sizeof(*e));
+    e->task = task;
+    e->ackHandle = -1;
+    e->pickupSem = pickup;
+    e->inbox = inbox;
+    e->inboxMsgMax = guard;
+    e->inboxDepth = depth;
+    pendingPayOf(e).store(0, std::memory_order_relaxed);
     return e;
 }
 
@@ -1674,9 +1688,16 @@ void itsClientInit(int maxConns,
     its_task_t* entry = taskFindOrCreate(me, inboxMaxMsgLen, inboxDepth);
     if (!entry || entry->isClient) return;
 
+    /* No ack semaphore, no client: itsConnect then refuses this task instead
+     * of taking a null semaphore. */
+    entry->ackSem = xSemaphoreCreateBinary();
+    if (!entry->ackSem) {
+        ITS_LOGE("ack semaphore alloc failed for [%s] — not a client",
+                 pcTaskGetName(me));
+        return;
+    }
     entry->maxConns = maxConns;
     entry->isClient = true;
-    entry->ackSem = xSemaphoreCreateBinary();
     entry->ackHandle = -1;
 }
 
