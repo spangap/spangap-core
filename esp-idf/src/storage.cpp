@@ -1511,22 +1511,25 @@ static void sdbForEachInstance(sdb_store* st, const std::string& fullPrefix,
   (void)cb;
 }
 
-/* Returns true if the prefix was handled by a store (values collected into
- * `out` as alternating key,val). Caller holds CFG_LOCK. */
-static bool sdbForEachUnderLocked(const char* prefix, std::vector<std::string>& out) {
-  if (g_sdbRegs.empty()) return false;
+/* One instance a store prefix spans: its key in sdb_reg::insts and its dot-path. */
+struct sdb_inst_ref { std::string ik; std::string prefix; };
+
+/* The store a prefix routes to, and every instance under it (created if absent,
+ * not loaded), or nullptr if no store handles the prefix. Caller holds CFG_LOCK. */
+static sdb_reg* sdbInstancesUnderLocked(const char* prefix, std::vector<sdb_inst_ref>& out) {
+  if (g_sdbRegs.empty()) return nullptr;
   std::vector<std::string> pre = splitDots(prefix);
   for (auto* r : g_sdbRegs) {
     /* Case A: prefix is at/below a full instance (>= patLen segments). */
     if (pre.size() >= r->patLen) {
       sdb_match m;
       if (!sdbRoute(prefix, m) || m.reg != r) continue;
-      sdb_store* st = sdbResolveLoaded(m);
+      sdbInstance(r, m.binds);
       /* the instance's full dot-prefix is the first patLen key segments */
       std::string instPrefix;
       for (size_t i = 0; i < r->patLen; i++) { if (i) instPrefix += '.'; instPrefix += pre[i]; }
-      sdbForEachInstance(st, instPrefix, nullptr, out);
-      return true;
+      out.push_back({ joinBinds(m.binds), instPrefix });
+      return r;
     }
     /* Case B: prefix matches a leading portion, last wildcard unbound —
      * enumerate every instance (disk + resident) consistent with the binds. */
@@ -1572,15 +1575,28 @@ static bool sdbForEachUnderLocked(const char* prefix, std::vector<std::string>& 
       }
       for (const std::string& stem : stems) {
         std::vector<std::string> ib = binds; ib.push_back(stem);
-        sdb_store* st = sdbInstance(r, ib);
-        if (!st->loaded) sdbLoad(st);
+        sdbInstance(r, ib);
         std::string instPrefix(prefix); instPrefix += '.'; instPrefix += stem;
-        sdbForEachInstance(st, instPrefix, nullptr, out);
+        out.push_back({ joinBinds(ib), instPrefix });
       }
-      return true;
+      return r;
     }
   }
-  return false;
+  return nullptr;
+}
+
+/* Returns true if the prefix was handled by a store (values collected into
+ * `out` as alternating key,val). Caller holds CFG_LOCK. */
+static bool sdbForEachUnderLocked(const char* prefix, std::vector<std::string>& out) {
+  std::vector<sdb_inst_ref> insts;
+  sdb_reg* r = sdbInstancesUnderLocked(prefix, insts);
+  if (!r) return false;
+  for (auto& i : insts) {
+    sdb_store* st = r->insts[i.ik];
+    if (!st->loaded) sdbLoad(st);
+    sdbForEachInstance(st, i.prefix, nullptr, out);
+  }
+  return true;
 }
 
 /* ---- write side (runs in the actor's pass 2, under CFG_LOCK) ----
@@ -3386,7 +3402,7 @@ static void dcQueueClear(const char* prefix) {
 }
 
 /* Queue a full reload of `prefix`: one message clearing the subtree, then its
- * entire current contents packed into DC_DUMP_MAX chunks.
+ * current contents packed into DC_DUMP_MAX chunks.
  *
  * This is a resync, not an optimisation — a snapshot is never fewer bytes than a
  * patch carrying only what changed, so it belongs where the delta stream has
@@ -3401,53 +3417,107 @@ static void dcQueueClear(const char* prefix) {
  *
  * Chunks ride dcDumpQueue, so they stream paced to buffer space and patches are
  * held behind them (dcDumpInProgress) — the snapshot can never be overtaken by
- * an older leaf write. Runs on the storage task. */
+ * an older leaf write.
+ *
+ * A store can be far bigger than the heap can hold twice over (a busy mesh fills
+ * the announce catalogue to its cap), so a reload is never materialized: it is a
+ * cursor into the store (sdbWalk), and dcReloadStep packs one chunk from it only
+ * once the previous chunk has gone out. Queued reloads run one at a time, in
+ * order. Runs on the storage task. */
+struct dc_reload_t {
+    std::string               prefix;
+    sdb_reg*                  reg = nullptr;
+    std::vector<sdb_inst_ref> insts;
+    size_t                    next = 0;        /* insts[next] is being walked */
+    bool                      begun = false;   /* clear sent */
+    bool                      walking = false; /* insts[next]'s walk started */
+    size_t                    leaves = 0, chunks = 0;
+};
+static std::deque<dc_reload_t> dcReloads;
+
 static void dcQueueReload(const char* prefix) {
-    std::vector<std::string> kv;
+    for (auto& rl : dcReloads)
+        if (rl.prefix == prefix) return;
+    dc_reload_t rl;
+    rl.prefix = prefix;
     CFG_LOCK();
-    bool routed = sdbForEachUnderLocked(prefix, kv);
+    rl.reg = sdbInstancesUnderLocked(prefix, rl.insts);
     CFG_UNLOCK();
-    if (!routed) return;
+    if (!rl.reg) return;
+    dcReloads.push_back(std::move(rl));
+}
 
-    /* Everything pending under the prefix is superseded by the snapshot. */
-    size_t plen = strlen(prefix);
-    for (auto it = dcDirtyKeys.begin(); it != dcDirtyKeys.end(); ) {
-        bool under = it->size() >= plen && it->compare(0, plen, prefix) == 0 &&
-                     (it->size() == plen || (*it)[plen] == '.');
-        it = under ? dcDirtyKeys.erase(it) : std::next(it);
-    }
+/* Drop a queued or running reload of exactly `prefix`. */
+static void dcReloadCancel(const char* prefix) {
+    for (auto it = dcReloads.begin(); it != dcReloads.end(); ++it)
+        if (it->prefix == prefix) { dcReloads.erase(it); return; }
+}
 
-    dcQueueClear(prefix);
+struct dc_pack_t { cJSON* batch; const std::string* pre; size_t est; size_t leaves; };
 
+static bool dcPackLeaf(const char* rec, const char* field, const char* val, void* vp) {
+    auto* c = (dc_pack_t*)vp;
+    std::string k = *c->pre + "." + rec + "." + field;
     char leaf[96];
-    /* Pack into chunks the pump can actually send. Records arrive in arena
-     * order, so a chunk's objects stay shallow and navigateOrCreate's scans stay
-     * short — the batch is reset every DC_DUMP_MAX bytes. The budget is an
-     * over-estimate (it counts each full path, while the tree shares prefixes),
-     * which only makes chunks smaller than the cap. */
-    cJSON* batch = cJSON_CreateObject();
-    size_t est = 0;
-    size_t chunks = 0;
-    auto emit = [&]() {
-        if (!batch || !batch->child) return;
-        char* t = cJSON_PrintUnformatted(batch);
-        if (t) { dcDumpQueue.emplace_back(t); cJSON_free(t); chunks++; }
-        cJSON_Delete(batch);
-        batch = cJSON_CreateObject();
-        est = 0;
-    };
-    for (size_t i = 0; i + 1 < kv.size() && batch; i += 2) {
-        cJSON* p = navigateOrCreate(batch, kv[i].c_str(), leaf, sizeof(leaf));
-        if (!p) continue;
+    cJSON* p = navigateOrCreate(c->batch, k.c_str(), leaf, sizeof(leaf));
+    if (p) {
         cJSON_DeleteItemFromObject(p, leaf);
-        cJSON_AddStringToObject(p, leaf, kv[i + 1].c_str());
-        est += kv[i].size() + kv[i + 1].size() + 8;
-        if (est >= DC_DUMP_MAX) emit();
+        cJSON_AddStringToObject(p, leaf, val);
+        c->leaves++;
     }
-    emit();
-    cJSON_Delete(batch);
-    verb("storage: reload %s (%u leaves, %u chunks)\n",
-         prefix, (unsigned)(kv.size() / 2), (unsigned)chunks);
+    c->est += k.size() + strlen(val) + 8;
+    return c->est < DC_DUMP_MAX;
+}
+
+/* Advance the front reload by one chunk into dcDumpQueue. Returns false when
+ * there was nothing left to pack. Records arrive in arena order, so a chunk's
+ * objects stay shallow and navigateOrCreate's scans stay short. The budget is an
+ * over-estimate (it counts each full path, while the tree shares prefixes),
+ * which only makes chunks smaller than the cap. */
+static bool dcReloadStep() {
+    while (!dcReloads.empty()) {
+        dc_reload_t& rl = dcReloads.front();
+        if (!rl.begun) {
+            /* Everything pending under the prefix is superseded by the snapshot. */
+            size_t plen = rl.prefix.size();
+            for (auto it = dcDirtyKeys.begin(); it != dcDirtyKeys.end(); ) {
+                bool under = it->size() >= plen && it->compare(0, plen, rl.prefix) == 0 &&
+                             (it->size() == plen || (*it)[plen] == '.');
+                it = under ? dcDirtyKeys.erase(it) : std::next(it);
+            }
+            dcQueueClear(rl.prefix.c_str());
+            rl.begun = true;
+        }
+        if (rl.next >= rl.insts.size()) {
+            verb("storage: reload %s (%u leaves, %u chunks)\n",
+                 rl.prefix.c_str(), (unsigned)rl.leaves, (unsigned)rl.chunks);
+            dcReloads.pop_front();
+            continue;
+        }
+        dc_pack_t pk{ cJSON_CreateObject(), &rl.insts[rl.next].prefix, 0, 0 };
+        if (!pk.batch) return false;
+        bool done = true;
+        CFG_LOCK();
+        auto it = rl.reg->insts.find(rl.insts[rl.next].ik);
+        if (it != rl.reg->insts.end()) {           /* else dropped since queued */
+            sdb_store* st = it->second;
+            if (!st->loaded) sdbLoad(st);
+            /* A store evicted or replaced mid-walk has lost its cursor: start it over. */
+            if (!rl.walking || !st->walk_off) { sdbWalkStart(st); rl.walking = true; }
+            done = sdbWalk(st, dcPackLeaf, &pk);
+        }
+        CFG_UNLOCK();
+        if (done) { rl.next++; rl.walking = false; }
+        rl.leaves += pk.leaves;
+        bool packed = false;
+        if (pk.batch->child) {
+            char* t = cJSON_PrintUnformatted(pk.batch);
+            if (t) { dcDumpQueue.emplace_back(t); cJSON_free(t); rl.chunks++; packed = true; }
+        }
+        cJSON_Delete(pk.batch);
+        if (packed) return true;
+    }
+    return false;
 }
 
 /* Queue a reload of every store subtree the client mirrors: each resident
@@ -3492,6 +3562,7 @@ static void dcOpenAdd(const char* prefix) {
         if (*it == prefix) { dcOpenPrefixes.erase(it); break; }
     dcOpenPrefixes.insert(dcOpenPrefixes.begin(), prefix);
     while (dcOpenPrefixes.size() > DC_OPEN_MAX) {
+        dcReloadCancel(dcOpenPrefixes.back().c_str());
         dcQueueClear(dcOpenPrefixes.back().c_str());
         dcOpenPrefixes.pop_back();
     }
@@ -3635,7 +3706,7 @@ static void dcFlushPatch() {
  *  drains (see the task loop) so a post-snapshot change can't be overwritten by
  *  an older dump chunk that lands after it. */
 static bool dcDumpInProgress() {
-    return dcDumpPending || dcDumpPos < dcDumpQueue.size();
+    return dcDumpPending || dcDumpPos < dcDumpQueue.size() || !dcReloads.empty();
 }
 
 /** Stream the pre-built dump from the task loop, paced to buffer space. Builds
@@ -3678,6 +3749,14 @@ static void dcPumpDump() {
         s_dumpStaging.clear();
         s_dumpStaging.shrink_to_fit();
         s_dumpBuilding.store(false, std::memory_order_release);
+    }
+
+    /* The next reload chunk is packed only once everything before it has gone,
+     * so a reload holds one chunk of RAM however big its store is. */
+    if (dcDumpPos >= dcDumpQueue.size()) {
+        dcDumpQueue.clear();
+        dcDumpPos = 0;
+        dcReloadStep();
     }
 
     size_t cap = itsSendBufSize(dcHandle);
@@ -3801,6 +3880,7 @@ static void storageItsDisconnect(int ref) {
     dcDumpQueue.clear();
     dcDumpQueue.shrink_to_fit();
     dcDumpPos = 0;
+    dcReloads.clear();
     dcDirtyKeys.clear();
     dcDirtyKeys.rehash(0);   /* return the backlog's RAM, not just its contents */
     dcMirrorLost = false;

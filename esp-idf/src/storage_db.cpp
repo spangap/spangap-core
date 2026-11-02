@@ -395,7 +395,9 @@ static void sdbCompactInPlace(sdb_store* s) {
   size_t off = SDB_FILE_HDR;  /* source (read) cursor */
   size_t sc = 0;              /* live bytes currently buffered in sdbScratch */
   uint32_t kept = 0;
+  size_t walk = s->walk_off;  /* re-pointed at the first live record at/after it */
   while (off < s->used) {
+    if (off == s->walk_off) walk = w + sc;
     uint32_t rlen = rdU32(s->block + off + SDB_REC_LEN_OFF);
     if (rlen < hs || off + rlen > s->used) break;
     if (!(s->block[off + SDB_FLAGS_OFF] & SDB_FLAG_DELETED)) {
@@ -414,6 +416,8 @@ static void sdbCompactInPlace(sdb_store* s) {
     off += rlen;
   }
   if (sc) { memcpy(s->block + w, sdbScratch, sc); w += sc; }
+  if (s->walk_off && (s->walk_off >= s->used || walk > w)) walk = w;
+  s->walk_off = walk;
   s->used = w;
   writeFileHeader(s, kept);
 }
@@ -447,7 +451,9 @@ static bool reclaimForAppend(sdb_store* s, size_t recSize) {
       memcpy(nb, s->block, SDB_FILE_HDR);
       size_t w = SDB_FILE_HDR, o = SDB_FILE_HDR;
       uint32_t kept = 0;
+      size_t walk = s->walk_off;
       while (o < s->used) {
+        if (o == s->walk_off) walk = w;
         uint32_t rlen = rdU32(s->block + o + SDB_REC_LEN_OFF);
         if (rlen < hs || o + rlen > s->used) break;
         if (!(s->block[o + SDB_FLAGS_OFF] & SDB_FLAG_DELETED)) {
@@ -457,6 +463,8 @@ static bool reclaimForAppend(sdb_store* s, size_t recSize) {
         }
         o += rlen;
       }
+      if (s->walk_off && (s->walk_off >= s->used || walk > w)) walk = w;
+      s->walk_off = walk;
       gp_free(s->block);
       s->block = nb; s->cap = newcap; s->used = w;
       writeFileHeader(s, kept);
@@ -763,6 +771,7 @@ void sdbEvict(sdb_store* s) {
   s->used = 0;
   s->loaded = false;
   s->dirty = false;
+  s->walk_off = 0;
   s->index.clear();
 }
 
@@ -942,47 +951,77 @@ void sdbDeleteRecord(sdb_store* s, const char* key) {
   s->dirty = true;
 }
 
+/* Call `emit` for every non-empty field of the live record at `off`. */
+template <typename F>
+static void emitRecord(const sdb_store* s, size_t off, F emit) {
+  char buf[16];
+  std::string key; std::vector<std::string> texts;
+  readRecordText(s, off, key, texts);
+  const uint8_t* h = s->block + off;
+  for (auto& fd : s->schema->fields) {
+    switch (fd.kind) {
+      case SDB_U8:  snprintf(buf, sizeof(buf), "%u", (unsigned)h[fd.off]); emit(key.c_str(), fd.name.c_str(), buf); break;
+      case SDB_U32: snprintf(buf, sizeof(buf), "%u", (unsigned)rdU32(h + fd.off)); emit(key.c_str(), fd.name.c_str(), buf); break;
+      case SDB_FIXSTR: {
+        const char* p = (const char*)h + fd.off;
+        size_t l = strnlen(p, fd.width);
+        if (l) emit(key.c_str(), fd.name.c_str(), std::string(p, l).c_str());
+        break;
+      }
+      case SDB_DATA: {
+        const uint8_t* p = h + fd.off;
+        if (!isAllZero(p, fd.width)) {
+          std::string hx; hexEncodeBytes(p, fd.width, hx);
+          emit(key.c_str(), fd.name.c_str(), hx.c_str());
+        }
+        break;
+      }
+      case SDB_TEXT:
+        if (fd.off < texts.size() && !texts[fd.off].empty())
+          emit(key.c_str(), fd.name.c_str(), texts[fd.off].c_str());
+        break;
+    }
+  }
+}
+
 void sdbForEach(sdb_store* s,
                 void (*cb)(const char* key, const char* field, const char* val, void* ctx),
                 void* ctx) {
   if (!s->loaded) return;
   uint16_t hs = s->schema->hdr_size;
   size_t off = SDB_FILE_HDR;
-  char buf[16];
   while (off < s->used) {
     uint32_t rlen = rdU32(s->block + off + SDB_REC_LEN_OFF);
     if (rlen < hs || off + rlen > s->used) break;
-    if (!(s->block[off + SDB_FLAGS_OFF] & SDB_FLAG_DELETED)) {
-      std::string key; std::vector<std::string> texts;
-      readRecordText(s, off, key, texts);
-      const uint8_t* h = s->block + off;
-      for (auto& fd : s->schema->fields) {
-        switch (fd.kind) {
-          case SDB_U8:  snprintf(buf, sizeof(buf), "%u", (unsigned)h[fd.off]); cb(key.c_str(), fd.name.c_str(), buf, ctx); break;
-          case SDB_U32: snprintf(buf, sizeof(buf), "%u", (unsigned)rdU32(h + fd.off)); cb(key.c_str(), fd.name.c_str(), buf, ctx); break;
-          case SDB_FIXSTR: {
-            const char* p = (const char*)h + fd.off;
-            size_t l = strnlen(p, fd.width);
-            if (l) cb(key.c_str(), fd.name.c_str(), std::string(p, l).c_str(), ctx);
-            break;
-          }
-          case SDB_DATA: {
-            const uint8_t* p = h + fd.off;
-            if (!isAllZero(p, fd.width)) {
-              std::string hx; hexEncodeBytes(p, fd.width, hx);
-              cb(key.c_str(), fd.name.c_str(), hx.c_str(), ctx);
-            }
-            break;
-          }
-          case SDB_TEXT:
-            if (fd.off < texts.size() && !texts[fd.off].empty())
-              cb(key.c_str(), fd.name.c_str(), texts[fd.off].c_str(), ctx);
-            break;
-        }
-      }
-    }
+    if (!(s->block[off + SDB_FLAGS_OFF] & SDB_FLAG_DELETED))
+      emitRecord(s, off, [&](const char* k, const char* f, const char* v) { cb(k, f, v, ctx); });
     off += rlen;
   }
+}
+
+void sdbWalkStart(sdb_store* s) {
+  s->walk_off = s->loaded ? SDB_FILE_HDR : 0;
+}
+
+bool sdbWalk(sdb_store* s,
+             bool (*cb)(const char* key, const char* field, const char* val, void* ctx),
+             void* ctx) {
+  if (!s->loaded || !s->walk_off) { s->walk_off = 0; return true; }
+  uint16_t hs = s->schema->hdr_size;
+  size_t off = s->walk_off;
+  bool more = true;
+  while (more && off < s->used) {
+    uint32_t rlen = rdU32(s->block + off + SDB_REC_LEN_OFF);
+    if (rlen < hs || off + rlen > s->used) { off = s->used; break; }
+    if (!(s->block[off + SDB_FLAGS_OFF] & SDB_FLAG_DELETED))
+      emitRecord(s, off, [&](const char* k, const char* f, const char* v) {
+        if (!cb(k, f, v, ctx)) more = false;
+      });
+    off += rlen;
+  }
+  if (off >= s->used) { s->walk_off = 0; return true; }
+  s->walk_off = off;
+  return false;
 }
 
 uint8_t* sdbSerializeGz(sdb_store* s, size_t* outLen) {

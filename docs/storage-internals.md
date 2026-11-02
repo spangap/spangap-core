@@ -77,13 +77,12 @@ unlinks are deferred to `g_sdbPendingDeletes`, drained here (fs I/O off the acto
 
 **Browser sync (three layers).** (1) The connect dump is cheap because bodies
 aren't in cfgRoot. (2) On open, the browser sends `{"fetch":"<instance-prefix>"}`;
-`dcShipStorePrefix` ships that instance's records as one merge-patch at the
-instance path (where the browser's message code already reads) and adds it to
-`dcOpenPrefixes`. (3) `dcAccumulateChange` mirrors a routed body change **only**
-when it's under one of those prefixes (reading the value from the store, not
-cfgRoot); other conversations are represented only by their directory entry.
-*Note:* this ships records as JSON, not the plan's raw `.db.gz` cold-ship — a
-correctness-first realization; the raw-bytes speedup is a future optimization.
+`dcShipStorePrefix` queues a reload of that instance (a clear, then its records
+as merge-patch chunks at the instance path, where the browser's message code
+already reads) and adds it to `dcOpenPrefixes`. (3) `dcAccumulateChange` mirrors
+a routed body change **only** when it's under one of those prefixes (reading the
+value from the store, not cfgRoot); other conversations are represented only by
+their directory entry. Records ship as JSON, not as the raw `.db.gz`.
 (4) **Browser-mirrored stores** (`opts.browserMirror`) are small always-needed
 collections — a directory or catalogue, not a body — so they behave like a
 cfgRoot subtree used to: the browser fetches each once (same `{"fetch":…}` →
@@ -104,6 +103,28 @@ whether the subtree is there. Same reasoning on the client side: a (re)dump is a
 new stream and the device's open set went with the old one, so the client forgets
 what it was shipped and re-asks for the conversation on screen
 (`browser/src/modules/lxmf.ts`, `shipThread`).
+
+**A reload is a cursor, never a copy.** A store can be far larger than the heap
+can hold twice: a busy mesh fills the announce catalogue to its cap, and
+collecting that whole into key/value strings and then a cJSON tree runs the
+heap out and holds the storage task on core 0 long enough to trip the task
+watchdog. So `dcQueueReload` only records the prefix and the instances it spans
+(`sdbInstancesUnderLocked`); `dcReloadStep`, called from `dcPumpDump`, packs
+**one** `≤ DC_DUMP_MAX` chunk from a resumable store walk (`sdbWalkStart` /
+`sdbWalk`), and only once every earlier chunk has gone out. A reload therefore
+costs one chunk of RAM and one bounded slice of a loop pass, however big the
+store. Reloads run one at a time in queue order; a prefix already queued is not
+queued again, and an open instance pushed out of the open set has its pending
+reload cancelled before its clear is sent.
+
+The walk cursor (`sdb_store::walk_off`) is a record offset, and the store moves
+records between steps — cap drops, flush compaction, relocation on a failed
+grow. Every one of those paths re-points the cursor at the first live record at
+or after it, and eviction zeroes it (the reload then restarts that instance).
+Every record live for the whole walk is visited once; one rewritten mid-walk
+may be visited twice, which a merge tolerates. Anything that changes after the
+walk starts reaches the browser as an ordinary patch, because patches are held
+until the reload queue is empty.
 
 **Conversation directory (LXMF-side, maintained).** `contacts.<peer>.{count,
 last_ts,preview,unread,display_name,…}` is now its own **browser-mirrored**
@@ -444,8 +465,9 @@ deadlocks the ack (client gives up after 3 s) and freezes the inbox drain.
   packet per pass, retried on back-pressure, never dropped (a deletion is echoed
   as an explicit `null`). It gates on `itsSpacesAvailable` **before**
   serializing: against a back-pressured or mid-teardown browser it must not pay
-  `cJSON_PrintUnformatted` of a potentially huge patch on every 10 ms pass. Patches are **held until the dump fully drains** so a
-  post-snapshot change can't be overwritten by a late dump chunk.
+  `cJSON_PrintUnformatted` of a potentially huge patch on every 10 ms pass. Patches are **held until the dump and every
+  queued store reload fully drain** so a post-snapshot change can't be
+  overwritten by a late chunk.
 - **Inbound**: `dcPollConfig` takes ownership of each JSON body (`itsRecvRef`,
   zero-copy), parses by length. `{"ping":1}`→`{"pong":1}`, `{"save":1}`→poke the
   worker, otherwise `mergeIncomingPatch` (null = silent delete, values =

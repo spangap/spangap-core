@@ -119,6 +119,8 @@ struct sdb_store {
   bool     loaded = false;       /* file decompressed into RAM (or RAM-only inited) */
   bool     dirty  = false;       /* needs flush */
   bool     grow_failed = false;  /* last arena grow hit OOM; gates one warning per episode */
+  size_t   walk_off = 0;         /* sdbWalk cursor (a record offset; 0 = none). Compaction
+                                  * re-points it, so it survives between walk steps. */
 
   std::unordered_map<std::string, uint32_t> index;  /* record key -> byte offset in block */
 };
@@ -200,6 +202,16 @@ size_t sdbRecordCount(const sdb_store* s);
 void sdbForEach(sdb_store* s,
                 void (*cb)(const char* key, const char* field, const char* val, void* ctx),
                 void* ctx);
+
+/* sdbForEach in steps, resumable across lock releases: sdbWalkStart, then call
+ * sdbWalk until it returns true (end reached). A step stops after the record in
+ * which cb returned false. Every record live from start to end is visited; one
+ * rewritten mid-walk may be visited twice. One walk per store at a time. Caller
+ * holds the storage lock for each call. */
+void sdbWalkStart(sdb_store* s);
+bool sdbWalk(sdb_store* s,
+             bool (*cb)(const char* key, const char* field, const char* val, void* ctx),
+             void* ctx);
 
 /* Serialize the resident block to a freshly gp_alloc'd gz buffer (the exact
  * bytes of the .db.gz file), for shipping a resident conversation to the
