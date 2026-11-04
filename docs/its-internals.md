@@ -131,6 +131,17 @@ not a global pool. A task is single-threaded, so it can have only one outstandin
 SMP races a shared claim-from-pool design had (non-atomic check-then-claim, and a
 giver firing before the waiter reached its wait).
 
+The semaphore is only a wake, not the proof of pickup. A send whose wait timed
+out is still handled later, and its give lands whenever that happens, possibly
+during the same task's next pickup wait. So every pickup send is numbered: the
+task's `pickupGen` advances per send and rides in the message's `nonce`; the
+receiver, after handling, raises the sender's `pickupDone` to that number (under
+`pickupMux`, only to numbers the slot issued) and then gives. A sender waits until
+`pickupDone` reaches its own number, so a stale give only wakes it to check again.
+Without that, a stale give releases a later wait early, and a sender that handed
+the receiver a pointer into its stack (the fs proxy does) returns while the
+receiver still uses it.
+
 ### Why plain heap blocks — rejected alternatives
 
 The borrowed-block design was chosen over several alternatives; the reasons
@@ -224,7 +235,8 @@ overhead in this mode.
 ### Inbox messages
 `its_msg` header carries: sender task handle, message kind (CONNECT / DISCONNECT /
 AUX / FORWARD / CONNECT_CANCEL), port, length, handle, a flag field
-(`ITS_F_PICKUP`), and the client's connect nonce. The payload (if any) is a
+(`ITS_F_PICKUP`), and a nonce: the client's connect nonce on CONNECT and
+CONNECT_CANCEL, the sender's pickup number on an AUX with `ITS_F_PICKUP`. The payload (if any) is a
 separate borrowed block.
 
 ## 4. Lifecycle

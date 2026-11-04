@@ -57,6 +57,7 @@
 #include "esp_heap_caps.h"
 #include "miniz.h"        /* ROM tdefl/tinfl — gz-compressed storage files */
 #include "esp_rom_crc.h"  /* esp_rom_crc32_le == zlib crc32 for the gzip footer */
+#include "storage_rotate.h"
 
 /* ---- External storage files ----
  *
@@ -74,6 +75,9 @@ struct external_t {
 };
 static std::vector<external_t> externals;
 static bool rootDirty = false;        /* root.json needs rewrite */
+/* An unreadable root file could not be set aside at load: nothing may be
+ * written over it this boot. */
+static bool rootWriteBlocked = false;
 
 /* ---- Config tree state ---- */
 
@@ -486,23 +490,36 @@ static char* readFileStr(const char* path, size_t* outLen = nullptr) {
  * ticks on the background flush. */
 #define STORAGE_FLUSH_CHUNK 8192
 
-/** Atomic write of `data[len]` to `path` via `<path>.new` + rename. */
-static bool atomicWriteFile(const char* path, const void* data, size_t len) {
-  std::string tmp = std::string(path) + ".new";
-  int f = fs_open(tmp.c_str(), "w");
-  if (f < 0) return false;
-  bool ok = true;
-  for (size_t off = 0; off < len; ) {
-    size_t n = len - off;
-    if (n > STORAGE_FLUSH_CHUNK) n = STORAGE_FLUSH_CHUNK;
-    if (fs_write((const char*)data + off, 1, n, f) != n) { ok = false; break; }
-    off += n;
-    if (off < len) vTaskDelay(1);
+/** storage_rotate.h's file-system adaptor over fs_*. write() is the chunked
+ *  writer described above, synced before close so a completed .new is on the
+ *  medium before any rename depends on it. */
+struct StoreFs {
+  bool write(const std::string& p, const void* data, size_t len) {
+    int f = fs_open(p.c_str(), "w");
+    if (f < 0) return false;
+    bool ok = true;
+    for (size_t off = 0; off < len; ) {
+      size_t n = len - off;
+      if (n > STORAGE_FLUSH_CHUNK) n = STORAGE_FLUSH_CHUNK;
+      if (fs_write((const char*)data + off, 1, n, f) != n) { ok = false; break; }
+      off += n;
+      if (off < len) vTaskDelay(1);
+    }
+    if (ok && fs_sync(f) != 0) ok = false;
+    fs_close(f);
+    return ok;
   }
-  fs_close(f);
-  if (ok) fs_rename(tmp.c_str(), path);
-  else    fs_remove(tmp.c_str());
-  return ok;
+  bool exists(const std::string& p) { struct stat st; return fs_stat(p.c_str(), &st) == 0; }
+  bool rename(const std::string& a, const std::string& b) { return fs_rename(a.c_str(), b.c_str()) == 0; }
+  bool remove(const std::string& p) { return fs_remove(p.c_str()) == 0; }
+};
+
+/** Atomic write of `data[len]` to `path` via `<path>.new` + rename. With a
+ *  `bak` path the replaced generation moves there (storage_rotate.h). */
+static bool atomicWriteFile(const char* path, const void* data, size_t len,
+                            const char* bak = nullptr) {
+  StoreFs sfs;
+  return srot::write(sfs, path, bak ? bak : "", data, len);
 }
 
 /* ---- gzip storage files (ROM miniz) ----
@@ -558,8 +575,10 @@ static uint8_t* gzDeflate(const void* in, size_t inLen, size_t* outLen) {
 }
 
 /** Inflate a gzip stream into a malloc'd NUL-terminated string. NULL on any
- *  malformation (bad magic, truncation, CRC mismatch, size lie). */
-static char* gzInflate(const uint8_t* gz, size_t n) {
+ *  malformation (bad magic, truncation, CRC mismatch, size lie), and NULL
+ *  with *oom set when a buffer could not be allocated (no verdict). */
+static char* gzInflate(const uint8_t* gz, size_t n, bool* oom = nullptr) {
+  if (oom) *oom = false;
   if (n < GZ_HDR_LEN + GZ_FOOT_LEN || gz[0] != 0x1f || gz[1] != 0x8b || gz[2] != 8)
     return nullptr;
   uint8_t flg = gz[3];
@@ -588,9 +607,9 @@ static char* gzInflate(const uint8_t* gz, size_t n) {
   if (isz > 8 * 1024 * 1024) return nullptr;
 
   char* out = (char*)gp_alloc((size_t)isz + 1);
-  if (!out) return nullptr;
+  if (!out) { if (oom) *oom = true; return nullptr; }
   tinfl_decompressor* inf = (tinfl_decompressor*)gp_alloc(sizeof(tinfl_decompressor));
-  if (!inf) { free(out); return nullptr; }
+  if (!inf) { free(out); if (oom) *oom = true; return nullptr; }
 
   size_t inSz = n - off - GZ_FOOT_LEN, outSz = isz;
   tinfl_init(inf);
@@ -625,18 +644,22 @@ static char* readJsonFile(const char* path) {
 /** Write a storage JSON file: gzip to `<path>.gz` (atomic), falling back to
  *  plain `<path>` if compression fails. On success remove the other-format
  *  sibling so a stale copy can't shadow this write on the next read. */
-static bool atomicWriteJsonGz(const char* path, const char* text) {
+static bool atomicWriteJsonGz(const char* path, const char* text,
+                              const char* bakBase = nullptr) {
   std::string gzPath = std::string(path) + ".gz";
+  std::string bakGz  = bakBase ? std::string(bakBase) + ".gz" : std::string();
   size_t gzLen = 0;
   uint8_t* gz = gzDeflate(text, strlen(text), &gzLen);
   if (gz) {
-    bool ok = atomicWriteFile(gzPath.c_str(), gz, gzLen);
+    bool ok = atomicWriteFile(gzPath.c_str(), gz, gzLen,
+                              bakBase ? bakGz.c_str() : nullptr);
     free(gz);
     if (ok) { fs_remove(path); return true; }
     return false;
   }
   warn("storage: gzip failed, writing %s uncompressed\n", path);
-  if (!atomicWriteFile(path, text, strlen(text))) return false;
+  if (!atomicWriteFile(path, text, strlen(text), bakBase)) return false;
+  if (bakBase) fs_rename(gzPath.c_str(), bakGz.c_str());   /* no-op when absent */
   fs_remove(gzPath.c_str());
   return true;
 }
@@ -743,11 +766,24 @@ static void writeExternalFile(const external_t& ext) {
  * alongside the per-prefix blobs in <stateDir>/storage/external/ — so
  * everything persisted is under storage/. */
 #define ROOT_JSON_PATH "/storage/root.json"
+/* The previous root.json generation, in a directory of its own so damage to
+ * storage/ itself does not take both generations (storage_rotate.h). */
+#define ROOT_BAK_DIR   "/storage.bak"
+#define ROOT_BAK_PATH  ROOT_BAK_DIR "/root.json"
+/* Unreadable root files kept aside per name (<file>.unreadable-1..N). */
+#define ROOT_UNREADABLE_KEEP 3
 
 /** Write root.json (cfgRoot minus external sub-trees).
  *  Same lock discipline as writeExternalFile: snapshot under CFG_LOCK,
  *  serialize lock-free, compact form. */
 static void writeSettingsFileOnly() {
+  if (rootWriteBlocked) {
+    static bool said = false;
+    if (!said) err("storage: root.json NOT written this boot — an unreadable root "
+                   "file could not be set aside and is kept as-is\n");
+    said = true;
+    return;
+  }
   cJSON* out = cJSON_CreateObject();
   if (!out) return;
   int64_t t0 = esp_timer_get_time();
@@ -767,7 +803,8 @@ static void writeSettingsFileOnly() {
   if (!text) return;
   {
     int64_t t0 = esp_timer_get_time();
-    atomicWriteJsonGz(fsStatePath(ROOT_JSON_PATH).c_str(), text);
+    atomicWriteJsonGz(fsStatePath(ROOT_JSON_PATH).c_str(), text,
+                      fsStatePath(ROOT_BAK_PATH).c_str());
     flushNoteFile(ROOT_JSON_PATH, esp_timer_get_time() - t0);
   }
   cJSON_free(text);
@@ -2239,6 +2276,97 @@ static void migrateLxmfMonolith() {
        skipped ? " (some left in root.json: name too long)" : "");
 }
 
+/** Parse one root candidate (gzip detected by its magic). Returns the tree, or
+ *  nullptr with *readFail set when the bytes could not even be read or
+ *  inflated for lack of memory (no verdict on the file) and clear when they were read and are not a JSON
+ *  object (the file is unreadable). */
+static cJSON* parseRootFile(const std::string& p, bool* readFail) {
+  size_t n = 0;
+  char* raw = readFileStr(p.c_str(), &n);
+  *readFail = (raw == nullptr);
+  if (!raw) return nullptr;
+  char* text = raw;
+  if (n >= 2 && (uint8_t)raw[0] == 0x1f && (uint8_t)raw[1] == 0x8b) {
+    bool oom = false;
+    text = gzInflate((const uint8_t*)raw, n, &oom);
+    free(raw);
+    if (!text) { *readFail = oom; return nullptr; }
+  }
+  cJSON* j = cJSON_Parse(text);
+  free(text);
+  if (j && !cJSON_IsObject(j)) { cJSON_Delete(j); j = nullptr; }
+  return j;
+}
+
+/** Load the root tree from the first readable generation: current, then the
+ *  completed in-flight write, then the previous generation (storage_rotate.h).
+ *  An unreadable current or previous file is set aside before anything can be
+ *  written over it; if that fails, root writes are blocked for this boot. Any
+ *  load that is not from the current file is logged as an error. */
+static cJSON* loadRootTree() {
+  StoreFs sfs;
+  const std::string base = fsStatePath(ROOT_JSON_PATH);
+  const std::string bak  = fsStatePath(ROOT_BAK_PATH);
+  struct cand_t { std::string path; bool isNew; bool current; };
+  const cand_t cands[] = {
+    { base + ".gz",     false, true  }, { base + ".gz.new", true,  false },
+    { base,             false, true  }, { base + ".new",    true,  false },
+    { bak + ".gz",      false, false }, { bak,              false, false },
+  };
+  const int nc = sizeof(cands) / sizeof(cands[0]);
+  rootWriteBlocked = false;
+  cJSON* tree = nullptr;
+  int used = -1;
+  bool anyFile = false;
+  for (int i = 0; i < nc; i++) {
+    const cand_t& c = cands[i];
+    if (!sfs.exists(c.path)) continue;
+    anyFile = true;
+    bool readFail = false;
+    tree = parseRootFile(c.path, &readFail);
+    if (tree) { used = i; break; }
+    if (c.isNew) { warn("storage: %s incomplete, skipped\n", c.path.c_str()); continue; }
+    if (readFail) {
+      rootWriteBlocked = true;
+      err("storage: %s could not be read — root.json will not be written this boot\n",
+          c.path.c_str());
+    } else if (srot::setAside(sfs, c.path, ROOT_UNREADABLE_KEEP)) {
+      err("storage: %s UNREADABLE — kept as %s.unreadable-1\n",
+          c.path.c_str(), c.path.c_str());
+    } else {
+      rootWriteBlocked = true;
+      err("storage: %s UNREADABLE and could not be set aside — root.json will "
+          "not be written this boot\n", c.path.c_str());
+    }
+  }
+  /* Every .new except the one loaded is superseded (its write never reached
+   * the commit rename) or incomplete. A loaded .new is committed below. */
+  for (int i = 0; i < nc; i++)
+    if (cands[i].isNew && i != used) fs_remove(cands[i].path.c_str());
+
+  if (used >= 0 && !cands[used].current) {
+    err("storage: root.json missing or unreadable — loaded %s %s\n",
+        cands[used].isNew ? "the completed in-flight write" : "the PREVIOUS generation",
+        cands[used].path.c_str());
+    /* Commit a loaded .new now (step 3 of the write order): the next root
+     * write would otherwise truncate the only copy of this generation. Its
+     * current path is free — a current file that existed was set aside, or
+     * writes are blocked. */
+    if (cands[used].isNew && !rootWriteBlocked) {
+      const std::string& np = cands[used].path;
+      fs_rename(np.c_str(), np.substr(0, np.size() - 4).c_str());
+    }
+    rootDirty = true;
+  } else if (used < 0 && anyFile) {
+    err("storage: no readable root.json, in-flight write or previous generation — "
+        "starting from defaults\n");
+  } else if (used < 0 && !fs_first_boot()) {
+    err("storage: no root.json, in-flight write or previous generation on a used "
+        "state store — starting from defaults\n");
+  }
+  return tree ? tree : cJSON_CreateObject();
+}
+
 void storageLoad() {
   if (!cfgMux) cfgMux = xSemaphoreCreateRecursiveMutex();
 
@@ -2258,14 +2386,10 @@ void storageLoad() {
    * read/write — a freshly-seeded SD store may only have what factory_state
    * shipped, and atomicWriteFile() does not create parent dirs. */
   fs_mkdirp(fsStatePath("/storage/external").c_str());
+  fs_mkdirp(fsStatePath(ROOT_BAK_DIR).c_str());
 
   /* Load <stateDir>/storage/root.json(.gz) — the single source of truth. */
-  char* text = readJsonFile(fsStatePath(ROOT_JSON_PATH).c_str());
-  if (text) {
-    cfgRoot = cJSON_Parse(text);
-    free(text);
-  }
-  if (!cfgRoot) cfgRoot = cJSON_CreateObject();
+  cfgRoot = loadRootTree();
 
   /* External files: scan /state/storage/<mode>/, register, then load each
    * file's contents into cfgRoot at its prefix. Externals overwrite anything
@@ -2303,12 +2427,6 @@ void storageLoad() {
       free(overlay);
     }
   }
-
-  /* Drop a stale temp from a crash between write and rename (atomicWriteFile
-   * writes "<path>.new"). With the FAT-safe rename this is rare, but cheap
-   * to clear. */
-  fs_remove(fsStatePath(ROOT_JSON_PATH ".new").c_str());
-  fs_remove(fsStatePath(ROOT_JSON_PATH ".gz.new").c_str());
 }
 
 /* ---- read-through providers ----

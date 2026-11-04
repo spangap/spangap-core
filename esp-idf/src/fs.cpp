@@ -593,8 +593,11 @@ static void onFsOp(TaskHandle_t sender, const void* data, size_t len) {
 static int proxyOp(fs_op_t& req) {
     fs_op_t* ptr = &req;
     uint32_t t0 = (uint32_t)esp_timer_get_time();
-    itsSendAuxByTaskHandle(fsWorkerHandle, FS_OP_PORT, &ptr, sizeof(ptr),
-                           portMAX_DELAY, ITS_WAIT_PICKUP);
+    /* The worker dereferences `req` (on this stack) and its buffers, so this
+     * wait must never time out: a finite timeout here is a use-after-return. */
+    if (!itsSendAuxByTaskHandle(fsWorkerHandle, FS_OP_PORT, &ptr, sizeof(ptr),
+                                portMAX_DELAY, ITS_WAIT_PICKUP))
+        return -1;
     uint32_t took = ((uint32_t)esp_timer_get_time() - t0) / 1000;
     if (took > 200) {
         verb("fs proxy: op=%s slot=%d wait %ums\n",

@@ -1275,6 +1275,19 @@ static void cmdPm(const char* args) {
 }
 
 #ifdef CONFIG_HEAP_TASK_TRACKING
+/* heap_caps_get_per_task_info() validates every allocated block it passes and,
+ * under heap poisoning, ASSERTS on the first damaged header — a diagnostic
+ * walk that finds a corrupt heap panics the device. Check the heaps it is
+ * about to walk first (the check reports instead of asserting) and skip the
+ * walk when they are damaged. Corruption landing between the check and the
+ * walk can still trip the assert; the window is the walk's own length. */
+static bool heapWalkSafe(uint32_t caps, const char* who) {
+    if (heap_caps_check_integrity(caps, true)) return true;
+    err("%s: heap CORRUPT (caps 0x%x) — per-task heap walk skipped\n",
+        who, (unsigned)caps);
+    return false;
+}
+
 /* `top -b <task>` — the DRAM column of `top -v` split into the individual heap
  * blocks behind it, grouped by size. A total says how much internal RAM a task
  * holds; only the size histogram says WHAT it holds, and that is the whole
@@ -1322,6 +1335,11 @@ static void topBlocks(const char* name, bool hex)
     p.max_totals = 0;
     p.tasks = &target; p.num_tasks = 1;
     p.blocks = blocks; p.max_blocks = MAX_BLOCKS;
+    if (!heapWalkSafe(MALLOC_CAP_INTERNAL, "top -b")) {
+        free(blocks); free(raw);
+        cliPrintf("top -b: heap corrupt, walk skipped (see log)\n");
+        return;
+    }
     size_t n = heap_caps_get_per_task_info(&p);
 
     /* Under heap task tracking every block carries its owner's TaskHandle_t as
@@ -1506,7 +1524,10 @@ static void cmdTop(const char* args) {
       p.caps[0] = MALLOC_CAP_INTERNAL; p.mask[0] = MALLOC_CAP_INTERNAL;
       p.caps[1] = MALLOC_CAP_SPIRAM;   p.mask[1] = MALLOC_CAP_SPIRAM;
       p.totals = htotals; p.num_totals = &ntot; p.max_totals = MAX_HT;
-      heap_caps_get_per_task_info(&p);
+      if (heapWalkSafe(MALLOC_CAP_INTERNAL, "top") && heapWalkSafe(MALLOC_CAP_SPIRAM, "top"))
+          heap_caps_get_per_task_info(&p);
+      else
+          cliPrintf("(heap corrupt — per-task heap columns skipped, see log)\n");
       if (ntot >= MAX_HT)
           cliPrintf("(heap owners hit the %u-entry cap — some rows under-report; "
                     "raise MAX_HT)\n", (unsigned)MAX_HT);
@@ -1709,7 +1730,9 @@ void heapDump(const char* reason) {
     p.totals = totals;
     p.num_totals = &ntotals;
     p.max_totals = MAX_TASKS;
-    heap_caps_get_per_task_info(&p);
+    if (heapWalkSafe(MALLOC_CAP_INTERNAL, "heap dump") &&
+        heapWalkSafe(MALLOC_CAP_SPIRAM, "heap dump"))
+        heap_caps_get_per_task_info(&p);
     std::sort(totals, totals + ntotals,
         [](const heap_task_totals_t& a, const heap_task_totals_t& b) {
             return a.size[0] > b.size[0];   /* largest internal-DRAM user first */

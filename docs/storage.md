@@ -182,6 +182,38 @@ runs no config-version migrations, so do not treat version-bumping as a
 user-facing feature — adding a key and bumping the version simply makes the new
 key appear at next boot beside untouched existing values.
 
+## root.json generations
+
+`root.json` (the whole tree minus externals, `secrets.*` included) is written so
+that a reset at any step leaves a readable generation, and an unreadable file is
+never replaced by a fresh empty tree:
+
+```
+write:  root.json.gz.new  written + synced
+        root.json.gz      -> storage.bak/root.json.gz   (previous generation)
+        root.json.gz.new  -> root.json.gz               (commit)
+load:   root.json.gz -> root.json.gz.new -> root.json -> root.json.new
+        -> storage.bak/root.json.gz -> storage.bak/root.json
+```
+
+The previous generation lives in `<stateDir>/storage.bak/`, its own directory,
+so damage to `storage/` itself does not take both copies. Boot loads the first
+candidate that reads, inflates and parses as a JSON object. Loading anything
+but the current file is logged as an error naming the file used, and the tree
+is rewritten on the first flush. A loaded `.new` is committed (renamed to its
+current name) at load, so that rewrite cannot truncate the only copy. An
+in-flight `.new` that was not loaded is removed: either its write never reached
+the commit rename or it is incomplete.
+
+A current or previous file that exists but does not read is set aside as
+`<file>.unreadable-1` (older ones shift to `-2`, `-3`; beyond three the oldest
+is dropped), with an error, before anything is written in its place. If it
+cannot be set aside, root writes are refused for the rest of the boot. A used
+state store (not a first boot) with no root file at all also logs an error
+before starting from defaults. The ordering lives in `storage_rotate.h` and is
+host-tested with a reset after every step
+(`esp-idf/test/host/test_storage_rotate.cpp`).
+
 ## External storage files
 
 A subtree can be persisted to its own file under

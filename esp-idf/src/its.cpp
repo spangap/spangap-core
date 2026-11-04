@@ -624,8 +624,15 @@ struct its_task_t {
     uint32_t              connectGen;   /* monotonic per-connect id this client hands out */
 
     /* ITS_WAIT_PICKUP — sender waits on its own pickupSem; receiver gives
-     * this sem after processing the aux. Created on first registration. */
+     * this sem after processing the aux. Created on first registration.
+     * pickupGen numbers this task's pickup sends (carried in the message's
+     * nonce); pickupDone is the highest one dispatched, raised under
+     * pickupMux. The sem is only a wake: a send whose wait timed out is
+     * dispatched later and gives it during the NEXT send's wait, so a waiter
+     * returns only once pickupDone reaches its own number. */
     SemaphoreHandle_t     pickupSem;
+    uint32_t              pickupGen;
+    volatile uint32_t     pickupDone;
 
     /* Aux callbacks (per-task, per-port) */
     its_aux_entry_t       auxCallbacks[ITS_MAX_PORTS];
@@ -649,6 +656,8 @@ struct its_task_t {
      * default; opt in via itsServerInit. */
     bool                  no_pool;
 };
+
+static portMUX_TYPE pickupMux = portMUX_INITIALIZER_UNLOCKED;   /* internal: S32C1I */
 
 /* s_tasks is large (~23 KB: each entry holds serverPorts[8] + auxCallbacks[8]
  * + inbox plumbing) and is task-context-only — never touched from an ISR or a
@@ -1227,7 +1236,15 @@ done:
          * sender isn't registered (shouldn't happen: ITS_WAIT_PICKUP forces
          * registration). */
         its_task_t* s = taskFind(m->sender);
-        if (s && s->pickupSem) xSemaphoreGive(s->pickupSem);
+        if (s && s->pickupSem) {
+            portENTER_CRITICAL(&pickupMux);
+            /* Only numbers this slot issued: a dead task's late message whose
+             * handle a new task reused must not pre-release the new waits. */
+            if ((int32_t)(m->nonce - s->pickupDone) > 0 &&
+                (int32_t)(m->nonce - s->pickupGen) <= 0) s->pickupDone = m->nonce;
+            portEXIT_CRITICAL(&pickupMux);
+            xSemaphoreGive(s->pickupSem);
+        }
     }
     /* Ownership exit: credit the in-flight bytes back to this task, then free
      * the payload (the receiver never took it in step 1) and the header. */
@@ -2026,6 +2043,20 @@ static its_task_t* pickupArm(its_wait_t wait, bool* ok) {
     return me;
 }
 
+/* Wait until this task's pickup send `gen` has been dispatched. Gives left
+ * by earlier sends that timed out wake the wait but do not end it. */
+static bool pickupWait(its_task_t* me, uint32_t gen, TickType_t timeout) {
+    TimeOut_t to;
+    vTaskSetTimeOutState(&to);
+    TickType_t left = timeout;
+    for (;;) {
+        if ((int32_t)(me->pickupDone - gen) >= 0) return true;
+        if (xSemaphoreTake(me->pickupSem, left) != pdTRUE ||
+            xTaskCheckForTimeOut(&to, &left) != pdFALSE)
+            return (int32_t)(me->pickupDone - gen) >= 0;
+    }
+}
+
 static bool itsSendAuxInternal(TaskHandle_t task, uint16_t port,
                                const void* data, size_t dataLen,
                                TickType_t timeout, its_wait_t wait) {
@@ -2043,12 +2074,16 @@ static bool itsSendAuxInternal(TaskHandle_t task, uint16_t port,
 
     its_msg* m = buildCopyMsg(ITS_K_AUX, port, -1, data, dataLen, te, "aux");
     if (!m) return false;
-    if (wait == ITS_WAIT_PICKUP) m->flags |= ITS_F_PICKUP;
+    uint32_t gen = 0;
+    if (me) {
+        gen = ++me->pickupGen;
+        m->flags |= ITS_F_PICKUP;
+        m->nonce = gen;
+    }
 
     if (!inboxEnqueue(te, m, timeout)) { msgFree(m); return false; }
 
-    if (me)
-        return xSemaphoreTake(me->pickupSem, timeout) == pdTRUE;
+    if (me) return pickupWait(me, gen, timeout);
     return true;
 }
 
@@ -2079,7 +2114,12 @@ bool itsSendAuxOwnedByTaskHandle(TaskHandle_t task, uint16_t port,
     m->sender = xTaskGetCurrentTaskHandle();
     m->len = (uint32_t)len;
     m->payload = ptr;
-    if (wait == ITS_WAIT_PICKUP) m->flags |= ITS_F_PICKUP;
+    uint32_t gen = 0;
+    if (me) {
+        gen = ++me->pickupGen;
+        m->flags |= ITS_F_PICKUP;
+        m->nonce = gen;
+    }
     payAdopt(len);           /* ownership boundary: the adopted block is now counted */
 
     if (!inboxEnqueue(te, m, timeout)) {
@@ -2099,7 +2139,7 @@ bool itsSendAuxOwnedByTaskHandle(TaskHandle_t task, uint16_t port,
      * "false return → caller still owns ptr") would free a block ITS already
      * owns, double-freeing it once the receiver finally drains the message.
      * Surface the stall as a warning and still return success. */
-    if (me && xSemaphoreTake(me->pickupSem, timeout) != pdTRUE)
+    if (me && !pickupWait(me, gen, timeout))
         ITS_LOGW("owned aux to port %u on [%s] enqueued but not picked up within "
                  "timeout (receiver stuck?)", port, pcTaskGetName(task));
     return true;

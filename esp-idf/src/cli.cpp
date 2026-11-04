@@ -2794,7 +2794,7 @@ void cliInit() {
    * chain is already that context. */
   cliBuiltinInit();
 
-  cliTaskHandle = spawnTask(cliTaskFn, "cli", 6144, nullptr, 1, 1);
+  cliTaskHandle = spawnTask(cliTaskFn, "cli", 8192, nullptr, 1, 1);
   /* 4096 instead of 3072 — apps linking C++ exception support (e.g.
    * reticulous + microReticulum) pay ~600B of libstdc++ unwinder stack
    * per dispatch, which the 3072 budget didn't allow for. */
