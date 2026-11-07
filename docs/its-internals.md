@@ -172,6 +172,15 @@ and its ITS calls fail as they would for any unknown task, rather than hand
 FreeRTOS a null queue. Likewise `itsClientInit` marks a task a client only once
 its ack semaphore exists.
 
+Adding a slot is serialised by one mutex, and lookups (`taskFind`) take no lock.
+Tasks on both cores register at the same moment during boot, and two appends
+racing on `s_taskCount` would land in the same slot: the loser's entry is
+overwritten, so it is left out of ITS while its own `itsClientInit` returned as
+if it had worked, and every `itsConnect` it makes then fails with "not
+initialised as a client". Under the mutex the table is searched again before
+appending, and a slot is filled completely before `s_taskCount` is published
+with a release store, so a lock-free reader never sees a half-written entry.
+
 `s_tasks` is append-only: `taskFindOrCreate` adds a permanent slot the first time
 a task touches ITS — including a transient task that registers only to use the
 connectionless fs/storage pickup proxy (`pickupArm`) and then dies. The slot is

@@ -688,15 +688,31 @@ static its_task_t* taskFind(TaskHandle_t task) {
     return nullptr;
 }
 
+/* Registration is serialised by one mutex: tasks on both cores register at
+ * once during boot, and two unserialised appends land in the same slot — the
+ * loser is left out of ITS while believing itself registered. A slot is filled
+ * before s_taskCount is published, so the lock-free taskFind() readers never
+ * see a half-written entry. */
+static its_task_t* taskCreateLocked(TaskHandle_t task, size_t inboxMaxMsgLen, size_t inboxDepth);
+
 static its_task_t* taskFindOrCreate(TaskHandle_t task, size_t inboxMaxMsgLen, size_t inboxDepth) {
     its_task_t* e = taskFind(task);
     if (e) return e;
+    static StaticSemaphore_t s_regBuf;
+    static SemaphoreHandle_t s_reg = xSemaphoreCreateMutexStatic(&s_regBuf);
+    xSemaphoreTake(s_reg, portMAX_DELAY);
+    e = taskFind(task);
+    if (!e) e = taskCreateLocked(task, inboxMaxMsgLen, inboxDepth);
+    xSemaphoreGive(s_reg);
+    return e;
+}
+
+static its_task_t* taskCreateLocked(TaskHandle_t task, size_t inboxMaxMsgLen, size_t inboxDepth) {
+    its_task_t* e = nullptr;
     if (!s_tasks) {
         /* First registration: allocate the big task-context tables in PSRAM
          * (zeroed). Done here — before any connection can exist — so packet
-         * connects find itsLinks ready without a concurrent lazy-alloc race
-         * (ITS registration is effectively serialized at boot, same assumption
-         * the lock-free s_taskCount already relies on). */
+         * connects find itsLinks ready. */
         s_tasks = (its_task_t*)heap_caps_calloc(ITS_MAX_TASKS, sizeof(its_task_t),
                                                 MALLOC_CAP_SPIRAM);
         itsLinks = (its_link_t*)heap_caps_calloc(ITS_MAX_LINKS, sizeof(its_link_t),
@@ -758,7 +774,7 @@ static its_task_t* taskFindOrCreate(TaskHandle_t task, size_t inboxMaxMsgLen, si
         return nullptr;
     }
 
-    e = &s_tasks[s_taskCount++];
+    e = &s_tasks[s_taskCount];
     memset(e, 0, sizeof(*e));
     e->task = task;
     e->ackHandle = -1;
@@ -767,6 +783,7 @@ static its_task_t* taskFindOrCreate(TaskHandle_t task, size_t inboxMaxMsgLen, si
     e->inboxMsgMax = guard;
     e->inboxDepth = depth;
     pendingPayOf(e).store(0, std::memory_order_relaxed);
+    __atomic_store_n(&s_taskCount, s_taskCount + 1, __ATOMIC_RELEASE);
     return e;
 }
 
